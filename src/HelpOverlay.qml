@@ -9,7 +9,7 @@ Popup {
     anchors.centerIn: Overlay.overlay
     modal: true
     padding: 26
-    width: 520
+    width: 660
 
     background: Rectangle {
         color: "#16161b"
@@ -17,20 +17,34 @@ Popup {
         border.color: "#2a2a32"
     }
 
-    readonly property var shortcuts: [
-        ["/", qsTr("Search")],
-        ["1  2  3", qsTr("Feed, subscriptions, history")],
-        ["← → ↑ ↓  Enter", qsTr("Move and play")],
-        ["R", qsTr("Refresh the feed")],
-        ["Space", qsTr("Play or pause")],
-        ["← →", qsTr("Back or forward 5 seconds while playing")],
-        ["J  L", qsTr("Back or forward 10 seconds")],
-        ["↑ ↓", qsTr("Volume while playing")],
-        ["M", qsTr("Mute")],
-        ["F", qsTr("Fullscreen")],
-        ["Esc", qsTr("Back")],
-        ["?", qsTr("This help")],
-        ["Q", qsTr("Quit")],
+    // Two groups, because the same key does different things in each: the
+    // arrows and Space move and play while browsing, and seek and pause while
+    // playing. Within a group, every key appears once.
+    readonly property var groups: [
+        {
+            title: qsTr("Browsing"),
+            keys: [
+                ["/", qsTr("Search")],
+                ["1  2  3", qsTr("Feed, subscriptions, history")],
+                ["← → ↑ ↓", qsTr("Move between videos")],
+                ["Enter  Space", qsTr("Play the selected video")],
+                ["R", qsTr("Refresh")],
+                ["Esc", qsTr("Back")],
+                ["?", qsTr("This help")],
+                ["Q", qsTr("Quit")],
+            ]
+        },
+        {
+            title: qsTr("Playing"),
+            keys: [
+                ["Space", qsTr("Play or pause")],
+                ["← →", qsTr("Back or forward 5 seconds")],
+                ["J  L", qsTr("Back or forward 10 seconds")],
+                ["↑ ↓", qsTr("Volume")],
+                ["M", qsTr("Mute")],
+                ["F", qsTr("Fullscreen")],
+            ]
+        },
     ]
 
     ColumnLayout {
@@ -43,32 +57,50 @@ Popup {
             font.weight: Font.DemiBold
         }
 
-        GridLayout {
-            columns: 2
-            columnSpacing: 22
-            rowSpacing: 8
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 36
+
             Repeater {
-                model: help.shortcuts
-                delegate: Label {
+                model: help.groups
+                delegate: ColumnLayout {
+                    id: group
                     required property var modelData
-                    required property int index
-                    Layout.row: index
-                    Layout.column: 0
-                    text: modelData[0]
-                    font.weight: Font.DemiBold
-                    color: theme.accent
-                }
-            }
-            Repeater {
-                model: help.shortcuts
-                delegate: Label {
-                    required property var modelData
-                    required property int index
-                    Layout.row: index
-                    Layout.column: 1
+                    Layout.alignment: Qt.AlignTop
                     Layout.fillWidth: true
-                    text: modelData[1]
-                    color: "#d0d0d8"
+                    // Equal widths, whatever the text in each group.
+                    Layout.preferredWidth: 1
+                    spacing: 8
+
+                    Label {
+                        Layout.bottomMargin: 2
+                        text: group.modelData.title
+                        font.pixelSize: 13
+                        font.weight: Font.DemiBold
+                        color: "#8d8d98"
+                    }
+
+                    Repeater {
+                        model: group.modelData.keys
+                        delegate: RowLayout {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            spacing: 14
+
+                            Label {
+                                Layout.preferredWidth: 96
+                                text: modelData[0]
+                                font.weight: Font.DemiBold
+                                color: theme.accent
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: modelData[1]
+                                wrapMode: Text.Wrap
+                                color: "#d0d0d8"
+                            }
+                        }
+                    }
                 }
             }
         }
