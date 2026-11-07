@@ -18,12 +18,13 @@ and to keep everything else on your machine.
 | | What qveil does |
 |---|---|
 | **One way out** | The window and its video player only ever talk to qveil's engine on `127.0.0.1`, behind a random token. Every request that leaves your machine (search, feeds, thumbnails and the video bytes themselves) is made by the engine, through the route you pick. |
-| **Route** | *Direct*, *Tor*, or your own *Proxy*, always shown in the top bar: amber while YouTube can see your IP. With Tor, every feed, thumbnail and video gets its own circuit, and seeking still works because the engine relays Range requests. A video that outlives its circuit is looked up again on a fresh one. Switching routes ends the streams playing on the old one. `socks5://` is refused (it leaks DNS); use `socks5h://`. |
-| **Account and cookies** | Never signed in, and no cookies stored or sent. yt-dlp runs with `--ignore-config --no-cookies --no-cookies-from-browser` and its own cache. Neither the embedded player nor `qveil play` loads your mpv config or scripts, and `qveil play` hands mpv its loopback URLs in a private temporary file rather than on the command line. |
-| **Subscription list** | Fetched one channel per request, in random order. With Tor each request has its own circuit, so they can't be linked by IP, but a refresh is still a burst of requests for exactly your channels, so timing and the set of IDs can still correlate them. |
+| **Route** | *Direct*, *Tor*, or your own *Proxy*, always shown in the top bar: amber while YouTube can see your IP. *Direct* means direct: qveil ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment, so the amber bar is the truth. With Tor, every feed, thumbnail and video gets its own circuit (always: `isolate_circuits = false` is refused with Tor), and seeking still works because the engine relays Range requests. A video that outlives its circuit is looked up again on a fresh one. Switching routes ends the streams playing on the old one, and a feed refresh that is running starts no further channels. `socks5://` is refused (it leaks DNS); use `socks5h://`. |
+| **Account and cookies** | Never signed in, and no cookies stored or sent. yt-dlp runs with `--ignore-config --no-cookies --no-cookies-from-browser --no-plugin-dirs` and its own cache, so neither your config nor a plugin can add cookies or a route of its own. Neither the embedded player nor `qveil play` loads your mpv config or scripts. |
+| **Command lines** | Anything on a command line can be read by every local user through `/proc`. So yt-dlp gets its proxy (and password), your searches and the video you open from a private file (mode `0600`, in a fresh `0700` directory that is removed afterwards), and `qveil play` hands mpv its loopback URLs the same way. |
+| **Subscription list** | Fetched one channel per request, in random order. With Tor each request has its own circuit, so they can't be linked by IP, but a refresh is still a burst of requests for exactly your channels, so timing and the set of IDs can still correlate them. A refresh skips channels fetched in the last 15 minutes (`qveil feed --force` fetches them all), which keeps pressing refresh from repeating that burst. |
 | **Tracking parameters** | Links are reduced to the video ID; `si=`, `pp=`, `feature=` and similar are dropped. |
 | **Player state** | No resume files, no watch history in mpv. |
-| **Local data** | Subscriptions and the feed cache live in `~/.local/share/qveil` and `~/.cache/qveil`, mode `0600`. Watch history is **off** by default. `qveil wipe` deletes all of it. |
+| **Local data** | Subscriptions and the feed cache live in `~/.local/share/qveil` and `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults. Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories. |
 | **Telemetry** | None. |
 
 **What YouTube can still see:** the IP you connect from (on Direct), each
@@ -80,7 +81,12 @@ qveil is only packaged for Arch and Omarchy: `pkgbuild/` is a PKGBUILD that
 builds from your checkout with makepkg. It pulls in Qt 6, mpv (libmpv), yt-dlp
 (keep it updated: it follows YouTube's changes) and [deno] (yt-dlp needs a
 JavaScript runtime for YouTube), and Rust is needed to build. For the Tor
-route, install `tor` and run `sudo systemctl enable --now tor`.
+route, install it with `sudo pacman -S tor` and run
+`sudo systemctl enable --now tor`.
+
+**Upgrading from veil.** qveil is veil under a new name. pacman asks whether to
+replace `veil` (the two conflict): answer `y`. Your subscriptions, history and
+settings move to the new locations on first launch.
 
 Settings are in `~/.config/qveil/config.toml`; a commented example is installed
 as `/usr/share/doc/qveil/config.example.toml`.
@@ -91,7 +97,8 @@ as `/usr/share/doc/qveil/config.example.toml`.
 it without a display (`qveil` alone, or `qveil open`, opens the window):
 
 ```
-qveil feed --json
+qveil feed --json           # refreshes channels not fetched in 15 minutes
+qveil feed --force --json   # refreshes every channel
 qveil search rust in 100 seconds --json
 qveil sub add @handle
 qveil sub import subscriptions.csv
@@ -110,6 +117,7 @@ core/        qveil-core, the engine (Rust)
   net.rs       route validation, per-request Tor circuit isolation
   feed.rs      per-channel RSS with a yt-dlp fallback when RSS is down
   ytdlp.rs     isolated yt-dlp calls: search, channels, stream resolution
+  private.rs   private scratch directories, so secrets stay off command lines
   ids.rs       URL → ID, dropping tracking parameters
 src/         the window (C++ / Qt Quick)
   backend.*    starts qveil-core and talks to it over loopback
@@ -131,6 +139,7 @@ bin/test     # Rust and Qt tests
 
 ## License
 
-MIT
+MIT. The icons in `src/icons` are Material Design icon paths (Copyright Google
+LLC), used under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
 
 [deno]: https://deno.com

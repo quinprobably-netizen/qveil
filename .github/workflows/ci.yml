@@ -4,12 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Mondays, off the hour so it isn't queued with everyone else's.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   engine:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -24,11 +29,43 @@ jobs:
       - run: cargo test --locked
 
   app:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
       - run: pacman -Syu --noconfirm --needed base-devel qt6-base qt6-declarative qt6-svg qt6-wayland mpv rust python desktop-file-utils
       - uses: actions/checkout@v4
       - run: desktop-file-validate pkgbuild/qveil.desktop
-      - run: ./bin/build
-      - run: ./bin/test
+      # makepkg refuses to run as root, and root would hide mistakes a real
+      # install as a normal user hits (a build writing outside its directory,
+      # say). The packages it would depend on at run time (yt-dlp, deno) are
+      # not needed to build or test, so --nodeps.
+      - name: Create a user to build as
+        run: |
+          useradd --create-home builder
+          chown -R builder "$GITHUB_WORKSPACE"
+      - name: Build the package
+        run: su builder -c 'cd "$GITHUB_WORKSPACE/pkgbuild" && makepkg --nodeps --force'
+      - name: Test
+        run: su builder -c 'cd "$GITHUB_WORKSPACE" && ./bin/test'
+
+  # Whether yt-dlp can still read YouTube with a fresh checkout: it breaks
+  # whenever YouTube changes something, and nothing else here would notice
+  # until a user did. It runs weekly and on request, not on every push.
+  canary:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    # YouTube may well ask a CI runner's address to sign in ("confirm you're
+    # not a bot"), which says nothing about qveil or yt-dlp, so a failure here
+    # is a prompt to look, not a failed build.
+    continue-on-error: true
+    steps:
+      - run: pacman -Syu --noconfirm --needed base-devel rust yt-dlp deno jq
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked --manifest-path core/Cargo.toml
+      - name: Search through the built engine
+        run: |
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_DATA_HOME="$RUNNER_TEMP/data" XDG_CACHE_HOME="$RUNNER_TEMP/cache"
+          core/target/release/qveil-core search "rust" -n 3 --json | tee "$RUNNER_TEMP/search.json"
+          jq -e 'length > 0' "$RUNNER_TEMP/search.json"

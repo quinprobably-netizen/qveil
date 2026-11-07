@@ -9,7 +9,9 @@ pub struct Config {
     /// through this proxy: `http://…`, `https://…` or `socks5h://…`.
     pub proxy: Option<String>,
     /// With a SOCKS proxy, use new random credentials for each request so
-    /// Tor puts them on separate circuits.
+    /// Tor puts them on separate circuits. Not optional with Tor itself
+    /// (`false` there is refused, see `Net::new`); the key is still accepted
+    /// so that existing config files load.
     pub isolate_circuits: bool,
     /// Cap the video resolution.
     pub max_height: u32,

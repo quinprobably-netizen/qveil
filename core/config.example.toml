@@ -6,7 +6,9 @@
 # proxy = "socks5h://127.0.0.1:9050"
 
 # With a SOCKS proxy, use new random credentials for each request so Tor puts
-# each channel feed and each video on its own circuit.
+# each channel feed and each video on its own circuit. With Tor this is always
+# on: setting it to false there is refused. It is still read, so old config
+# files keep working, and it only matters for a SOCKS proxy that isn't Tor.
 isolate_circuits = true
 
 max_height = 1080

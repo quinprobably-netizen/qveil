@@ -24,3 +24,7 @@ SOFTWARE.
 
 src/theme.* and src/translator.* follow Omacut and Monologue
 (MIT, Copyright (c) David Heinemeier Hansson).
+
+The icons in src/icons are Material Design icon paths
+(Copyright Google LLC), used under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0

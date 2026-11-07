@@ -1,4 +1,6 @@
 pkgname=qveil
+# The version lives in core/Cargo.toml; pkgver() below reads it from there and
+# makepkg keeps this line in step with it, so it never needs editing by hand.
 pkgver=0.2.0
 pkgrel=1
 pkgdesc='Private, account-free YouTube app: no cookies, no account, optional Tor for every byte'
@@ -19,6 +21,12 @@ options=('!lto' '!debug')
 # downloaded archive, so there is nothing to fetch and nothing to checksum.
 source=()
 sha256sums=()
+
+pkgver() {
+  # The package's own `version = "x.y.z"`, the first such line in the file.
+  # pkgver may not contain a hyphen, which a Cargo pre-release (1.0.0-rc.1) does.
+  sed -n 's/^version *= *"\(.*\)"/\1/p' "$startdir/../core/Cargo.toml" | head -n 1 | tr - _
+}
 
 build() {
   cd "$startdir/.."
