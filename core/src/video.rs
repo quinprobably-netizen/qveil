@@ -17,6 +17,12 @@ pub struct Video {
     pub views: Option<u64>,
     #[serde(default)]
     pub short: bool,
+    /// A live stream, or one that hasn't started yet (yt-dlp's `is_live` or
+    /// `is_upcoming`). qveil can't play those, so the window hides them.
+    /// Only written when true, which keeps old caches readable and the
+    /// API's JSON the same for every ordinary video.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
 }
 
 pub fn fmt_duration(secs: u64) -> String {
@@ -55,7 +61,9 @@ impl Video {
         if let Some(c) = &self.channel {
             parts.push(c.clone());
         }
-        if self.short {
+        if self.live {
+            parts.push("[live]".into());
+        } else if self.short {
             parts.push("short".into());
         } else if let Some(d) = self.duration {
             parts.push(fmt_duration(d));
@@ -84,5 +92,35 @@ mod tests {
         assert_eq!(fmt_duration(3723), "1:02:03");
         assert_eq!(fmt_age(1000, 1000 + 7200), "2h ago");
         assert_eq!(fmt_count(2_648_797), "2.6M");
+    }
+
+    fn video(live: bool) -> Video {
+        Video {
+            id: "dQw4w9WgXcQ".into(),
+            title: "T".into(),
+            channel: Some("C".into()),
+            channel_id: None,
+            published: None,
+            duration: Some(90),
+            views: None,
+            short: false,
+            live,
+        }
+    }
+
+    #[test]
+    fn live_is_only_in_the_json_when_true_and_old_caches_still_load() {
+        let plain = serde_json::to_value(video(false)).unwrap();
+        assert!(plain.get("live").is_none(), "{plain}");
+        assert_eq!(serde_json::to_value(video(true)).unwrap()["live"], true);
+        // A cache written before the field existed.
+        let old: Video = serde_json::from_str(r#"{"id":"dQw4w9WgXcQ","title":"T"}"#).unwrap();
+        assert!(!old.live);
+    }
+
+    #[test]
+    fn a_listing_marks_live_streams() {
+        assert_eq!(video(true).line(None, 0), "T  ·  C  ·  [live]");
+        assert_eq!(video(false).line(None, 0), "T  ·  C  ·  1:30");
     }
 }

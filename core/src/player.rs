@@ -31,7 +31,11 @@ pub fn play(cfg: &Config, info: &PlayInfo) -> Result<()> {
     ] {
         c.env_remove(var);
     }
-    let status = c.status().with_context(|| format!("running {}", cfg.mpv))?;
+    // Through the engine's one way of starting a child, so that mpv ends with
+    // the engine, however that ends, and so does whatever mpv starts.
+    let status = crate::proc::spawn(&mut c)
+        .and_then(|mut mpv| mpv.wait())
+        .with_context(|| format!("running {}", cfg.mpv))?;
     // 4 = interrupted by a signal (Ctrl+C); that's a user quit, not a failure.
     match status.code() {
         Some(0) | Some(4) => Ok(()),

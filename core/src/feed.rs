@@ -120,17 +120,22 @@ impl RssHealth {
 /// would go out over the route the user just left, and what is still on its
 /// way is dropped instead of kept. A `keep` that fails (the disk is full)
 /// stops the refresh too, since everything after it would be lost.
+///
+/// `progress(done, total)` is told each time a channel is finished with, in
+/// order and one call at a time, however it went.
 pub fn fetch_all(
     rt: &Runtime,
     subs: &[Sub],
     workers: usize,
     current: &(dyn Fn() -> bool + Sync),
     keep: &(dyn Fn(Fetched) -> Result<()> + Sync),
+    progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Fetch {
     let mut order: Vec<&Sub> = subs.iter().collect();
     order.shuffle(&mut rand::rng());
     let queue = Mutex::new(order);
-    let results = Mutex::new(Fetch::default());
+    // The results, and how many channels they are for.
+    let results = Mutex::new((Fetch::default(), 0usize));
     let rss = RssHealth::default();
     let broken = AtomicBool::new(false);
     std::thread::scope(|s| {
@@ -161,7 +166,8 @@ pub fn fetch_all(
                         Err(_) if !current() => Outcome::Late,
                         Err(e) => Outcome::Failed(e),
                     };
-                    let mut res = results.lock().unwrap();
+                    let mut guard = results.lock().unwrap();
+                    let (res, done) = &mut *guard;
                     match outcome {
                         Outcome::Kept { fallback } => {
                             res.fetched += 1;
@@ -174,11 +180,14 @@ pub fn fetch_all(
                             sub.name
                         )),
                     }
+                    // Under the lock, which is what puts the calls in order.
+                    *done += 1;
+                    progress(*done, subs.len());
                 }
             });
         }
     });
-    let mut res = results.into_inner().unwrap();
+    let (mut res, _) = results.into_inner().unwrap();
     res.skipped += queue.into_inner().unwrap().len();
     res
 }
@@ -234,15 +243,37 @@ fn fetched(sub: &Sub, mut videos: Vec<Video>, source: Source) -> Fetched {
     }
 }
 
-fn fetch_rss(rt: &Runtime, channel_id: &str) -> Result<Vec<Video>> {
+/// The text of the channel's feed, over the current route.
+fn get_rss(rt: &Runtime, channel_id: &str) -> Result<String> {
     let url = format!("{}/feeds/videos.xml?channel_id={channel_id}", rt.feed_base);
-    let body = rt
+    Ok(rt
         .web_client()?
         .get(url)
         .send()?
         .error_for_status()?
-        .text()?;
-    parse_rss(&body)
+        .text()?)
+}
+
+fn fetch_rss(rt: &Runtime, channel_id: &str) -> Result<Vec<Video>> {
+    parse_rss(&get_rss(rt, channel_id)?)
+}
+
+/// A channel's name from its RSS feed, which needs no yt-dlp (and so works
+/// from an address that YouTube has bot-checked, where yt-dlp doesn't). Two
+/// attempts, as for a feed: this endpoint fails now and then. `current` says
+/// whether the route is still the one in use.
+pub fn channel_title(rt: &Runtime, channel_id: &str, current: &dyn Fn() -> bool) -> Result<String> {
+    let mut last = None;
+    for _ in 0..2 {
+        if !current() {
+            bail!(crate::inflight::ROUTE_CHANGED);
+        }
+        match get_rss(rt, channel_id).and_then(|xml| parse_feed_title(&xml)) {
+            Ok(title) => return Ok(title),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("two attempts were made"))
 }
 
 fn child<'a, 'i>(n: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
@@ -253,6 +284,40 @@ fn child_text(n: Node, name: &str) -> Option<String> {
     child(n, name)
         .and_then(|c| c.text())
         .map(|t| t.trim().to_string())
+}
+
+/// Whether an entry says it is a live or upcoming stream. YouTube's feed has
+/// no documented marker for that, so this reads the one element its own APIs
+/// use (`liveBroadcastContent`), in case the feed carries it. Streams that it
+/// doesn't mark come through as ordinary videos here, and are marked when
+/// yt-dlp lists them (searches, the fallback).
+fn announces_live(entry: Node) -> bool {
+    entry.descendants().any(|n| {
+        n.tag_name().name() == "liveBroadcastContent"
+            && matches!(n.text().map(str::trim), Some("live" | "upcoming"))
+    })
+}
+
+/// The channel's name: the title of its feed, which is how the channel itself
+/// is called, without a lookup of the channel.
+pub fn parse_feed_title(xml: &str) -> Result<String> {
+    let doc = roxmltree::Document::parse(xml).context("feed is not valid XML")?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "feed" {
+        bail!("not an Atom feed");
+    }
+    // The title is what is shown in a list, so it is one short line of text.
+    let title: String = child_text(root, "title")
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect();
+    let title = title.trim();
+    if title.is_empty() {
+        bail!("the feed has no title");
+    }
+    Ok(title.to_string())
 }
 
 pub fn parse_rss(xml: &str) -> Result<Vec<Video>> {
@@ -283,6 +348,7 @@ pub fn parse_rss(xml: &str) -> Result<Vec<Video>> {
                 .and_then(|s| s.attribute("views"))
                 .and_then(|v| v.parse().ok()),
             short: link.contains("/shorts/"),
+            live: announces_live(e),
             id,
         });
     }
@@ -420,6 +486,50 @@ mod tests {
     }
 
     #[test]
+    fn the_channels_name_is_the_title_of_its_feed() {
+        assert_eq!(parse_feed_title(RSS).unwrap(), "Fireship");
+        // One short line, whatever the feed says.
+        let long = format!(
+            "<feed xmlns=\"http://www.w3.org/2005/Atom\"><title>  A\tB\nC{}  </title></feed>",
+            "x".repeat(500)
+        );
+        let title = parse_feed_title(&long).unwrap();
+        assert!(
+            title.starts_with("A B C") && title.chars().count() <= 200,
+            "{title}"
+        );
+        for bad in [
+            "<feed xmlns=\"http://www.w3.org/2005/Atom\"/>",
+            "<feed xmlns=\"http://www.w3.org/2005/Atom\"><title>  </title></feed>",
+            "<html/>",
+            "not xml",
+        ] {
+            assert!(parse_feed_title(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_stream_that_the_feed_marks_as_live_or_upcoming_is_live() {
+        let xml = |kind: &str| {
+            format!(
+                r#"<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom"><entry>
+                <yt:videoId>5C_HPTJg5ek</yt:videoId><title>t</title>
+                <yt:liveBroadcastContent>{kind}</yt:liveBroadcastContent></entry></feed>"#
+            )
+        };
+        for (kind, live) in [
+            ("live", true),
+            ("upcoming", true),
+            ("none", false),
+            ("", false),
+        ] {
+            assert_eq!(parse_rss(&xml(kind)).unwrap()[0].live, live, "{kind:?}");
+        }
+        // The feed as it is today carries nothing of the kind.
+        assert!(parse_rss(RSS).unwrap().iter().all(|v| !v.live));
+    }
+
+    #[test]
     fn fallback_baseline_is_undated_then_new_uploads_are_dated() {
         let s = sub();
         let mk = |id: &str| Video {
@@ -431,6 +541,7 @@ mod tests {
             duration: None,
             views: None,
             short: false,
+            live: false,
         };
         let mut cache = FeedCache::default();
         cache.merge(

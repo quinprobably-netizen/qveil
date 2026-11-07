@@ -1,0 +1,453 @@
+//! What qveil says about privacy, in one place.
+//!
+//! The window shows the sentences it gets from the engine (`GET api/config`),
+//! `qveil config` prints them, and the README's privacy section is printed by
+//! `qveil-core privacy --markdown` and checked against the file by a test. So
+//! no claim is worded twice, and a claim that stops being true is fixed here
+//! and nowhere else.
+//!
+//! Every sentence has to be literally true of the state it describes. The
+//! words that have been wrong before, and why they are chosen as they are:
+//!
+//! - Cookies are "never stored", not "never sent": yt-dlp sends a consent
+//!   cookie, and sends back what YouTube sets during one call.
+//! - Isolation is "fresh SOCKS credentials per request (a separate circuit if
+//!   this is Tor)". It is never said that YouTube *can't* link requests: the
+//!   fingerprint and the timing can.
+//! - A proxy URL with credentials of its own is "not isolated", and so is an
+//!   HTTP proxy.
+//! - A stream that is looked up again after a 403 links two circuits.
+
+use crate::net::{Net, TOR_PROXY};
+use serde::Serialize;
+
+/// What the route does, as far as what is said about it differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Direct,
+    /// The preset: the SOCKS port on 127.0.0.1:9050.
+    Tor,
+    /// Any other SOCKS proxy, which gets fresh credentials per request.
+    Socks,
+    /// A SOCKS proxy whose URL has credentials of its own.
+    SocksShared,
+    /// An HTTP or HTTPS proxy.
+    Http,
+}
+
+impl Kind {
+    pub fn of(net: &Net) -> Kind {
+        match net.proxy() {
+            None => Kind::Direct,
+            Some(TOR_PROXY) if net.isolates() => Kind::Tor,
+            Some(_) if net.isolates() => Kind::Socks,
+            Some(_) if net.is_socks() => Kind::SocksShared,
+            Some(_) => Kind::Http,
+        }
+    }
+
+    /// One sentence for the route chip's tooltip.
+    fn summary(self) -> &'static str {
+        match self {
+            Kind::Direct => "Direct: YouTube sees your IP address.",
+            Kind::Tor => {
+                "Through Tor: YouTube sees an exit node's address, not your IP, but can still link requests by their fingerprint and timing."
+            }
+            Kind::Socks => {
+                "Through your SOCKS proxy: YouTube sees its address, not your IP, but can still link requests by their fingerprint and timing."
+            }
+            Kind::SocksShared => {
+                "Through your SOCKS proxy: YouTube sees its address, not your IP, and the credentials in the proxy URL make every request one identity (not isolated)."
+            }
+            Kind::Http => {
+                "Through your HTTP proxy: YouTube sees its address, not your IP, and requests are not isolated."
+            }
+        }
+    }
+
+    /// What the route does to the address and to the requests, which is the
+    /// part of the story that depends on it.
+    fn route_points(self) -> Vec<&'static str> {
+        let relink = "A video that outlives its circuit is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.";
+        let isolated = "Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page.";
+        match self {
+            Kind::Direct => {
+                vec!["YouTube sees your IP address with every request, which links them all."]
+            }
+            Kind::Tor => vec![
+                "Requests go through the SOCKS proxy on 127.0.0.1:9050 (Tor), so YouTube sees an exit node's address instead of yours.",
+                isolated,
+                relink,
+            ],
+            Kind::Socks => vec![
+                "Requests go through your SOCKS proxy, so YouTube sees its address instead of yours; if it is Tor, that is an exit node's.",
+                isolated,
+                relink,
+            ],
+            Kind::SocksShared => vec![
+                "Requests go through your SOCKS proxy, so YouTube sees its address instead of yours.",
+                "The proxy URL has credentials of its own, which every request sends, so qveil can't isolate requests: they all share one identity (not isolated).",
+            ],
+            Kind::Http => vec![
+                "Requests go through your HTTP proxy, so YouTube sees its address instead of yours.",
+                "qveil can't isolate requests on an HTTP proxy: they all leave from its address (not isolated).",
+            ],
+        }
+    }
+}
+
+/// What holds on every route, and is short enough for the window.
+const EVERYWHERE: &[&str] = &[
+    "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits.",
+    "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
+    "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
+    "Subscriptions, history and the feed cache stay on this computer, in files only you can read, and qveil has no telemetry.",
+];
+
+/// What the README says besides the above: the details behind them.
+const DETAILS: &[(&str, &str)] = &[
+    (
+        "One way out",
+        "The window and its video player only ever talk to qveil's engine on `127.0.0.1`, behind a random token. Every request that leaves your machine (search, feeds, thumbnails and the video bytes themselves) is made by the engine, or by the yt-dlp it runs, through the route you pick.",
+    ),
+    (
+        "Route",
+        "*Direct*, *Tor*, or your own *Proxy*, always shown in the top bar, amber while YouTube can see your IP. *Direct* means direct: qveil ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment. qveil can't tell Tor from another SOCKS proxy by its address (it may be `localhost`, Tor Browser's port 9150 or a tunnel), so every SOCKS proxy gets fresh credentials per request, and `isolate_circuits = false` is refused. Seeking still works over any route, because the engine relays Range requests. `socks5://` is refused (it leaks DNS); use `socks5h://`. Thumbnails are fetched a page at a time: all the thumbnails of one page of the window share one identity, and the next page gets another.",
+    ),
+    (
+        "Switching routes",
+        "Switching routes ends the streams playing on the old route, kills the searches, lookups and refreshes still running on it (they answer \"The route changed; try again\"), and drops thumbnails and feeds that were still on their way.",
+    ),
+    (
+        "Account and cookies",
+        "yt-dlp runs with `--ignore-config --no-cookies --no-cookies-from-browser --no-plugin-dirs` and its own cache, so neither your config nor a plugin can add cookies or a route of its own. The engine's own requests (feeds, thumbnails and video bytes) send no cookies, and the cookies in yt-dlp's resolved headers are not passed on to the relay. Neither the embedded player nor `qveil play` loads your mpv config or scripts.",
+    ),
+    (
+        "Command lines",
+        "Anything on a command line can be read by every local user through `/proc`. So the app's own calls give yt-dlp its proxy (and password), your searches and the video you open through a private file (mode `0600`, in a fresh `0700` directory that is removed afterwards, also when the engine is stopped: the window closing, Ctrl+C or `kill` end any yt-dlp first, and a run that was killed hard has its directory swept up by the next one), and `qveil play` hands mpv its loopback URLs the same way. **qveil's own command line is not covered:** `qveil search …`, `qveil play <url>` and `qveil sub add …` carry what you type in their arguments, which other local users can read through `/proc` while the command runs, unlike a search typed into the window.",
+    ),
+    (
+        "Process tree",
+        "yt-dlp and mpv are started in process groups of their own, and are killed together with whatever they started (a deno for yt-dlp's JavaScript challenge, say) when the engine stops, and also when it is killed outright: a small guard process, which is qveil itself, outlives it for a moment and does that.",
+    ),
+    (
+        "Tracking parameters",
+        "Links are reduced to the video ID; `si=`, `pp=`, `feature=` and similar are dropped. A start time (`t=`) is kept, for the player only.",
+    ),
+    ("Player state", "No resume files, no watch history in mpv."),
+    (
+        "Local data",
+        "Subscriptions and the feed cache live in `~/.local/share/qveil` and `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those).",
+    ),
+];
+
+/// What YouTube can still see, on any route.
+const STILL_SEES: &str = "**What YouTube can still see:** the IP you connect from (on Direct, yours; otherwise the route's), each search and video you play, and the timing of your requests. Even over Tor, a long session of related videos can be linked by content, and the fingerprint above can link requests that come from separate circuits. qveil reduces linkability; it doesn't eliminate it.";
+
+/// What qveil says about the route in use. This is the `privacy` object of
+/// `GET api/config`.
+#[derive(Debug, Serialize)]
+pub struct Privacy {
+    /// One sentence, for the route chip's tooltip.
+    pub summary: String,
+    /// Sentences for the route popup, in order.
+    pub points: Vec<String>,
+    /// One line under each route option.
+    pub routes: Routes,
+    /// Lines that go with the pages.
+    pub pages: Pages,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Routes {
+    pub direct: &'static str,
+    pub tor: &'static str,
+    pub proxy: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Pages {
+    pub search: &'static str,
+    pub subscriptions: &'static str,
+    pub history_off: &'static str,
+    pub history_on: &'static str,
+}
+
+const ROUTES: Routes = Routes {
+    direct: "YouTube sees your IP address.",
+    tor: "Fresh SOCKS credentials per request, which Tor puts on separate circuits (a video, and a page of thumbnails, each share one); requests can still be linked by their fingerprint and timing.",
+    proxy: "A proxy you trust, such as a VPN's: YouTube sees its address, not yours. A SOCKS proxy gets fresh credentials per request (a separate circuit if it is Tor); a proxy URL with credentials of its own is not isolated.",
+};
+
+const PAGES: Pages = Pages {
+    search: "Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches.",
+    subscriptions: "Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels.",
+    history_off: "Off: qveil doesn't remember what you watch.",
+    history_on: "On: kept only on this computer, in a file only you can read, until you clear it.",
+};
+
+/// The text for the route `net` is.
+pub fn describe(net: &Net) -> Privacy {
+    let kind = Kind::of(net);
+    let points = kind
+        .route_points()
+        .into_iter()
+        .chain(EVERYWHERE.iter().copied())
+        .map(String::from)
+        .collect();
+    Privacy {
+        summary: kind.summary().into(),
+        points,
+        routes: ROUTES,
+        pages: PAGES,
+    }
+}
+
+/// The README's privacy section: everything above, for every route, as
+/// Markdown. `qveil-core privacy --markdown` prints it, and a test fails
+/// when the README says anything else.
+pub fn markdown() -> String {
+    let mut md = String::new();
+    md.push_str("qveil can't make you invisible to YouTube: it still has to ask YouTube for videos. The goal is to give YouTube as little as possible to link together, and to keep everything else on your machine.\n\n");
+
+    md.push_str("**The routes**\n\n| Route | |\n|---|---|\n");
+    for (name, line) in [
+        ("Direct", ROUTES.direct),
+        ("Tor", ROUTES.tor),
+        ("Proxy", ROUTES.proxy),
+    ] {
+        md.push_str(&format!("| **{name}** | {line} |\n"));
+    }
+
+    md.push_str("\n**What a route does**\n\n");
+    for (kind, name) in [
+        (Kind::Direct, "Direct"),
+        (Kind::Tor, "Tor (127.0.0.1:9050)"),
+        (Kind::Socks, "Another SOCKS proxy"),
+        (
+            Kind::SocksShared,
+            "A SOCKS proxy with credentials in its URL",
+        ),
+        (Kind::Http, "An HTTP or HTTPS proxy"),
+    ] {
+        md.push_str(&format!(
+            "- **{name}.** {}\n",
+            kind.route_points().join(" ")
+        ));
+    }
+
+    md.push_str("\n**On every route**\n\n");
+    for point in EVERYWHERE {
+        md.push_str(&format!("- {point}\n"));
+    }
+
+    md.push_str("\n**The details**\n\n| | |\n|---|---|\n");
+    for (title, text) in DETAILS {
+        md.push_str(&format!("| **{title}** | {text} |\n"));
+    }
+    md.push_str("| **Telemetry** | None. |\n");
+
+    md.push_str(&format!("\n{STILL_SEES}\n"));
+
+    md.push_str("\n**On the pages**\n\n");
+    for (name, line) in [
+        ("Search", PAGES.search),
+        ("Subscriptions", PAGES.subscriptions),
+        ("History, off", PAGES.history_off),
+        ("History, on", PAGES.history_on),
+    ] {
+        md.push_str(&format!("- **{name}.** {line}\n"));
+    }
+    md.trim_end().to_string()
+}
+
+/// The text for the route `net` is, for the command line.
+pub fn text(net: &Net) -> String {
+    let p = describe(net);
+    let mut out = format!("{}\n", p.summary);
+    for point in &p.points {
+        out.push_str(&format!("\n- {point}"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    const BEGIN: &str = "<!-- privacy:begin -->";
+    const END: &str = "<!-- privacy:end -->";
+
+    fn net(proxy: Option<&str>) -> Net {
+        Net::new(proxy.map(String::from), true).unwrap()
+    }
+
+    /// One route of each kind.
+    fn routes() -> Vec<(Kind, Net)> {
+        vec![
+            (Kind::Direct, net(None)),
+            (Kind::Tor, net(Some(TOR_PROXY))),
+            (Kind::Socks, net(Some("socks5h://10.0.0.2:1080"))),
+            (Kind::Socks, net(Some("socks5h://127.0.0.1:9150"))),
+            (
+                Kind::SocksShared,
+                net(Some("socks5h://me:pw@10.0.0.2:1080")),
+            ),
+            (
+                Kind::SocksShared,
+                net(Some("socks5h://me:pw@127.0.0.1:9050")),
+            ),
+            (Kind::Http, net(Some("http://10.0.0.1:3128"))),
+            (Kind::Http, net(Some("http://me:pw@10.0.0.1:3128"))),
+        ]
+    }
+
+    /// Every sentence there is, with the route it is for.
+    fn everything() -> Vec<String> {
+        let mut all = vec![markdown()];
+        for (_, n) in routes() {
+            let p = describe(&n);
+            all.push(p.summary);
+            all.extend(p.points);
+        }
+        all
+    }
+
+    #[test]
+    fn the_kind_follows_what_the_route_really_does() {
+        for (kind, n) in routes() {
+            assert_eq!(Kind::of(&n), kind, "{}", n.describe());
+        }
+    }
+
+    #[test]
+    fn the_readme_has_exactly_what_the_engine_prints() {
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md"))
+            .expect("the README is beside core/");
+        let (_, rest) = readme
+            .split_once(BEGIN)
+            .unwrap_or_else(|| panic!("README.md has no {BEGIN}"));
+        let (section, _) = rest
+            .split_once(END)
+            .unwrap_or_else(|| panic!("README.md has no {END}"));
+        assert!(
+            section.trim() == markdown(),
+            "README.md's privacy section is out of date: put the output of \
+             `qveil-core privacy --markdown` between {BEGIN} and {END}"
+        );
+    }
+
+    #[test]
+    fn the_words_that_were_wrong_are_not_used_and_the_right_ones_are() {
+        for text in everything() {
+            for wrong in [
+                "never sent",
+                "Never sent",
+                "can't link",
+                "cannot link",
+                "can't be linked",
+                "unlinkable",
+            ] {
+                assert!(!text.contains(wrong), "{wrong:?} in: {text}");
+            }
+        }
+        // The README says all of these somewhere.
+        let md = markdown();
+        for right in [
+            "never stored",
+            "fresh SOCKS credentials per request (a separate circuit if this is Tor)",
+            "not isolated",
+            "links the two circuits",
+            "fingerprint",
+        ] {
+            assert!(
+                md.contains(right),
+                "{right:?} is missing from the README text"
+            );
+        }
+    }
+
+    #[test]
+    fn each_route_says_what_is_true_of_it() {
+        let says = |n: &Net, words: &str| {
+            let p = describe(n);
+            p.summary.contains(words) || p.points.iter().any(|s| s.contains(words))
+        };
+        let direct = net(None);
+        assert!(says(&direct, "your IP address"));
+        // Nothing about circuits or credentials where there are none.
+        let p = describe(&direct);
+        assert!(
+            !p.points
+                .iter()
+                .any(|s| s.contains("circuit") && s.contains("credentials"))
+        );
+
+        for isolated in [net(Some(TOR_PROXY)), net(Some("socks5h://10.0.0.2:1080"))] {
+            assert!(says(
+                &isolated,
+                "fresh SOCKS credentials per request (a separate circuit if this is Tor)"
+            ));
+            assert!(says(&isolated, "links the two circuits"));
+            assert!(!says(&isolated, "not isolated"));
+        }
+        // A proxy that can't isolate says so, and doesn't claim a circuit each.
+        for shared in [
+            net(Some("socks5h://me:pw@127.0.0.1:9050")),
+            net(Some("http://10.0.0.1:3128")),
+        ] {
+            assert!(says(&shared, "not isolated"));
+            assert!(!says(&shared, "fresh SOCKS credentials"));
+            assert!(!says(&shared, "links the two circuits"));
+        }
+        // Only the preset is Tor.
+        assert!(says(&net(Some(TOR_PROXY)), "Through Tor"));
+        assert!(!says(&net(Some("socks5h://127.0.0.1:9150")), "Through Tor"));
+    }
+
+    #[test]
+    fn credentials_never_appear_in_what_is_said() {
+        for (_, n) in routes() {
+            for text in [describe(&n).summary, describe(&n).points.join("\n")] {
+                assert!(!text.contains("pw") && !text.contains("me:"), "{text}");
+            }
+        }
+    }
+
+    /// What the window is coded against.
+    #[test]
+    fn the_json_has_the_shape_the_window_expects() {
+        let v = serde_json::to_value(describe(&net(Some(TOR_PROXY)))).unwrap();
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&v), ["pages", "points", "routes", "summary"]);
+        assert_eq!(keys(&v["routes"]), ["direct", "proxy", "tor"]);
+        assert_eq!(
+            keys(&v["pages"]),
+            ["history_off", "history_on", "search", "subscriptions"]
+        );
+        assert!(v["summary"].is_string());
+        let points = v["points"].as_array().unwrap();
+        assert!(points.len() >= 4 && points.iter().all(|p| p.is_string()));
+        // One sentence for a tooltip.
+        let summary = v["summary"].as_str().unwrap();
+        assert_eq!(summary.matches(". ").count(), 0, "{summary}");
+        assert_eq!(
+            json!(describe(&net(None)).routes)["direct"],
+            "YouTube sees your IP address."
+        );
+    }
+
+    #[test]
+    fn the_markdown_has_no_trailing_space_and_ends_without_a_blank_line() {
+        let md = markdown();
+        assert!(!md.ends_with('\n'));
+        for line in md.lines() {
+            assert_eq!(line, line.trim_end(), "{line:?}");
+        }
+    }
+}

@@ -7,12 +7,21 @@ use crate::ids;
 use crate::net::{self, Net};
 use crate::store::{self, Paths};
 use crate::subs::{self, Sub, Subs};
+use crate::util::lock;
 use crate::video::Video;
 use crate::ytdlp::Ytdlp;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, OnceLock};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long what a refresh has fetched may wait before it is saved. Saving
+/// rewrites the whole cache, which for a few hundred channels is a lot to do
+/// after each one; a burst of channels shares one write, and an engine that is
+/// killed mid-refresh loses at most this much of it.
+const SAVE_EVERY: Duration = Duration::from_secs(2);
 
 pub struct Runtime {
     pub cfg: Config,
@@ -24,6 +33,8 @@ pub struct Runtime {
     /// thumbnails. Only tests change them, to stand a local server in for YouTube.
     pub feed_base: String,
     pub thumb_base: String,
+    /// How often a refresh saves (`SAVE_EVERY`); only tests change it.
+    pub save_every: Duration,
 }
 
 impl Runtime {
@@ -48,6 +59,7 @@ impl Runtime {
             shared: OnceLock::new(),
             feed_base: "https://www.youtube.com".into(),
             thumb_base: "https://i.ytimg.com".into(),
+            save_every: SAVE_EVERY,
         })
     }
 
@@ -139,18 +151,29 @@ pub enum Refresh {
     Channel(String),
 }
 
-/// `current` says whether `rt`'s route is still the one in use, so a refresh
-/// that is running when the route changes stops fetching (see `feed::fetch_all`).
-pub fn feed(
+/// What a refresh found out besides the videos, which are in the cache.
+pub struct Refreshed {
+    /// Channels whose RSS feed was down, so their dates are approximate.
+    pub fallbacks: usize,
+    pub errors: Vec<String>,
+    /// Channels left out because they were fetched recently.
+    pub fresh: usize,
+}
+
+/// Fetches what `refresh` asks for and saves it in the feed cache, a burst of
+/// channels at a time (see `Saver`). `current` says whether `rt`'s route is
+/// still the one in use, so a refresh that is running when the route changes
+/// stops fetching (see `feed::fetch_all`). `progress(done, total)` is told
+/// how it is going: once with nothing done, and after each channel.
+pub fn refresh(
     rt: &Runtime,
     paths: &Paths,
     refresh: Refresh,
-    no_shorts: bool,
-    limit: usize,
     current: &(dyn Fn() -> bool + Sync),
-) -> Result<FeedResult> {
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<Refreshed> {
     let subs = load_subs(paths)?;
-    let (mut fallbacks, mut errors, mut fresh) = (0, Vec::new(), 0);
+    let mut fresh = 0;
     let due: Vec<Sub> = match &refresh {
         Refresh::Off => vec![],
         Refresh::Force => subs.channels.clone(),
@@ -176,38 +199,169 @@ pub fn feed(
             due
         }
     };
-    let cache: FeedCache = if !due.is_empty() {
-        // The slow part, with nothing locked: the network can take minutes
-        // over Tor, and other commands must not wait for it. Each channel is
-        // merged and saved as it arrives, and only for that moment is the
-        // store locked, so a refresh that is cut off has kept what it got.
-        let keep = |f: feed::Fetched| {
-            update_feed_cache(paths, |cache| cache.merge(std::slice::from_ref(&f), now()))
-                .map(|_| ())
-        };
-        let fetch = feed::fetch_all(rt, &due, rt.cfg.feed_workers, current, &keep);
-        fallbacks = fetch.fallbacks;
-        errors = fetch.errors;
-        if fetch.skipped > 0 {
-            errors.push(format!(
-                "The route changed during the refresh; {} channel(s) were not fetched.",
-                fetch.skipped
-            ));
-        }
-        // Once more, with nothing to add: it rebuilds a cache that couldn't
-        // be read, drops what is no longer subscribed to, and is the state
-        // the answer is made from.
-        update_feed_cache(paths, |_| {})?
-    } else {
-        store::load_cache(&paths.feed_cache())?
+    let mut done = Refreshed {
+        fallbacks: 0,
+        errors: Vec::new(),
+        fresh,
     };
+    if due.is_empty() {
+        return Ok(done);
+    }
+    // The slow part, with nothing locked: the network can take minutes over
+    // Tor, and other commands must not wait for it. What is fetched is saved
+    // as it arrives, if not channel by channel, and only for that moment is
+    // the store locked, so a refresh that is cut off has kept nearly all it got.
+    progress(0, due.len());
+    let saver = Saver::new(paths, rt.save_every);
+    let fetch = std::thread::scope(|scope| {
+        // Something has to notice that what is waiting has waited long enough
+        // when no further channel arrives to remind it, as when one is slow.
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let tick = (rt.save_every / 4).clamp(Duration::from_millis(5), Duration::from_millis(500));
+        let saver = &saver;
+        scope.spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(tick) {
+                // A failure stays pending, and is tried again (and reported) by `finish`.
+                let _ = saver.save_if_due();
+            }
+        });
+        let fetch = feed::fetch_all(
+            rt,
+            &due,
+            rt.cfg.feed_workers,
+            current,
+            &|f| saver.keep(f),
+            progress,
+        );
+        drop(stop);
+        fetch
+    });
+    done.fallbacks = fetch.fallbacks;
+    done.errors = fetch.errors;
+    if fetch.skipped > 0 {
+        done.errors.push(format!(
+            "The route changed during the refresh; {} channel(s) were not fetched.",
+            fetch.skipped
+        ));
+    }
+    saver.finish()?;
+    Ok(done)
+}
+
+/// The feed as the cache has it now, for a refresh that is over (or none).
+pub fn feed_result(
+    paths: &Paths,
+    no_shorts: bool,
+    limit: usize,
+    done: &Refreshed,
+) -> Result<FeedResult> {
+    let subs = load_subs(paths)?;
+    let cache: FeedCache = store::load_cache(&paths.feed_cache())?;
     Ok(FeedResult {
         entries: cache.entries(&subs.channels, no_shorts, limit),
-        fallbacks,
-        errors,
+        fallbacks: done.fallbacks,
+        errors: done.errors.clone(),
         channels: subs.channels.len(),
-        fresh,
+        fresh: done.fresh,
     })
+}
+
+/// `refresh`, and then the feed.
+pub fn feed(
+    rt: &Runtime,
+    paths: &Paths,
+    refreshing: Refresh,
+    no_shorts: bool,
+    limit: usize,
+    current: &(dyn Fn() -> bool + Sync),
+) -> Result<FeedResult> {
+    let done = refresh(rt, paths, refreshing, current, &|_, _| {})?;
+    feed_result(paths, no_shorts, limit, &done)
+}
+
+/// Saves the channels that a refresh fetches, a batch at a time: a channel
+/// is saved when it arrives only if the last save was long enough ago,
+/// otherwise it waits (with the others that come meanwhile) for the next one.
+struct Saver<'a> {
+    paths: &'a Paths,
+    every: Duration,
+    waiting: Mutex<Waiting>,
+    /// How many times the cache was written, for the tests.
+    #[cfg(test)]
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Default)]
+struct Waiting {
+    /// Each with the time it arrived, which is the time it is dated by.
+    fetched: Vec<(feed::Fetched, i64)>,
+    last_save: Option<Instant>,
+}
+
+impl<'a> Saver<'a> {
+    fn new(paths: &'a Paths, every: Duration) -> Self {
+        Saver {
+            paths,
+            every,
+            waiting: Mutex::default(),
+            #[cfg(test)]
+            saves: Default::default(),
+        }
+    }
+
+    /// Takes a channel that was fetched. An error means it couldn't be saved
+    /// (and neither could any that waited with it), which stops the refresh.
+    fn keep(&self, f: feed::Fetched) -> Result<()> {
+        let mut waiting = lock(&self.waiting);
+        waiting.fetched.push((f, now()));
+        if waiting.due(self.every) {
+            self.save(&mut waiting)?;
+        }
+        Ok(())
+    }
+
+    fn save_if_due(&self) -> Result<()> {
+        let mut waiting = lock(&self.waiting);
+        if waiting.due(self.every) {
+            self.save(&mut waiting)?;
+        }
+        Ok(())
+    }
+
+    /// The last save of a refresh, which happens even with nothing waiting:
+    /// it rebuilds a cache that couldn't be read, and drops what is no longer
+    /// subscribed to.
+    fn finish(&self) -> Result<()> {
+        self.save(&mut lock(&self.waiting))
+    }
+
+    fn save(&self, waiting: &mut Waiting) -> Result<()> {
+        let batch = std::mem::take(&mut waiting.fetched);
+        let saved = update_feed_cache(self.paths, |cache| {
+            for (f, at) in &batch {
+                cache.merge(std::slice::from_ref(f), *at);
+            }
+        });
+        match saved {
+            Ok(_) => {
+                waiting.last_save = Some(Instant::now());
+                #[cfg(test)]
+                self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            Err(e) => {
+                // Not lost: the next save has them too.
+                waiting.fetched = batch;
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Waiting {
+    fn due(&self, every: Duration) -> bool {
+        !self.fetched.is_empty() && self.last_save.is_none_or(|at| at.elapsed() >= every)
+    }
 }
 
 /// Changes the feed cache as it is on disk now, not as it was when a refresh
@@ -224,7 +378,7 @@ fn update_feed_cache(paths: &Paths, change: impl FnOnce(&mut FeedCache)) -> Resu
             .fetched_at
             .retain(|id, _| subs.channels.iter().any(|s| s.id == *id));
     }
-    store::save(&paths.feed_cache(), &cache)?;
+    store::save_compact(&paths.feed_cache(), &cache)?;
     Ok(cache)
 }
 
@@ -281,7 +435,25 @@ pub fn add_sub(
 ) -> Result<(Sub, bool)> {
     let r = ids::parse_channel(input)
         .with_context(|| format!("{input:?} isn't a channel (@handle, channel URL or UC… ID)"))?;
-    let (id, name) = rt.yt.channel_info(&r.url())?;
+    let (id, name) = match r {
+        // The ID is all a subscription needs, and the channel's own feed
+        // says what it is called. That needs no yt-dlp, which YouTube may
+        // refuse (a bot check on this address) when RSS still answers, and
+        // spares the one request that is a lookup of this channel in
+        // particular. If the feed doesn't answer either, the ID will do as a
+        // name until the channel is renamed.
+        ids::ChannelRef::Id(id) => match feed::channel_title(rt, &id, current) {
+            Ok(name) => (id, name),
+            Err(_) if !current() => bail!(crate::inflight::ROUTE_CHANGED),
+            Err(e) => {
+                note!("qveil: couldn't read the name of {id} from its feed ({e:#}); using the ID");
+                let name = id.clone();
+                (id, name)
+            }
+        },
+        // A handle has to be looked up, which only yt-dlp does.
+        ids::ChannelRef::Url(url) => rt.yt.channel_info(&url)?,
+    };
     // Only the file update is locked, not the lookup above.
     let _lock = store::lock(paths)?;
     if !current() {
@@ -356,10 +528,9 @@ pub fn clear_history(paths: &Paths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::testing::{TempDir, listing_runs, listing_ytdlp};
+    use crate::store::testing::{TempDir, listing_runs, listing_ytdlp, socks_spy};
     use std::fs;
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
 
     /// A runtime whose every request fails at once (nothing listens on the
     /// proxy port) and whose yt-dlp is `ytdlp`.
@@ -369,40 +540,6 @@ mod tests {
             ..Config::default()
         };
         Runtime::new(cfg, paths, Some("http://127.0.0.1:1".into()), false).unwrap()
-    }
-
-    /// A SOCKS5 proxy that records the user name each connection
-    /// authenticates with, then refuses it.
-    fn socks_spy() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let users = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = std::sync::Arc::clone(&users);
-        std::thread::spawn(move || {
-            for mut c in listener.incoming().flatten() {
-                // Greeting: version, method count, methods. Ask for a password.
-                let mut head = [0u8; 2];
-                if c.read_exact(&mut head).is_err() {
-                    continue;
-                }
-                let mut methods = vec![0u8; head[1] as usize];
-                let _ = c.read_exact(&mut methods);
-                let _ = c.write_all(&[5, 2]);
-                // Version 1, the user name, then the password.
-                let mut len = [0u8; 2];
-                if c.read_exact(&mut len).is_err() {
-                    continue;
-                }
-                let mut user = vec![0u8; len[1] as usize];
-                let _ = c.read_exact(&mut user);
-                seen.lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&user).into_owned());
-                let _ = c.write_all(&[1, 1]);
-            }
-        });
-        (port, users)
     }
 
     #[test]
@@ -714,6 +851,8 @@ mod tests {
                 feed_workers: 1,
                 ..rt_cfg(&ytdlp)
             },
+            // Saves are batched (see `Saver`); here, a batch is a few ms.
+            save_every: Duration::from_millis(50),
             ..offline(&paths, &ytdlp)
         };
         let refresh = {
@@ -826,5 +965,222 @@ mod tests {
         let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
         assert!(cache.fetched_at.is_empty() && cache.seen.is_empty());
         assert_eq!(listing_runs(&dir.0), 0);
+    }
+
+    fn fetched(channel: u32, video: &str) -> feed::Fetched {
+        feed::Fetched {
+            channel_id: format!("UC{channel:022}"),
+            videos: vec![Video {
+                id: video.into(),
+                title: video.into(),
+                channel: None,
+                channel_id: Some(format!("UC{channel:022}")),
+                published: Some(1_700_000_000),
+                duration: None,
+                views: None,
+                short: false,
+                live: false,
+            }],
+            source: feed::Source::Rss,
+        }
+    }
+
+    #[test]
+    fn a_burst_of_channels_shares_one_write_of_the_cache() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=10 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let saves = |saver: &Saver| saver.saves.load(Ordering::SeqCst);
+        let saver = Saver::new(&paths, Duration::from_secs(3600));
+        for n in 1..=10 {
+            saver.keep(fetched(n, &format!("video{n:06}"))).unwrap();
+        }
+        // The first channel is saved at once, the other nine wait together…
+        assert_eq!(saves(&saver), 1);
+        saver.save_if_due().unwrap();
+        assert_eq!(saves(&saver), 1, "an hour hasn't passed");
+        let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
+        assert_eq!(cache.seen.len(), 1);
+        // …and the end of the refresh saves what is left.
+        saver.finish().unwrap();
+        assert_eq!(saves(&saver), 2);
+        let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
+        assert_eq!((cache.seen.len(), cache.fetched_at.len()), (10, 10));
+
+        // With no wait to speak of, every channel is its own write.
+        let eager = Saver::new(&paths, Duration::ZERO);
+        for n in 1..=3 {
+            eager.keep(fetched(n, &format!("other{n:07}"))).unwrap();
+        }
+        assert_eq!(saves(&eager), 3);
+    }
+
+    #[test]
+    fn what_could_not_be_saved_is_kept_for_the_next_save() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        import_subs(&paths, &channel(1)).unwrap();
+        // A directory where the cache file goes: the write fails.
+        fs::create_dir_all(paths.feed_cache()).unwrap();
+        let saver = Saver::new(&paths, Duration::ZERO);
+        assert!(saver.keep(fetched(1, "videoAAAAAA")).is_err());
+        assert!(saver.finish().is_err());
+        fs::remove_dir_all(paths.feed_cache()).unwrap();
+        saver.finish().unwrap();
+        let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
+        assert!(
+            cache.seen.contains_key("videoAAAAAA"),
+            "the channel was not lost"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_written_as_compact_json() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        import_subs(&paths, &channel(1)).unwrap();
+        let rt = offline(&paths, &listing_ytdlp(&dir.0, ""));
+        feed(&rt, &paths, Refresh::Stale, false, 10, &|| true).unwrap();
+        let text = fs::read_to_string(paths.feed_cache()).unwrap();
+        assert!(
+            text.starts_with("{\"seen\":") && !text.contains('\n'),
+            "{text}"
+        );
+        // The user's own data stays easy to read and edit.
+        import_subs(&paths, &channel(2)).unwrap();
+        assert!(
+            fs::read_to_string(paths.subscriptions())
+                .unwrap()
+                .contains("\n  ")
+        );
+    }
+
+    #[test]
+    fn a_refresh_reports_its_progress_one_channel_at_a_time() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=4 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let ytdlp = listing_ytdlp(&dir.0, "");
+        let rt = Runtime {
+            cfg: Config {
+                feed_workers: 3,
+                ..rt_cfg(&ytdlp)
+            },
+            ..offline(&paths, &ytdlp)
+        };
+        let told = Mutex::new(Vec::new());
+        refresh(&rt, &paths, Refresh::Stale, &|| true, &|done, total| {
+            lock(&told).push((done, total))
+        })
+        .unwrap();
+        // In order, whichever worker finished: the window shows a bar.
+        assert_eq!(*lock(&told), [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]);
+
+        // Nothing to fetch, nothing to report.
+        let told = Mutex::new(Vec::new());
+        refresh(&rt, &paths, Refresh::Stale, &|| true, &|done, total| {
+            lock(&told).push((done, total))
+        })
+        .unwrap();
+        assert!(lock(&told).is_empty());
+    }
+
+    const SOMEONE: &str = "UCsBjURrPoezykLs9EqgamOA";
+
+    #[test]
+    fn subscribing_by_id_takes_the_name_from_the_feed_and_needs_no_yt_dlp() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (base, hits) = crate::store::testing::rss_upstream(0);
+        // A yt-dlp that would be counted if it were run: the bot check has
+        // closed it to this address, in the case that matters.
+        let rt = with_feeds_at(&paths, &base, &listing_ytdlp(&dir.0, ""));
+        let (sub, added) = add_sub(&rt, &paths, SOMEONE, &|| true).unwrap();
+        assert_eq!(
+            (sub.name.as_str(), added),
+            (&*format!("Name of {SOMEONE}"), true)
+        );
+        // A channel URL is the same thing.
+        let other = format!("UC{:022}", 7);
+        let (sub, _) = add_sub(
+            &rt,
+            &paths,
+            &format!("https://www.youtube.com/channel/{other}/videos?si=x"),
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(sub.id, other);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one request each");
+        assert_eq!(listing_runs(&dir.0), 0, "yt-dlp was not run");
+        assert_eq!(load_subs(&paths).unwrap().channels.len(), 2);
+        // Again: nothing new.
+        assert!(!add_sub(&rt, &paths, SOMEONE, &|| true).unwrap().1);
+    }
+
+    #[test]
+    fn subscribing_by_id_falls_back_to_the_id_when_the_feed_is_down() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (base, hits) = crate::store::testing::rss_upstream(usize::MAX);
+        let rt = with_feeds_at(&paths, &base, &listing_ytdlp(&dir.0, ""));
+        let (sub, added) = add_sub(&rt, &paths, SOMEONE, &|| true).unwrap();
+        assert_eq!((sub.name.as_str(), added), (SOMEONE, true));
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "tried twice, then gave up");
+        assert_eq!(listing_runs(&dir.0), 0, "and did not ask yt-dlp either");
+        // A first attempt that fails and a second that works is not a fallback.
+        let (base, hits) = crate::store::testing::rss_upstream(1);
+        let rt = with_feeds_at(&paths, &base, &listing_ytdlp(&dir.0, ""));
+        let other = format!("UC{:022}", 3);
+        let (sub, _) = add_sub(&rt, &paths, &other, &|| true).unwrap();
+        assert_eq!(sub.name, format!("Name of {other}"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_handle_still_needs_yt_dlp_and_the_feed_is_not_asked() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (base, hits) = crate::store::testing::rss_upstream(0);
+        let named = crate::store::testing::script(
+            &dir.0.join("yt-dlp"),
+            &format!(
+                "echo x >> '{}'\necho '{{\"channel_id\":\"{SOMEONE}\",\"channel\":\"Someone\",\"entries\":[]}}'\n",
+                dir.0.join("runs").display()
+            ),
+        );
+        let rt = with_feeds_at(&paths, &base, &named);
+        let (sub, added) = add_sub(&rt, &paths, "@someone", &|| true).unwrap();
+        assert_eq!(
+            (sub.id.as_str(), sub.name.as_str(), added),
+            (SOMEONE, "Someone", true)
+        );
+        assert_eq!((listing_runs(&dir.0), hits.load(Ordering::SeqCst)), (1, 0));
+    }
+
+    #[test]
+    fn a_name_that_came_back_from_a_route_that_was_left_is_not_added() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (base, hits) = crate::store::testing::rss_upstream(0);
+        let rt = with_feeds_at(&paths, &base, &listing_ytdlp(&dir.0, ""));
+        let err = add_sub(&rt, &paths, SOMEONE, &|| false).unwrap_err();
+        assert!(err.to_string().contains("route changed"), "{err}");
+        // Not even asked: nothing goes out on the route that was left.
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(load_subs(&paths).unwrap().channels.is_empty());
+        // The route changing while the feed was being read is the same: the
+        // first look says all is well, and the feed fails, and the next says no.
+        let (base, _) = crate::store::testing::rss_upstream(usize::MAX);
+        let rt = with_feeds_at(&paths, &base, &listing_ytdlp(&dir.0, ""));
+        let looks = std::sync::atomic::AtomicUsize::new(0);
+        let err = add_sub(&rt, &paths, SOMEONE, &|| {
+            looks.fetch_add(1, Ordering::SeqCst) == 0
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("route changed"), "{err}");
     }
 }

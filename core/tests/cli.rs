@@ -462,3 +462,81 @@ fn a_reader_that_hangs_up_is_not_an_error() {
     assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("isn't a YouTube video"), "{stderr}");
 }
+
+/// Whether the process is gone: not there, or a zombie that nobody has reaped.
+fn is_gone(pid: &str) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+        .unwrap_or(true)
+}
+
+#[test]
+fn killing_the_engine_outright_takes_yt_dlp_and_what_it_started_with_it() {
+    let home = Home::new();
+    let bin = home.0.join("bin");
+    // Like yt-dlp with the deno it starts for its JavaScript challenge: a
+    // child of its own, which only a kill of the whole group reaches.
+    let ytdlp = script(
+        &bin.join("yt-dlp"),
+        r#"d=$(dirname "$0")
+sleep 60 &
+echo $! > "$d/grandchild.tmp"; mv "$d/grandchild.tmp" "$d/grandchild"
+echo $$ > "$d/leader.tmp"; mv "$d/leader.tmp" "$d/leader"
+wait
+"#,
+    );
+    let mut serve = home.serve(&ytdlp);
+    let search = serve.get_in_background("api/search?q=anything");
+    let read = |name: &str| fs::read_to_string(bin.join(name)).ok();
+    let started = Instant::now();
+    let (leader, grandchild) = loop {
+        if let Some((l, g)) = read("leader").zip(read("grandchild")) {
+            break (l.trim().to_string(), g.trim().to_string());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "yt-dlp never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!is_gone(&leader) && !is_gone(&grandchild));
+
+    // No chance to clean up: SIGKILL, as the OOM killer would.
+    let killed = Command::new("kill")
+        .args(["-KILL", &serve.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert_eq!(serve.wait_for_exit().signal(), Some(9));
+    let started = Instant::now();
+    while !(is_gone(&leader) && is_gone(&grandchild)) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "yt-dlp ({leader}) or what it started ({grandchild}) is still running"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(serve.stdin.take());
+    let _ = search.join();
+}
+
+#[test]
+fn the_privacy_text_prints_without_a_home_and_wipe_needs_no_confirmation_with_yes() {
+    let home = Home::new();
+    let out = home.run(&["privacy", "--markdown"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let md = text(&out.stdout);
+    assert!(
+        md.contains("never stored") && !md.contains("never sent"),
+        "{md}"
+    );
+    // For the route that is configured, as text.
+    let out = home.run(&["privacy"], "");
+    assert!(text(&out.stdout).starts_with("Direct: YouTube sees your IP address."));
+    // `wipe --yes` doesn't ask.
+    write(&home.data().join("qveil/subscriptions.json"), "{}");
+    let out = home.run(&["wipe", "--yes"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("wiped"));
+    assert!(!home.data().join("qveil").exists());
+}

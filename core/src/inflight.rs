@@ -8,10 +8,12 @@
 //! (shared by every settings change that keeps the route), which is closed
 //! when the route changes, so that nothing more can start on it either.
 
+use crate::proc::{self, Group};
+use crate::util::lock as locked;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// What the API says to a request whose work was cut off by a route change.
@@ -52,7 +54,7 @@ pub enum StartError {
 /// A process that the registry can stop and its owner can wait for. Shared by
 /// both, which is why the child is behind a lock that is never held while waiting.
 pub struct Proc {
-    child: Mutex<Child>,
+    child: Mutex<Group>,
     /// Where its private files are, which `close` removes when the engine is exiting.
     dir: PathBuf,
     /// Set (once) by the registry when it stopped the process, so its owner
@@ -60,14 +62,10 @@ pub struct Proc {
     stopped: OnceLock<Why>,
 }
 
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 impl Proc {
+    /// Kills the process and everything it started (its process group).
     pub fn kill(&self) {
-        // An error means it was gone already.
-        let _ = locked(&self.child).kill();
+        locked(&self.child).kill();
     }
 
     fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
@@ -97,7 +95,7 @@ impl Proc {
         let mut child = locked(&self.child);
         if matches!(child.try_wait(), Ok(None)) {
             let _ = self.stopped.set(why);
-            let _ = child.kill();
+            child.kill();
         }
     }
 }
@@ -126,12 +124,9 @@ impl Inflight {
         if let Some(why) = state.closed {
             return Err(StartError::Closed(why));
         }
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let mut child = proc::spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
             .map_err(StartError::Spawn)?;
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let (stdout, stderr) = (child.take_stdout(), child.take_stderr());
         let proc = Arc::new(Proc {
             child: Mutex::new(child),
             dir: dir.to_path_buf(),

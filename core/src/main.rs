@@ -36,11 +36,14 @@ mod inflight;
 mod net;
 mod pick;
 mod player;
+mod privacy;
 mod private;
+mod proc;
 mod server;
 mod signals;
 mod store;
 mod subs;
+mod util;
 mod video;
 mod ytdlp;
 
@@ -145,6 +148,12 @@ enum Cmd {
     },
     /// Show file locations, effective settings and what is exposed
     Config,
+    /// What qveil does, and doesn't, about your privacy on the configured route
+    Privacy {
+        /// Print the README's privacy section instead (Markdown)
+        #[arg(long)]
+        markdown: bool,
+    },
     /// Delete all local qveil data: subscriptions, history and caches
     Wipe {
         /// Don't ask for confirmation
@@ -240,6 +249,15 @@ fn flush() -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    // The process guard (see `proc::guard`) is this same binary, started by
+    // the engine; it has no command line of its own to parse.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == proc::guard::ARG)
+    {
+        proc::guard::main();
+        return ExitCode::SUCCESS;
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.downcast_ref::<Hangup>().is_some() => ExitCode::SUCCESS,
@@ -261,6 +279,12 @@ fn run() -> Result<()> {
         anyhow::bail!(
             "`serve` doesn't take --proxy or --tor: the app's route is a setting, saved in its config file"
         );
+    }
+    // Nothing about the machine is needed to print it, so this works anywhere
+    // (a build machine regenerating the README, say).
+    if let Cmd::Privacy { markdown: true } = &cli.cmd {
+        outln!("{}", privacy::markdown());
+        return Ok(());
     }
     let route = match &cli.cmd {
         Cmd::Search { route, .. }
@@ -354,6 +378,10 @@ fn run() -> Result<()> {
         Cmd::Sub(cmd) => sub(&rt, paths, cmd),
         Cmd::History { clear, json } => history(&rt.cfg, paths, clear, json),
         Cmd::Config => show_config(&rt, paths),
+        Cmd::Privacy { .. } => {
+            outln!("{}", privacy::text(&rt.net));
+            Ok(())
+        }
         Cmd::Wipe { yes } => wipe(paths, yes),
     }
 }
@@ -505,17 +533,8 @@ fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
     );
     outln!("max height     {}p", rt.cfg.max_height);
     outln!("");
-    outln!("Never sent: cookies, a Google account, tracking URL parameters, Referer headers,");
-    outln!("or player state (mpv resume/history off).");
-    outln!("Feeds are fetched one channel per request, in random order, but a refresh is still");
-    outln!("a burst of requests for exactly your channels, so timing can link them.");
-    if rt.net.proxy().is_none() {
-        outln!("Visible to YouTube: your IP, the videos you search and play, and when.");
-        outln!("Use --tor or a proxy to hide your IP.");
-    } else {
-        outln!("Visible to YouTube: the route's IP instead of yours, the videos you search and");
-        outln!("play, and when.");
-    }
+    // What the window says too, from the same place (see `privacy`).
+    outln!("{}", privacy::text(&rt.net));
     Ok(())
 }
 

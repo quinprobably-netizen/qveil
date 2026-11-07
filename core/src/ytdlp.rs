@@ -35,6 +35,10 @@ const LIVE_UNSUPPORTED: &str =
     "Live streams aren't supported yet: they can't be relayed through your route.";
 const MANIFEST_ONLY: &str = "This video is only offered as an HLS/DASH stream, which can't be relayed through your route yet.";
 
+/// What a lookup that its caller gave up on (the window hung up) ends with.
+/// Nobody is left to read it; it is only the end of the call.
+pub const CANCELLED: &str = "The request was cancelled";
+
 /// The format selector only takes plain downloads, so the HLS manifest that
 /// yt-dlp fetches for every video (a quarter of a second of a 1.3 s resolve,
 /// measured) is never used. Skipped when resolving; `explain_no_format` still
@@ -119,11 +123,15 @@ impl Ytdlp {
     /// returns `None`. The output is read on separate threads, so a child that
     /// fills a pipe isn't left waiting for us. An error if the registry
     /// stopped it, because what it printed belongs to a route that was left.
+    /// `abort` is asked every few milliseconds while the child runs, and when
+    /// it says yes the child is killed (with everything it started) and the
+    /// call ends with `CANCELLED`.
     fn output_within(
         &self,
         cmd: &mut Command,
         call: &Call,
         limit: Duration,
+        abort: &dyn Fn() -> bool,
     ) -> Result<Option<Output>> {
         let mut run = self.start(cmd, call)?;
         let stdout = drain(run.stdout.take());
@@ -133,12 +141,14 @@ impl Ytdlp {
             if let Some(status) = run.try_wait()? {
                 break status;
             }
-            if Instant::now() >= deadline {
+            let cancelled = abort();
+            if cancelled || Instant::now() >= deadline {
                 run.kill();
                 let _ = run.wait();
                 // The readers end on their own now that the pipes are closed.
                 return match run.stopped() {
                     Some(why) => Err(anyhow!(why.message())),
+                    None if cancelled => Err(anyhow!(CANCELLED)),
                     None => Ok(None),
                 };
             }
@@ -157,7 +167,7 @@ impl Ytdlp {
     /// Runs yt-dlp on `target` (a URL or a `ytsearchN:` query) with `args`
     /// and parses its JSON. It is killed if it takes longer than `limit`.
     fn json(&self, args: &[&str], target: &str, limit: Duration) -> Result<Value> {
-        self.json_with(args, None, target, limit)
+        self.json_with(args, None, target, limit, &|| false)
     }
 
     /// Like `json`, with `extractor_args` for yt-dlp's `--extractor-args`.
@@ -169,12 +179,13 @@ impl Ytdlp {
         extractor_args: Option<&str>,
         target: &str,
         limit: Duration,
+        abort: &dyn Fn() -> bool,
     ) -> Result<Value> {
         // yt-dlp would create it with the default mode, and every directory
         // above it that doesn't exist yet along with it.
         crate::store::ensure_dir(&self.cache_dir)?;
         let call = Call::new(&self.net, extractor_args, target)?;
-        let out = self.output_within(self.command(&call).args(args), &call, limit)?;
+        let out = self.output_within(self.command(&call).args(args), &call, limit, abort)?;
         // The files are only needed while it runs.
         drop(call);
         let Some(out) = out else {
@@ -333,10 +344,21 @@ impl Ytdlp {
     /// manifest slipping through would make mpv fetch segments directly,
     /// around the route.
     pub fn resolve(&self, url: &str, format: &str) -> Result<Streams> {
+        self.resolve_until(url, format, &|| false)
+    }
+
+    /// `resolve`, which ends (and kills yt-dlp) once `abort` says that nobody
+    /// is waiting for the result any more: the window hung up on the request.
+    pub fn resolve_until(
+        &self,
+        url: &str,
+        format: &str,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Streams> {
         let args = ["-J", "--no-playlist", "-f", format];
-        match self.json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE) {
+        match self.json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort) {
             Ok(v) => streams_from(&v, url),
-            Err(e) if is_no_format(&e) => Err(self.explain_no_format(url, e)),
+            Err(e) if is_no_format(&e) => Err(self.explain_no_format(url, e, abort)),
             Err(e) => Err(e),
         }
     }
@@ -345,10 +367,16 @@ impl Ytdlp {
     /// (HLS only) makes yt-dlp fail with a bare "no format". Ask again with
     /// its default selector, which does return something, to say why. This
     /// costs a second request, but only on a path that was failing anyway.
-    fn explain_no_format(&self, url: &str, original: anyhow::Error) -> anyhow::Error {
-        match self.json(&["-J", "--no-playlist"], url, RESOLVE) {
-            Ok(v) if is_live(&v) => anyhow!(LIVE_UNSUPPORTED),
+    fn explain_no_format(
+        &self,
+        url: &str,
+        original: anyhow::Error,
+        abort: &dyn Fn() -> bool,
+    ) -> anyhow::Error {
+        match self.json_with(&["-J", "--no-playlist"], None, url, RESOLVE, abort) {
+            Ok(v) if is_live_or_upcoming(&v) => anyhow!(LIVE_UNSUPPORTED),
             Ok(v) if !chosen_formats(&v).iter().all(|f| is_plain(f)) => anyhow!(MANIFEST_ONLY),
+            Err(e) if e.to_string() == CANCELLED => e,
             _ => original,
         }
     }
@@ -425,6 +453,14 @@ fn is_live(v: &Value) -> bool {
     v["is_live"].as_bool() == Some(true) || v["live_status"].as_str() == Some("is_live")
 }
 
+/// A stream that is running or has been announced. A finished one (`was_live`,
+/// `post_live`) is an ordinary video, and `is_live` is only set while it runs.
+fn is_live_or_upcoming(v: &Value) -> bool {
+    is_live(v)
+        || v["is_upcoming"].as_bool() == Some(true)
+        || v["live_status"].as_str() == Some("is_upcoming")
+}
+
 /// The formats yt-dlp chose: both halves of a merge, or the video itself.
 fn chosen_formats(v: &Value) -> Vec<&Value> {
     match v["requested_formats"].as_array() {
@@ -441,7 +477,7 @@ fn is_plain(f: &Value) -> bool {
 }
 
 fn streams_from(v: &Value, url: &str) -> Result<Streams> {
-    if is_live(v) {
+    if is_live_or_upcoming(v) {
         bail!(LIVE_UNSUPPORTED);
     }
     let title = str_field(v, &["title"]).unwrap_or_else(|| url.into());
@@ -516,6 +552,7 @@ fn entry(e: &Value, channel: &Option<String>, channel_id: &Option<String>) -> Op
         duration: e["duration"].as_f64().map(|d| d as u64),
         views: e["view_count"].as_u64(),
         short: e["url"].as_str().is_some_and(|u| u.contains("/shorts/")),
+        live: is_live_or_upcoming(e),
     })
 }
 
@@ -610,6 +647,35 @@ mod tests {
         assert_eq!(es[0].duration, Some(149));
         assert!(es[1].short);
         assert_eq!(es[1].channel.as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn running_and_announced_streams_are_marked_live_and_finished_ones_are_not() {
+        let v: Value = serde_json::from_str(
+            r#"{"entries":[
+                {"id":"aaaaaaaaaaa","live_status":"is_live"},
+                {"id":"bbbbbbbbbbb","live_status":"is_upcoming"},
+                {"id":"ccccccccccc","is_live":true},
+                {"id":"ddddddddddd","live_status":"was_live"},
+                {"id":"eeeeeeeeeee","live_status":"post_live"},
+                {"id":"fffffffffff","live_status":"not_live"},
+                {"id":"ggggggggggg","live_status":null},
+                {"id":"hhhhhhhhhhh"}
+            ]}"#,
+        )
+        .unwrap();
+        let live: Vec<_> = entries(&v).iter().map(|v| v.live).collect();
+        assert_eq!(live, [true, true, true, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn an_announced_stream_is_refused_like_a_running_one() {
+        let e = resolved(
+            r#"{"live_status":"is_upcoming","url":"https://gv.test/x","protocol":"https"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(e, LIVE_UNSUPPORTED);
     }
 
     use crate::net::TOR_PROXY;
@@ -806,6 +872,41 @@ done"#
             !Path::new("/proc").join(pid.trim()).exists(),
             "yt-dlp was left running"
         );
+        assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
+    }
+
+    #[test]
+    fn a_lookup_that_is_given_up_on_kills_yt_dlp_and_what_it_started() {
+        let dir = TempDir::new();
+        // Like yt-dlp with a deno: a child of its own, which a kill of the
+        // script alone would leave running.
+        let hang = r#"d=$(dirname "$0")
+sleep 60 &
+echo $! > "$d/grandchild"
+echo $$ > "$d/pid"
+while [ $# -gt 0 ]; do
+  [ "$1" = --config-locations ] && dirname "$2" > "$d/private-dir"
+  shift
+done
+wait
+"#;
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), hang), None);
+        let started = Instant::now();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        // Nobody is waiting from the third look at it on.
+        let abort = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3;
+        let err = yt
+            .resolve_until("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b", &abort)
+            .unwrap_err();
+        assert_eq!(err.to_string(), CANCELLED);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        for name in ["pid", "grandchild"] {
+            let pid = spied(&dir, name);
+            let gone = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                .map(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+                .unwrap_or(true);
+            assert!(gone, "{name} {pid} was left running");
+        }
         assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
     }
 

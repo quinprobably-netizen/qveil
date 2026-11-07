@@ -263,6 +263,13 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, &serde_json::to_vec_pretty(value)?)
 }
 
+/// Like `save`, without the indentation: for a cache that grows with every
+/// channel and is only ever read by this program, where the whitespace would
+/// make up a good part of a file that is rewritten every few seconds.
+pub fn save_compact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec(value)?)
+}
+
 /// Atomic write: a temp file created with mode 0600, synced, then renamed over the target.
 /// The temp name is unique (process ID and a random part) and in the target's
 /// directory, so concurrent writers never share a temp file and the rename
@@ -383,7 +390,7 @@ pub mod testing {
                     ("500 Internal Server Error", String::new())
                 } else {
                     let feed = format!(
-                        "<feed xmlns:yt=\"http://www.youtube.com/xml/schemas/2015\" xmlns=\"http://www.w3.org/2005/Atom\"><entry><yt:videoId>v{n:010}</yt:videoId><yt:channelId>{channel}</yt:channelId><title>t{n}</title><published>2024-01-01T00:00:00+00:00</published></entry></feed>"
+                        "<feed xmlns:yt=\"http://www.youtube.com/xml/schemas/2015\" xmlns=\"http://www.w3.org/2005/Atom\"><title>Name of {channel}</title><entry><yt:videoId>v{n:010}</yt:videoId><yt:channelId>{channel}</yt:channelId><title>t{n}</title><published>2024-01-01T00:00:00+00:00</published></entry></feed>"
                     );
                     ("200 OK", feed)
                 };
@@ -395,6 +402,40 @@ pub mod testing {
             }
         });
         (base, hits)
+    }
+
+    /// A SOCKS5 proxy that records the user name each connection
+    /// authenticates with, then refuses it.
+    pub fn socks_spy() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let users = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&users);
+        std::thread::spawn(move || {
+            for mut c in listener.incoming().flatten() {
+                // Greeting: version, method count, methods. Ask for a password.
+                let mut head = [0u8; 2];
+                if c.read_exact(&mut head).is_err() {
+                    continue;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                let _ = c.read_exact(&mut methods);
+                let _ = c.write_all(&[5, 2]);
+                // Version 1, the user name, then the password.
+                let mut len = [0u8; 2];
+                if c.read_exact(&mut len).is_err() {
+                    continue;
+                }
+                let mut user = vec![0u8; len[1] as usize];
+                let _ = c.read_exact(&mut user);
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&user).into_owned());
+                let _ = c.write_all(&[1, 1]);
+            }
+        });
+        (port, users)
     }
 
     /// How often `listing_ytdlp` has run.

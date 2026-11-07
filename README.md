@@ -48,36 +48,58 @@ as `/usr/share/doc/qveil/config.example.toml`.
 
 ## Privacy model
 
-qveil can't make you invisible to YouTube: it still has to ask YouTube for
-videos. The goal is to give YouTube as little as possible to link together,
-and to keep everything else on your machine.
+This section is printed by `qveil-core privacy --markdown`, the same text the window shows, and a test fails if it differs from the engine's.
 
-| | What qveil does |
+<!-- privacy:begin -->
+qveil can't make you invisible to YouTube: it still has to ask YouTube for videos. The goal is to give YouTube as little as possible to link together, and to keep everything else on your machine.
+
+**The routes**
+
+| Route | |
+|---|---|
+| **Direct** | YouTube sees your IP address. |
+| **Tor** | Fresh SOCKS credentials per request, which Tor puts on separate circuits (a video, and a page of thumbnails, each share one); requests can still be linked by their fingerprint and timing. |
+| **Proxy** | A proxy you trust, such as a VPN's: YouTube sees its address, not yours. A SOCKS proxy gets fresh credentials per request (a separate circuit if it is Tor); a proxy URL with credentials of its own is not isolated. |
+
+**What a route does**
+
+- **Direct.** YouTube sees your IP address with every request, which links them all.
+- **Tor (127.0.0.1:9050).** Requests go through the SOCKS proxy on 127.0.0.1:9050 (Tor), so YouTube sees an exit node's address instead of yours. Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page. A video that outlives its circuit is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.
+- **Another SOCKS proxy.** Requests go through your SOCKS proxy, so YouTube sees its address instead of yours; if it is Tor, that is an exit node's. Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page. A video that outlives its circuit is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.
+- **A SOCKS proxy with credentials in its URL.** Requests go through your SOCKS proxy, so YouTube sees its address instead of yours. The proxy URL has credentials of its own, which every request sends, so qveil can't isolate requests: they all share one identity (not isolated).
+- **An HTTP or HTTPS proxy.** Requests go through your HTTP proxy, so YouTube sees its address instead of yours. qveil can't isolate requests on an HTTP proxy: they all leave from its address (not isolated).
+
+**On every route**
+
+- qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits.
+- Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.
+- You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.
+- Subscriptions, history and the feed cache stay on this computer, in files only you can read, and qveil has no telemetry.
+
+**The details**
+
+| | |
 |---|---|
 | **One way out** | The window and its video player only ever talk to qveil's engine on `127.0.0.1`, behind a random token. Every request that leaves your machine (search, feeds, thumbnails and the video bytes themselves) is made by the engine, or by the yt-dlp it runs, through the route you pick. |
-| **Route** | *Direct*, *Tor*, or your own *Proxy*, always shown in the top bar: amber while YouTube can see your IP. *Direct* means direct: qveil ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment, so the amber bar is the truth. Through a SOCKS proxy such as Tor, every search, feed, thumbnail and video goes out with fresh SOCKS credentials, which Tor puts on a circuit of its own, and seeking still works because the engine relays Range requests. qveil can't tell Tor from another SOCKS proxy by its address (it may be `localhost`, Tor Browser's port 9150 or a tunnel), so this can't be switched off for any of them: `isolate_circuits = false` is refused. The one exception is a proxy URL with credentials of its own, which are sent with every request and make everything one identity; qveil then says "not isolated" instead of claiming a circuit per request. A video that outlives its circuit is looked up again on a fresh one, and that links the two circuits: it is the same video, resumed at the same byte. Switching routes ends the streams playing on the old one, kills the searches, lookups and refreshes still running on it (they answer "The route changed; try again"), and drops thumbnails and feeds that were still on their way. `socks5://` is refused (it leaks DNS); use `socks5h://`. |
-| **Account and cookies** | Never signed in, and no cookies stored or read from a browser or login. The engine's own requests send none. yt-dlp sends the one consent cookie it sets for itself (`SOCS`, the same for everyone), and, like any HTTP client, sends back what YouTube sets during a call; that is kept in memory and ends with the call. yt-dlp runs with `--ignore-config --no-cookies --no-cookies-from-browser --no-plugin-dirs` and its own cache, so neither your config nor a plugin can add cookies or a route of its own. Neither the embedded player nor `qveil play` loads your mpv config or scripts. |
+| **Route** | *Direct*, *Tor*, or your own *Proxy*, always shown in the top bar, amber while YouTube can see your IP. *Direct* means direct: qveil ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment. qveil can't tell Tor from another SOCKS proxy by its address (it may be `localhost`, Tor Browser's port 9150 or a tunnel), so every SOCKS proxy gets fresh credentials per request, and `isolate_circuits = false` is refused. Seeking still works over any route, because the engine relays Range requests. `socks5://` is refused (it leaks DNS); use `socks5h://`. Thumbnails are fetched a page at a time: all the thumbnails of one page of the window share one identity, and the next page gets another. |
+| **Switching routes** | Switching routes ends the streams playing on the old route, kills the searches, lookups and refreshes still running on it (they answer "The route changed; try again"), and drops thumbnails and feeds that were still on their way. |
+| **Account and cookies** | yt-dlp runs with `--ignore-config --no-cookies --no-cookies-from-browser --no-plugin-dirs` and its own cache, so neither your config nor a plugin can add cookies or a route of its own. The engine's own requests (feeds, thumbnails and video bytes) send no cookies, and the cookies in yt-dlp's resolved headers are not passed on to the relay. Neither the embedded player nor `qveil play` loads your mpv config or scripts. |
 | **Command lines** | Anything on a command line can be read by every local user through `/proc`. So the app's own calls give yt-dlp its proxy (and password), your searches and the video you open through a private file (mode `0600`, in a fresh `0700` directory that is removed afterwards, also when the engine is stopped: the window closing, Ctrl+C or `kill` end any yt-dlp first, and a run that was killed hard has its directory swept up by the next one), and `qveil play` hands mpv its loopback URLs the same way. **qveil's own command line is not covered:** `qveil search …`, `qveil play <url>` and `qveil sub add …` carry what you type in their arguments, which other local users can read through `/proc` while the command runs, unlike a search typed into the window. |
-| **Subscription list** | Fetched one channel per request, in random order. With Tor each request has its own circuit, so they can't be linked by IP, but a refresh is still a burst of requests for exactly your channels, so timing and the set of IDs can still correlate them. A refresh skips channels fetched in the last 15 minutes (`qveil feed --force` fetches them all), which keeps pressing refresh from repeating that burst, and it saves each channel as it arrives, so one that is cut off doesn't start over. |
+| **Process tree** | yt-dlp and mpv are started in process groups of their own, and are killed together with whatever they started (a deno for yt-dlp's JavaScript challenge, say) when the engine stops, and also when it is killed outright: a small guard process, which is qveil itself, outlives it for a moment and does that. |
 | **Tracking parameters** | Links are reduced to the video ID; `si=`, `pp=`, `feature=` and similar are dropped. A start time (`t=`) is kept, for the player only. |
 | **Player state** | No resume files, no watch history in mpv. |
 | **Local data** | Subscriptions and the feed cache live in `~/.local/share/qveil` and `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those). |
 | **Telemetry** | None. |
 
-**What YouTube can still see:** the IP you connect from (on Direct), each
-search and video you play, and the timing of your requests. Even over Tor, a
-long session of related videos can be linked by content. And qveil has a
-fingerprint of its own. The engine's requests and the video bytes carry one
-browser User-Agent (yt-dlp is told to send the engine's, so it is one identity,
-not two; only yt-dlp's player lookups name whichever YouTube client it is
-pretending to be), but it goes over rustls, in the engine's feeds, thumbnails
-and video bytes, or over yt-dlp's Python TLS stack, and neither is a real
-browser's TLS handshake.
-A browser User-Agent on a handshake no browser makes is likely to be rare, quite
-possibly unique to qveil, so a careful observer can link requests from separate
-Tor circuits by that fingerprint even though each circuit has its own IP.
-qveil doesn't hide it and doesn't imitate a browser's handshake. qveil reduces
-linkability; it doesn't eliminate it.
+**What YouTube can still see:** the IP you connect from (on Direct, yours; otherwise the route's), each search and video you play, and the timing of your requests. Even over Tor, a long session of related videos can be linked by content, and the fingerprint above can link requests that come from separate circuits. qveil reduces linkability; it doesn't eliminate it.
+
+**On the pages**
+
+- **Search.** Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches.
+- **Subscriptions.** Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels.
+- **History, off.** Off: qveil doesn't remember what you watch.
+- **History, on.** On: kept only on this computer, in a file only you can read, until you clear it.
+<!-- privacy:end -->
 
 ## The app
 
@@ -138,7 +160,11 @@ Output piped into `head` and the like ends quietly when the reader is done.
 
 ```
 core/        qveil-core, the engine (Rust)
-  server.rs    loopback API, thumbnail fetcher, Range-forwarding video relay
+  server.rs    loopback server: state, lifecycle, routing
+  server/      http (limits, token), api, jobs (the feed refresh), thumbs, relay
+  privacy.rs   every privacy claim, for the window, `qveil config` and this README
+  errors.rs    plain-language errors, and the code each carries
+  proc.rs      every child process: own process group, killed with the engine
   net.rs       route validation, per-request Tor circuit isolation
   inflight.rs  the running yt-dlp calls, so a route switch or exit can stop them
   signals.rs   clean-up on SIGINT, SIGTERM and SIGHUP

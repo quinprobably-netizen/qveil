@@ -18,19 +18,11 @@ impl VideoRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelRef {
-    /// A canonical `UC…` channel ID; needs no lookup to fetch its feed.
+    /// A canonical `UC…` channel ID; needs no lookup, not even for its name,
+    /// which its feed has.
     Id(String),
     /// A handle or legacy URL that must be resolved to an ID.
     Url(String),
-}
-
-impl ChannelRef {
-    pub fn url(&self) -> String {
-        match self {
-            ChannelRef::Id(id) => format!("https://www.youtube.com/channel/{id}"),
-            ChannelRef::Url(u) => u.clone(),
-        }
-    }
 }
 
 fn id_chars(s: &str) -> bool {
