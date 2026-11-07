@@ -24,6 +24,9 @@ ApplicationWindow {
     // Whether the first engine start has loaded the window yet.
     property bool started: false
     readonly property bool fullscreen: visibility === Window.FullScreen
+    // Before the first subscription there is nothing to refresh or filter. Both
+    // counts must say so, so a loading window doesn't flash the controls away.
+    readonly property bool noSubs: backend.feedInfo.channels === 0 && backend.subs.length === 0
     // Whether keys are going into a text field (the search box, the add field
     // on the subscriptions page, the proxy field). Every Qt Quick text input
     // has a cursor position and nothing else that takes focus does.
@@ -251,6 +254,7 @@ ApplicationWindow {
                     onChannelRequested: id => win.openChannel(id)
                     actions: [
                         CheckBox {
+                            visible: !win.noSubs
                             text: qsTr("Shorts")
                             checked: prefs.showShorts
                             onToggled: {
@@ -259,6 +263,7 @@ ApplicationWindow {
                             }
                         },
                         Button {
+                            visible: !win.noSubs
                             text: qsTr("Refresh")
                             flat: true
                             icon.source: "qrc:/icons/refresh.svg"
