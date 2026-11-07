@@ -10,10 +10,17 @@ pub const USER_AGENT: &str =
 
 pub const TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
 
+/// How long a relayed stream may go without receiving a single byte.
+pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Debug, Default)]
 pub struct Net {
     proxy: Option<String>,
     isolate: bool,
+    /// Whether plain `http://` URLs may be fetched. Always false in
+    /// production, so nothing leaves the machine unencrypted through the exit
+    /// node or proxy; only tests, which talk to a local server, turn it on.
+    allow_http: bool,
 }
 
 impl Net {
@@ -28,7 +35,24 @@ impl Net {
                 _ => bail!("unsupported proxy {p:?}; use http://, https:// or socks5h://"),
             }
         }
-        Ok(Self { proxy, isolate })
+        Ok(Self {
+            proxy,
+            isolate,
+            allow_http: false,
+        })
+    }
+
+    /// The same route, but plain http is allowed (for tests with a local upstream).
+    #[cfg(test)]
+    pub fn allowing_http(mut self) -> Self {
+        self.allow_http = true;
+        self
+    }
+
+    /// Whether both go through the same proxy with the same isolation, which
+    /// is what decides if a stream resolved on one can be played on the other.
+    pub fn same_route(&self, other: &Net) -> bool {
+        self.proxy == other.proxy && self.isolates() == other.isolates()
     }
 
     pub fn is_socks(&self) -> bool {
@@ -83,6 +107,7 @@ impl Net {
         Net {
             proxy: self.proxy_url(),
             isolate: false,
+            ..self.clone()
         }
     }
 
@@ -92,16 +117,24 @@ impl Net {
     }
 
     /// Like `client`, but without a total timeout, because a relayed video
-    /// body can stream for an hour.
+    /// body can stream for an hour. What it has instead is an idle timeout:
+    /// reqwest's blocking client applies its timeout to waiting for the
+    /// response head and then to each separate read of the body, so a stalled
+    /// upstream (a dead Tor circuit, say) ends the stream with an error
+    /// instead of holding a thread and a connection forever.
     pub fn relay_client(&self) -> Result<Client> {
-        self.build(None)
+        self.relay_client_idle(RELAY_IDLE_TIMEOUT)
+    }
+
+    fn relay_client_idle(&self, idle: Duration) -> Result<Client> {
+        self.build(Some(idle))
     }
 
     fn build(&self, timeout: Option<Duration>) -> Result<Client> {
         let mut b = Client::builder()
             .user_agent(USER_AGENT)
             .referer(false)
-            .https_only(true)
+            .https_only(!self.allow_http)
             .connect_timeout(Duration::from_secs(20))
             .timeout(timeout);
         if let Some(p) = self.proxy_url() {
@@ -117,7 +150,8 @@ pub fn tor_running() -> bool {
         .is_ok()
 }
 
-fn redact(p: &str) -> String {
+/// The proxy URL without its credentials: `scheme://***@host:port`.
+pub fn redact(p: &str) -> String {
     match (p.split_once("://"), p.rsplit_once('@')) {
         (Some((scheme, _)), Some((_, host))) => format!("{scheme}://***@{host}"),
         _ => p.to_string(),
@@ -146,6 +180,108 @@ mod tests {
             pinned.proxy_url(),
             "a pinned route keeps one circuit"
         );
+    }
+
+    /// Answers one request on a local port: the head, then `chunks`, each
+    /// after its delay. Returns the base URL.
+    fn upstream(chunks: &'static [(u64, &'static str)]) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                while r.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+                let total: usize = chunks.iter().map(|c| c.1.len()).sum();
+                let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+                for (delay, data) in chunks {
+                    std::thread::sleep(Duration::from_millis(*delay));
+                    let _ = conn.write_all(data.as_bytes());
+                }
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn production_clients_refuse_plain_http() {
+        let url = upstream(&[(0, "hi")]);
+        let direct = Net::new(None, true).unwrap();
+        for client in [direct.client().unwrap(), direct.relay_client().unwrap()] {
+            let err = client.get(&url).send().unwrap_err();
+            assert!(
+                err.is_builder(),
+                "plain http must be refused up front: {err}"
+            );
+        }
+        // Only the test-only switch allows it, and it survives `pinned`.
+        let open = direct.allowing_http();
+        assert_eq!(
+            open.client()
+                .unwrap()
+                .get(&url)
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "hi"
+        );
+        let pinned = open.pinned();
+        assert!(pinned.client().unwrap().get(&url).send().is_ok());
+    }
+
+    #[test]
+    fn the_relay_times_out_when_idle_but_not_in_total() {
+        use std::io::Read;
+        let net = Net::new(None, true).unwrap().allowing_http();
+        let idle = Duration::from_millis(400);
+        let client = net.relay_client_idle(idle).unwrap();
+
+        // Four chunks 150 ms apart take longer than the idle timeout in
+        // total, but never go quiet for that long: this must succeed.
+        let url = upstream(&[(150, "a"), (150, "b"), (150, "c"), (150, "d")]);
+        let started = std::time::Instant::now();
+        let mut body = String::new();
+        client
+            .get(&url)
+            .send()
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        assert_eq!(body, "abcd");
+        assert!(
+            started.elapsed() > idle,
+            "the test no longer outlasts the timeout"
+        );
+
+        // One chunk, then silence for 5 s: the read fails after about 400 ms.
+        let url = upstream(&[(0, "a"), (5_000, "b")]);
+        let started = std::time::Instant::now();
+        let mut resp = client.get(&url).send().unwrap();
+        let mut got = String::new();
+        let err = resp.read_to_string(&mut got).unwrap_err();
+        let timed_out = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<reqwest::Error>())
+            .is_some_and(|e| e.is_timeout());
+        assert!(timed_out, "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn same_route_means_same_proxy_and_isolation() {
+        let tor = || Net::new(Some(TOR_PROXY.into()), true).unwrap();
+        assert!(tor().same_route(&tor()));
+        assert!(!tor().same_route(&Net::new(None, true).unwrap()));
+        assert!(!tor().same_route(&Net::new(Some(TOR_PROXY.into()), false).unwrap()));
+        let http = Net::new(Some("http://10.0.0.1:3128".into()), true).unwrap();
+        assert!(!tor().same_route(&http));
+        // Isolation only means something over SOCKS, so it can't tell two HTTP proxies apart.
+        assert!(http.same_route(&Net::new(Some("http://10.0.0.1:3128".into()), false).unwrap()));
     }
 
     #[test]

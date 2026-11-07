@@ -11,10 +11,11 @@ use crate::app::{self, Runtime, Watched};
 use crate::config::Config;
 use crate::errors::friendly;
 use crate::ids::{self, VideoRef};
-use crate::net::{self, TOR_PROXY};
+use crate::net::{self, Net, TOR_PROXY};
 use crate::store::Paths;
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use serde::{Deserialize, Serialize};
@@ -59,11 +60,32 @@ pub struct Server {
     thumbs: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     /// Serializes read-modify-write of the subscription, feed and history files.
     store: Mutex<()>,
+    /// Serializes settings changes.
+    settings: Mutex<()>,
     /// Connections being served right now (see `MAX_CONNECTIONS`).
     connections: Arc<AtomicUsize>,
 }
 
+/// One relayed stream. What mpv fetches goes through `live`, which is
+/// replaced when the upstream URLs go stale (see `Server::refresh`).
 struct Session {
+    source: VideoRef,
+    /// The yt-dlp format selector it was resolved with, to resolve it again the same way.
+    format: String,
+    /// The route it was opened on, not one pinned identity of it: a fresh
+    /// identity is derived from it each time the stream is resolved again.
+    route: Net,
+    live: Mutex<Live>,
+    /// Held while resolving again, so simultaneous failures share one resolve.
+    refreshing: Mutex<()>,
+}
+
+/// The upstream half of a session: URLs that only work from the address
+/// that resolved them, and the client with that same address.
+#[derive(Clone)]
+struct Live {
+    /// Counts resolves, so a waiter can tell that someone else already refreshed.
+    generation: u32,
     video: String,
     audio: Option<String>,
     headers: Vec<(String, String)>,
@@ -155,6 +177,7 @@ impl Server {
             sessions: Mutex::new(VecDeque::new()),
             thumbs: Mutex::new(HashMap::new()),
             store: Mutex::new(()),
+            settings: Mutex::new(()),
             connections: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -195,22 +218,23 @@ impl Server {
         let base = self.listen()?;
         let rt = self.runtime();
         let yt = rt.pinned_ytdlp();
-        let s = yt.resolve(&v.watch_url(), &rt.cfg.format())?;
-        let sid = random_hex();
+        let format = rt.cfg.format();
+        let s = yt.resolve(&v.watch_url(), &format)?;
+        let has_audio = s.audio.is_some();
         let session = Session {
-            video: s.video,
-            audio: s.audio,
-            headers: s.headers,
-            client: yt.net.relay_client()?,
+            source: v.clone(),
+            format,
+            route: rt.net.clone(),
+            live: Mutex::new(Live {
+                generation: 0,
+                video: s.video,
+                audio: s.audio,
+                headers: s.headers,
+                client: yt.net.relay_client()?,
+            }),
+            refreshing: Mutex::new(()),
         };
-        let has_audio = session.audio.is_some();
-        {
-            let mut sessions = lock(&self.sessions);
-            sessions.push_back((sid.clone(), Arc::new(session)));
-            while sessions.len() > MAX_SESSIONS {
-                sessions.pop_front();
-            }
-        }
+        let sid = self.register(&rt, session)?;
         if rt.cfg.history {
             let _g = lock(&self.store);
             app::record_history(
@@ -233,6 +257,24 @@ impl Server {
             video: format!("{base}/s/{sid}/v"),
             audio: has_audio.then(|| format!("{base}/s/{sid}/a")),
         })
+    }
+
+    /// Adds a session that was resolved under `rt`, unless the route has
+    /// changed since: a stream resolved on Direct must not become playable
+    /// after the user switched to Tor. The check happens under the sessions
+    /// lock, which `update_config` also holds while it swaps the runtime and
+    /// clears the sessions, so no session can slip in after that clear.
+    fn register(&self, rt: &Runtime, session: Session) -> Result<String> {
+        let mut sessions = lock(&self.sessions);
+        if !self.runtime().net.same_route(&rt.net) {
+            bail!("The route changed while opening the video; try again");
+        }
+        let sid = random_hex();
+        sessions.push_back((sid.clone(), Arc::new(session)));
+        while sessions.len() > MAX_SESSIONS {
+            sessions.pop_front();
+        }
+        Ok(sid)
     }
 
     fn session(&self, sid: &str) -> Option<Arc<Session>> {
@@ -389,7 +431,9 @@ impl Server {
         };
         json!({
             "route": route,
-            "proxy": proxy,
+            // Credentials never leave the engine: the window shows this and
+            // sends it back unchanged to mean "keep the current proxy".
+            "proxy": proxy.map(net::redact),
             "describe": rt.net.describe(),
             "isolated": rt.net.isolates(),
             "torRunning": net::tor_running(),
@@ -401,6 +445,8 @@ impl Server {
     }
 
     fn update_config(&self, p: ConfigPatch) -> Result<()> {
+        // One change at a time: each reads the current settings, edits them and saves.
+        let _one_at_a_time = lock(&self.settings);
         let rt = self.runtime();
         let mut cfg: Config = toml::from_str(&toml::to_string(&rt.cfg)?)?;
         match p.route.as_deref() {
@@ -415,7 +461,14 @@ impl Server {
                     .proxy
                     .filter(|s| !s.trim().is_empty())
                     .context("enter a proxy URL")?;
-                cfg.proxy = Some(proxy.trim().into());
+                let proxy = proxy.trim();
+                // The window is only ever shown the proxy with its credentials
+                // redacted, and sends that back unchanged when the field wasn't
+                // edited. That means "keep the proxy I have".
+                cfg.proxy = match rt.net.proxy() {
+                    Some(current) if net::redact(current) == proxy => Some(current.into()),
+                    _ => Some(proxy.into()),
+                };
             }
             Some(other) => bail!("unknown route {other:?}"),
         }
@@ -431,9 +484,15 @@ impl Server {
         // Validates the proxy before anything is saved.
         let next = Runtime::new(cfg, &self.paths, None, false)?;
         next.cfg.save(&self.paths.config)?;
+        let route_changed = !next.net.same_route(&rt.net);
+        // Under the sessions lock (see `register`). Streams stay valid across
+        // settings like thumbnails or quality, which don't touch the route; a
+        // new route would make their upstream URLs play from the wrong address.
+        let mut sessions = lock(&self.sessions);
         *self.runtime.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
-        // Thumbnails fetched over the old route stay valid; streams don't.
-        lock(&self.sessions).clear();
+        if route_changed {
+            sessions.clear();
+        }
         Ok(())
     }
 
@@ -472,29 +531,31 @@ impl Server {
         let Some(s) = self.session(sid) else {
             return respond(out, 404, "text/plain", b"stream expired");
         };
-        let url = match kind {
-            "v" => s.video.as_str(),
-            _ => match &s.audio {
-                Some(a) => a.as_str(),
-                None => return respond(out, 404, "text/plain", b"no separate audio"),
-            },
+        let mut live = lock(&s.live).clone();
+        let mut up = match fetch_upstream(&live, req, kind) {
+            Ok(Some(up)) => up,
+            Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
+            Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
         };
-        let method = if req.method == "HEAD" {
-            Method::HEAD
-        } else {
-            Method::GET
-        };
-        let mut rb = s.client.request(method, url);
-        for (k, v) in &s.headers {
-            rb = rb.header(k.as_str(), v.as_str());
+        if up.status() == StatusCode::FORBIDDEN {
+            // googlevideo URLs only work from the address that resolved them,
+            // and Tor stops using a circuit for new streams after about ten
+            // minutes even when the SOCKS credentials stay the same. On a long
+            // video the first 403 is usually that: resolve again under a fresh
+            // identity and retry this request once.
+            live = match self.refresh(&s, live.generation) {
+                Ok(live) => live,
+                Err(e) => {
+                    let msg = friendly(&format!("{e:#}"));
+                    return respond(out, 502, "text/plain", msg.as_bytes());
+                }
+            };
+            up = match fetch_upstream(&live, req, kind) {
+                Ok(Some(up)) => up,
+                Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
+                Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
+            };
         }
-        if let Some(r) = req.header("range") {
-            rb = rb.header(RANGE, r);
-        }
-        let mut up = match rb.send() {
-            Ok(r) => r,
-            Err(e) => return respond(out, 502, "text/plain", format!("{e:#}").as_bytes()),
-        };
         let status = up.status();
         // The format selector only picks plain downloads, but if a manifest
         // still turns up, relaying it would hand mpv absolute segment URLs
@@ -532,6 +593,69 @@ impl Server {
         }
         Ok(())
     }
+
+    /// Resolves the session's video again on a fresh pinned identity and
+    /// swaps the result in. `seen` is the generation the failed request used.
+    fn refresh(&self, s: &Session, seen: u32) -> Result<Live> {
+        // Requests that fail together (video and audio, or mpv reconnecting)
+        // queue here and then all use the first one's result.
+        let _one = lock(&s.refreshing);
+        {
+            let live = lock(&s.live);
+            if live.generation != seen {
+                return Ok(live.clone());
+            }
+        }
+        let rt = self.runtime();
+        if !rt.net.same_route(&s.route) {
+            // The user switched routes while this stream was playing. Resolving
+            // it again would send a request over the route they left.
+            bail!("The route changed; open the video again");
+        }
+        let yt = rt.pinned_ytdlp();
+        let streams = yt.resolve(&s.source.watch_url(), &s.format)?;
+        let fresh = Live {
+            generation: seen + 1,
+            video: streams.video,
+            audio: streams.audio,
+            headers: streams.headers,
+            client: yt.net.relay_client()?,
+        };
+        *lock(&s.live) = fresh.clone();
+        Ok(fresh)
+    }
+}
+
+/// Starts the upstream request for one relayed GET or HEAD, forwarding the
+/// Range header. `None` means there is no separate audio stream. Errors are
+/// text for the client, without the URL: it is signed for this address.
+fn fetch_upstream(
+    live: &Live,
+    req: &Request,
+    kind: &str,
+) -> Result<Option<reqwest::blocking::Response>, String> {
+    let url = match kind {
+        "v" => live.video.as_str(),
+        _ => match &live.audio {
+            Some(a) => a.as_str(),
+            None => return Ok(None),
+        },
+    };
+    let method = if req.method == "HEAD" {
+        Method::HEAD
+    } else {
+        Method::GET
+    };
+    let mut rb = live.client.request(method, url);
+    for (k, v) in &live.headers {
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    if let Some(r) = req.header("range") {
+        rb = rb.header(RANGE, r);
+    }
+    rb.send()
+        .map(Some)
+        .map_err(|e| friendly(&format!("{:#}", e.without_url())))
 }
 
 /// Streams the body to the client. mpv drops the connection whenever it
@@ -781,13 +905,21 @@ mod tests {
     use crate::config::Config;
 
     fn server() -> (Arc<Server>, String, tempdir::Dir) {
+        server_with(Config::default())
+    }
+
+    /// A server whose clients may talk plain http, so a local upstream can
+    /// stand in for googlevideo.
+    fn server_with(cfg: Config) -> (Arc<Server>, String, tempdir::Dir) {
         let dir = tempdir::Dir::new();
         let paths = Paths {
             config: dir.0.join("config.toml"),
             data: dir.0.join("data"),
             cache: dir.0.join("cache"),
         };
-        let rt = Runtime::new(Config::default(), &paths, None, false).unwrap();
+        let mut rt = Runtime::new(cfg, &paths, None, false).unwrap();
+        rt.net = rt.net.allowing_http();
+        rt.yt.net = rt.net.clone();
         let s = Server::new(rt, paths);
         let base = s.listen().unwrap();
         (s, base, dir)
@@ -994,6 +1126,432 @@ mod tests {
         );
         drop(reader);
         trickler.join().unwrap();
+    }
+
+    /// 100 bytes of `abc…zabc…`, easy to recognise a range of.
+    fn payload() -> Vec<u8> {
+        (0..100u8).map(|i| b'a' + i % 26).collect()
+    }
+
+    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// A tiny stand-in for googlevideo on a local port. It records every
+    /// request target and Range header it gets.
+    struct Upstream {
+        addr: std::net::SocketAddr,
+        seen: Seen,
+    }
+
+    impl Upstream {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen = Seen::default();
+            let log = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                for conn in listener.incoming().flatten() {
+                    let log = Arc::clone(&log);
+                    std::thread::spawn(move || upstream_serve(conn, &log));
+                }
+            });
+            Upstream { addr, seen }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.addr)
+        }
+
+        fn requests(&self) -> Vec<(String, Option<String>)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn upstream_serve(mut conn: TcpStream, log: &Mutex<Vec<(String, Option<String>)>>) {
+        let mut r = BufReader::new(conn.try_clone().unwrap());
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let head_only = line.starts_with("HEAD");
+        let mut range = None;
+        loop {
+            let mut h = String::new();
+            r.read_line(&mut h).unwrap();
+            if h.trim().is_empty() {
+                break;
+            }
+            if let Some(v) = h.to_ascii_lowercase().strip_prefix("range:") {
+                range = Some(v.trim().to_string());
+            }
+        }
+        log.lock().unwrap().push((target.clone(), range.clone()));
+        let body = payload();
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let mut send = |status: &str, headers: &str, body: &[u8], claimed: usize| {
+            let _ = write!(
+                conn,
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {claimed}\r\nConnection: close\r\n\r\n"
+            );
+            if !head_only {
+                let _ = conn.write_all(body);
+            }
+        };
+        match path {
+            // Like a URL from a retired Tor circuit: `gen=1` is the first
+            // resolve of a stream, and anything under `stale=` is never good.
+            "/video" if query == "gen=1" || query.starts_with("stale=") => {
+                send("403 Forbidden", "", b"denied", 6)
+            }
+            "/video" => match range.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                Some(r) => {
+                    let (a, b) = r.split_once('-').unwrap();
+                    let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                    send(
+                        "206 Partial Content",
+                        &format!("Content-Type: video/mp4\r\nContent-Range: bytes {a}-{b}/100\r\n"),
+                        &body[a..=b],
+                        b - a + 1,
+                    );
+                }
+                None => send("200 OK", "Content-Type: video/mp4\r\n", &body, 100),
+            },
+            "/hls" => send(
+                "200 OK",
+                "Content-Type: application/vnd.apple.mpegurl\r\n",
+                b"#EXTM3U\nhttps://rr1.googlevideo.com/seg1.ts\n",
+                43,
+            ),
+            "/dash" => send(
+                "200 OK",
+                "Content-Type: application/dash+xml\r\n",
+                b"<MPD><BaseURL>https://rr1.googlevideo.com/</BaseURL></MPD>",
+                57,
+            ),
+            // Promises 100 bytes, sends 10 and hangs up.
+            "/cut" => send("200 OK", "Content-Type: video/mp4\r\n", &body[..10], 100),
+            _ => send("404 Not Found", "", b"", 0),
+        }
+    }
+
+    type Fetched = (u16, HashMap<String, String>, Vec<u8>);
+
+    /// A request with extra headers; returns the status, the lowercased
+    /// response headers and the body bytes.
+    fn fetch(base: &str, method: &str, rest: &str, headers: &[(&str, &str)]) -> Fetched {
+        let mut c = TcpStream::connect(addr(base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let extra: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect();
+        let target = path(base, rest);
+        write!(c, "{method} {target} HTTP/1.1\r\nHost: x\r\n{extra}\r\n").unwrap();
+        let mut raw = Vec::new();
+        let _ = c.read_to_end(&mut raw);
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no response head");
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        let mut lines = head.lines();
+        let status = lines.next().unwrap()[9..12].parse().unwrap();
+        let headers = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        (status, headers, raw[split + 4..].to_vec())
+    }
+
+    fn test_video() -> VideoRef {
+        VideoRef {
+            id: "dQw4w9WgXcQ".into(),
+            start: None,
+        }
+    }
+
+    fn session_for(rt: &Runtime, url: String) -> Session {
+        Session {
+            source: test_video(),
+            format: rt.cfg.format(),
+            route: rt.net.clone(),
+            live: Mutex::new(Live {
+                generation: 0,
+                video: url,
+                audio: None,
+                headers: vec![],
+                client: rt.net.relay_client().unwrap(),
+            }),
+            refreshing: Mutex::new(()),
+        }
+    }
+
+    /// A session pointing at `url`, registered the way `open` does it.
+    fn add_session(s: &Arc<Server>, url: String) -> String {
+        let rt = s.runtime();
+        s.register(&rt, session_for(&rt, url)).unwrap()
+    }
+
+    #[test]
+    fn range_requests_are_forwarded_and_answered_as_ranges() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/video"));
+        let stream = format!("s/{sid}/v");
+
+        let (status, headers, body) = fetch(&base, "GET", &stream, &[("Range", "bytes=10-19")]);
+        assert_eq!(status, 206);
+        assert_eq!(headers["content-range"], "bytes 10-19/100");
+        assert_eq!(headers["content-length"], "10");
+        assert_eq!(body, b"klmnopqrst");
+        let seen = up.requests();
+        assert_eq!(seen.last().unwrap().1.as_deref(), Some("bytes=10-19"));
+
+        // Without a Range header the whole thing comes back, and the upstream
+        // is not sent one that nobody asked for.
+        let (status, _, body) = fetch(&base, "GET", &stream, &[]);
+        assert_eq!((status, body), (200, payload()));
+        assert_eq!(up.requests().last().unwrap().1, None);
+
+        let (status, headers, body) = fetch(&base, "HEAD", &stream, &[]);
+        assert_eq!((status, headers["content-length"].as_str()), (200, "100"));
+        assert!(body.is_empty());
+        assert_eq!(headers["accept-ranges"], "bytes");
+    }
+
+    #[test]
+    fn playlists_are_refused_not_relayed() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        for path in ["/hls", "/dash"] {
+            let sid = add_session(&s, up.url(path));
+            let (status, _, body) = fetch(&base, "GET", &format!("s/{sid}/v"), &[]);
+            let text = String::from_utf8_lossy(&body);
+            assert_eq!(status, 502, "{path}");
+            assert!(text.contains("can't relay"), "{text}");
+            assert!(
+                !text.contains("googlevideo") && !text.contains("EXTM3U"),
+                "{text}"
+            );
+        }
+        assert!(is_playlist_type("Application/X-MpegURL; charset=utf-8"));
+        assert!(!is_playlist_type("video/mp4"));
+    }
+
+    #[test]
+    fn a_stream_cut_short_upstream_is_cut_short_for_the_client() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/cut"));
+        let (status, headers, body) = fetch(&base, "GET", &format!("s/{sid}/v"), &[]);
+        // The client was promised 100 bytes and got 10, so it can tell the
+        // stream failed; it isn't passed off as a complete one.
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-length"], "100");
+        assert_eq!(body.len(), 10);
+    }
+
+    #[test]
+    fn upstream_errors_never_expose_the_signed_url() {
+        let (s, base, _d) = server();
+        // Nothing listens on port 1, so connecting fails.
+        let sid = add_session(&s, "http://127.0.0.1:1/videoplayback?sig=SECRETSIG".into());
+        let (status, _, body) = fetch(&base, "GET", &format!("s/{sid}/v"), &[]);
+        assert_eq!(status, 502);
+        assert!(!String::from_utf8_lossy(&body).contains("SECRETSIG"));
+    }
+
+    #[test]
+    fn sessions_survive_settings_but_not_a_route_change() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/video"));
+        let post = |body: &str| http(&base, "POST", &path(&base, "api/config"), body);
+        let works = || fetch(&base, "GET", &format!("s/{sid}/v"), &[]).0;
+
+        // Thumbnails, history and quality have nothing to do with the route.
+        for patch in [
+            r#"{"thumbnails":false}"#,
+            r#"{"history":true,"maxHeight":720}"#,
+            r#"{"route":"direct"}"#,
+        ] {
+            assert_eq!(post(patch).0, 200, "{patch}");
+            assert!(s.session(&sid).is_some(), "{patch} dropped the session");
+            assert_eq!(works(), 200, "{patch}");
+        }
+
+        assert_eq!(post(r#"{"route":"tor"}"#).0, 200);
+        assert!(s.session(&sid).is_none());
+        assert_eq!(
+            works(),
+            404,
+            "a Direct stream must not outlive the switch to Tor"
+        );
+    }
+
+    #[test]
+    fn a_stream_resolved_on_the_old_route_cannot_be_registered() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        // `open` resolves under this snapshot of the settings…
+        let before = s.runtime();
+        // …and the user switches to Tor while yt-dlp is still running.
+        let post = |body: &str| http(&base, "POST", &path(&base, "api/config"), body);
+        assert_eq!(post(r#"{"route":"tor"}"#).0, 200);
+        let err = s
+            .register(&before, session_for(&before, up.url("/video")))
+            .unwrap_err();
+        assert!(err.to_string().contains("route changed"), "{err}");
+        assert!(lock(&s.sessions).is_empty());
+
+        // A change that leaves the route alone doesn't make `open` fail.
+        let before = s.runtime();
+        assert_eq!(post(r#"{"thumbnails":false}"#).0, 200);
+        let session = session_for(&before, up.url("/video"));
+        assert!(s.register(&before, session).is_ok());
+    }
+
+    /// A yt-dlp that answers with a URL on the local upstream, numbered by how
+    /// often it has run (`<url>1`, `<url>2`, …), and counts its runs.
+    fn fake_ytdlp(dir: &std::path::Path, url: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let script = r#"#!/bin/sh
+n=$(cat '@COUNT@' 2>/dev/null || echo 0)
+n=$((n + 1))
+echo $n > '@COUNT@'
+cat <<EOF
+{"title":"T","requested_formats":[
+ {"url":"@URL@$n","protocol":"https","vcodec":"avc1"},
+ {"url":"@URL@$n","protocol":"https","vcodec":"none"}]}
+EOF
+"#
+        .replace("@COUNT@", &dir.join("runs").display().to_string())
+        .replace("@URL@", url);
+        let bin = dir.join("yt-dlp");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.display().to_string()
+    }
+
+    fn runs(dir: &std::path::Path) -> u32 {
+        std::fs::read_to_string(dir.join("runs"))
+            .map(|s| s.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    /// The path of a relay URL below the server's base.
+    fn rel<'a>(base: &str, url: &'a str) -> &'a str {
+        url.strip_prefix(&format!("{base}/")).unwrap()
+    }
+
+    #[test]
+    fn a_403_resolves_again_once_and_retries() {
+        let up = Upstream::start();
+        let bin = tempdir::Dir::new();
+        // The first resolve gives `…?gen=1`, which the upstream rejects with a
+        // 403 like a URL from a retired circuit; the second gives `…?gen=2`.
+        let ytdlp = fake_ytdlp(&bin.0, &up.url("/video?gen="));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        assert_eq!(runs(&bin.0), 1);
+
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            rel(&base, &info.video),
+            &[("Range", "bytes=0-4")],
+        );
+        assert_eq!((status, body.as_slice()), (206, &b"abcde"[..]));
+        assert_eq!(runs(&bin.0), 2, "one more resolve, not more");
+        let targets: Vec<_> = up.requests().into_iter().map(|r| r.0).collect();
+        assert_eq!(targets, ["/video?gen=1", "/video?gen=2"]);
+        assert_eq!(
+            up.requests()[1].1.as_deref(),
+            Some("bytes=0-4"),
+            "the Range survives the retry"
+        );
+
+        // The session now holds the fresh URLs: the audio half and later
+        // requests need no further resolve.
+        let audio = rel(&base, info.audio.as_deref().unwrap());
+        assert_eq!(fetch(&base, "GET", audio, &[]).0, 200);
+        assert_eq!(fetch(&base, "GET", rel(&base, &info.video), &[]).0, 200);
+        assert_eq!(runs(&bin.0), 2);
+    }
+
+    #[test]
+    fn a_403_that_persists_is_passed_on_after_one_retry() {
+        let up = Upstream::start();
+        let bin = tempdir::Dir::new();
+        let ytdlp = fake_ytdlp(&bin.0, &up.url("/video?stale="));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        let (status, _, body) = fetch(&base, "GET", rel(&base, &info.video), &[]);
+        assert_eq!((status, body.as_slice()), (403, &b"denied"[..]));
+        assert_eq!(runs(&bin.0), 2, "no resolve loop");
+    }
+
+    #[test]
+    fn a_stream_is_not_resolved_again_on_a_route_the_user_left() {
+        let up = Upstream::start();
+        let bin = tempdir::Dir::new();
+        let ytdlp = fake_ytdlp(&bin.0, &up.url("/video?gen="));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        let sid = rel(&base, &info.video)
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let held = s.session(&sid).unwrap();
+        http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"route":"tor"}"#,
+        );
+        let err = s.refresh(&held, 0).err().expect("must refuse");
+        assert!(err.to_string().contains("route changed"), "{err}");
+        assert_eq!(runs(&bin.0), 1, "no request went out on the old route");
+    }
+
+    #[test]
+    fn the_proxy_is_shown_without_credentials_and_kept_when_sent_back() {
+        let (s, base, _d) = server();
+        let post = |body: &str| http(&base, "POST", &path(&base, "api/config"), body);
+        let (status, body) =
+            post(r#"{"route":"proxy","proxy":"http://user:secret@127.0.0.1:3128"}"#);
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["proxy"], "http://***@127.0.0.1:3128");
+        assert!(!body.contains("secret"), "{body}");
+        let (_, shown) = http(&base, "GET", &path(&base, "api/config"), "");
+        assert!(!shown.contains("secret"), "{shown}");
+        let saved = |s: &Server| Config::load(&s.paths.config).unwrap().proxy;
+        assert_eq!(
+            saved(&s).as_deref(),
+            Some("http://user:secret@127.0.0.1:3128")
+        );
+
+        // The window sends back what it was shown: that keeps the real proxy.
+        let (status, _) = post(r#"{"route":"proxy","proxy":"http://***@127.0.0.1:3128"}"#);
+        assert_eq!(status, 200);
+        assert_eq!(
+            saved(&s).as_deref(),
+            Some("http://user:secret@127.0.0.1:3128")
+        );
+        assert_eq!(s.runtime().net.proxy(), saved(&s).as_deref());
+
+        // Anything else replaces it.
+        post(r#"{"route":"proxy","proxy":"http://10.0.0.1:8080"}"#);
+        assert_eq!(saved(&s).as_deref(), Some("http://10.0.0.1:8080"));
     }
 
     mod tempdir {
