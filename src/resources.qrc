@@ -23,5 +23,6 @@
         <file alias="icons/search.svg">icons/search.svg</file>
         <file alias="icons/replay.svg">icons/replay.svg</file>
         <file alias="icons/close.svg">icons/close.svg</file>
+        <file alias="icons/check.svg">icons/check.svg</file>
     </qresource>
 </RCC>

@@ -301,12 +301,29 @@ ApplicationWindow {
                     onActivated: video => backend.play(video.id)
                     actions: [
                         Button {
+                            id: subscribe
+                            readonly property bool isOn: !!backend.channel.subscribed
                             visible: !!backend.channel.name
-                            text: backend.channel.subscribed ? qsTr("Subscribed") : qsTr("Subscribe")
-                            highlighted: !backend.channel.subscribed
-                            flat: !!backend.channel.subscribed
-                            onClicked: backend.channel.subscribed ? backend.unsubscribe(backend.channel.id)
-                                                                   : backend.subscribe(backend.channel.id)
+                            text: isOn ? qsTr("Subscribed") : qsTr("Subscribe")
+                            // Subscribe is the filled call to action. Subscribed is the same
+                            // control switched on: a check and an accent outline, not flat text.
+                            highlighted: !isOn
+                            flat: isOn
+                            checked: isOn
+                            icon.source: isOn ? "qrc:/icons/check.svg" : ""
+                            icon.width: 18
+                            icon.height: 18
+                            onClicked: isOn ? backend.unsubscribe(backend.channel.id)
+                                            : backend.subscribe(backend.channel.id)
+
+                            Rectangle {
+                                anchors.fill: subscribe.background
+                                visible: subscribe.isOn
+                                radius: subscribe.background.radius
+                                color: "transparent"
+                                border.width: 1
+                                border.color: theme.accent
+                            }
                         }
                     ]
                 }
