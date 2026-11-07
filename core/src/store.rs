@@ -223,6 +223,22 @@ pub mod testing {
         path.display().to_string()
     }
 
+    /// A yt-dlp that lists one video for any channel and counts its runs in
+    /// `<dir>/runs`. `extra` is shell run first.
+    pub fn listing_ytdlp(dir: &std::path::Path, extra: &str) -> String {
+        // The video is named after the process, so that every channel has its own.
+        let body = format!(
+            "echo x >> '{runs}'\n{extra}\nprintf '{{\"entries\":[{{\"id\":\"v%010d\",\"title\":\"t\"}}]}}' $$\n",
+            runs = dir.join("runs").display()
+        );
+        script(&dir.join("yt-dlp"), &body)
+    }
+
+    /// How often `listing_ytdlp` has run.
+    pub fn listing_runs(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("runs")).map_or(0, |s| s.lines().count())
+    }
+
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);

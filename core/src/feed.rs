@@ -17,10 +17,18 @@ use std::sync::Mutex;
 
 const RETENTION_SECS: i64 = 86_400 * 180;
 const FALLBACK_LIMIT: usize = 15;
+/// A refresh leaves out channels fetched this recently (unless forced), so
+/// pressing refresh again doesn't repeat a burst of requests for exactly the
+/// same channels, which is slow over Tor and adds to what can be correlated.
+pub const FRESH_SECS: i64 = 15 * 60;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct FeedCache {
     pub seen: HashMap<String, Seen>,
+    /// When each channel was last fetched successfully. A channel that failed
+    /// has no new entry, so the next refresh tries it again.
+    #[serde(default)]
+    pub fetched_at: HashMap<String, i64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -52,43 +60,70 @@ pub struct Fetched {
     pub source: Source,
 }
 
+#[derive(Default)]
+pub struct Fetch {
+    pub fetched: Vec<Fetched>,
+    pub errors: Vec<String>,
+    /// Channels not fetched because the route changed meanwhile.
+    pub skipped: usize,
+}
+
+/// Fetches the channels' feeds on `net`. `current` says whether `net` is
+/// still the route in use: once it isn't, no further channel is started,
+/// because every request would go out over the route the user just left.
 pub fn fetch_all(
     net: &Net,
     yt: &Ytdlp,
     subs: &[Sub],
     workers: usize,
-) -> (Vec<Fetched>, Vec<String>) {
+    current: &(dyn Fn() -> bool + Sync),
+) -> Fetch {
     let mut order: Vec<&Sub> = subs.iter().collect();
     order.shuffle(&mut rand::rng());
     let queue = Mutex::new(order);
-    let results = Mutex::new((Vec::new(), Vec::new()));
+    let results = Mutex::new(Fetch::default());
     std::thread::scope(|s| {
         for _ in 0..workers.clamp(1, 16).min(subs.len().max(1)) {
             s.spawn(|| {
-                loop {
+                // Checked before each channel, so a channel that has been
+                // started is not abandoned half-way.
+                while current() {
                     let Some(sub) = queue.lock().unwrap().pop() else {
                         break;
                     };
-                    let r = fetch_one(net, yt, sub);
+                    let r = fetch_one(net, yt, sub, current);
                     let mut res = results.lock().unwrap();
                     match r {
-                        Ok(f) => res.0.push(f),
-                        Err(e) => res.1.push(format!("{}: {e:#}", sub.name)),
+                        Ok(f) => res.fetched.push(f),
+                        // A failure after the route changed is probably that
+                        // change cutting it off, and its result is moot.
+                        Err(_) if !current() => res.skipped += 1,
+                        Err(e) => res.errors.push(format!("{}: {e:#}", sub.name)),
                     }
                 }
             });
         }
     });
-    results.into_inner().unwrap()
+    let mut res = results.into_inner().unwrap();
+    res.skipped += queue.into_inner().unwrap().len();
+    res
 }
 
-fn fetch_one(net: &Net, yt: &Ytdlp, sub: &Sub) -> Result<Fetched> {
+fn fetch_one(net: &Net, yt: &Ytdlp, sub: &Sub, current: &dyn Fn() -> bool) -> Result<Fetched> {
     let mut rss_err = None;
     for _ in 0..2 {
+        // Each attempt is a request of its own, and the fallback below is a
+        // slow one, so the route is looked at again before every step.
+        if !current() {
+            bail!("the route changed");
+        }
         match fetch_rss(net, &sub.id) {
             Ok(videos) => return Ok(fetched(sub, videos, Source::Rss)),
             Err(e) => rss_err = Some(e),
         }
+    }
+    if !current() {
+        bail!("the route changed");
     }
     let videos = yt
         .channel_videos(&sub.id, FALLBACK_LIMIT)
@@ -164,8 +199,17 @@ pub fn parse_rss(xml: &str) -> Result<Vec<Video>> {
 }
 
 impl FeedCache {
+    /// Whether the channel is due for a fetch: never fetched, or not within
+    /// `FRESH_SECS`. A time in the future (the clock was set back) counts as stale.
+    pub fn is_stale(&self, channel_id: &str, now: i64) -> bool {
+        self.fetched_at
+            .get(channel_id)
+            .is_none_or(|&at| at > now || now - at >= FRESH_SECS)
+    }
+
     pub fn merge(&mut self, fetched: &[Fetched], now: i64) {
         for f in fetched {
+            self.fetched_at.insert(f.channel_id.clone(), now);
             let known = self
                 .seen
                 .values()

@@ -76,6 +76,9 @@ enum Cmd {
         /// Don't fetch anything; show what's cached
         #[arg(long)]
         offline: bool,
+        /// Fetch every channel, including ones fetched in the last 15 minutes
+        #[arg(long, conflicts_with = "offline")]
+        force: bool,
         #[command(flatten)]
         out: Output,
     },
@@ -175,12 +178,25 @@ fn run() -> Result<()> {
             limit,
             no_shorts,
             offline,
+            force,
             out,
         } => {
             if !offline {
                 eprintln!("fetching feeds (proxy: {})…", rt.net.describe());
             }
-            let r = app::feed(&rt, paths, !offline, no_shorts, limit)?;
+            let refresh = match (offline, force) {
+                (true, _) => app::Refresh::Off,
+                (false, true) => app::Refresh::Force,
+                (false, false) => app::Refresh::Stale,
+            };
+            let r = app::feed(&rt, paths, refresh, no_shorts, limit, &|| true)?;
+            if r.fresh > 0 {
+                eprintln!(
+                    "{} channel(s) were fetched in the last {} minutes and are not fetched again (--force fetches them all)",
+                    r.fresh,
+                    feed::FRESH_SECS / 60
+                );
+            }
             if r.channels == 0 {
                 anyhow::bail!(
                     "no subscriptions yet: try `qveil sub add @handle` or `qveil sub import subscriptions.csv`"

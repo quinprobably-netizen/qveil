@@ -7,7 +7,7 @@
 //! random token, so other local programs and web pages can't use it.
 //! Relayed streams forward Range requests, so seeking works over Tor as well.
 
-use crate::app::{self, Runtime, Watched};
+use crate::app::{self, Refresh, Runtime, Watched};
 use crate::config::Config;
 use crate::errors::friendly;
 use crate::ids::{self, VideoRef};
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,56 @@ struct Session {
     live: Mutex<Live>,
     /// Held while resolving again, so simultaneous failures share one resolve.
     refreshing: Mutex<()>,
+    /// Set when the route changes. A relay that is already copying bytes
+    /// would otherwise keep pulling the rest of the video over the route the
+    /// user just left (mpv holds one open-ended Range request).
+    cancelled: AtomicBool,
+    /// The client sockets of the relays in flight, so that cancelling can
+    /// wake one that is blocked writing to a player that has paused.
+    clients: Mutex<Vec<(u64, TcpStream)>>,
+}
+
+impl Session {
+    fn new(source: VideoRef, format: String, route: Net, live: Live) -> Self {
+        Session {
+            source,
+            format,
+            route,
+            live: Mutex::new(live),
+            refreshing: Mutex::new(()),
+            cancelled: AtomicBool::new(false),
+            clients: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Ends the streams of this session: no relay reads another byte from
+    /// upstream, and the players' connections are closed.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        for (_, client) in lock(&self.clients).drain(..) {
+            // Wakes a relay blocked in a write, and makes the player's
+            // reads end, so it doesn't wait on a stream that is gone.
+            let _ = client.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Lets `cancel` reach this relay's client until the guard is dropped.
+    fn attach(&self, client: &TcpStream) -> io::Result<Attached<'_>> {
+        let id = rand::random();
+        lock(&self.clients).push((id, client.try_clone()?));
+        Ok(Attached { session: self, id })
+    }
+}
+
+struct Attached<'a> {
+    session: &'a Session,
+    id: u64,
+}
+
+impl Drop for Attached<'_> {
+    fn drop(&mut self) {
+        lock(&self.session.clients).retain(|(id, _)| *id != self.id);
+    }
 }
 
 /// The upstream half of a session: URLs that only work from the address
@@ -217,19 +267,18 @@ impl Server {
         let format = rt.cfg.format();
         let s = yt.resolve(&v.watch_url(), &format)?;
         let has_audio = s.audio.is_some();
-        let session = Session {
-            source: v.clone(),
+        let session = Session::new(
+            v.clone(),
             format,
-            route: rt.net.clone(),
-            live: Mutex::new(Live {
+            rt.net.clone(),
+            Live {
                 generation: 0,
                 video: s.video,
                 audio: s.audio,
                 headers: s.headers,
                 client: yt.net.relay_client()?,
-            }),
-            refreshing: Mutex::new(()),
-        };
+            },
+        );
         let sid = self.register(&rt, session)?;
         if rt.cfg.history {
             app::record_history(
@@ -369,12 +418,23 @@ impl Server {
                 json!(app::search(&rt, req.param("q")?, req.num("n", 40))?)
             }
             ("GET", ["api", "feed"]) => {
+                // `refresh=1` fetches the channels not fetched recently,
+                // `&force=1` all of them, and `&channel=UC…` just that one.
+                let refresh = match req.query.get("channel").filter(|c| !c.is_empty()) {
+                    _ if !req.flag("refresh") => Refresh::Off,
+                    Some(id) => Refresh::Channel(id.clone()),
+                    None if req.flag("force") => Refresh::Force,
+                    None => Refresh::Stale,
+                };
+                // A refresh can take minutes, and the route can change in the meantime.
+                let current = || self.runtime().net.same_route(&rt.net);
                 json!(app::feed(
                     &rt,
                     paths,
-                    req.flag("refresh"),
+                    refresh,
                     !req.flag("shorts"),
-                    req.num("n", 150)
+                    req.num("n", 150),
+                    &current
                 )?)
             }
             ("GET", ["api", "channel"]) => json!(app::channel(&rt, paths, req.param("id")?)?),
@@ -481,7 +541,11 @@ impl Server {
         let mut sessions = lock(&self.sessions);
         *self.runtime.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         if route_changed {
-            sessions.clear();
+            // Not just forgotten: a relay already copying a body holds its own
+            // reference, and would carry on over the old route.
+            for (_, session) in sessions.drain(..) {
+                session.cancel();
+            }
         }
         Ok(())
     }
@@ -521,8 +585,14 @@ impl Server {
         let Some(s) = self.session(sid) else {
             return respond(out, 404, "text/plain", b"stream expired");
         };
+        // Attached before looking at the flag, so a cancel is either seen
+        // here or finds this client to close.
+        let _attached = s.attach(out)?;
+        if s.cancelled.load(Ordering::Acquire) {
+            return respond(out, 404, "text/plain", b"stream expired");
+        }
         let mut live = lock(&s.live).clone();
-        let mut up = match fetch_upstream(&live, req, kind) {
+        let mut up = match fetch_upstream(&live, &s.route, req, kind) {
             Ok(Some(up)) => up,
             Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
             Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
@@ -540,11 +610,15 @@ impl Server {
                     return respond(out, 502, "text/plain", msg.as_bytes());
                 }
             };
-            up = match fetch_upstream(&live, req, kind) {
+            up = match fetch_upstream(&live, &s.route, req, kind) {
                 Ok(Some(up)) => up,
                 Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
                 Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
             };
+        }
+        if s.cancelled.load(Ordering::Acquire) {
+            // The route changed while the upstream request was in flight.
+            return respond(out, 404, "text/plain", b"stream expired");
         }
         let status = up.status();
         // The format selector only picks plain downloads, but if a manifest
@@ -579,7 +653,7 @@ impl Server {
         out.write_all(head.as_bytes())?;
         if req.method != "HEAD" {
             out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
-            copy_body(&mut up, out)?;
+            copy_body(&mut up, out, &s.cancelled)?;
         }
         Ok(())
     }
@@ -621,6 +695,7 @@ impl Server {
 /// text for the client, without the URL: it is signed for this address.
 fn fetch_upstream(
     live: &Live,
+    route: &Net,
     req: &Request,
     kind: &str,
 ) -> Result<Option<reqwest::blocking::Response>, String> {
@@ -645,22 +720,32 @@ fn fetch_upstream(
     }
     rb.send()
         .map(Some)
-        .map_err(|e| friendly(&format!("{:#}", e.without_url())))
+        .map_err(|e| friendly(&route.explain(&format!("{:#}", e.without_url()))))
 }
 
 /// Streams the body to the client. mpv drops the connection whenever it
 /// seeks, so a failed write ends the copy quietly. A failed *read* from
 /// upstream is returned instead: the connection is then closed short of the
 /// Content-Length, which mpv reports, rather than looking like a complete body.
-fn copy_body(up: &mut impl Read, out: &mut impl Write) -> Result<()> {
+/// Once `cancelled` is set (the route changed) the copy ends the same quiet
+/// way, short of the Content-Length, and bytes read since are not passed on.
+fn copy_body(up: &mut impl Read, out: &mut impl Write, cancelled: &AtomicBool) -> Result<()> {
     let mut buf = vec![0u8; 64 << 10];
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let n = match up.read(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) if cancelled.load(Ordering::Acquire) => return Ok(()),
             Err(e) => return Err(StreamBroke(e).into()),
         };
+        // The read can have taken a long time.
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if out.write_all(&buf[..n]).is_err() {
             return Ok(());
         }
@@ -1133,11 +1218,21 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
+    /// What the upstream's endless streams are doing.
+    #[derive(Default)]
+    struct Gauge {
+        /// Streams still being written.
+        live: AtomicUsize,
+        /// Bytes written so far, over all of them.
+        sent: AtomicUsize,
+    }
+
     /// A tiny stand-in for googlevideo on a local port. It records every
     /// request target and Range header it gets.
     struct Upstream {
         addr: std::net::SocketAddr,
         seen: Seen,
+        gauge: Arc<Gauge>,
     }
 
     impl Upstream {
@@ -1146,13 +1241,15 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let seen = Seen::default();
             let log = Arc::clone(&seen);
+            let gauge = Arc::new(Gauge::default());
+            let counted = Arc::clone(&gauge);
             std::thread::spawn(move || {
                 for conn in listener.incoming().flatten() {
-                    let log = Arc::clone(&log);
-                    std::thread::spawn(move || upstream_serve(conn, &log));
+                    let (log, gauge) = (Arc::clone(&log), Arc::clone(&counted));
+                    std::thread::spawn(move || upstream_serve(conn, &log, &gauge));
                 }
             });
-            Upstream { addr, seen }
+            Upstream { addr, seen, gauge }
         }
 
         fn url(&self, path: &str) -> String {
@@ -1164,7 +1261,11 @@ mod tests {
         }
     }
 
-    fn upstream_serve(mut conn: TcpStream, log: &Mutex<Vec<(String, Option<String>)>>) {
+    fn upstream_serve(
+        mut conn: TcpStream,
+        log: &Mutex<Vec<(String, Option<String>)>>,
+        gauge: &Gauge,
+    ) {
         let mut r = BufReader::new(conn.try_clone().unwrap());
         let mut line = String::new();
         r.read_line(&mut line).unwrap();
@@ -1184,6 +1285,26 @@ mod tests {
         log.lock().unwrap().push((target.clone(), range.clone()));
         let body = payload();
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        if path == "/endless" {
+            // A video that never ends, 16 KiB at a time, `pace` ms apart, until
+            // the other side hangs up.
+            let pace: u64 = query
+                .strip_prefix("pace=")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(0);
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 1000000000000\r\nConnection: close\r\n\r\n"
+            );
+            gauge.live.fetch_add(1, Ordering::SeqCst);
+            let chunk = [b'x'; 16 << 10];
+            while conn.write_all(&chunk).is_ok() {
+                gauge.sent.fetch_add(chunk.len(), Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(pace));
+            }
+            gauge.live.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
         let mut send = |status: &str, headers: &str, body: &[u8], claimed: usize| {
             let _ = write!(
                 conn,
@@ -1267,19 +1388,18 @@ mod tests {
     }
 
     fn session_for(rt: &Runtime, url: String) -> Session {
-        Session {
-            source: test_video(),
-            format: rt.cfg.format(),
-            route: rt.net.clone(),
-            live: Mutex::new(Live {
+        Session::new(
+            test_video(),
+            rt.cfg.format(),
+            rt.net.clone(),
+            Live {
                 generation: 0,
                 video: url,
                 audio: None,
                 headers: vec![],
                 client: rt.net.relay_client().unwrap(),
-            }),
-            refreshing: Mutex::new(()),
-        }
+            },
+        )
     }
 
     /// A session pointing at `url`, registered the way `open` does it.
@@ -1405,6 +1525,227 @@ mod tests {
         assert_eq!(post(r#"{"thumbnails":false}"#).0, 200);
         let session = session_for(&before, up.url("/video"));
         assert!(s.register(&before, session).is_ok());
+    }
+
+    /// Polls until `cond` holds, or panics after `within`.
+    fn wait_for(what: &str, within: Duration, cond: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !cond() {
+            assert!(started.elapsed() < within, "gave up waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Opens a relayed stream like a player would, and returns the socket once
+    /// the response head has arrived.
+    fn start_stream(base: &str, sid: &str) -> TcpStream {
+        let mut c = TcpStream::connect(addr(base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            c,
+            "GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=0-\r\n\r\n",
+            path(base, &format!("s/{sid}/v"))
+        )
+        .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            assert_eq!(c.read(&mut b).unwrap(), 1, "the head ended early");
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 200"), "{head:?}");
+        c
+    }
+
+    fn switch_to_tor(base: &str) {
+        let (status, body) = http(
+            base,
+            "POST",
+            &path(base, "api/config"),
+            r#"{"route":"tor"}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
+    fn a_route_switch_ends_a_stream_that_is_playing() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/endless?pace=5"));
+        let mut player = start_stream(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0;
+        while got < 100 << 10 {
+            got += player.read(&mut buf).unwrap();
+        }
+        assert_eq!(up.gauge.live.load(Ordering::SeqCst), 1);
+
+        switch_to_tor(&base);
+        // The player's connection is closed (what it was promised was a
+        // terabyte), and the upstream's too, so nothing more is pulled.
+        let started = Instant::now();
+        let ended = loop {
+            match player.read(&mut buf) {
+                Ok(0) | Err(_) => break started.elapsed(),
+                Ok(_) => assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the stream carries on"
+                ),
+            }
+        };
+        assert!(ended < Duration::from_secs(5), "{ended:?}");
+        wait_for(
+            "the upstream connection to close",
+            Duration::from_secs(5),
+            || up.gauge.live.load(Ordering::SeqCst) == 0,
+        );
+        let sent = up.gauge.sent.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            up.gauge.sent.load(Ordering::SeqCst),
+            sent,
+            "bytes still flow upstream"
+        );
+    }
+
+    #[test]
+    fn a_route_switch_also_ends_a_stream_whose_player_has_paused() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/endless"));
+        // The player reads the head and then nothing: its cache is full. The
+        // relay ends up blocked writing to it, so it wouldn't notice a flag.
+        let _paused = start_stream(&base, &sid);
+        let sent = || up.gauge.sent.load(Ordering::SeqCst);
+        let stalled = |ms| {
+            let before = sent();
+            std::thread::sleep(Duration::from_millis(ms));
+            sent() == before
+        };
+        wait_for("the relay to back up", Duration::from_secs(10), || {
+            sent() > 0 && stalled(400)
+        });
+        assert_eq!(up.gauge.live.load(Ordering::SeqCst), 1);
+
+        switch_to_tor(&base);
+        // Without the player reading a single byte, the relay lets go.
+        wait_for("the relay to let go", Duration::from_secs(5), || {
+            up.gauge.live.load(Ordering::SeqCst) == 0
+        });
+    }
+
+    /// A server whose every request to YouTube fails at once (nothing listens
+    /// on the proxy port), and whose yt-dlp lists a video per channel and
+    /// counts its runs. `extra` is shell run first.
+    fn feed_server(extra: &str, channels: u32) -> (Arc<Server>, String, TempDir, TempDir) {
+        let bin = TempDir::new();
+        let (s, base, dir) = server_with(Config {
+            proxy: Some("http://127.0.0.1:1".into()),
+            ytdlp: crate::store::testing::listing_ytdlp(&bin.0, extra),
+            feed_workers: 1,
+            ..Config::default()
+        });
+        for n in 1..=channels {
+            let csv = format!("UC{n:022},http://x,Chan{n}\n");
+            assert_eq!(
+                http(&base, "POST", &path(&base, "api/subs/import"), &csv).0,
+                200
+            );
+        }
+        (s, base, dir, bin)
+    }
+
+    #[test]
+    fn the_feed_api_refreshes_stale_channels_all_of_them_or_one() {
+        use crate::store::testing::listing_runs as runs;
+        let (_s, base, _d, bin) = feed_server("", 2);
+        let feed = |query: &str| http(&base, "GET", &path(&base, &format!("api/feed?{query}")), "");
+
+        // Without `refresh` nothing is fetched.
+        assert_eq!(feed("shorts=1").0, 200);
+        assert_eq!(runs(&bin.0), 0);
+        // `refresh=1` fetches what is stale: here, both.
+        let (status, body) = feed("refresh=1");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(runs(&bin.0), 2);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["channels", "entries", "errors", "fallbacks"]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+        // Straight after, they are fresh.
+        assert_eq!(feed("refresh=1").0, 200);
+        assert_eq!(runs(&bin.0), 2);
+        // `force=1` fetches them all anyway, and `channel=` just the one.
+        assert_eq!(feed("refresh=1&force=1").0, 200);
+        assert_eq!(runs(&bin.0), 4);
+        assert_eq!(feed(&format!("refresh=1&channel=UC{:022}", 2)).0, 200);
+        assert_eq!(runs(&bin.0), 5);
+        // Both are ignored unless asked to refresh.
+        assert_eq!(feed("refresh=0&force=1").0, 200);
+        assert_eq!(feed(&format!("channel=UC{:022}", 1)).0, 200);
+        assert_eq!(runs(&bin.0), 5);
+        // A channel that isn't one of ours is an error, not a quiet no-op.
+        let (status, body) = feed(&format!("refresh=1&channel=UC{:022}", 7));
+        assert_eq!(status, 500);
+        assert!(body.contains("not one of your subscriptions"), "{body}");
+        assert_eq!(feed("refresh=1&channel=nope").0, 500);
+        assert_eq!(runs(&bin.0), 5);
+    }
+
+    #[test]
+    fn a_feed_refresh_stops_when_the_route_is_switched() {
+        use crate::store::testing::listing_runs as runs;
+        // The first channel's lookup takes a moment, and that is when the
+        // route is switched; the other four channels must not be fetched.
+        let (_s, base, _d, bin) = feed_server("sleep 1", 5);
+        let refresh = {
+            let base = base.clone();
+            std::thread::spawn(move || http(&base, "GET", &path(&base, "api/feed?refresh=1"), ""))
+        };
+        wait_for("the first lookup to start", Duration::from_secs(10), || {
+            runs(&bin.0) == 1
+        });
+        switch_to_tor(&base);
+        let (status, body) = refresh.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(runs(&bin.0), 1, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let errors = v["errors"].to_string();
+        assert!(errors.contains("route changed"), "{errors}");
+    }
+
+    #[test]
+    fn copy_body_stops_at_once_when_cancelled() {
+        struct Chunks {
+            sent: usize,
+            cancel: Arc<AtomicBool>,
+        }
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.sent += 1;
+                // The route changes while the second read is in progress.
+                if self.sent == 2 {
+                    self.cancel.store(true, Ordering::Release);
+                }
+                buf[..4].copy_from_slice(b"data");
+                Ok(4)
+            }
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut up = Chunks {
+            sent: 0,
+            cancel: Arc::clone(&cancel),
+        };
+        let mut out = Vec::new();
+        copy_body(&mut up, &mut out, &cancel).unwrap();
+        // The second chunk arrived after the change, so it isn't passed on.
+        assert_eq!((up.sent, out.as_slice()), (2, &b"data"[..]));
+
+        // Already cancelled: not a single read.
+        let mut out = Vec::new();
+        copy_body(&mut up, &mut out, &cancel).unwrap();
+        assert_eq!((up.sent, out.len()), (2, 0));
     }
 
     /// A yt-dlp that answers with a URL on the local upstream, numbered by how
