@@ -19,11 +19,16 @@ FocusScope {
         add.text = ""
     }
 
+    // A list of names doesn't need a wide window: the column is capped, so
+    // the field and its button don't stretch across a big screen. It stays on
+    // the left, where the other pages' headings are.
     ColumnLayout {
-        anchors.fill: parent
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
         anchors.leftMargin: 28
-        anchors.rightMargin: 28
         anchors.topMargin: 22
+        width: Math.min(720, parent.width - 56)
         spacing: 10
 
         Label {
@@ -42,15 +47,23 @@ FocusScope {
         RowLayout {
             Layout.topMargin: 6
             spacing: 10
-            TextField {
+            // The same field as the search box in the top bar, and as tall as the button.
+            SearchBox {
                 id: add
                 Layout.preferredWidth: 380
-                placeholderText: qsTr("@handle, channel URL or ID")
-                onAccepted: page.submit()
+                placeholder: qsTr("@handle, channel URL or ID")
+                icon: ""
+                hint: ""
+                onSubmitted: page.submit()
             }
             Button {
                 text: qsTr("Subscribe")
                 highlighted: true
+                // The style draws its pill 12px shorter than the button; with
+                // no inset the button is as tall as the field beside it.
+                topInset: 0
+                bottomInset: 0
+                Layout.preferredHeight: add.implicitHeight
                 enabled: add.text.trim() !== ""
                 onClicked: page.submit()
             }

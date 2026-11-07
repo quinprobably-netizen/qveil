@@ -81,7 +81,7 @@ Popup {
         spacing: 6
 
         Label {
-            text: qsTr("Privacy")
+            text: qsTr("Route & privacy")
             font.pixelSize: 17
             font.weight: Font.DemiBold
         }

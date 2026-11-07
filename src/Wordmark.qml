@@ -14,8 +14,8 @@ Item {
     Text {
         id: word
         font.pixelSize: mark.pixelSize
-        font.weight: Font.Black
-        font.letterSpacing: 0.5
+        font.weight: Font.Bold
+        font.letterSpacing: 1.5
         color: "white"
         visible: false
         layer.enabled: true

@@ -45,8 +45,8 @@ Popup {
             title: qsTr("Playing"),
             keys: [
                 ["Space", qsTr("Play or pause")],
-                ["← →", qsTr("Back or forward 5 seconds")],
-                ["J  L", qsTr("Back or forward 10 seconds")],
+                ["← →", qsTr("Seek 5 s")],
+                ["J  L", qsTr("Seek 10 s")],
                 ["↑ ↓", qsTr("Volume")],
                 ["M", qsTr("Mute")],
                 ["F", qsTr("Fullscreen")],
@@ -95,7 +95,7 @@ Popup {
                             spacing: 14
 
                             Label {
-                                Layout.preferredWidth: 96
+                                Layout.preferredWidth: 88
                                 text: modelData[0]
                                 font.weight: Font.DemiBold
                                 color: theme.accent

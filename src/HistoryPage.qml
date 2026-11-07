@@ -40,8 +40,8 @@ FocusScope {
             }
             Button {
                 text: page.enabled_ ? qsTr("Turn off") : qsTr("Turn on")
-                flat: page.enabled_
-                highlighted: !page.enabled_
+                // Flat both ways: turning tracking on is no call to action.
+                flat: true
                 onClicked: backend.setConfig({ history: !page.enabled_ })
             }
             Button {
@@ -86,7 +86,7 @@ FocusScope {
                         }
                     }
                     Label {
-                        text: Format.age(row.modelData.at, false)
+                        text: Format.age(row.modelData.at)
                         font.pixelSize: 12
                         color: "#6f6f7b"
                     }

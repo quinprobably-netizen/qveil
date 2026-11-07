@@ -9,9 +9,9 @@ function clock(seconds) {
     return h > 0 ? h + ":" + pad(m) + ":" + pad(r) : m + ":" + pad(r)
 }
 
-// "3 days ago"; estimated dates (RSS was down, or a channel's Videos tab)
-// get a leading "~".
-function age(timestamp, estimated) {
+// "3 days ago". Whether a date is only approximate is said where it is shown
+// (a tooltip), not in the text: a "~" in front reads as noise.
+function age(timestamp) {
     if (!timestamp)
         return ""
     const d = Math.max(0, Date.now() / 1000 - timestamp)
@@ -26,7 +26,7 @@ function age(timestamp, estimated) {
         text = qsTr("%n months ago", "", Math.floor(d / (86400 * 30)))
     else
         text = qsTr("%n years ago", "", Math.floor(d / (86400 * 365)))
-    return (estimated ? "~" : "") + text
+    return text
 }
 
 function views(n) {
@@ -42,9 +42,9 @@ function views(n) {
     return qsTr("%1 views").arg(n)
 }
 
-function meta(video, date, estimated) {
+function meta(video, date) {
     const parts = []
-    const when = age(date, estimated)
+    const when = age(date)
     if (when)
         parts.push(when)
     const v = views(video.views)
