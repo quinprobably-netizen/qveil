@@ -11,6 +11,13 @@ Popup {
     padding: 26
     width: 660
 
+    // A dark scrim. The style's own dim is a pale grey on a dark theme, which
+    // reads as a rendering fault. Every modal popup sets this.
+    Overlay.modal: Rectangle {
+        color: "#b0000000"
+        Behavior on opacity { NumberAnimation { duration: 150 } }
+    }
+
     background: Rectangle {
         color: "#16161b"
         radius: theme.radius

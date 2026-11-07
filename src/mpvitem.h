@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QMutex>
 #include <QQuickFramebufferObject>
 
@@ -42,6 +43,9 @@ class MpvItem : public QQuickFramebufferObject {
     Q_PROPERTY(bool ended READ ended NOTIFY endedChanged)
     Q_PROPERTY(double volume READ volume WRITE setVolume NOTIFY volumeChanged)
     Q_PROPERTY(bool muted READ muted WRITE setMuted NOTIFY mutedChanged)
+    // What mpv paints where there is no video: before the first frame and in
+    // the letterbox. It has to be the scene's own colour behind the item.
+    Q_PROPERTY(QColor backgroundColor READ backgroundColor WRITE setBackgroundColor NOTIFY backgroundColorChanged)
 
 public:
     explicit MpvItem(QQuickItem *parent = nullptr);
@@ -65,6 +69,8 @@ public:
     bool muted() const { return m_muted; }
     void setVolume(double volume);
     void setMuted(bool muted);
+    QColor backgroundColor() const { return m_background; }
+    void setBackgroundColor(const QColor &color);
 
 signals:
     void positionChanged();
@@ -76,6 +82,7 @@ signals:
     void endedChanged();
     void volumeChanged();
     void mutedChanged();
+    void backgroundColorChanged();
     void failed(const QString &message);
 
 private slots:
@@ -90,4 +97,5 @@ private:
     double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false;
+    QColor m_background = Qt::black;
 };

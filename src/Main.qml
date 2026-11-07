@@ -79,13 +79,22 @@ ApplicationWindow {
         Qt.callLater(() => win.focusPage("channel"))
     }
 
+    // What the Refresh button and R do. Asked for by hand, so every channel is
+    // fetched, not only the ones the engine thinks are stale.
     function refresh() {
         if (page === "channel")
             backend.openChannel(backend.channel.id)
         else if (page === "search")
             backend.search(backend.query)
         else
-            backend.refreshFeed(true, prefs.showShorts)
+            backend.refreshFeed(true, prefs.showShorts, true)
+    }
+
+    // The first run's way in: Subscriptions, with the add field ready to type in.
+    function addChannel() {
+        go("subs")
+        // go() puts focus on the list on the next turn; the field comes after.
+        Qt.callLater(() => subsPage.focusAdd())
     }
 
     function playCurrent() {
@@ -126,8 +135,16 @@ ApplicationWindow {
                 return
             win.started = true
             backend.refreshFeed(false, prefs.showShorts)
+            // Only the channels that have gone stale: opening the window must
+            // not refetch what was fetched minutes ago.
             backend.refreshFeed(true, prefs.showShorts)
             backend.loadSubs()
+        }
+        // The engine ends the streams of the old route, so the player has
+        // nothing left to play, and must not stay up as if it had.
+        function onRouteChanged() {
+            if (player.active)
+                player.close()
         }
         function onPlayReady(info) { player.open(info) }
         function onNotice(text) { toast.show(text) }
@@ -158,16 +175,48 @@ ApplicationWindow {
         LayoutMirroring.enabled: Qt.application.layoutDirection === Qt.RightToLeft
         LayoutMirroring.childrenInherit: true
 
+        // The player owns the whole window while a video is open, the top bar's
+        // strip included, so it is the bottom layer: the pages above it are
+        // hidden then, and the bar floats over the video with the controls.
+        PlayerView {
+            id: player
+            anchors.fill: parent
+            topInset: topBar.visible ? topBar.height : 0
+            // The bar goes with the controls, but not while it is in use.
+            hold: barHover.hovered || win.typing || route.opened || help.opened
+            savedVolume: prefs.volume
+            onSavedVolumeChanged: prefs.volume = savedVolume
+            onClosed: {
+                if (win.fullscreen)
+                    win.showNormal()
+                Qt.callLater(() => win.focusPage(win.page))
+            }
+            onChannelRequested: id => win.openChannel(id)
+            onFullscreenToggled: win.toggleFullscreen()
+        }
+
         ColumnLayout {
             anchors.fill: parent
             spacing: 0
 
             // The top bar: wordmark, places, search, and the route.
             Rectangle {
+                id: topBar
                 Layout.fillWidth: true
                 Layout.preferredHeight: 60
                 visible: !win.fullscreen
-                color: "#111115"
+                // Over a video the bar has no fill of its own: the player's
+                // gradient sits behind it, like behind the controls.
+                color: player.active ? "transparent" : "#111115"
+                // It fades with the player's controls, and while it is hidden
+                // it must not catch clicks that belong to the video.
+                opacity: player.active && !player.chrome ? 0 : 1
+                enabled: opacity > 0
+                Behavior on opacity { NumberAnimation { duration: 220 } }
+
+                HoverHandler { id: barHover }
+                // Clicks on the bar's empty space are not clicks on the video.
+                MouseArea { anchors.fill: parent }
 
                 Rectangle {
                     anchors.left: parent.left
@@ -175,6 +224,7 @@ ApplicationWindow {
                     anchors.bottom: parent.bottom
                     height: 1
                     color: "#1e1e25"
+                    visible: !player.active
                 }
 
                 RowLayout {
@@ -248,8 +298,16 @@ ApplicationWindow {
                     estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
                     loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
                     emptyText: backend.feedInfo.channels === 0
-                               ? qsTr("Your feed is built from channels you subscribe to, on this computer only.\n\nSearch for a channel, press 2 to add one, or drop a Google Takeout subscriptions.csv here.")
+                               ? qsTr("Your feed is built from the channels you subscribe to, on this computer only. Add one below, or drop a Google Takeout subscriptions.csv here.")
                                : qsTr("Nothing here yet. Press R to refresh.")
+                    emptyActions: [
+                        Button {
+                            visible: backend.feedInfo.channels === 0
+                            text: qsTr("Add a channel")
+                            highlighted: true
+                            onClicked: win.addChannel()
+                        }
+                    ]
                     onActivated: video => backend.play(video.id)
                     onChannelRequested: id => win.openChannel(id)
                     actions: [
@@ -268,7 +326,7 @@ ApplicationWindow {
                             flat: true
                             icon.source: "qrc:/icons/refresh.svg"
                             enabled: backend.busy.indexOf("feed") < 0
-                            onClicked: backend.refreshFeed(true, prefs.showShorts)
+                            onClicked: win.refresh()
                         }
                     ]
                 }
@@ -281,6 +339,7 @@ ApplicationWindow {
                     heading: backend.query ? qsTr("“%1”").arg(backend.query) : qsTr("Search")
                     subheading: qsTr("Straight from YouTube's search, without an account, cookies or history.")
                     model: backend.results
+                    estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
                     loading: backend.busy.indexOf("search") >= 0
                     emptyText: backend.query ? qsTr("No results.") : ""
                     onActivated: video => backend.play(video.id)
@@ -294,8 +353,9 @@ ApplicationWindow {
                     veil: prefs.veilThumbnails
                     heading: backend.channel.name || ""
                     subheading: backend.channel.videos && backend.channel.videos.length
-                                ? qsTr("%n recent videos  ·  dates are approximate", "", backend.channel.videos.length) : ""
+                                ? qsTr("%n recent videos", "", backend.channel.videos.length) : ""
                     model: backend.channel.videos || []
+                    estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
                     loading: backend.busy.indexOf("channel") >= 0
                     emptyText: qsTr("No videos.")
                     onActivated: video => backend.play(video.id)
@@ -359,20 +419,6 @@ ApplicationWindow {
                         }
                     }
                     MouseArea { anchors.fill: parent }
-                }
-
-                PlayerView {
-                    id: player
-                    anchors.fill: parent
-                    savedVolume: prefs.volume
-                    onSavedVolumeChanged: prefs.volume = savedVolume
-                    onClosed: {
-                        if (win.fullscreen)
-                            win.showNormal()
-                        Qt.callLater(() => win.focusPage(win.page))
-                    }
-                    onChannelRequested: id => win.openChannel(id)
-                    onFullscreenToggled: win.toggleFullscreen()
                 }
 
                 ProgressBar {
@@ -475,8 +521,9 @@ ApplicationWindow {
     component TabButtonish: AbstractButton {
         id: tab
         required property var modelData
-        readonly property bool current: win.page === modelData.key
-                                        || (win.page === "channel" && win.returnPage === modelData.key)
+        // Nothing is "current" while a video has the window.
+        readonly property bool current: !player.active && (win.page === modelData.key
+                                        || (win.page === "channel" && win.returnPage === modelData.key))
         Layout.fillHeight: true
         leftPadding: 12
         rightPadding: 12
@@ -484,7 +531,8 @@ ApplicationWindow {
         contentItem: Label {
             text: tab.modelData.label
             font.pixelSize: 14
-            font.weight: tab.current ? Font.DemiBold : Font.Normal
+            // One weight for every tab: a bolder current tab is wider, and would
+            // push its neighbours sideways. Colour and the underline mark it.
             color: tab.current ? "#ffffff" : tab.hovered ? "#d0d0d8" : "#8d8d98"
             verticalAlignment: Text.AlignVCenter
         }

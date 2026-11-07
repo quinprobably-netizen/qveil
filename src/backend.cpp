@@ -14,6 +14,10 @@ Backend::Backend(const QProcessEnvironment &environment, const QString &core, QO
     // Only loopback traffic leaves this process; see main.cpp.
     m_net.setProxy(QNetworkProxy::NoProxy);
 
+    m_stable.setSingleShot(true);
+    m_stable.setInterval(StableAfterMs);
+    connect(&m_stable, &QTimer::timeout, this, [this] { m_restarts = 0; });
+
     connect(&m_core, &QProcess::readyReadStandardOutput, this, [this] {
         if (ready())
             return;
@@ -80,6 +84,7 @@ void Backend::onEngineReady() {
     // one is loaded by the page that asked for it.
     const bool recovered = m_hadReady;
     m_hadReady = true;
+    m_stable.start();
     emit readyChanged();
     loadConfig();
     if (recovered) {
@@ -92,12 +97,24 @@ void Backend::onEngineStopped() {
     if (m_quitting)
         return;
     const bool wasReady = ready();
+    m_stable.stop();
     // Whatever was in flight belonged to the dead engine; its answers are
     // dropped, not shown as connection errors.
     ++m_generation;
     m_base.clear();
     if (wasReady)
         emit readyChanged();
+
+    // An engine that died before it was ready would die the same way again,
+    // so it isn't restarted: its own words say more than a retry would.
+    if (!wasReady) {
+        const QStringList lines = QString::fromUtf8(m_coreStderr).trimmed().split('\n', Qt::SkipEmptyParts);
+        const QString detail = lines.mid(qMax(0, lines.size() - 4)).join('\n');
+        m_fatal = detail.isEmpty() ? tr("The qveil engine stopped before it was ready.")
+                                   : tr("The qveil engine couldn't start:\n%1").arg(detail);
+        setError(m_fatal);
+        return;
+    }
 
     if (m_restarts < MaxRestarts) {
         ++m_restarts;
@@ -134,7 +151,7 @@ void Backend::setBusy(const QString &task, int delta) {
 }
 
 void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
-                   const QString &task, Done done) {
+                   const QString &task, Done done, bool everyAnswer) {
     if (!ready()) {
         // While the engine restarts, requests are dropped and the restart
         // reloads what the window shows. Once it is gone for good, say so
@@ -155,7 +172,7 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
     m_latest.insert(task, id);
     setBusy(task, +1);
     QNetworkReply *reply = m_net.sendCustomRequest(request, verb, body);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, task, id, generation, done] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, task, id, generation, done, everyAnswer] {
         reply->deleteLater();
         setBusy(task, -1);
         if (generation != m_generation)
@@ -168,7 +185,7 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
             setError(message.isEmpty() ? reply->errorString() : message);
             return;
         }
-        if (m_latest.value(task) != id)
+        if (!everyAnswer && m_latest.value(task) != id)
             return;
         done(doc.isArray() ? QJsonValue(doc.array()) : QJsonValue(doc.object()));
     });
@@ -176,33 +193,61 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
 
 void Backend::loadConfig() {
     call("GET", "api/config", {}, {}, "config", [this](const QJsonValue &v) {
-        m_config = v.toObject().toVariantMap();
-        emit configChanged();
+        adoptConfig(v.toObject().toVariantMap(), false);
     });
+}
+
+void Backend::adoptConfig(const QVariantMap &next, bool routeSet) {
+    // A proxy address only matters while the proxy is the route, and an
+    // unchanged one comes back redacted, so it compares equal to itself.
+    auto way = [](const QVariantMap &config) {
+        const QString route = config.value("route").toString();
+        return route == "proxy" ? route + ' ' + config.value("proxy").toString() : route;
+    };
+    const bool moved = !m_config.isEmpty() && (routeSet || way(next) != way(m_config));
+    m_config = next;
+    emit configChanged();
+    if (!moved)
+        return;
+    // A video that was still being looked up went through the old route, so
+    // its answer must not open a player now.
+    m_latest.insert("play", ++m_sequence);
+    emit routeChanged();
 }
 
 void Backend::setConfig(const QVariantMap &patch) {
     call("POST", "api/config", {}, QJsonDocument(QJsonObject::fromVariantMap(patch)).toJson(QJsonDocument::Compact),
-         "config", [this](const QJsonValue &v) {
-             m_config = v.toObject().toVariantMap();
-             emit configChanged();
+         "config", [this, patch](const QJsonValue &v) {
+             const QVariantMap next = v.toObject().toVariantMap();
+             // The engine reports a saved proxy redacted, so a different
+             // string than the one it reported is a new address, even if it
+             // redacts to the same text (a changed password).
+             const bool newProxy = next.value("route").toString() == "proxy" && patch.contains("proxy")
+                                   && patch.value("proxy").toString() != m_config.value("proxy").toString();
+             adoptConfig(next, newProxy);
              emit notice(tr("Settings saved"));
          });
 }
 
-void Backend::refreshFeed(bool network, bool shorts) {
+void Backend::refreshFeed(bool network, bool shorts, bool force) {
     m_shorts = shorts;
-    // A refresh fetches every channel and can take minutes over Tor, so a
-    // second one while it runs would only repeat the work. Every caller
-    // (the button, the R shortcut) gets this guard.
+    // A refresh can take minutes over Tor, so a second one while it runs would
+    // only repeat the work. Every caller (startup, the button, the R shortcut)
+    // gets this guard.
     if (network && m_busy.contains("feed"))
         return;
-    loadFeed(network, shorts);
+    loadFeed(network, shorts, force);
 }
 
-void Backend::loadFeed(bool network, bool shorts) {
+void Backend::loadFeed(bool network, bool shorts, bool force, const QString &channel) {
     QUrlQuery q;
     q.addQueryItem("refresh", network ? "1" : "0");
+    // Without `force` the engine fetches only channels it hasn't fetched in
+    // the last 15 minutes; a single channel is fetched whatever its age.
+    if (network && force)
+        q.addQueryItem("force", "1");
+    if (network && !channel.isEmpty())
+        q.addQueryItem("channel", channel);
     q.addQueryItem("shorts", shorts ? "1" : "0");
     // The cached feed and the network refresh are separate tasks, so the quick
     // cached answer shows while the refresh is still running.
@@ -267,15 +312,18 @@ void Backend::subscribe(const QString &input) {
             emit channelChanged();
         }
         loadSubs();
-        // The running refresh, if any, started with the old list.
-        loadFeed(true, m_shorts);
-    });
+        // Only the new channel needs fetching: the others are as fresh as
+        // they were, and a refresh of all of them is a burst of requests that
+        // would link the whole list. A running refresh started with the old
+        // list, so this one is not held back by the guard of refreshFeed().
+        loadFeed(true, m_shorts, false, sub.value("id").toString());
+    }, true);
 }
 
 void Backend::unsubscribe(const QString &id) {
     QUrlQuery q;
     q.addQueryItem("id", id);
-    call("POST", "api/subs/rm", q, {}, "subscribe", [this, id](const QJsonValue &v) {
+    call("POST", "api/subs/rm", q, {}, "unsubscribe", [this, id](const QJsonValue &v) {
         emit notice(tr("Unsubscribed from %1").arg(v.toObject().value("name").toString()));
         if (m_channel.value("id").toString() == id) {
             m_channel.insert("subscribed", false);
@@ -283,7 +331,7 @@ void Backend::unsubscribe(const QString &id) {
         }
         loadSubs();
         loadFeed(false, m_shorts);
-    });
+    }, true);
 }
 
 void Backend::importFile(const QUrl &file) {
@@ -296,12 +344,13 @@ void Backend::importFile(const QUrl &file) {
         setError(tr("%1 is too large to be a subscriptions export.").arg(QFileInfo(f).fileName()));
         return;
     }
-    call("POST", "api/subs/import", {}, f.readAll(), "subscribe", [this](const QJsonValue &v) {
+    call("POST", "api/subs/import", {}, f.readAll(), "import", [this](const QJsonValue &v) {
         const int added = v.toObject().value("added").toInt();
         emit notice(tr("Imported %n new channel(s), offline", "", added));
         loadSubs();
+        // The imported channels have never been fetched, so they count as stale.
         loadFeed(true, m_shorts);
-    });
+    }, true);
 }
 
 void Backend::loadHistory() {

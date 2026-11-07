@@ -5,21 +5,35 @@ import QtQuick.Layouts
 import Qveil
 import "Format.js" as Format
 
-// The video, with controls that fade out while it plays.
+// The video, with controls that fade out while it plays. It fills the whole
+// window, and the window's top bar fades with the controls (see `chrome`).
 FocusScope {
     id: view
 
+    // The one colour behind the video, from the window's edge to the video's:
+    // the letterbox that mpv draws and the scene behind it must be the same, or
+    // a seam shows where they meet. Black, so it never competes with the video.
+    readonly property color stage: "#000000"
+
     property bool active: false
     property var info: ({})
+    // Whether the controls, and the window's top bar with them, are showing.
     property bool chrome: true
     property alias mpv: mpv
     property real savedVolume: 80
+    // How much of the top the window's bar covers, which the title row clears.
+    property real topInset: 0
+    // True while something outside the player is in use (the bar, a popup), so
+    // the controls aren't taken away from under it.
+    property bool hold: false
 
     signal closed()
     signal channelRequested(string id)
     signal fullscreenToggled()
 
     visible: active
+    // Letting go of the controls' hold restarts their countdown.
+    onHoldChanged: if (!hold) reveal()
 
     function open(i) {
         info = i
@@ -44,12 +58,13 @@ FocusScope {
 
     Rectangle {
         anchors.fill: parent
-        color: "black"
+        color: view.stage
     }
 
     MpvItem {
         id: mpv
         anchors.fill: parent
+        backgroundColor: view.stage
         onFailed: message => backend.reportError(message)
         onVolumeChanged: view.savedVolume = volume
         onPausedChanged: view.reveal()
@@ -64,7 +79,7 @@ FocusScope {
         id: hideTimer
         interval: 2600
         onTriggered: {
-            if (!mpv.paused && !mpv.ended && !seekBar.pressed && !controlsHover.hovered)
+            if (!mpv.paused && !mpv.ended && !seekBar.pressed && !controlsHover.hovered && !view.hold)
                 view.chrome = false
         }
     }
@@ -95,7 +110,7 @@ FocusScope {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        height: 110
+        height: 110 + view.topInset
         opacity: view.chrome ? 1 : 0
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 220 } }
@@ -109,6 +124,7 @@ FocusScope {
             anchors.right: parent.right
             anchors.top: parent.top
             anchors.margins: 14
+            anchors.topMargin: 14 + view.topInset
             spacing: 10
 
             ToolButton {

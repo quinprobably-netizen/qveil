@@ -6,6 +6,7 @@
 #include <QObject>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QVariantList>
@@ -57,7 +58,9 @@ public:
     QVariantList history() const { return m_history; }
     QString thumbBase() const;
 
-    Q_INVOKABLE void refreshFeed(bool network, bool shorts);
+    // `network` asks the engine to fetch. That covers the channels not fetched
+    // in the last 15 minutes, or every channel with `force`.
+    Q_INVOKABLE void refreshFeed(bool network, bool shorts, bool force = false);
     Q_INVOKABLE void search(const QString &query);
     Q_INVOKABLE void openChannel(const QString &id);
     Q_INVOKABLE void loadSubs();
@@ -72,6 +75,11 @@ public:
     Q_INVOKABLE void reportError(const QString &message);
     Q_INVOKABLE void clearError();
 
+    // How long an engine must stay ready before a later death counts as a
+    // new failure rather than a repeat of the last one.
+    static constexpr int StableAfterMs = 60000;
+    void setStableAfter(int milliseconds) { m_stable.setInterval(milliseconds); }
+
 signals:
     void readyChanged();
     void errorChanged();
@@ -82,22 +90,29 @@ signals:
     void channelChanged();
     void subsChanged();
     void historyChanged();
+    // The route or proxy was changed, so whatever plays over the old one must stop.
+    void routeChanged();
     void playReady(const QVariantMap &info);
     void notice(const QString &text);
 
 private:
     using Done = std::function<void(const QJsonValue &)>;
-    // One request to the engine. `task` drives the busy state, and only the
-    // newest request per task is delivered, so a slow old search can't
-    // overwrite a newer one.
+    // One request to the engine. `task` drives the busy state. Reads deliver
+    // only the newest answer per task, so a slow old search can't overwrite a
+    // newer one; a write (`everyAnswer`) delivers each answer, because every
+    // one of them changed something the window must hear about.
     void call(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
-              const QString &task, Done done);
+              const QString &task, Done done, bool everyAnswer = false);
     void setError(const QString &message);
     void setBusy(const QString &task, int delta);
     void onEngineReady();
     void onEngineStopped();
-    // The feed request itself, without the one-refresh-at-a-time guard of refreshFeed().
-    void loadFeed(bool network, bool shorts);
+    // The feed request itself, without the one-refresh-at-a-time guard of
+    // refreshFeed(). `channel` limits a refresh to that one channel.
+    void loadFeed(bool network, bool shorts, bool force = false, const QString &channel = {});
+    // Takes a config from the engine, and says so if it moved the route.
+    // `routeSet` is true when the window itself just asked for that route.
+    void adoptConfig(const QVariantMap &next, bool routeSet);
 
     QProcessEnvironment m_environment;
     QString m_corePath;
@@ -112,9 +127,13 @@ private:
     quint64 m_sequence = 0;
     bool m_quitting = false;
 
-    // The engine is restarted once if it dies; a second death is final.
+    // An engine that dies is restarted once. A second death in a row is final,
+    // and so is a death before the engine was ever ready, which a restart
+    // would only repeat (a bad config, say). Once an engine has been ready for
+    // StableAfterMs, the next death is a fresh failure and gets its restart.
     static constexpr int MaxRestarts = 1;
     int m_restarts = 0;
+    QTimer m_stable;
     bool m_hadReady = false;
     // Counts engine lives, so an answer from a dead engine can be told apart.
     quint64 m_generation = 0;

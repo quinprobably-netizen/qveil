@@ -17,6 +17,11 @@ Item {
     readonly property bool lit: hover.hovered || selected
     readonly property bool veiled: view.veil && !lit
     readonly property string thumb: backend.thumbBase ? backend.thumbBase + modelData.id : ""
+    // Feed and channel entries say whether their date is approximate. A search
+    // result has only YouTube's "3 days ago", so there it always is.
+    readonly property bool approximate: modelData.estimated === undefined || !!modelData.estimated
+    // Unix seconds, or 0 when the video has no date at all.
+    readonly property real stamp: modelData.date || modelData.published || 0
 
     width: view.cellWidth
     height: view.cellHeight
@@ -162,14 +167,13 @@ Item {
             anchors.top: channel.bottom
             anchors.topMargin: 2
             width: Math.min(implicitWidth, parent.width)
-            text: Format.meta(card.modelData, card.modelData.date || card.modelData.published,
-                              card.modelData.estimated)
+            text: Format.meta(card.modelData, card.stamp, card.approximate)
             elide: Text.ElideRight
             font.pixelSize: 12
             color: "#6f6f7b"
 
             HoverHandler { id: dateHover }
-            ToolTip.visible: dateHover.hovered && !!card.modelData.estimated && card.view.estimateNote !== ""
+            ToolTip.visible: dateHover.hovered && card.stamp > 0 && card.approximate && card.view.estimateNote !== ""
             ToolTip.delay: 500
             ToolTip.text: card.view.estimateNote
         }
