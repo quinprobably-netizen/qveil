@@ -237,13 +237,12 @@ ApplicationWindow {
                         if (!info.channels)
                             return ""
                         let s = qsTr("Latest from %n channels", "", info.channels)
-                        if (info.fallbacks > 0)
-                            s += "  ·  " + qsTr("dates marked ~ are approximate (RSS was down for %n)", "", info.fallbacks)
                         if (info.errors && info.errors.length > 0)
                             s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
                         return s
                     }
                     model: backend.feed
+                    estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
                     loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
                     emptyText: backend.feedInfo.channels === 0
                                ? qsTr("Your feed is built from channels you subscribe to, on this computer only.\n\nSearch for a channel, press 2 to add one, or drop a Google Takeout subscriptions.csv here.")

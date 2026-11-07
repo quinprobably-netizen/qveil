@@ -5,6 +5,7 @@ GridView {
     id: grid
 
     property bool veil: true
+    property string estimateNote
     // The selection ring shows once the keyboard is used, and hides on hover.
     property bool navigating: false
     signal activated(var video)

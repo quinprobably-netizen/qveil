@@ -161,12 +161,17 @@ Item {
         Label {
             anchors.top: channel.bottom
             anchors.topMargin: 2
-            width: parent.width
+            width: Math.min(implicitWidth, parent.width)
             text: Format.meta(card.modelData, card.modelData.date || card.modelData.published,
                               card.modelData.estimated)
             elide: Text.ElideRight
             font.pixelSize: 12
             color: "#6f6f7b"
+
+            HoverHandler { id: dateHover }
+            ToolTip.visible: dateHover.hovered && !!card.modelData.estimated && card.view.estimateNote !== ""
+            ToolTip.delay: 500
+            ToolTip.text: card.view.estimateNote
         }
     }
 }
