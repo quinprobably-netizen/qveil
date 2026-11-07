@@ -187,7 +187,7 @@ Popup {
         Label {
             Layout.fillWidth: true
             Layout.topMargin: 8
-            text: qsTr("Never sent: cookies, a Google account, tracking parameters, or your list of subscriptions. Subscriptions and history stay on this computer.")
+            text: qsTr("Never sent: cookies, a Google account, or tracking parameters. Subscriptions and history are stored only on this computer.")
             wrapMode: Text.Wrap
             font.pixelSize: 12
             lineHeight: 1.25
