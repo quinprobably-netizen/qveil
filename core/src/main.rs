@@ -1,6 +1,32 @@
 //! qveil-core: the engine behind the qveil desktop app, and a command line of
 //! its own. `qveil-core serve` runs the loopback server the app talks to.
 
+/// Prints to stderr, and ignores a failure to: when what reads it has gone
+/// (`qveil feed 2>&1 | head -1`), `eprintln!` would panic. Defined before the
+/// modules so that they can use it too.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
+/// `println!` for a function that returns a `Result`: when the reader of
+/// stdout has hung up (`qveil config | head -1`) it returns `Hangup`, which
+/// `main` takes for a quiet end, where `println!` would panic with "Broken pipe".
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        $crate::emit(format_args!("{}\n", format_args!($($arg)*)))?
+    };
+}
+
+/// `print!`, the same way as `outln!`.
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::emit(format_args!($($arg)*))?
+    };
+}
+
 mod app;
 mod config;
 mod errors;
@@ -42,34 +68,53 @@ use video::Video;
     after_help = "Run `qveil` with no command (or `qveil open`) to open the app window."
 )]
 struct Cli {
-    /// Route all traffic through this proxy (http://, https://, socks5h://). Overrides the config.
-    #[arg(long, global = true, value_name = "URL")]
-    proxy: Option<String>,
-    /// Use the local Tor SOCKS port (127.0.0.1:9050) with a fresh circuit per request.
-    #[arg(long, global = true, conflicts_with = "proxy")]
-    tor: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
+/// The route of a command that makes network requests. Only those take it:
+/// the others never leave the machine, so they have no use for it.
+#[derive(Args, Clone, Default)]
+struct Route {
+    /// Route all traffic through this proxy (http://, https://, socks5h://). Overrides the config
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+    /// Use the local Tor SOCKS port (127.0.0.1:9050) with a fresh circuit per request
+    #[arg(long, conflicts_with = "proxy")]
+    tor: bool,
+}
+
+/// What a command line argument shows to other users of this machine.
+const IN_PROC: &str = "Anything you type here is visible to other users of this machine, through /proc, while the command runs. The app window doesn't have that problem.";
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Search for videos and pick one to play
-    #[command(visible_alias = "s")]
+    #[command(visible_alias = "s", after_help = IN_PROC)]
     Search {
+        /// What to search for (several words are joined)
         #[arg(required = true)]
         query: Vec<String>,
+        /// How many results to ask for
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
         #[command(flatten)]
         out: Output,
+        #[command(flatten)]
+        route: Route,
     },
     /// Play a video by URL or ID (tracking parameters are dropped)
-    #[command(visible_alias = "p")]
-    Play { target: String },
+    #[command(visible_alias = "p", after_help = IN_PROC)]
+    Play {
+        /// A YouTube video URL, or its 11-character ID
+        target: String,
+        #[command(flatten)]
+        route: Route,
+    },
     /// Latest uploads from your subscriptions
     #[command(visible_alias = "f")]
     Feed {
+        /// How many videos to show
         #[arg(short = 'n', long, default_value_t = 80)]
         limit: usize,
         /// Hide Shorts
@@ -83,14 +128,18 @@ enum Cmd {
         force: bool,
         #[command(flatten)]
         out: Output,
+        #[command(flatten)]
+        route: Route,
     },
     /// Manage subscriptions (stored only on this machine)
     #[command(subcommand)]
     Sub(SubCmd),
     /// Show or clear the local watch history (off unless `history = true`)
     History {
+        /// Delete the watch history instead of showing it
         #[arg(long)]
         clear: bool,
+        /// Print the history as JSON
         #[arg(long)]
         json: bool,
     },
@@ -105,7 +154,13 @@ enum Cmd {
     /// Run the loopback server for the desktop app; prints its base URL as
     /// JSON and runs until stdin closes
     #[command(hide = true)]
-    Serve,
+    Serve {
+        // Not used: they are here so that `run` can refuse them with a reason.
+        #[arg(long, hide = true)]
+        proxy: Option<String>,
+        #[arg(long, hide = true)]
+        tor: bool,
+    },
 }
 
 #[derive(Args)]
@@ -121,29 +176,75 @@ struct Output {
 #[derive(Subcommand)]
 enum SubCmd {
     /// Subscribe: @handle, channel URL or UC… ID
+    #[command(after_help = IN_PROC)]
     Add {
+        /// The channels: @handle, channel URL or UC… ID
         #[arg(required = true)]
         channels: Vec<String>,
+        #[command(flatten)]
+        route: Route,
     },
     /// Unsubscribe by channel ID or name
-    Rm { channel: String },
+    Rm {
+        /// The channel's ID or name, as `qveil sub list` shows it
+        channel: String,
+    },
     /// List subscriptions
     #[command(visible_alias = "ls")]
     List {
+        /// Print the subscriptions as JSON
         #[arg(long)]
         json: bool,
     },
     /// Import from a Google Takeout subscriptions.csv or a NewPipe/FreeTube export (offline)
-    Import { file: PathBuf },
+    Import {
+        /// The file to read
+        file: PathBuf,
+    },
     /// Export as NewPipe-compatible JSON on stdout
     Export,
+}
+
+/// The reader of our stdout hung up before we had written everything, as
+/// `head` does after its first line. It has what it wanted, so this isn't a
+/// failure, and it is no reason to print anything either.
+#[derive(Debug)]
+struct Hangup;
+
+impl std::fmt::Display for Hangup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the reader of our output went away")
+    }
+}
+
+impl std::error::Error for Hangup {}
+
+fn hung_up(e: &std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        Hangup.into()
+    } else {
+        anyhow::Error::new(std::io::Error::new(e.kind(), e.to_string()))
+    }
+}
+
+/// Writes to stdout (see `outln!`).
+fn emit(args: std::fmt::Arguments<'_>) -> Result<()> {
+    std::io::stdout()
+        .lock()
+        .write_fmt(args)
+        .map_err(|e| hung_up(&e))
+}
+
+fn flush() -> Result<()> {
+    std::io::stdout().flush().map_err(|e| hung_up(&e))
 }
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.downcast_ref::<Hangup>().is_some() => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("qveil: {}", friendly(&format!("{e:#}")));
+            note!("qveil: {}", friendly(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -154,15 +255,24 @@ fn run() -> Result<()> {
     // The app's route is a setting it can change at any time. A flag given
     // here would be lost the first time it did, and the app would carry on
     // over a route nobody chose.
-    if matches!(cli.cmd, Cmd::Serve) && (cli.proxy.is_some() || cli.tor) {
+    if let Cmd::Serve { proxy, tor } = &cli.cmd
+        && (proxy.is_some() || *tor)
+    {
         anyhow::bail!(
             "`serve` doesn't take --proxy or --tor: the app's route is a setting, saved in its config file"
         );
     }
+    let route = match &cli.cmd {
+        Cmd::Search { route, .. }
+        | Cmd::Play { route, .. }
+        | Cmd::Feed { route, .. }
+        | Cmd::Sub(SubCmd::Add { route, .. }) => route.clone(),
+        _ => Route::default(),
+    };
     let paths = Paths::from_env()?;
     store::secure(&paths);
     let cfg = Config::load(&paths.config)?;
-    let rt = Runtime::new(cfg, &paths, cli.proxy, cli.tor)?;
+    let rt = Runtime::new(cfg, &paths, route.proxy, route.tor)?;
     let server = Server::new(rt, paths);
     let rt = server.runtime();
     let paths = &server.paths;
@@ -170,12 +280,14 @@ fn run() -> Result<()> {
     // leave them (and the files with the proxy's password) behind.
     let stopping = Arc::clone(&server);
     if let Err(e) = signals::on_stop(move || stopping.shutdown()) {
-        eprintln!("qveil: couldn't watch for Ctrl+C and the like: {e}");
+        note!("qveil: couldn't watch for Ctrl+C and the like: {e}");
     }
 
     match cli.cmd {
-        Cmd::Serve => serve(&server),
-        Cmd::Search { query, limit, out } => {
+        Cmd::Serve { .. } => serve(&server),
+        Cmd::Search {
+            query, limit, out, ..
+        } => {
             let videos = app::search(&rt, &query.join(" "), limit)?;
             if out.json {
                 return print_json(&videos);
@@ -186,7 +298,7 @@ fn run() -> Result<()> {
                 out.list,
             )
         }
-        Cmd::Play { target } => {
+        Cmd::Play { target, .. } => {
             let v = ids::parse_video(&target)
                 .with_context(|| format!("{target:?} isn't a YouTube video URL or ID"))?;
             player::play(&rt.cfg, &server.open(&v)?)
@@ -197,9 +309,10 @@ fn run() -> Result<()> {
             offline,
             force,
             out,
+            ..
         } => {
             if !offline {
-                eprintln!("fetching feeds (proxy: {})…", rt.net.describe());
+                note!("fetching feeds (proxy: {})…", rt.net.describe());
             }
             let refresh = match (offline, force) {
                 (true, _) => app::Refresh::Off,
@@ -208,7 +321,7 @@ fn run() -> Result<()> {
             };
             let r = app::feed(&rt, paths, refresh, no_shorts, limit, &|| true)?;
             if r.fresh > 0 {
-                eprintln!(
+                note!(
                     "{} channel(s) were fetched in the last {} minutes and are not fetched again (--force fetches them all)",
                     r.fresh,
                     feed::FRESH_SECS / 60
@@ -220,13 +333,13 @@ fn run() -> Result<()> {
                 );
             }
             if r.fallbacks > 0 {
-                eprintln!(
+                note!(
                     "note: RSS was unavailable for {} channel(s); dates marked ~ are approximate",
                     r.fallbacks
                 );
             }
             for e in &r.errors {
-                eprintln!("warning: {e}");
+                note!("warning: {e}");
             }
             if out.json {
                 return print_json(&r.entries);
@@ -247,10 +360,8 @@ fn run() -> Result<()> {
 
 fn serve(server: &Arc<Server>) -> Result<()> {
     let base = server.listen()?;
-    let mut out = std::io::stdout().lock();
-    writeln!(out, "{}", serde_json::json!({ "base": base }))?;
-    out.flush()?;
-    drop(out);
+    outln!("{}", serde_json::json!({ "base": base }));
+    flush()?;
     // The app holds our stdin; when it exits, for any reason, so do we. Its
     // yt-dlp processes don't outlive it: they are killed and their files removed.
     let mut buf = [0u8; 256];
@@ -261,7 +372,7 @@ fn serve(server: &Arc<Server>) -> Result<()> {
 }
 
 fn print_json<T: Serialize>(v: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
+    outln!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
 
@@ -272,14 +383,14 @@ fn browse(
     list_only: bool,
 ) -> Result<()> {
     if rows.is_empty() {
-        eprintln!("nothing found");
+        note!("nothing found");
         return Ok(());
     }
     let t = app::now();
     let lines: Vec<String> = rows.iter().map(|(v, d)| v.line(*d, t)).collect();
     if list_only || !std::io::stdout().is_terminal() {
         for ((v, _), l) in rows.iter().zip(&lines) {
-            println!("{}  {l}", v.id);
+            outln!("{}  {l}", v.id);
         }
         return Ok(());
     }
@@ -290,7 +401,7 @@ fn browse(
             start: None,
         };
         if let Err(e) = server.open(&r).and_then(|info| player::play(cfg, &info)) {
-            eprintln!("qveil: {}", friendly(&format!("{e:#}")));
+            note!("qveil: {}", friendly(&format!("{e:#}")));
         }
     }
     Ok(())
@@ -298,7 +409,7 @@ fn browse(
 
 fn sub(rt: &Runtime, paths: &Paths, cmd: SubCmd) -> Result<()> {
     match cmd {
-        SubCmd::Add { channels } => {
+        SubCmd::Add { channels, .. } => {
             for input in channels {
                 let (s, added) = app::add_sub(rt, paths, &input, &|| true)?;
                 let verb = if added {
@@ -306,11 +417,11 @@ fn sub(rt: &Runtime, paths: &Paths, cmd: SubCmd) -> Result<()> {
                 } else {
                     "already subscribed"
                 };
-                println!("{verb}: {} ({})", s.name, s.id);
+                outln!("{verb}: {} ({})", s.name, s.id);
             }
         }
         SubCmd::Rm { channel } => {
-            println!("unsubscribed: {}", app::remove_sub(paths, &channel)?.name)
+            outln!("unsubscribed: {}", app::remove_sub(paths, &channel)?.name)
         }
         SubCmd::List { json } => {
             let subs = app::load_subs(paths)?;
@@ -318,15 +429,15 @@ fn sub(rt: &Runtime, paths: &Paths, cmd: SubCmd) -> Result<()> {
                 return print_json(&subs.channels);
             }
             for s in &subs.channels {
-                println!("{}  {}", s.id, s.name);
+                outln!("{}  {}", s.id, s.name);
             }
-            eprintln!("{} subscription(s)", subs.channels.len());
+            note!("{} subscription(s)", subs.channels.len());
         }
         SubCmd::Import { file } => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
             let (added, total) = app::import_subs(paths, &text)?;
-            println!("imported {added} new of {total} channel(s); no network requests were made");
+            outln!("imported {added} new of {total} channel(s); no network requests were made");
         }
         SubCmd::Export => print_json(&app::load_subs(paths)?.export_newpipe())?,
     }
@@ -336,7 +447,7 @@ fn sub(rt: &Runtime, paths: &Paths, cmd: SubCmd) -> Result<()> {
 fn history(cfg: &Config, paths: &Paths, clear: bool, json: bool) -> Result<()> {
     if clear {
         app::clear_history(paths)?;
-        println!("history cleared");
+        outln!("history cleared");
         return Ok(());
     }
     let mut watched = app::load_history(paths)?.watched;
@@ -345,7 +456,7 @@ fn history(cfg: &Config, paths: &Paths, clear: bool, json: bool) -> Result<()> {
         return print_json(&watched);
     }
     if watched.is_empty() && !cfg.history {
-        println!(
+        outln!(
             "history is off (set `history = true` in {})",
             paths.config.display()
         );
@@ -353,38 +464,38 @@ fn history(cfg: &Config, paths: &Paths, clear: bool, json: bool) -> Result<()> {
     }
     let t = app::now();
     for w in &watched {
-        println!("{}  {}  ·  {}", w.id, w.title, video::fmt_age(w.at, t));
+        outln!("{}  {}  ·  {}", w.id, w.title, video::fmt_age(w.at, t));
     }
     Ok(())
 }
 
 fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
     let exists = |path: &std::path::Path| if path.exists() { "" } else { " (not created)" };
-    println!("config         {}{}", p.config.display(), exists(&p.config));
-    println!(
+    outln!("config         {}{}", p.config.display(), exists(&p.config));
+    outln!(
         "subscriptions  {}{}",
         p.subscriptions().display(),
         exists(&p.subscriptions())
     );
-    println!(
+    outln!(
         "history        {}{}",
         p.history().display(),
         exists(&p.history())
     );
-    println!("cache          {}{}", p.cache.display(), exists(&p.cache));
+    outln!("cache          {}{}", p.cache.display(), exists(&p.cache));
     // Migration couldn't merge these (both names had the same file), so they
     // are still there, and still hold subscriptions or settings.
     let legacy = p.legacy();
     if !legacy.is_empty() {
         let paths: Vec<_> = legacy.iter().map(|d| d.display().to_string()).collect();
-        println!(
+        outln!(
             "left over from veil: {} \u{2014} `qveil wipe` removes them",
             paths.join(", ")
         );
     }
-    println!();
-    println!("proxy          {}", rt.net.describe());
-    println!(
+    outln!("");
+    outln!("proxy          {}", rt.net.describe());
+    outln!(
         "history        {}",
         if rt.cfg.history {
             "on (local only)"
@@ -392,18 +503,18 @@ fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
             "off"
         }
     );
-    println!("max height     {}p", rt.cfg.max_height);
-    println!();
-    println!("Never sent: cookies, a Google account, tracking URL parameters, Referer headers,");
-    println!("or player state (mpv resume/history off).");
-    println!("Feeds are fetched one channel per request, in random order, but a refresh is still");
-    println!("a burst of requests for exactly your channels, so timing can link them.");
+    outln!("max height     {}p", rt.cfg.max_height);
+    outln!("");
+    outln!("Never sent: cookies, a Google account, tracking URL parameters, Referer headers,");
+    outln!("or player state (mpv resume/history off).");
+    outln!("Feeds are fetched one channel per request, in random order, but a refresh is still");
+    outln!("a burst of requests for exactly your channels, so timing can link them.");
     if rt.net.proxy().is_none() {
-        println!("Visible to YouTube: your IP, the videos you search and play, and when.");
-        println!("Use --tor or a proxy to hide your IP.");
+        outln!("Visible to YouTube: your IP, the videos you search and play, and when.");
+        outln!("Use --tor or a proxy to hide your IP.");
     } else {
-        println!("Visible to YouTube: the route's IP instead of yours, the videos you search and");
-        println!("play, and when.");
+        outln!("Visible to YouTube: the route's IP instead of yours, the videos you search and");
+        outln!("play, and when.");
     }
     Ok(())
 }
@@ -417,22 +528,22 @@ fn wipe(paths: &Paths, yes: bool) -> Result<()> {
     // What the old name left behind, which holds the same kind of data.
     let legacy = paths.legacy();
     if present.is_empty() && legacy.is_empty() {
-        println!("nothing to wipe");
+        outln!("nothing to wipe");
         return Ok(());
     }
     if !yes {
-        println!("this permanently deletes:");
+        outln!("this permanently deletes:");
         for p in &present {
-            println!("  {}", p.display());
+            outln!("  {}", p.display());
         }
         for p in &legacy {
-            println!(
+            outln!(
                 "  {}  (left over from when qveil was called veil)",
                 p.display()
             );
         }
-        print!("type 'wipe' to confirm: ");
-        std::io::stdout().flush()?;
+        out!("type 'wipe' to confirm: ");
+        flush()?;
         let mut answer = String::new();
         std::io::stdin().lock().read_line(&mut answer)?;
         if answer.trim() != "wipe" {
@@ -442,6 +553,85 @@ fn wipe(paths: &Paths, yes: bool) -> Result<()> {
     for p in present.iter().chain(&legacy) {
         std::fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))?;
     }
-    println!("wiped (config file kept: {})", paths.config.display());
+    outln!("wiped (config file kept: {})", paths.config.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Every command below `cmd`, with its path (`sub add`).
+    fn commands(cmd: &clap::Command, path: &str, out: &mut Vec<(String, clap::Command)>) {
+        for sub in cmd.get_subcommands().filter(|c| c.get_name() != "help") {
+            let path = format!("{path} {}", sub.get_name());
+            out.push((path.trim().to_string(), sub.clone()));
+            commands(sub, &path, out);
+        }
+    }
+
+    fn all_commands() -> Vec<(String, clap::Command)> {
+        let root = Cli::command();
+        let mut all = vec![(String::new(), root.clone())];
+        commands(&root, "", &mut all);
+        all
+    }
+
+    #[test]
+    fn no_entry_in_the_help_is_blank() {
+        for (path, cmd) in all_commands() {
+            if cmd.is_hide_set() {
+                continue;
+            }
+            assert!(
+                path.is_empty() || cmd.get_about().is_some(),
+                "`{path}` has no description"
+            );
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                if arg.is_hide_set() || id == "help" || id == "version" {
+                    continue;
+                }
+                assert!(
+                    arg.get_help()
+                        .is_some_and(|h| !h.to_string().trim().is_empty()),
+                    "`qveil {path}`: {id} has no help text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_commands_that_use_the_network_take_a_route() {
+        let takes = |cmd: &clap::Command| {
+            cmd.get_arguments()
+                .any(|a| matches!(a.get_id().as_str(), "proxy" | "tor") && !a.is_hide_set())
+        };
+        for (path, cmd) in all_commands() {
+            // A command with subcommands only shows what it holds itself.
+            if cmd.has_subcommands() {
+                assert!(!takes(&cmd), "`qveil {path}` shows a route it doesn't use");
+                continue;
+            }
+            let uses_network = ["search", "play", "feed", "sub add"].contains(&path.as_str());
+            assert_eq!(takes(&cmd), uses_network, "`qveil {path}`");
+        }
+        // They can't be given both, and the others don't take either.
+        assert!(Cli::try_parse_from(["qveil", "feed", "--tor", "--proxy", "http://x:1"]).is_err());
+        assert!(Cli::try_parse_from(["qveil", "config", "--tor"]).is_err());
+        assert!(Cli::try_parse_from(["qveil", "--tor", "feed"]).is_err());
+        assert!(Cli::try_parse_from(["qveil", "sub", "add", "--tor", "@x"]).is_ok());
+    }
+
+    #[test]
+    fn the_commands_that_put_input_on_the_command_line_say_who_can_see_it() {
+        for (path, cmd) in all_commands() {
+            let says = cmd
+                .get_after_help()
+                .is_some_and(|h| h.to_string().contains("/proc"));
+            let takes_input = ["search", "play", "sub add"].contains(&path.as_str());
+            assert_eq!(says, takes_input, "`qveil {path}`");
+        }
+    }
 }

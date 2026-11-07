@@ -25,9 +25,19 @@ pub fn friendly(err: &str) -> String {
             "The proxy at {addr} refused the connection. Start it, or switch the route to Direct."
         );
     }
-    if err.contains("Sign in to confirm") {
+    // Only the bot check is about the IP. yt-dlp's words for it are "Sign in
+    // to confirm you're not a bot", with a curly apostrophe these days, so
+    // this matches the part after it. The broader "Sign in to confirm" would
+    // also catch the age check below, which no other route can help with.
+    if err.contains("not a bot") {
         return "YouTube is asking this IP to sign in (bot check). Try another route or try later."
             .into();
+    }
+    // An age-restricted video asks to sign in too ("Sign in to confirm your
+    // age"), and qveil never has an account, so it can't be played.
+    const AGE_GATE: &[&str] = &["confirm your age", "inappropriate for some users"];
+    if AGE_GATE.iter().any(|needle| err.contains(needle)) {
+        return "This video is age-restricted; YouTube requires an account to play it.".into();
     }
     // yt-dlp needs one to solve YouTube's challenges, and it fails like
     // an outdated yt-dlp does when there is none, so say what is missing.
@@ -105,6 +115,36 @@ mod tests {
     }
 
     #[test]
+    fn the_bot_check_and_the_age_check_are_told_apart() {
+        // Both of yt-dlp's apostrophes.
+        for raw in [
+            "ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies for the authentication.",
+            "ERROR: [youtube] abc: Sign in to confirm you\u{2019}re not a bot. Use --cookies-from-browser or --cookies for the authentication.",
+            "yt-dlp: Sign in to confirm you're not a bot",
+        ] {
+            let msg = friendly(raw);
+            assert!(msg.contains("bot check"), "{raw} -> {msg}");
+            assert!(!msg.contains("age"), "{msg}");
+        }
+        for raw in [
+            "ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate for some users.",
+            "yt-dlp: Sign in to confirm your age",
+            "This video may be inappropriate for some users.",
+        ] {
+            assert_eq!(
+                friendly(raw),
+                "This video is age-restricted; YouTube requires an account to play it.",
+                "{raw}"
+            );
+        }
+        // Any other sign-in request is neither, and is left as it is.
+        assert_eq!(
+            friendly("Sign in to confirm something else"),
+            "Sign in to confirm something else"
+        );
+    }
+
+    #[test]
     fn maps_the_common_failures() {
         assert!(friendly("ERROR: Sign in to confirm you're not a bot").contains("bot check"));
         for raw in [
@@ -132,6 +172,7 @@ mod tests {
             "connect to 127.0.0.1:9050 failed: connection refused",
             "Connection refused [proxy 10.0.0.1:3128]",
             "Sign in to confirm you're not a bot",
+            "Sign in to confirm your age",
             "Unable to extract player response",
             "No supported JavaScript runtime could be found",
             "Requested format is not available",

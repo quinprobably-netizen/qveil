@@ -92,7 +92,7 @@ fn migrate(old: &Path, new: &Path, held: Held) {
     let is_dir = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
     let exists = |p: &Path| fs::symlink_metadata(p).is_ok();
     let warn = |what: &str, path: &Path, e: std::io::Error| {
-        eprintln!("qveil: couldn't {what} {}: {e}", path.display());
+        note!("qveil: couldn't {what} {}: {e}", path.display());
     };
     if is_dir(old) {
         if !exists(new) {
@@ -194,7 +194,7 @@ fn restrict(path: &Path, mode: u32) -> bool {
     if meta.permissions().mode() & 0o7777 != mode
         && let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode))
     {
-        eprintln!("qveil: couldn't restrict {}: {e}", path.display());
+        note!("qveil: couldn't restrict {}: {e}", path.display());
     }
     true
 }
@@ -225,7 +225,7 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 pub fn load_cache<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match load(path) {
         Err(e) if e.root_cause().is::<serde_json::Error>() => {
-            eprintln!("qveil: ignoring unreadable cache ({e:#}); it will be rebuilt");
+            note!("qveil: ignoring unreadable cache ({e:#}); it will be rebuilt");
             Ok(T::default())
         }
         other => other,

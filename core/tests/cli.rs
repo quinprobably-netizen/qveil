@@ -81,7 +81,7 @@ fn text(bytes: &[u8]) -> String {
 fn serve_refuses_the_route_flags_that_the_first_settings_change_would_drop() {
     let home = Home::new();
     for flags in [&["--tor"][..], &["--proxy", "http://127.0.0.1:3128"]] {
-        let args: Vec<&str> = flags.iter().copied().chain(["serve"]).collect();
+        let args: Vec<&str> = ["serve"].into_iter().chain(flags.iter().copied()).collect();
         let out = home.run(&args, "");
         assert!(!out.status.success(), "{flags:?}");
         assert!(text(&out.stdout).is_empty(), "it must not start serving");
@@ -392,4 +392,73 @@ fn config_lists_what_veil_left_behind_and_startup_makes_it_private() {
     let out = home.run(&["wipe", "--yes"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(!text(&home.run(&["config"], "").stdout).contains("left over"));
+}
+
+impl Home {
+    /// Runs `args` with `stdout` and/or `stderr` connected to a pipe whose
+    /// reader has already gone, as `qveil-core config | head -1` has it once
+    /// `head` has quit. Returns the exit status, and stderr if it was left open.
+    fn run_into_closed_pipes(
+        &self,
+        args: &[&str],
+        close_stdout: bool,
+        close_stderr: bool,
+    ) -> (std::process::ExitStatus, String) {
+        let closed = || {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            writer
+        };
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qveil-core"));
+        cmd.args(args)
+            .env("HOME", &self.0)
+            .env("XDG_CONFIG_HOME", self.config())
+            .env("XDG_DATA_HOME", self.data())
+            .env("XDG_CACHE_HOME", self.cache())
+            .stdin(Stdio::null());
+        if close_stdout {
+            cmd.stdout(closed());
+        } else {
+            cmd.stdout(Stdio::null());
+        }
+        if close_stderr {
+            cmd.stderr(closed());
+        } else {
+            cmd.stderr(Stdio::piped());
+        }
+        let out = cmd.spawn().unwrap().wait_with_output().unwrap();
+        (out.status, text(&out.stderr))
+    }
+}
+
+#[test]
+fn a_reader_that_hangs_up_is_not_an_error() {
+    let home = Home::new();
+    // `config | head -1` once panicked with "failed printing to stdout:
+    // Broken pipe" and exited with 101.
+    for args in [
+        &["config"][..],
+        &["sub", "list", "--json"],
+        &["sub", "list"],
+        &["sub", "export"],
+        &["history", "--json"],
+    ] {
+        let (status, stderr) = home.run_into_closed_pipes(args, true, false);
+        assert_eq!(status.code(), Some(0), "{args:?}: {status} {stderr}");
+        // (`sub list` does say how many there are, on stderr; that isn't it.)
+        for complaint in ["Broken pipe", "panicked", "failed printing"] {
+            assert!(!stderr.contains(complaint), "{args:?} said: {stderr}");
+        }
+    }
+    // The same for what goes to stderr (`qveil sub list 2>&1 | head -1`).
+    for args in [&["sub", "list"][..], &["config"]] {
+        let (status, _) = home.run_into_closed_pipes(args, false, true);
+        assert_eq!(status.code(), Some(0), "{args:?}: {status}");
+        let (status, _) = home.run_into_closed_pipes(args, true, true);
+        assert_eq!(status.code(), Some(0), "{args:?}: {status}");
+    }
+    // A real failure is still one.
+    let (status, stderr) = home.run_into_closed_pipes(&["play", "not a video"], true, false);
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("isn't a YouTube video"), "{stderr}");
 }

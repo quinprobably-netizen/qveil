@@ -52,15 +52,14 @@ fn fzf(lines: &[String]) -> Result<Option<usize>> {
 }
 
 fn numbered(lines: &[String]) -> Result<Option<usize>> {
-    let mut out = std::io::stdout().lock();
     for (i, l) in lines.iter().enumerate() {
-        writeln!(out, "{:>3}  {l}", i + 1)?;
+        outln!("{:>3}  {l}", i + 1);
     }
     if !std::io::stdin().is_terminal() {
         return Ok(None);
     }
-    write!(out, "play # (enter to quit)> ")?;
-    out.flush()?;
+    out!("play # (enter to quit)> ");
+    crate::flush()?;
     let mut input = String::new();
     std::io::stdin().lock().read_line(&mut input)?;
     Ok(input

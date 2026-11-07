@@ -349,7 +349,7 @@ impl Server {
             // The history is a convenience, and the video is resolved and
             // registered by now: a full disk or a damaged history file
             // is not a reason to refuse to play it.
-            eprintln!("qveil: couldn't add this video to the history: {e:#}");
+            note!("qveil: couldn't add this video to the history: {e:#}");
         }
         Ok(PlayInfo {
             id: v.id.clone(),
@@ -403,7 +403,7 @@ impl Server {
                 // A client that hangs up (mpv does, whenever it seeks) isn't
                 // news, but a stream that broke upstream is.
                 if e.downcast_ref::<StreamBroke>().is_some() {
-                    eprintln!("qveil: {e:#}");
+                    note!("qveil: {e:#}");
                 }
             }
         });
