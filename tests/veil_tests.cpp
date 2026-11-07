@@ -4,7 +4,10 @@
 #include <QTemporaryDir>
 #include <QtTest>
 
+#include <clocale>
+
 #include "backend.h"
+#include "mpvitem.h"
 #include "theme.h"
 #include "translator.h"
 
@@ -161,6 +164,21 @@ private slots:
         backend.start();
         QTRY_VERIFY(!backend.error().isEmpty());
         QVERIFY(!backend.ready());
+    }
+
+    void aPlayerThatWasNeverDrawnShutsDown()
+    {
+        // Without a window nothing makes a render context, so the player is
+        // destroyed with the item. It must not wait for a renderer that
+        // doesn't exist (the scene graph can't be had offscreen).
+        std::setlocale(LC_NUMERIC, "C");
+        {
+            MpvItem item;
+            item.setVolume(40);
+            item.load("/nonexistent/video.mp4", "", 0);
+            QTest::qWait(50);
+        }
+        QVERIFY(true);
     }
 
     void themeFallsBack()
