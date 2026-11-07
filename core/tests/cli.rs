@@ -365,3 +365,31 @@ fn a_termination_signal_stops_yt_dlp_removes_its_private_files_and_ends_by_that_
         let _ = search.join();
     }
 }
+
+#[test]
+fn config_lists_what_veil_left_behind_and_startup_makes_it_private() {
+    let home = Home::new();
+    // Both names have a subscriptions file, so migration can't merge them.
+    let old = home.data().join("veil");
+    let old_file = old.join("subscriptions.json");
+    write(&old_file, "{}");
+    write(&home.data().join("qveil/subscriptions.json"), "{}");
+    fs::set_permissions(&old_file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = home.run(&["config"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let said = text(&out.stdout);
+    let line = said
+        .lines()
+        .find(|l| l.starts_with("left over from veil:"))
+        .unwrap_or_else(|| panic!("no mention of leftovers:\n{said}"));
+    assert!(line.contains(&old.display().to_string()), "{line}");
+    assert!(line.ends_with("`qveil wipe` removes them"), "{line}");
+    assert_eq!((mode(&old), mode(&old_file)), (0o700, 0o600));
+
+    // Nothing left over, nothing said.
+    let out = home.run(&["wipe", "--yes"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!text(&home.run(&["config"], "").stdout).contains("left over"));
+}

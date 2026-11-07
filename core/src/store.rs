@@ -133,6 +133,11 @@ fn migrate(old: &Path, new: &Path, held: Held) {
 /// default 0755 and 0644, which would let any local user read what you
 /// subscribe to and what you watch. Symbolic links are left alone: what they
 /// point at isn't qveil's to change.
+///
+/// What the old `veil` name left behind (see `migrate`, which can't merge
+/// when both names have a file) holds the same subscriptions and settings,
+/// and was made with the same loose modes, so all of it is tightened too,
+/// down to the last file.
 pub fn secure(paths: &Paths) {
     for dir in [paths.config_dir(), &paths.data, &paths.cache] {
         if !restrict(dir, 0o700) {
@@ -143,6 +148,30 @@ pub fn secure(paths: &Paths) {
         };
         for entry in entries.flatten() {
             restrict(&entry.path(), 0o600);
+        }
+    }
+    for old in paths.legacy() {
+        restrict_tree(&old);
+    }
+}
+
+/// `dir` and everything under it: directories to 0700 and files to 0600.
+/// Nothing behind a symbolic link is visited.
+fn restrict_tree(dir: &Path) {
+    if !restrict(dir, 0o700) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // `file_type` doesn't follow a link, so a link is neither kind.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => restrict_tree(&entry.path()),
+            Ok(t) if t.is_file() => {
+                restrict(&entry.path(), 0o600);
+            }
+            _ => {}
         }
     }
 }
@@ -631,5 +660,61 @@ mod tests {
             paths.legacy(),
             [root.0.join("config/veil"), root.0.join("cache/veil")]
         );
+    }
+
+    #[test]
+    fn leftover_veil_directories_are_made_private_all_the_way_down() {
+        let root = TempDir::new();
+        let paths = Paths {
+            config: root.0.join("config/qveil/config.toml"),
+            data: root.0.join("data/qveil"),
+            cache: root.0.join("cache/qveil"),
+        };
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let set =
+            |p: &Path, mode| fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        // What a migration that couldn't merge leaves: loose modes, a nested directory.
+        let (cfg, data) = (root.0.join("config/veil"), root.0.join("data/veil"));
+        fs::create_dir_all(data.join("nested/deeper")).unwrap();
+        fs::create_dir_all(&cfg).unwrap();
+        let files = [
+            data.join("subscriptions.json"),
+            data.join("nested/history.json"),
+            data.join("nested/deeper/x"),
+            cfg.join("config.toml"),
+        ];
+        for f in &files {
+            fs::write(f, "x").unwrap();
+            set(f, 0o644);
+        }
+        for d in [
+            &data,
+            &data.join("nested"),
+            &data.join("nested/deeper"),
+            &cfg,
+        ] {
+            set(d, 0o755);
+        }
+        // A link isn't followed to change what it points at.
+        let outside = root.0.join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("f"), "x").unwrap();
+        set(&outside, 0o755);
+        set(&outside.join("f"), 0o644);
+        std::os::unix::fs::symlink(&outside, data.join("link")).unwrap();
+
+        secure(&paths);
+        for f in &files {
+            assert_eq!(mode(f), 0o600, "{}", f.display());
+        }
+        for d in [
+            &data,
+            &data.join("nested"),
+            &data.join("nested/deeper"),
+            &cfg,
+        ] {
+            assert_eq!(mode(d), 0o700, "{}", d.display());
+        }
+        assert_eq!((mode(&outside), mode(&outside.join("f"))), (0o755, 0o644));
     }
 }

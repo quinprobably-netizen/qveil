@@ -372,6 +372,16 @@ fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
         exists(&p.history())
     );
     println!("cache          {}{}", p.cache.display(), exists(&p.cache));
+    // Migration couldn't merge these (both names had the same file), so they
+    // are still there, and still hold subscriptions or settings.
+    let legacy = p.legacy();
+    if !legacy.is_empty() {
+        let paths: Vec<_> = legacy.iter().map(|d| d.display().to_string()).collect();
+        println!(
+            "left over from veil: {} \u{2014} `qveil wipe` removes them",
+            paths.join(", ")
+        );
+    }
     println!();
     println!("proxy          {}", rt.net.describe());
     println!(
