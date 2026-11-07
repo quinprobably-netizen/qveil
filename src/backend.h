@@ -58,9 +58,10 @@ public:
     QVariantList history() const { return m_history; }
     QString thumbBase() const;
 
-    // `network` asks the engine to fetch. That covers the channels not fetched
-    // in the last 15 minutes, or every channel with `force`.
-    Q_INVOKABLE void refreshFeed(bool network, bool shorts, bool force = false);
+    // `network` asks the engine to fetch the channels not fetched in the last
+    // 15 minutes. The window never forces the others: pressing refresh again
+    // must not repeat a burst of requests for exactly your channels.
+    Q_INVOKABLE void refreshFeed(bool network, bool shorts);
     Q_INVOKABLE void search(const QString &query);
     Q_INVOKABLE void openChannel(const QString &id);
     Q_INVOKABLE void loadSubs();
@@ -121,7 +122,7 @@ private:
     void onEngineStopped();
     // The feed request itself, without the one-refresh-at-a-time guard of
     // refreshFeed(). `channel` limits a refresh to that one channel.
-    void loadFeed(bool network, bool shorts, bool force = false, const QString &channel = {});
+    void loadFeed(bool network, bool shorts, const QString &channel = {});
     // Takes a config from the engine, and says so if it moved the route.
     // `routeSet` is true when the window itself just asked for that route.
     void adoptConfig(const QVariantMap &next, bool routeSet);

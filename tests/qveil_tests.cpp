@@ -222,19 +222,20 @@ private slots:
 
         backend.refreshFeed(false, false);
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed-cache"), 5000);
-        backend.refreshFeed(true, false);
-        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
-        backend.refreshFeed(true, false, true);
-        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
+        // The window's startup, then its Refresh button once that is done.
+        for (int i = 0; i < 2; ++i) {
+            backend.refreshFeed(true, false);
+            QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
+        }
 
         const QStringList feeds = requests(log, "/api/feed");
         QCOMPARE(feeds.size(), 3);
         // From the cache alone.
         QVERIFY(feeds[0].contains("refresh=0") && !feeds[0].contains("force"));
-        // Startup: the channels that have gone stale, not all of them.
-        QVERIFY(feeds[1].contains("refresh=1") && !feeds[1].contains("force") && !feeds[1].contains("channel="));
-        // The Refresh button: everything.
-        QVERIFY(feeds[2].contains("refresh=1") && feeds[2].contains("force=1"));
+        // Startup, and the Refresh button after it: the channels that have
+        // gone stale, never all of them (the README promises that).
+        for (const QString &feed : feeds.mid(1))
+            QVERIFY2(feed.contains("refresh=1") && !feed.contains("force") && !feed.contains("channel="), qPrintable(feed));
     }
 
     void subscribingRefreshesOnlyThatChannel()

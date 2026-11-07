@@ -79,15 +79,16 @@ ApplicationWindow {
         Qt.callLater(() => win.focusPage("channel"))
     }
 
-    // What the Refresh button and R do. Asked for by hand, so every channel is
-    // fetched, not only the ones the engine thinks are stale.
+    // What the Refresh button and R do. Like startup, this fetches only the
+    // channels that have gone stale: pressing it again must not repeat the
+    // burst of requests for exactly your channels.
     function refresh() {
         if (page === "channel")
             backend.openChannel(backend.channel.id)
         else if (page === "search")
             backend.search(backend.query)
         else
-            backend.refreshFeed(true, prefs.showShorts, true)
+            backend.refreshFeed(true, prefs.showShorts)
     }
 
     // The first run's way in: Subscriptions, with the add field ready to type in.

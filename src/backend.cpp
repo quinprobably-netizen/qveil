@@ -235,23 +235,21 @@ void Backend::setConfig(const QVariantMap &patch) {
          });
 }
 
-void Backend::refreshFeed(bool network, bool shorts, bool force) {
+void Backend::refreshFeed(bool network, bool shorts) {
     m_shorts = shorts;
     // A refresh can take minutes over Tor, so a second one while it runs would
     // only repeat the work. Every caller (startup, the button, the R shortcut)
     // gets this guard.
     if (network && m_busy.contains("feed"))
         return;
-    loadFeed(network, shorts, force);
+    loadFeed(network, shorts);
 }
 
-void Backend::loadFeed(bool network, bool shorts, bool force, const QString &channel) {
+void Backend::loadFeed(bool network, bool shorts, const QString &channel) {
     QUrlQuery q;
+    // The engine fetches only channels it hasn't fetched in the last 15
+    // minutes; a single channel is fetched whatever its age.
     q.addQueryItem("refresh", network ? "1" : "0");
-    // Without `force` the engine fetches only channels it hasn't fetched in
-    // the last 15 minutes; a single channel is fetched whatever its age.
-    if (network && force)
-        q.addQueryItem("force", "1");
     if (network && !channel.isEmpty())
         q.addQueryItem("channel", channel);
     q.addQueryItem("shorts", shorts ? "1" : "0");
@@ -407,7 +405,7 @@ void Backend::subscribe(const QString &input) {
         // they were, and a refresh of all of them is a burst of requests that
         // would link the whole list. A running refresh started with the old
         // list, so this one is not held back by the guard of refreshFeed().
-        loadFeed(true, m_shorts, false, sub.value("id").toString());
+        loadFeed(true, m_shorts, sub.value("id").toString());
     }, true);
 }
 
