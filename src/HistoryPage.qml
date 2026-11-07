@@ -8,6 +8,8 @@ FocusScope {
     id: page
 
     readonly property bool enabled_: !!backend.config.history
+    // Where focus belongs when the page is shown.
+    readonly property Item content: list
     signal playRequested(string id)
 
     ColumnLayout {
@@ -50,15 +52,14 @@ FocusScope {
             }
         }
 
-        ListView {
+        QuietList {
+            id: list
+            focus: true
             Layout.fillWidth: true
             Layout.fillHeight: true
-            clip: true
             model: backend.history
-            boundsBehavior: Flickable.StopAtBounds
-            ScrollBar.vertical: ScrollBar {}
 
-            delegate: ItemDelegate {
+            delegate: QuietRow {
                 id: row
                 required property var modelData
                 width: ListView.view.width

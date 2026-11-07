@@ -27,10 +27,6 @@
     "one": "Latest from %n channel",
     "other": "Latest from %n channels"
   },
-  "dates marked ~ are approximate (RSS was down for %n)": {
-    "one": "dates marked ~ are approximate (RSS was down for %n)",
-    "other": "dates marked ~ are approximate (RSS was down for %n)"
-  },
   "%n couldn't be fetched": {
     "one": "%n couldn't be fetched",
     "other": "%n couldn't be fetched"

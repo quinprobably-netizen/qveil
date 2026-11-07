@@ -80,10 +80,10 @@ Item {
                 // Keep the blur inside the frame instead of bleeding past its edges.
                 autoPaddingEnabled: false
                 blurEnabled: true
-                blurMax: 48
-                blur: card.veiled ? 0.9 : 0
-                saturation: card.veiled ? -0.55 : 0
-                brightness: card.veiled ? -0.18 : 0
+                blurMax: 64
+                blur: card.veiled ? 1.0 : 0
+                saturation: card.veiled ? -0.7 : 0
+                brightness: card.veiled ? -0.25 : 0
                 maskEnabled: theme.radius > 0
                 maskSource: mask
                 Behavior on blur { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
@@ -161,12 +161,17 @@ Item {
         Label {
             anchors.top: channel.bottom
             anchors.topMargin: 2
-            width: parent.width
+            width: Math.min(implicitWidth, parent.width)
             text: Format.meta(card.modelData, card.modelData.date || card.modelData.published,
                               card.modelData.estimated)
             elide: Text.ElideRight
             font.pixelSize: 12
             color: "#6f6f7b"
+
+            HoverHandler { id: dateHover }
+            ToolTip.visible: dateHover.hovered && !!card.modelData.estimated && card.view.estimateNote !== ""
+            ToolTip.delay: 500
+            ToolTip.text: card.view.estimateNote
         }
     }
 }

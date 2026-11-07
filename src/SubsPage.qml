@@ -6,6 +6,8 @@ import QtQuick.Layouts
 FocusScope {
     id: page
 
+    // Where focus belongs when the page is shown.
+    readonly property Item content: list
     signal channelRequested(string id)
 
     function submit() {
@@ -40,7 +42,6 @@ FocusScope {
             spacing: 10
             TextField {
                 id: add
-                focus: true
                 Layout.preferredWidth: 380
                 placeholderText: qsTr("@handle, channel URL or ID")
                 onAccepted: page.submit()
@@ -69,16 +70,16 @@ FocusScope {
             color: "#a2a2ad"
         }
 
-        ListView {
+        QuietList {
             id: list
+            // Focus starts on the list, not the field, so the global keys
+            // (1 3 ? R Q) work as soon as the page opens.
+            focus: true
             Layout.fillWidth: true
             Layout.fillHeight: true
-            clip: true
             model: backend.subs
-            boundsBehavior: Flickable.StopAtBounds
-            ScrollBar.vertical: ScrollBar {}
 
-            delegate: ItemDelegate {
+            delegate: QuietRow {
                 id: row
                 required property var modelData
                 width: ListView.view.width
@@ -105,9 +106,25 @@ FocusScope {
                         elide: Text.ElideRight
                         font.pixelSize: 14
                     }
+                    // Leaving a channel is the least common thing here, so it is
+                    // quiet and only shows while the row is hovered or focused.
+                    // Only its label fades: a fully transparent item would drop
+                    // out of the Tab order, and keyboard focus is how it appears.
                     Button {
+                        id: unsubscribe
                         flat: true
-                        text: qsTr("Unsubscribe")
+                        // Hover and focus show in the label's colour; the style's
+                        // pill would be louder than the text it holds.
+                        background: null
+                        contentItem: Label {
+                            opacity: row.lit || unsubscribe.hovered || unsubscribe.activeFocus ? 1 : 0
+                            Behavior on opacity { NumberAnimation { duration: 120 } }
+                            text: qsTr("Unsubscribe")
+                            font.pixelSize: 13
+                            color: unsubscribe.hovered || unsubscribe.activeFocus ? "#c0c0ca" : "#8d8d98"
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
                         onClicked: backend.unsubscribe(row.modelData.id)
                     }
                 }

@@ -1,9 +1,32 @@
 #pragma once
 
+#include <QMutex>
 #include <QQuickFramebufferObject>
+
+#include <memory>
 
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
+
+class MpvItem;
+
+// What an MpvItem and its renderer share. The item lives on the GUI thread
+// and the renderer on the render thread, and either can be destroyed first,
+// so neither owns the player alone: it is destroyed when the last of them lets
+// go, and the renderer always frees the render context before that.
+struct MpvShared {
+    explicit MpvShared(mpv_handle *player) : handle(player) {}
+    ~MpvShared();
+
+    mpv_handle *const handle;
+    // Created, used and freed by the renderer alone, on the render thread with
+    // its GL context current: render.h allows one mpv_render_* call at a time.
+    mpv_render_context *render = nullptr;
+    // mpv's threads post to the item through this; it is cleared (under the
+    // mutex) before the item goes away.
+    QMutex mutex;
+    MpvItem *item = nullptr;
+};
 
 // libmpv rendered into the Qt Quick scene. mpv runs without any user config
 // or scripts, keeps no resume or history state, and is only ever handed
@@ -43,9 +66,6 @@ public:
     void setVolume(double volume);
     void setMuted(bool muted);
 
-    mpv_handle *handle() const { return m_mpv; }
-    mpv_render_context *renderContext = nullptr;
-
 signals:
     void positionChanged();
     void durationChanged();
@@ -66,6 +86,7 @@ private:
     void onProperty(const mpv_event_property *p);
 
     mpv_handle *m_mpv = nullptr;
+    std::shared_ptr<MpvShared> m_shared;
     double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false;

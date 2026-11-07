@@ -14,21 +14,51 @@ void *procAddress(void *, const char *name) {
     return context ? reinterpret_cast<void *>(context->getProcAddress(QByteArray(name))) : nullptr;
 }
 
-// Both callbacks arrive on mpv's threads; hop to the item's thread.
-void onRenderUpdate(void *item) {
-    QMetaObject::invokeMethod(static_cast<MpvItem *>(item), "update", Qt::QueuedConnection);
+// Both callbacks arrive on mpv's threads, and the item can be destroyed at any
+// moment, so it is only touched under the lock its destructor takes to clear it.
+void post(void *shared, const char *method) {
+    auto *s = static_cast<MpvShared *>(shared);
+    QMutexLocker lock(&s->mutex);
+    if (s->item)
+        QMetaObject::invokeMethod(s->item, method, Qt::QueuedConnection);
 }
 
-void onWakeup(void *item) {
-    QMetaObject::invokeMethod(static_cast<MpvItem *>(item), "handleEvents", Qt::QueuedConnection);
-}
+void onRenderUpdate(void *shared) { post(shared, "update"); }
+void onWakeup(void *shared) { post(shared, "handleEvents"); }
 
 class MpvRenderer : public QQuickFramebufferObject::Renderer {
 public:
-    explicit MpvRenderer(MpvItem *item) : m_item(item) {}
+    explicit MpvRenderer(std::shared_ptr<MpvShared> shared) : m_shared(std::move(shared)) {}
+
+    // The scene graph deletes the renderer on the render thread with its GL
+    // context current, which is exactly what freeing the render context needs.
+    // The item can't do it: it is destroyed on the GUI thread, while this
+    // thread may be inside mpv_render_context_render.
+    ~MpvRenderer() override {
+        mpv_render_context *context = m_shared->render;
+        if (!context)
+            return;
+        if (!QOpenGLContext::currentContext()) {
+            // Freeing without the context would crash in the driver, and
+            // destroying the player with the context alive is undefined, so
+            // keep the player for the rest of the process instead.
+            qWarning("libmpv: no current OpenGL context to free the render context in");
+            new std::shared_ptr<MpvShared>(m_shared);
+            return;
+        }
+        m_shared->render = nullptr;
+        // Every mpv_render_* call happens on this thread, so none can overlap
+        // these two. After the first, mpv's threads no longer reach the item.
+        mpv_render_context_set_update_callback(context, nullptr, nullptr);
+        mpv_render_context_free(context);
+    }
+
+    // Runs on the render thread while the GUI thread waits; the only moment
+    // the item can be read safely.
+    void synchronize(QQuickFramebufferObject *item) override { m_window = item->window(); }
 
     QOpenGLFramebufferObject *createFramebufferObject(const QSize &size) override {
-        if (!m_item->renderContext) {
+        if (!m_shared->render) {
             mpv_opengl_init_params gl{procAddress, nullptr};
             QList<mpv_render_param> params{
                 {MPV_RENDER_PARAM_API_TYPE, const_cast<char *>(MPV_RENDER_API_TYPE_OPENGL)},
@@ -41,18 +71,22 @@ public:
                     params.append({MPV_RENDER_PARAM_WL_DISPLAY, display});
 #endif
             params.append({MPV_RENDER_PARAM_INVALID, nullptr});
-            if (mpv_render_context_create(&m_item->renderContext, m_item->handle(), params.data()) < 0)
+            mpv_render_context *context = nullptr;
+            if (mpv_render_context_create(&context, m_shared->handle, params.data()) < 0) {
                 qWarning("libmpv: couldn't create the OpenGL render context");
-            else
-                mpv_render_context_set_update_callback(m_item->renderContext, onRenderUpdate, m_item);
+            } else {
+                m_shared->render = context;
+                mpv_render_context_set_update_callback(context, onRenderUpdate, m_shared.get());
+            }
         }
         return QQuickFramebufferObject::Renderer::createFramebufferObject(size);
     }
 
     void render() override {
-        if (!m_item->renderContext)
+        mpv_render_context *context = m_shared->render;
+        if (!context || !m_window)
             return;
-        m_item->window()->beginExternalCommands();
+        m_window->beginExternalCommands();
         QOpenGLFramebufferObject *fbo = framebufferObject();
         mpv_opengl_fbo target{static_cast<int>(fbo->handle()), fbo->width(), fbo->height(), 0};
         int flip = 0;
@@ -61,19 +95,30 @@ public:
             {MPV_RENDER_PARAM_FLIP_Y, &flip},
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
-        mpv_render_context_render(m_item->renderContext, params);
-        m_item->window()->endExternalCommands();
+        mpv_render_context_render(context, params);
+        m_window->endExternalCommands();
     }
 
 private:
-    MpvItem *m_item;
+    std::shared_ptr<MpvShared> m_shared;
+    QQuickWindow *m_window = nullptr;
 };
 
 } // namespace
 
+MpvShared::~MpvShared() {
+    // The renderer frees the render context before it lets go of this, and an
+    // item that was never drawn never made one, so mpv needs no GL context
+    // any more. Destroying the core with a live render context is undefined
+    // (render.h), and so is doing it before that.
+    mpv_terminate_destroy(handle);
+}
+
 MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mpv_create()) {
     if (!m_mpv)
         qFatal("libmpv: couldn't create a player");
+    m_shared = std::make_shared<MpvShared>(m_mpv);
+    m_shared->item = this;
 
     const std::pair<const char *, const char *> options[] = {
         {"vo", "libmpv"},
@@ -112,22 +157,27 @@ MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mp
     };
     for (const auto &[name, format] : observed)
         mpv_observe_property(m_mpv, 0, name, format);
-    mpv_set_wakeup_callback(m_mpv, onWakeup, this);
+    mpv_set_wakeup_callback(m_mpv, onWakeup, m_shared.get());
 }
 
 MpvItem::~MpvItem() {
-    if (renderContext) {
-        mpv_render_context_set_update_callback(renderContext, nullptr, nullptr);
-        mpv_render_context_free(renderContext);
+    {
+        // From here on, mpv's threads can no longer reach this object.
+        QMutexLocker lock(&m_shared->mutex);
+        m_shared->item = nullptr;
     }
     mpv_set_wakeup_callback(m_mpv, nullptr, nullptr);
-    mpv_terminate_destroy(m_mpv);
+    // The render context belongs to the renderer, which frees it on the render
+    // thread, so the player may outlive this item for a frame. It mustn't play
+    // on meanwhile; once the renderer and this item are both gone, it is
+    // destroyed (see ~MpvShared).
+    command({"stop"});
 }
 
 QQuickFramebufferObject::Renderer *MpvItem::createRenderer() const {
     window()->setPersistentGraphics(true);
     window()->setPersistentSceneGraph(true);
-    return new MpvRenderer(const_cast<MpvItem *>(this));
+    return new MpvRenderer(m_shared);
 }
 
 void MpvItem::command(const QList<QByteArray> &args) {

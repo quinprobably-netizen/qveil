@@ -10,14 +10,33 @@ Popup {
     required property var prefs
     readonly property var config: backend.config
     property string route: config.route || "direct"
+    // The saved proxy as the engine reports it: redacted when it has
+    // credentials. Sent back unchanged, it means "keep the saved proxy". (A
+    // function, not a property: a change handler would otherwise read it
+    // before its binding had caught up with the new config.)
+    function savedProxy() { return config.route === "proxy" ? (config.proxy || "") : "" }
+    // Whether the user has chosen a route or typed an address since the form
+    // was last filled from the config.
+    property bool touched: false
+    readonly property bool changed: route !== (config.route || "direct")
+                                    || (route === "proxy" && proxyField.text !== savedProxy())
+
+    function fillFromConfig() {
+        route = config.route || "direct"
+        proxyField.text = savedProxy()
+    }
 
     width: 440
     padding: 22
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    // The config can arrive after the popup opens, and after saving it comes
+    // back with the proxy redacted, so the form follows it until the user
+    // touches it.
+    onConfigChanged: if (!touched) fillFromConfig()
     onAboutToShow: {
+        touched = false
         backend.loadConfig()
-        route = config.route || "direct"
-        proxyField.text = config.route === "proxy" ? (config.proxy || "") : ""
+        fillFromConfig()
     }
 
     background: Rectangle {
@@ -49,7 +68,10 @@ Popup {
                 ButtonGroup.group: routes
                 text: option.label
                 checked: popup.route === option.value
-                onClicked: popup.route = option.value
+                onClicked: {
+                    popup.route = option.value
+                    popup.touched = true
+                }
                 Layout.leftMargin: -8
             }
             Label {
@@ -81,7 +103,7 @@ Popup {
                 : qsTr("Tor isn't running. Install and start it: omarchy-pkg-add tor, then sudo systemctl enable --now tor")
             wrapMode: Text.Wrap
             font.pixelSize: 12
-            color: popup.config.torRunning ? theme.accent : "#ff8a80"
+            color: popup.config.torRunning ? theme.protectedColor : "#ff8a80"
         }
         RouteOption {
             value: "proxy"
@@ -94,15 +116,21 @@ Popup {
             Layout.leftMargin: 32
             visible: popup.route === "proxy"
             placeholderText: qsTr("socks5h://host:port or http://host:port")
+            onTextEdited: popup.touched = true
         }
 
         Button {
             Layout.alignment: Qt.AlignRight
             text: qsTr("Use this route")
             highlighted: true
-            enabled: popup.route !== popup.config.route
-                     || (popup.route === "proxy" && proxyField.text !== (popup.config.proxy || ""))
-            onClicked: backend.setConfig({ route: popup.route, proxy: proxyField.text })
+            // Only when something changed, and a proxy route needs an address.
+            enabled: popup.changed && (popup.route !== "proxy" || proxyField.text.trim() !== "")
+            onClicked: {
+                // The field goes as it is: an untouched redacted value keeps
+                // the saved proxy.
+                backend.setConfig({ route: popup.route, proxy: proxyField.text })
+                popup.touched = false
+            }
         }
 
         MenuSeparator { Layout.fillWidth: true }

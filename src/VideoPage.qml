@@ -14,7 +14,11 @@ FocusScope {
     property bool loading: false
     property alias actions: actionRow.data
     property alias grid: grid
+    // Where focus belongs when the page is shown.
+    readonly property Item content: grid
     property alias veil: grid.veil
+    // Explains a "~" in a card's date, where the page knows why dates are estimated.
+    property alias estimateNote: grid.estimateNote
 
     signal activated(var video)
     signal channelRequested(string id)

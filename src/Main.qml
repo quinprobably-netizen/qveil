@@ -21,7 +21,16 @@ ApplicationWindow {
 
     property string page: "feed"
     property string returnPage: "feed"
+    // Whether the first engine start has loaded the window yet.
+    property bool started: false
     readonly property bool fullscreen: visibility === Window.FullScreen
+    // Before the first subscription there is nothing to refresh or filter. Both
+    // counts must say so, so a loading window doesn't flash the controls away.
+    readonly property bool noSubs: backend.feedInfo.channels === 0 && backend.subs.length === 0
+    // Whether keys are going into a text field (the search box, the add field
+    // on the subscriptions page, the proxy field). Every Qt Quick text input
+    // has a cursor position and nothing else that takes focus does.
+    readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
     readonly property var pages: ({ feed: feedPage, search: searchPage, channel: channelPage,
                                     subs: subsPage, history: historyPage })
 
@@ -37,12 +46,24 @@ ApplicationWindow {
             player.close()
         if (p !== "channel")
             returnPage = p
+        // What was typed in the top bar belongs to the search page only.
+        if (p !== "search")
+            search.text = ""
         page = p
         if (p === "subs")
             backend.loadSubs()
         if (p === "history")
             backend.loadHistory()
-        Qt.callLater(() => pages[p].forceActiveFocus())
+        Qt.callLater(() => win.focusPage(p))
+    }
+
+    // Focus goes to what the page is about (its grid or list), never to
+    // whatever was clicked last: a focus scope would hand it back to a text
+    // field or a button the page had before.
+    function focusPage(p) {
+        const view = pages[p]
+        const target = view.content ? view.content : view
+        target.forceActiveFocus()
     }
 
     function openChannel(id) {
@@ -52,9 +73,10 @@ ApplicationWindow {
             player.close()
         if (page !== "channel")
             returnPage = page
+        search.text = ""
         page = "channel"
         backend.openChannel(id)
-        Qt.callLater(() => channelPage.forceActiveFocus())
+        Qt.callLater(() => win.focusPage("channel"))
     }
 
     function refresh() {
@@ -88,17 +110,21 @@ ApplicationWindow {
             showNormal()
         else if (player.active)
             player.close()
-        else if (search.activeFocus)
-            pages[page].forceActiveFocus()
+        else if (typing)
+            focusPage(page)
         else if (page === "channel")
             go(returnPage)
     }
 
     Connections {
         target: backend
+        // Only the first start loads things here: if the engine has to be
+        // restarted, Backend reloads what the window shows by itself, and a
+        // full refresh would be unasked for.
         function onReadyChanged() {
-            if (!backend.ready)
+            if (!backend.ready || win.started)
                 return
+            win.started = true
             backend.refreshFeed(false, prefs.showShorts)
             backend.refreshFeed(true, prefs.showShorts)
             backend.loadSubs()
@@ -214,13 +240,12 @@ ApplicationWindow {
                         if (!info.channels)
                             return ""
                         let s = qsTr("Latest from %n channels", "", info.channels)
-                        if (info.fallbacks > 0)
-                            s += "  ·  " + qsTr("dates marked ~ are approximate (RSS was down for %n)", "", info.fallbacks)
                         if (info.errors && info.errors.length > 0)
                             s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
                         return s
                     }
                     model: backend.feed
+                    estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
                     loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
                     emptyText: backend.feedInfo.channels === 0
                                ? qsTr("Your feed is built from channels you subscribe to, on this computer only.\n\nSearch for a channel, press 2 to add one, or drop a Google Takeout subscriptions.csv here.")
@@ -229,6 +254,7 @@ ApplicationWindow {
                     onChannelRequested: id => win.openChannel(id)
                     actions: [
                         CheckBox {
+                            visible: !win.noSubs
                             text: qsTr("Shorts")
                             checked: prefs.showShorts
                             onToggled: {
@@ -237,6 +263,7 @@ ApplicationWindow {
                             }
                         },
                         Button {
+                            visible: !win.noSubs
                             text: qsTr("Refresh")
                             flat: true
                             icon.source: "qrc:/icons/refresh.svg"
@@ -274,12 +301,29 @@ ApplicationWindow {
                     onActivated: video => backend.play(video.id)
                     actions: [
                         Button {
+                            id: subscribe
+                            readonly property bool isOn: !!backend.channel.subscribed
                             visible: !!backend.channel.name
-                            text: backend.channel.subscribed ? qsTr("Subscribed") : qsTr("Subscribe")
-                            highlighted: !backend.channel.subscribed
-                            flat: !!backend.channel.subscribed
-                            onClicked: backend.channel.subscribed ? backend.unsubscribe(backend.channel.id)
-                                                                   : backend.subscribe(backend.channel.id)
+                            text: isOn ? qsTr("Subscribed") : qsTr("Subscribe")
+                            // Subscribe is the filled call to action. Subscribed is the same
+                            // control switched on: a check and an accent outline, not flat text.
+                            highlighted: !isOn
+                            flat: isOn
+                            checked: isOn
+                            icon.source: isOn ? "qrc:/icons/check.svg" : ""
+                            icon.width: 18
+                            icon.height: 18
+                            onClicked: isOn ? backend.unsubscribe(backend.channel.id)
+                                            : backend.subscribe(backend.channel.id)
+
+                            Rectangle {
+                                anchors.fill: subscribe.background
+                                visible: subscribe.isOn
+                                radius: subscribe.background.radius
+                                color: "transparent"
+                                border.width: 1
+                                border.color: theme.accent
+                            }
                         }
                     ]
                 }
@@ -325,7 +369,7 @@ ApplicationWindow {
                     onClosed: {
                         if (win.fullscreen)
                             win.showNormal()
-                        Qt.callLater(() => win.pages[win.page].forceActiveFocus())
+                        Qt.callLater(() => win.focusPage(win.page))
                     }
                     onChannelRequested: id => win.openChannel(id)
                     onFullscreenToggled: win.toggleFullscreen()
@@ -458,11 +502,13 @@ ApplicationWindow {
         }
     }
 
-    // The route, always in view: amber while YouTube can see your IP.
+    // The route, always in view: amber while YouTube can see your IP, a
+    // steady green once it can't. Neither follows the theme accent, which
+    // tabs, rings and buttons use.
     component RouteChip: AbstractButton {
         id: chip
         readonly property string route: backend.config.route || "direct"
-        readonly property color tone: route === "direct" ? "#e0a93b" : theme.accent
+        readonly property color tone: route === "direct" ? "#e0a93b" : theme.protectedColor
         Layout.preferredHeight: 34
         leftPadding: 12
         rightPadding: 14
