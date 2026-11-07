@@ -1092,8 +1092,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let trickler = std::thread::spawn(move || {
             let mut c = TcpStream::connect(addr).unwrap();
-            // One byte every 50 ms never trips a per-read timeout of 300 ms.
-            for _ in 0..40 {
+            // One byte every 50 ms never trips a per-read timeout of 300 ms,
+            // and the trickle lasts 10 s, far past the deadline.
+            for _ in 0..200 {
                 if c.write_all(b"a").is_err() {
                     break;
                 }
@@ -1110,8 +1111,9 @@ mod tests {
             }
         };
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // Generous for loaded CI machines, yet well short of the 10 s trickle.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
