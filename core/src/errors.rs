@@ -6,10 +6,13 @@
 /// replacements never contain the text they match, so applying this twice
 /// (once where yt-dlp fails, once where the error is finally shown) is safe.
 pub fn friendly(err: &str) -> String {
+    // yt-dlp spells it "SocksHTTPSConnection … Connection refused", other
+    // libraries in lower case, so compare without regard to case.
+    let lower = err.to_ascii_lowercase();
     if err.contains("127.0.0.1:9050")
-        || (err.contains("socks") && err.contains("onnection refused"))
+        || (lower.contains("socks") && lower.contains("connection refused"))
     {
-        return "Tor isn't running on 127.0.0.1:9050. Start it, or switch the route to Direct."
+        return "The proxy refused the connection (Tor listens on 127.0.0.1:9050). Start it, or switch the route to Direct."
             .into();
     }
     if err.contains("Sign in to confirm") {
@@ -42,7 +45,14 @@ mod tests {
 
     #[test]
     fn maps_the_common_failures() {
-        assert!(friendly("socks connect error: Connection refused").starts_with("Tor isn't"));
+        for raw in [
+            "socks connect error: Connection refused",
+            "yt-dlp: [youtube] x: Unable to download API page: SocksHTTPSConnection(host='www.youtube.com', port=443): Failed to establish a new connection: [Errno 111] Connection refused",
+        ] {
+            let msg = friendly(raw);
+            assert!(msg.contains("switch the route to Direct"), "{raw} -> {msg}");
+            assert!(msg.len() < 120, "{msg}");
+        }
         assert!(friendly("ERROR: Sign in to confirm you're not a bot").contains("bot check"));
         for raw in [
             "ERROR: [youtube] abc: Unable to extract yt initial data; please report this issue on https://github.com/yt-dlp/yt-dlp/issues",

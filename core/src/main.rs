@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use app::Runtime;
 use clap::{Args, Parser, Subcommand};
 use config::Config;
+use errors::friendly;
 use serde::Serialize;
 use server::Server;
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -133,7 +134,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("veil: {e:#}");
+            eprintln!("veil: {}", friendly(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -250,7 +251,7 @@ fn browse(
             start: None,
         };
         if let Err(e) = server.open(&r).and_then(|info| player::play(cfg, &info)) {
-            eprintln!("veil: {e:#}");
+            eprintln!("veil: {}", friendly(&format!("{e:#}")));
         }
     }
     Ok(())
