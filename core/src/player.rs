@@ -135,6 +135,7 @@ fn private_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute() && p.is_dir())
         .unwrap_or_else(std::env::temp_dir);
+    sweep_stale(&base);
     for _ in 0..8 {
         let name = format!(
             "veil-mpv-{}-{:016x}",
@@ -153,6 +154,29 @@ fn private_dir() -> Result<PathBuf> {
         "couldn't create a private directory under {}",
         base.display()
     )
+}
+
+/// Ctrl+C takes veil down along with mpv, and a process that is killed can't
+/// clean up after itself. So each run removes the directories of runs whose
+/// process is gone, which keeps a title from lingering in the temp dir.
+fn sweep_stale(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("veil-mpv-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok());
+        if let Some(pid) = pid
+            && !Path::new("/proc").join(pid.to_string()).exists()
+        {
+            // Doesn't follow symlinks; one with this name would just be unlinked.
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -235,6 +259,25 @@ mod tests {
         assert!(dir.is_dir());
         drop(staged);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn directories_of_dead_runs_are_swept() {
+        let base = crate::store::testing::TempDir::new();
+        let (dead, mine, other) = (
+            base.0.join("veil-mpv-999999999-0123456789abcdef"),
+            base.0
+                .join(format!("veil-mpv-{}-0123456789abcdef", std::process::id())),
+            base.0.join("unrelated"),
+        );
+        for d in [&dead, &mine, &other] {
+            fs::create_dir(d).unwrap();
+            fs::write(d.join("options.conf"), "x").unwrap();
+        }
+        sweep_stale(&base.0);
+        assert!(!dead.exists(), "a run whose process is gone leaves nothing");
+        assert!(mine.exists(), "a live run keeps its files");
+        assert!(other.exists(), "only veil's own directories are touched");
     }
 
     #[test]
