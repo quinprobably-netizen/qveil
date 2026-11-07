@@ -3,7 +3,6 @@
         <file alias="Main.qml">Main.qml</file>
         <file alias="DyeWash.qml">DyeWash.qml</file>
         <file alias="Wordmark.qml">Wordmark.qml</file>
-        <file alias="shaders/dye.frag.qsb">shaders/dye.frag.qsb</file>
         <file alias="SearchBox.qml">SearchBox.qml</file>
         <file alias="VideoCard.qml">VideoCard.qml</file>
         <file alias="VideoGrid.qml">VideoGrid.qml</file>

@@ -29,4 +29,4 @@ SOURCES += \
     src/theme.cpp \
     src/translator.cpp
 
-RESOURCES += src/resources.qrc
+include(src/resources.pri)
