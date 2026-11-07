@@ -4,6 +4,10 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cargo test --locked --manifest-path "$ROOT/core/Cargo.toml"
 
+# The window tests include one against the real engine, which needs the
+# build tree's qveil-core; build everything first so it never silently skips.
+"$ROOT/bin/build"
+
 mkdir -p "$ROOT/build/tests"
 cd "$ROOT/build/tests"
 qmake6 "$ROOT/tests/qveil_tests.pro"

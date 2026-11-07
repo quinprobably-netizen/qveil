@@ -155,7 +155,7 @@ src/         the window (C++ / Qt Quick)
 YouTube's private API, signature deciphering and PO tokens change
 constantly. qveil leaves that to yt-dlp, so a fix there is a package update
 away. YouTube's RSS endpoint is often down; the feed then falls back to the
-channel's Videos tab through yt-dlp, with approximate dates (shown with `~`).
+channel's Videos tab through yt-dlp, with approximate dates (a card's date tooltip says so).
 That fallback costs one yt-dlp call per affected channel, so a refresh while
 RSS is down is slow, most of all over Tor. After three channels in a row that
 RSS fails for, the rest of that refresh doesn't ask it again.

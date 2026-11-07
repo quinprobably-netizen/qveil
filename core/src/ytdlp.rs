@@ -208,7 +208,18 @@ impl Ytdlp {
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Video>> {
         let q = format!("ytsearch{limit}:{query}");
-        let v = self.json(&["--flat-playlist", "-J"], &q, QUICK)?;
+        // `approximate_date` turns YouTube's "3 days ago" into a timestamp, so
+        // search results can show an age like the feed does.
+        let v = self.json(
+            &[
+                "--flat-playlist",
+                "--extractor-args",
+                "youtubetab:approximate_date",
+                "-J",
+            ],
+            &q,
+            QUICK,
+        )?;
         Ok(entries(&v))
     }
 
@@ -227,8 +238,13 @@ impl Ytdlp {
         crate::store::ensure_dir(&self.cache_dir)?;
         let call = Call::new(&self.net, None, &q)?;
         let mut run = self.start(
-            self.command(&call)
-                .args(["--flat-playlist", "--lazy-playlist", "-j"]),
+            self.command(&call).args([
+                "--flat-playlist",
+                "--lazy-playlist",
+                "--extractor-args",
+                "youtubetab:approximate_date",
+                "-j",
+            ]),
             &call,
         )?;
         let stdout = run.stdout.take().context("no stdout")?;
