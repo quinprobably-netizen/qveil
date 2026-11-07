@@ -1,9 +1,6 @@
 // qveil: a private, account-free YouTube app. This is the window; the Rust
 // engine (qveil-core) does all networking, behind a loopback-only server.
 
-#include <QDir>
-#include <QFile>
-#include <QFileInfo>
 #include <QGuiApplication>
 #include <QIcon>
 #include <QNetworkProxy>
@@ -21,9 +18,16 @@
 #include <vector>
 
 #include "backend.h"
+#include "datadirs.h"
 #include "mpvitem.h"
 #include "theme.h"
 #include "translator.h"
+
+// qveil.pro reads it from core/Cargo.toml, so the engine and the window can't
+// disagree about the version.
+#ifndef QVEIL_VERSION
+#error "QVEIL_VERSION is defined by qveil.pro"
+#endif
 
 int main(int argc, char *argv[]) {
     // `qveil` and `qveil open` open the window. Anything else is a command for
@@ -40,17 +44,11 @@ int main(int argc, char *argv[]) {
         return 127;
     }
 
-    // The app was called veil before it was qveil. The window's settings live in
-    // the config directory and are read before the engine starts (the engine
-    // moves the data and cache directories), so move the config one here.
-    {
-        const QString base = qEnvironmentVariableIsEmpty("XDG_CONFIG_HOME")
-                                 ? QDir::homePath() + "/.config" : qEnvironmentVariable("XDG_CONFIG_HOME");
-        if (QFileInfo(base + "/veil").isDir() && !QFileInfo::exists(base + "/qveil"))
-            QDir(base).rename("veil", "qveil");
-        if (QFileInfo(base + "/qveil/veil.conf").isFile() && !QFileInfo::exists(base + "/qveil/qveil.conf"))
-            QFile::rename(base + "/qveil/veil.conf", base + "/qveil/qveil.conf");
-    }
+    // The app was called veil before it was qveil, and its directories must
+    // move before Qt exists: Qt creates ~/.cache/qveil for its QML cache on its
+    // own, and would leave the old cache stranded next to it. The engine starts
+    // later and finds nothing left to move.
+    DataDirs::prepare();
 
     // libmpv renders through OpenGL into the scene.
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
@@ -58,7 +56,7 @@ int main(int argc, char *argv[]) {
     QGuiApplication app(argc, argv);
     app.setOrganizationName("qveil");
     app.setApplicationName("qveil");
-    app.setApplicationVersion("0.2.0");
+    app.setApplicationVersion(QStringLiteral(QVEIL_VERSION));
 
     // Matches the window to qveil.desktop, so the compositor (Wayland app_id)
     // and the launcher pick up the installed icon.
@@ -68,9 +66,10 @@ int main(int argc, char *argv[]) {
     // libmpv parses numbers with the C locale and refuses to start otherwise.
     std::setlocale(LC_NUMERIC, "C");
 
-    // The engine gets the environment as it was, so a proxy set there still
-    // applies to its Direct route. The window and mpv only ever talk to the
-    // engine on 127.0.0.1, so no proxy may sit in between.
+    // The engine gets the environment as it was, but its Direct route ignores
+    // proxy variables, so what the environment says can't sit between it and
+    // YouTube. The window and mpv only ever talk to the engine on 127.0.0.1,
+    // so no proxy may sit in between there either.
     const auto environment = QProcessEnvironment::systemEnvironment();
     for (const char *variable : {"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"})
         qunsetenv(variable);
@@ -97,5 +96,8 @@ int main(int argc, char *argv[]) {
         return 1;
 
     backend.start();
-    return app.exec();
+    const int code = app.exec();
+    // Qt has written its settings by now, whatever mode it gave the file.
+    DataDirs::tightenSettings();
+    return code;
 }
