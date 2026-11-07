@@ -4,8 +4,8 @@ import QtQuick.Controls.Material
 import QtQuick.Effects
 import "Format.js" as Format
 
-// One video in a grid. Thumbnails stay veiled (blurred and muted) until the
-// card is hovered or selected, unless veiling is switched off.
+// One video in a grid. Thumbnails stay veiled (blurred and steeped in the
+// theme's dyes) until the card is hovered or selected, unless veiling is off.
 Item {
     id: card
 
@@ -17,6 +17,16 @@ Item {
     readonly property bool lit: hover.hovered || selected
     readonly property bool veiled: view.veil && !lit
     readonly property string thumb: backend.thumbBase ? backend.thumbBase + modelData.id : ""
+    // How steeped in dye the thumbnail is: 1 veiled, 0 clear.
+    property real steep: veiled ? 1 : 0
+    Behavior on steep { NumberAnimation { duration: 420; easing.type: Easing.InOutCubic } }
+    // A stable, different swirl for every video.
+    readonly property real seed: {
+        let h = 0
+        for (let i = 0; i < modelData.id.length; i++)
+            h = (h * 31 + modelData.id.charCodeAt(i)) % 9973
+        return h / 97
+    }
     // Feed and channel entries say whether their date is approximate. A search
     // result has only YouTube's "3 days ago", so there it always is.
     readonly property bool approximate: modelData.estimated === undefined || !!modelData.estimated
@@ -78,22 +88,31 @@ Item {
                 layer.enabled: true
             }
 
+            // First pass: blur (and round the corners). The dye goes on top.
             MultiEffect {
+                id: blurred
                 anchors.fill: parent
                 source: img
-                visible: img.status === Image.Ready
+                visible: false
+                layer.enabled: true
                 // Keep the blur inside the frame instead of bleeding past its edges.
                 autoPaddingEnabled: false
                 blurEnabled: true
                 blurMax: 64
-                blur: card.veiled ? 1.0 : 0
-                saturation: card.veiled ? -0.7 : 0
-                brightness: card.veiled ? -0.25 : 0
+                blur: 0.85 * card.steep
                 maskEnabled: theme.radius > 0
                 maskSource: mask
-                Behavior on blur { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
-                Behavior on saturation { NumberAnimation { duration: 260 } }
-                Behavior on brightness { NumberAnimation { duration: 260 } }
+            }
+
+            // The veil: the thumbnail steeps in the theme's dyes, and hovering or
+            // selecting the card drains the dye away (the swirl only moves then).
+            DyeWash {
+                anchors.fill: parent
+                source: blurred
+                visible: img.status === Image.Ready
+                strength: card.steep
+                seed: card.seed
+                drift: (1 - card.steep) * 1.4
             }
 
             Rectangle {

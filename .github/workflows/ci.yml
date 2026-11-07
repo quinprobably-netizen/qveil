@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel qt6-base qt6-declarative qt6-svg qt6-wayland mpv rust python desktop-file-utils
+      - run: pacman -Syu --noconfirm --needed base-devel qt6-base qt6-declarative qt6-svg qt6-wayland qt6-shadertools mpv rust python desktop-file-utils
       - uses: actions/checkout@v4
       - run: desktop-file-validate pkgbuild/qveil.desktop
       # makepkg refuses to run as root, and root would hide mistakes a real

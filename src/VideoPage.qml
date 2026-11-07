@@ -75,7 +75,29 @@ FocusScope {
         }
     }
 
+    // A soft cloud of the veil's dye behind the empty state, where the page wants one.
+    property bool washEmpty: false
+    Rectangle {
+        id: washSource
+        anchors.fill: emptyWash
+        color: "#9a9aa0"
+        visible: false
+        layer.enabled: true
+    }
+    DyeWash {
+        id: emptyWash
+        anchors.centerIn: emptyState
+        width: emptyState.width + 260
+        height: emptyState.height + 200
+        visible: page.washEmpty && emptyState.visible
+        source: washSource
+        seed: 11.3
+        vignette: 1
+        opacity: 0.55
+    }
+
     ColumnLayout {
+        id: emptyState
         anchors.centerIn: parent
         width: Math.min(parent.width - 80, 520)
         visible: !page.loading && page.model.length === 0 && page.emptyText !== ""

@@ -233,12 +233,11 @@ ApplicationWindow {
                     anchors.rightMargin: 14
                     spacing: 6
 
-                    Label {
+                    Wordmark {
                         text: "qveil"
-                        font.pixelSize: 22
-                        font.weight: Font.Bold
-                        font.letterSpacing: 0.5
+                        pixelSize: 23
                         Layout.rightMargin: 18
+                        Layout.alignment: Qt.AlignVCenter
                     }
 
                     Repeater {
@@ -284,6 +283,8 @@ ApplicationWindow {
                     visible: win.page === "feed" && !player.active
                     focus: visible
                     veil: prefs.veilThumbnails
+                    // The first-run welcome sits on a cloud of the veil's dye.
+                    washEmpty: win.noSubs
                     heading: qsTr("Feed")
                     subheading: {
                         const info = backend.feedInfo

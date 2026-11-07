@@ -7,6 +7,9 @@ cargo build --release --locked --manifest-path "$ROOT/core/Cargo.toml"
 mkdir -p "$ROOT/build"
 install -m755 "$ROOT/core/target/release/qveil-core" "$ROOT/build/qveil-core"
 
+# The veil's shader, compiled for every GL version the scene graph may use.
+"$(qmake6 -query QT_INSTALL_BINS)/qsb" --glsl "100es,120,150" -o "$ROOT/src/shaders/dye.frag.qsb" "$ROOT/src/shaders/dye.frag"
+
 cd "$ROOT/build"
 qmake6 "$ROOT/qveil.pro"
 make -j"$(nproc)"

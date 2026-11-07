@@ -14,7 +14,7 @@ provides=('veil')
 conflicts=('veil')
 replaces=('veil')
 optdepends=('tor: hide your IP from YouTube, with a fresh circuit per request')
-makedepends=('cargo' 'gcc' 'make')
+makedepends=('cargo' 'gcc' 'make' 'qt6-shadertools')
 # makepkg's -flto makes ring's C objects LTO bitcode, which the Rust linker can't read.
 options=('!lto' '!debug')
 # This builds from the local checkout (the parent of this directory), not from a
