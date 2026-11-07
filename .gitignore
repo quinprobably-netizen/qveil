@@ -1,0 +1,9 @@
+/target
+
+# Personal data must never be committed: exports, takeouts, local configs.
+*.csv
+*.db
+subscriptions*.json
+newpipe*.json
+/config.toml
+.env*

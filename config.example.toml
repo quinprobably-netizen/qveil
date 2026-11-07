@@ -1,0 +1,22 @@
+# veil config: copy to ~/.config/veil/config.toml
+# Every key is optional; these are the defaults unless noted.
+
+# Route ALL traffic (search, feeds, metadata and the video bytes) through a proxy.
+# http://, https:// or socks5h:// (plain socks5:// is refused because it leaks DNS).
+# proxy = "socks5h://127.0.0.1:9050"
+
+# With a SOCKS proxy, use new random credentials for each request so Tor puts
+# each channel feed and each video on its own circuit.
+isolate_circuits = true
+
+max_height = 1080
+
+# Keep a local watch history. Nothing ever leaves this machine either way.
+history = false
+
+# Channel feeds fetched at once.
+feed_workers = 4
+
+ytdlp = "yt-dlp"
+mpv = "mpv"
+mpv_args = []
