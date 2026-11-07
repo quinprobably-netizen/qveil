@@ -733,7 +733,12 @@ impl Read for Deadline {
             .filter(|d| !d.is_zero())
             .ok_or(io::ErrorKind::TimedOut)?;
         self.stream.set_read_timeout(Some(left))?;
-        self.stream.read(buf)
+        // A socket read timeout surfaces as WouldBlock on Unix; report it as
+        // the deadline it is, so callers see one kind for "too slow".
+        self.stream.read(buf).map_err(|e| match e.kind() {
+            io::ErrorKind::WouldBlock => io::Error::from(io::ErrorKind::TimedOut),
+            _ => e,
+        })
     }
 }
 
