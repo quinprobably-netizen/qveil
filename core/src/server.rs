@@ -56,6 +56,18 @@ const LINGER: Duration = Duration::from_secs(1);
 const LINGER_BYTES: u64 = 64 << 10;
 /// Pause after a failed `accept`, so running out of file descriptors doesn't spin a core.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// googlevideo paces one long Range request to about twice the video's
+/// bitrate, from the first byte (0.4 MB/s for a 1080p video, measured), while a
+/// bounded range of this size comes at line speed. So a player's open-ended
+/// request is fetched upstream as consecutive ranges of this size and handed
+/// on as one response. yt-dlp splits its downloads the same way.
+const CHUNK: u64 = 10 << 20;
+/// The next chunk is requested once no more than this is waiting for the
+/// player, so it arrives before the player runs out. At most this plus one
+/// chunk is held per relayed stream.
+const LOW_WATER: usize = 2 << 20;
+/// How often a relay waiting on the other side of `Ahead` looks at the cancel flag.
+const AHEAD_POLL: Duration = Duration::from_millis(250);
 
 pub struct Server {
     runtime: RwLock<Arc<Runtime>>,
@@ -609,7 +621,13 @@ impl Server {
         }
     }
 
-    fn relay(&self, out: &mut TcpStream, req: &Request, sid: &str, kind: &str) -> Result<()> {
+    fn relay(
+        self: &Arc<Self>,
+        out: &mut TcpStream,
+        req: &Request,
+        sid: &str,
+        kind: &str,
+    ) -> Result<()> {
         let Some(s) = self.session(sid) else {
             return respond(out, 404, "text/plain", b"stream expired");
         };
@@ -619,8 +637,20 @@ impl Server {
         if s.cancelled.load(Ordering::Acquire) {
             return respond(out, 404, "text/plain", b"stream expired");
         }
+        // A GET for a byte range (what mpv sends, `bytes=N-` at the start and
+        // after every seek) starts with one bounded chunk; anything else is
+        // forwarded as it is.
+        let wanted = match req.method.as_str() {
+            "GET" => req.header("range").and_then(Wanted::parse),
+            _ => None,
+        };
+        let range = match &wanted {
+            Some(w) => Some(w.first_chunk()),
+            None => req.header("range").map(String::from),
+        };
+        let range = range.as_deref();
         let mut live = lock(&s.live).clone();
-        let mut up = match fetch_upstream(&live, &s.route, req, kind) {
+        let mut up = match fetch_upstream(&live, &s.route, &req.method, kind, range) {
             Ok(Some(up)) => up,
             Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
             Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
@@ -638,7 +668,7 @@ impl Server {
                     return respond(out, 502, "text/plain", msg.as_bytes());
                 }
             };
-            up = match fetch_upstream(&live, &s.route, req, kind) {
+            up = match fetch_upstream(&live, &s.route, &req.method, kind, range) {
                 Ok(Some(up)) => up,
                 Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
                 Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
@@ -665,6 +695,9 @@ impl Server {
                 b"the stream is a playlist (HLS or DASH), which qveil can't relay through your route",
             );
         }
+        if let Some(plan) = wanted.and_then(|w| w.plan(&up)) {
+            return self.relay_chunked(out, &s, kind, live, up, plan);
+        }
         let mut head = format!(
             "HTTP/1.1 {} {}\r\n",
             status.as_u16(),
@@ -684,6 +717,62 @@ impl Server {
             copy_body(&mut up, out, &s.cancelled)?;
         }
         Ok(())
+    }
+
+    /// Answers a range with one response while a second thread fetches it
+    /// upstream chunk by chunk (see `CHUNK`). `first` is the first chunk's
+    /// response, already checked by `relay`.
+    fn relay_chunked(
+        self: &Arc<Self>,
+        out: &mut TcpStream,
+        s: &Arc<Session>,
+        kind: &str,
+        live: Live,
+        first: reqwest::blocking::Response,
+        plan: Plan,
+    ) -> Result<()> {
+        let ctype = first
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let ahead = Arc::new(Ahead::default());
+        let fetcher = Fetcher {
+            server: Arc::clone(self),
+            session: Arc::clone(s),
+            kind: kind.to_string(),
+            live,
+            ahead: Arc::clone(&ahead),
+            pos: plan.start,
+            chunk_end: plan.first_end,
+            end: plan.end,
+            total: plan.total,
+        };
+        if std::thread::Builder::new()
+            .spawn(move || fetcher.run(first))
+            .is_err()
+        {
+            return respond(out, 503, "text/plain", b"too busy to relay this stream");
+        }
+        // Whatever happens from here on, the fetcher stops once this returns.
+        let _gone = Gone(&ahead);
+        let mut head = String::from("HTTP/1.1 206 Partial Content\r\n");
+        if let Some(t) = ctype {
+            head.push_str(&format!("Content-Type: {t}\r\n"));
+        }
+        head.push_str(&format!(
+            "Content-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\n",
+            plan.end - plan.start + 1,
+            plan.start,
+            plan.end,
+            plan.total
+        ));
+        head.push_str(
+            "Accept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        );
+        out.write_all(head.as_bytes())?;
+        out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
+        ahead.drain_into(out, &s.cancelled)
     }
 
     /// Resolves the session's video again on a fresh pinned identity and
@@ -718,14 +807,15 @@ impl Server {
     }
 }
 
-/// Starts the upstream request for one relayed GET or HEAD, forwarding the
-/// Range header. `None` means there is no separate audio stream. Errors are
-/// text for the client, without the URL: it is signed for this address.
+/// Starts the upstream request for one relayed GET or HEAD, with `range` as
+/// its Range header. `None` means there is no separate audio stream. Errors
+/// are text for the client, without the URL: it is signed for this address.
 fn fetch_upstream(
     live: &Live,
     route: &Net,
-    req: &Request,
+    method: &str,
     kind: &str,
+    range: Option<&str>,
 ) -> Result<Option<reqwest::blocking::Response>, String> {
     let url = match kind {
         "v" => live.video.as_str(),
@@ -734,7 +824,7 @@ fn fetch_upstream(
             None => return Ok(None),
         },
     };
-    let method = if req.method == "HEAD" {
+    let method = if method == "HEAD" {
         Method::HEAD
     } else {
         Method::GET
@@ -743,12 +833,321 @@ fn fetch_upstream(
     for (k, v) in &live.headers {
         rb = rb.header(k.as_str(), v.as_str());
     }
-    if let Some(r) = req.header("range") {
+    if let Some(r) = range {
         rb = rb.header(RANGE, r);
     }
     rb.send()
         .map(Some)
         .map_err(|e| friendly(&route.explain(&format!("{:#}", e.without_url()))))
+}
+
+/// The byte range a player asked for: `bytes=start-` or `bytes=start-end`.
+/// Suffix ranges and lists of ranges are forwarded as they are instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Wanted {
+    start: u64,
+    end: Option<u64>,
+}
+
+impl Wanted {
+    fn parse(header: &str) -> Option<Wanted> {
+        let spec = header.trim().strip_prefix("bytes=")?.trim();
+        let (a, b) = spec.split_once('-')?;
+        let start = a.trim().parse().ok()?;
+        let end = match b.trim() {
+            "" => None,
+            b => Some(b.parse().ok()?),
+        };
+        match end {
+            Some(e) if e < start => None,
+            _ => Some(Wanted { start, end }),
+        }
+    }
+
+    /// The Range header of the first upstream request: at most one chunk.
+    fn first_chunk(&self) -> String {
+        let last = self.start.saturating_add(CHUNK - 1);
+        let last = self.end.map_or(last, |e| e.min(last));
+        format!("bytes={}-{last}", self.start)
+    }
+
+    /// How to serve the rest, if the first chunk's response allows it: a 206
+    /// that starts where asked and says how long the whole stream is.
+    /// Anything else (a 200, a 416, an unknown length) is forwarded as it is.
+    fn plan(&self, first: &reqwest::blocking::Response) -> Option<Plan> {
+        if first.status() != StatusCode::PARTIAL_CONTENT {
+            return None;
+        }
+        let (a, b, total) = content_range(first)?;
+        if a != self.start || total == 0 {
+            return None;
+        }
+        let end = self.end.map_or(total - 1, |e| e.min(total - 1));
+        (b <= end).then_some(Plan {
+            start: a,
+            first_end: b,
+            end,
+            total,
+        })
+    }
+}
+
+/// A chunked relay: the bytes `start..=end` of a stream `total` bytes long,
+/// of which the first response carries `start..=first_end`.
+#[derive(Debug)]
+struct Plan {
+    start: u64,
+    first_end: u64,
+    end: u64,
+    total: u64,
+}
+
+/// `Content-Range: bytes a-b/total`, with a known total.
+fn content_range(up: &reqwest::blocking::Response) -> Option<(u64, u64, u64)> {
+    let v = up.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    let (span, total) = v.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (a, b) = span.split_once('-')?;
+    let (a, b, total) = (a.parse().ok()?, b.parse().ok()?, total.parse().ok()?);
+    (a <= b && b < total).then_some((a, b, total))
+}
+
+/// The bytes fetched for one relayed range and not yet written to the player,
+/// shared by the thread that fetches them (`Fetcher`) and the one that writes
+/// them (`drain_into`).
+#[derive(Default)]
+struct Ahead {
+    state: Mutex<AheadState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct AheadState {
+    blocks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// Set by the fetcher when it stops: `Ok` once the range is complete or it
+    /// was told to stop, `Err` when the stream broke upstream.
+    done: Option<Result<(), String>>,
+    /// Set when the player has gone, or the relay ended for any other reason.
+    gone: bool,
+}
+
+impl Ahead {
+    fn wait<'a>(&self, st: MutexGuard<'a, AheadState>) -> MutexGuard<'a, AheadState> {
+        match self.changed.wait_timeout(st, AHEAD_POLL) {
+            Ok((st, _)) => st,
+            Err(e) => e.into_inner().0,
+        }
+    }
+
+    /// Writes what the fetcher delivers to the player, until the range is
+    /// complete. As in `copy_body`, a failed write or a cancel ends it
+    /// quietly, and a stream that broke upstream is returned as an error, so
+    /// the player is left short of the Content-Length.
+    fn drain_into(&self, out: &mut impl Write, cancelled: &AtomicBool) -> Result<()> {
+        loop {
+            let block = {
+                let mut st = lock(&self.state);
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    if let Some(b) = st.blocks.pop_front() {
+                        st.bytes -= b.len();
+                        self.changed.notify_all();
+                        break b;
+                    }
+                    match &st.done {
+                        Some(Ok(())) => return Ok(()),
+                        Some(Err(e)) => return Err(StreamBroke(io::Error::other(e.clone())).into()),
+                        None => st = self.wait(st),
+                    }
+                }
+            };
+            if out.write_all(&block).is_err() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Tells the fetcher the player is gone when the relay ends, however it ends.
+struct Gone<'a>(&'a Ahead);
+
+impl Drop for Gone<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.state).gone = true;
+        self.0.changed.notify_all();
+    }
+}
+
+/// Fetches a relayed range upstream, one bounded chunk after another, ahead
+/// of the player by at most `LOW_WATER` plus one chunk. Each chunk is read to
+/// its end straight away, so its connection goes back to the session's pool
+/// for the next chunk (or the next seek) instead of being held half-read
+/// while the player's cache is full.
+struct Fetcher {
+    server: Arc<Server>,
+    session: Arc<Session>,
+    kind: String,
+    live: Live,
+    ahead: Arc<Ahead>,
+    /// The next byte to fetch.
+    pos: u64,
+    /// The last byte of the chunk being read.
+    chunk_end: u64,
+    /// The last byte the player asked for.
+    end: u64,
+    total: u64,
+}
+
+/// How reading one chunk's body ended.
+enum Taken {
+    Complete,
+    Stopped,
+    Broke(String),
+}
+
+impl Fetcher {
+    fn run(mut self, first: reqwest::blocking::Response) {
+        let result = self.fetch(first);
+        lock(&self.ahead.state).done = Some(result);
+        self.ahead.changed.notify_all();
+    }
+
+    fn stopped(&self) -> bool {
+        self.session.cancelled.load(Ordering::Acquire) || lock(&self.ahead.state).gone
+    }
+
+    fn fetch(&mut self, first: reqwest::blocking::Response) -> Result<(), String> {
+        let mut up = first;
+        // Where the last connection failed. A connection that drops part-way
+        // is picked up again at the byte where it broke, but a second failure
+        // at the same byte ends the stream.
+        let mut failed_at = None;
+        loop {
+            match self.take(&mut up) {
+                Taken::Stopped => return Ok(()),
+                Taken::Complete if self.pos > self.end => return Ok(()),
+                Taken::Complete => {}
+                Taken::Broke(e) => once_at(self.pos, &mut failed_at, e)?,
+            }
+            up = loop {
+                if !self.wait_for_room() {
+                    return Ok(());
+                }
+                match self.request() {
+                    Ok(next) => break next,
+                    Err(_) if self.stopped() => return Ok(()),
+                    Err(Failure::Connection(e)) => once_at(self.pos, &mut failed_at, e)?,
+                    Err(Failure::Final(e)) => return Err(e),
+                }
+            };
+        }
+    }
+
+    /// Reads the current chunk's body into `ahead`.
+    fn take(&mut self, up: &mut reqwest::blocking::Response) -> Taken {
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            if self.stopped() {
+                return Taken::Stopped;
+            }
+            let n = match up.read(&mut buf) {
+                Ok(0) if self.pos > self.chunk_end => return Taken::Complete,
+                Ok(0) => return Taken::Broke("the stream ended early upstream".into()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) if self.stopped() => return Taken::Stopped,
+                Err(e) => return Taken::Broke(e.to_string()),
+            };
+            // The read can have taken a long time.
+            if self.stopped() {
+                return Taken::Stopped;
+            }
+            // Never more than the chunk that was asked for.
+            let n = n.min((self.chunk_end + 1 - self.pos) as usize);
+            if n == 0 {
+                return Taken::Broke("the stream sent more than it was asked for".into());
+            }
+            self.pos += n as u64;
+            let mut st = lock(&self.ahead.state);
+            st.bytes += n;
+            st.blocks.push_back(buf[..n].to_vec());
+            drop(st);
+            self.ahead.changed.notify_all();
+        }
+    }
+
+    /// Waits until the player has used up all but `LOW_WATER` of what is
+    /// fetched. False if it went away meanwhile, or the route changed.
+    fn wait_for_room(&self) -> bool {
+        let mut st = lock(&self.ahead.state);
+        loop {
+            if st.gone || self.session.cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+            if st.bytes <= LOW_WATER {
+                return true;
+            }
+            st = self.ahead.wait(st);
+        }
+    }
+
+    /// Requests the next chunk, from `pos`. A 403 resolves the stream again
+    /// once, as in `relay`: a long video outlives the address its URLs were
+    /// resolved from.
+    fn request(&mut self) -> Result<reqwest::blocking::Response, Failure> {
+        let last = self.end.min(self.pos + CHUNK - 1);
+        let range = format!("bytes={}-{last}", self.pos);
+        let route = &self.session.route;
+        let get = |live: &Live| match fetch_upstream(live, route, "GET", &self.kind, Some(&range)) {
+            Ok(Some(up)) => Ok(up),
+            Ok(None) => Err(Failure::Final("no separate audio".into())),
+            Err(e) => Err(Failure::Connection(e)),
+        };
+        let mut up = get(&self.live)?;
+        if up.status() == StatusCode::FORBIDDEN {
+            self.live = self
+                .server
+                .refresh(&self.session, self.live.generation)
+                .map_err(|e| Failure::Final(friendly(&format!("{e:#}"))))?;
+            up = get(&self.live)?;
+        }
+        let status = up.status();
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(Failure::Final(format!(
+                "upstream answered {status} part-way through the stream"
+            )));
+        }
+        match content_range(&up) {
+            Some((a, b, total)) if a == self.pos && total == self.total && b <= self.end => {
+                self.chunk_end = b;
+                Ok(up)
+            }
+            _ => Err(Failure::Final(
+                "upstream sent a different range than the one asked for".into(),
+            )),
+        }
+    }
+}
+
+/// Why the next chunk couldn't be requested.
+enum Failure {
+    /// The connection failed; worth one more try.
+    Connection(String),
+    /// Upstream answered, and not with the chunk (a 403 that a fresh resolve
+    /// didn't cure, say): trying again would only repeat that.
+    Final(String),
+}
+
+/// Lets the first failure at byte `pos` pass, so it is tried again, and
+/// returns the second one in a row as the error that ends the stream.
+fn once_at(pos: u64, failed_at: &mut Option<u64>, e: String) -> Result<(), String> {
+    if *failed_at == Some(pos) {
+        return Err(e);
+    }
+    *failed_at = Some(pos);
+    Ok(())
 }
 
 /// Streams the body to the client. mpv drops the connection whenever it
@@ -1390,6 +1789,8 @@ echo '{"entries":[]}'"#,
         live: AtomicUsize,
         /// Bytes written so far, over all of them.
         sent: AtomicUsize,
+        /// How many more `/big` responses to cut off half-way.
+        cuts: Mutex<usize>,
     }
 
     /// A tiny stand-in for googlevideo on a local port. It records every
@@ -1450,6 +1851,9 @@ echo '{"entries":[]}'"#,
         log.lock().unwrap().push((target.clone(), range.clone()));
         let body = payload();
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        if path == "/big" {
+            return big(conn, query, range.as_deref(), head_only, gauge);
+        }
         if path == "/endless" {
             // A video that never ends, 16 KiB at a time, `pace` ms apart, until
             // the other side hangs up.
@@ -1514,6 +1918,101 @@ echo '{"entries":[]}'"#,
             "/cut" => send("200 OK", "Content-Type: video/mp4\r\n", &body[..10], 100),
             _ => send("404 Not Found", "", b"", 0),
         }
+    }
+
+    /// The size of `/big` unless asked otherwise: two chunks and a bit, so a
+    /// whole read crosses two chunk boundaries.
+    const BIG: u64 = 2 * CHUNK + 12_345;
+
+    /// Byte `i` of `/big`. 251 is prime, so the pattern never lines up with
+    /// a chunk boundary and a byte lost or repeated there shows.
+    fn big_byte(i: u64) -> u8 {
+        (i % 251) as u8
+    }
+
+    fn big_bytes(from: u64, to: u64) -> Vec<u8> {
+        (from..to).map(big_byte).collect()
+    }
+
+    /// A long video on the fake googlevideo, answering Range requests like
+    /// the real one. In the query: `size=` its length, `pace=` ms between
+    /// 16 KiB writes, `gen=1` a URL that has gone stale once the first chunk
+    /// is through (a retired Tor circuit), `stale=` one that is never good
+    /// again after that, and `dead=1` one whose connections die at once after
+    /// the first chunk. `Gauge::cuts` makes that many responses stop half-way.
+    fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: bool, gauge: &Gauge) {
+        let param = |k: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+        };
+        let size: u64 = param("size").and_then(|s| s.parse().ok()).unwrap_or(BIG);
+        let pace: u64 = param("pace").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let (a, b) = match range.and_then(|r| r.strip_prefix("bytes=")) {
+            Some(r) => {
+                let (a, b) = r.split_once('-').unwrap();
+                let a: u64 = a.parse().unwrap();
+                let b = b.parse().map_or(size - 1, |b: u64| b.min(size - 1));
+                (a, b)
+            }
+            None => (0, size - 1),
+        };
+        let past_first = a > 0;
+        if past_first && (param("gen") == Some("1") || param("stale").is_some()) {
+            let _ = write!(
+                conn,
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied"
+            );
+            return;
+        }
+        if a >= size {
+            let _ = write!(
+                conn,
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            return;
+        }
+        let status = if range.is_some() {
+            format!("206 Partial Content\r\nContent-Range: bytes {a}-{b}/{size}")
+        } else {
+            "200 OK".to_string()
+        };
+        let _ = write!(
+            conn,
+            "HTTP/1.1 {status}\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            b - a + 1
+        );
+        if head_only {
+            return;
+        }
+        let mut stop = b + 1;
+        if past_first && param("dead").is_some() {
+            stop = a;
+        }
+        let cut = {
+            let mut cuts = gauge.cuts.lock().unwrap();
+            let cut = *cuts > 0;
+            *cuts = cuts.saturating_sub(1);
+            cut
+        };
+        if cut {
+            stop = a + (b + 1 - a) / 2;
+        }
+        gauge.live.fetch_add(1, Ordering::SeqCst);
+        let mut at = a;
+        while at < stop {
+            let n = (16 << 10).min(stop - at);
+            let block = big_bytes(at, at + n);
+            if conn.write_all(&block).is_err() {
+                break;
+            }
+            gauge.sent.fetch_add(block.len(), Ordering::SeqCst);
+            at += n;
+            if pace > 0 {
+                std::thread::sleep(Duration::from_millis(pace));
+            }
+        }
+        gauge.live.fetch_sub(1, Ordering::SeqCst);
     }
 
     type Fetched = (u16, HashMap<String, String>, Vec<u8>);
@@ -1693,7 +2192,7 @@ echo '{"entries":[]}'"#,
     }
 
     /// Polls until `cond` holds, or panics after `within`.
-    fn wait_for(what: &str, within: Duration, cond: impl Fn() -> bool) {
+    fn wait_for(what: &str, within: Duration, mut cond: impl FnMut() -> bool) {
         let started = Instant::now();
         while !cond() {
             assert!(started.elapsed() < within, "gave up waiting for {what}");
@@ -2083,5 +2582,315 @@ EOF
         // Anything else replaces it.
         post(r#"{"route":"proxy","proxy":"http://10.0.0.1:8080"}"#);
         assert_eq!(saved(&s).as_deref(), Some("http://10.0.0.1:8080"));
+    }
+
+    #[test]
+    fn player_ranges_are_parsed_and_anything_else_is_left_alone() {
+        let w = |start, end| Some(Wanted { start, end });
+        assert_eq!(Wanted::parse("bytes=0-"), w(0, None));
+        assert_eq!(Wanted::parse(" bytes=5-9 "), w(5, Some(9)));
+        for other in [
+            "bytes=-500",
+            "bytes=0-1,5-9",
+            "bytes=9-5",
+            "items=0-",
+            "bytes=x-",
+        ] {
+            assert_eq!(Wanted::parse(other), None, "{other}");
+        }
+        assert_eq!(
+            w(7, None).unwrap().first_chunk(),
+            format!("bytes=7-{}", 7 + CHUNK - 1)
+        );
+        assert_eq!(w(7, Some(9)).unwrap().first_chunk(), "bytes=7-9");
+    }
+
+    /// The Range headers the upstream has been sent, in order.
+    fn ranges(up: &Upstream) -> Vec<String> {
+        up.requests().into_iter().filter_map(|r| r.1).collect()
+    }
+
+    #[test]
+    fn a_long_range_is_fetched_in_chunks_and_served_as_one_response() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/big"));
+        let stream = format!("s/{sid}/v");
+        let get = |range: &str| fetch(&base, "GET", &stream, &[("Range", range)]);
+
+        // What mpv sends at the start: the whole video, in one response…
+        let (status, headers, body) = get("bytes=0-");
+        assert_eq!(status, 206);
+        assert_eq!(
+            headers["content-range"],
+            format!("bytes 0-{}/{BIG}", BIG - 1)
+        );
+        assert_eq!(headers["content-length"], BIG.to_string());
+        assert_eq!(headers["content-type"], "video/mp4");
+        assert!(body == big_bytes(0, BIG), "the bytes differ");
+        // …fetched as bounded ranges that follow on from each other.
+        assert_eq!(
+            ranges(&up),
+            [
+                format!("bytes=0-{}", CHUNK - 1),
+                format!("bytes={CHUNK}-{}", 2 * CHUNK - 1),
+                format!("bytes={}-{}", 2 * CHUNK, BIG - 1),
+            ]
+        );
+
+        // After a seek: from wherever the player asks, not from a boundary.
+        let from = CHUNK - 7;
+        let before = ranges(&up).len();
+        let (status, headers, body) = get(&format!("bytes={from}-"));
+        assert_eq!(status, 206);
+        assert_eq!(
+            headers["content-range"],
+            format!("bytes {from}-{}/{BIG}", BIG - 1)
+        );
+        assert!(body == big_bytes(from, BIG), "the bytes differ");
+        assert_eq!(
+            ranges(&up)[before..],
+            [
+                format!("bytes={from}-{}", from + CHUNK - 1),
+                format!("bytes={}-{}", from + CHUNK, BIG - 1),
+            ]
+        );
+
+        // A bounded range that spans a chunk boundary, and one that spans more
+        // than a chunk.
+        let (status, headers, body) = get(&format!("bytes={}-{}", CHUNK - 5, CHUNK + 4));
+        assert_eq!(status, 206);
+        assert_eq!(headers["content-length"], "10");
+        assert_eq!(body, big_bytes(CHUNK - 5, CHUNK + 5));
+        let last = 2 * CHUNK + 50;
+        let before = ranges(&up).len();
+        let (_, headers, body) = get(&format!("bytes=100-{last}"));
+        assert_eq!(headers["content-range"], format!("bytes 100-{last}/{BIG}"));
+        assert!(body == big_bytes(100, last + 1), "the bytes differ");
+        assert_eq!(
+            ranges(&up)[before..],
+            [
+                format!("bytes=100-{}", CHUNK + 99),
+                format!("bytes={}-{last}", CHUNK + 100),
+            ]
+        );
+
+        // An end past the video is cut to it, and a start past it is the
+        // upstream's 416, passed on.
+        let (_, headers, body) = get(&format!("bytes={}-{}", BIG - 3, BIG + 1000));
+        assert_eq!(
+            headers["content-range"],
+            format!("bytes {}-{}/{BIG}", BIG - 3, BIG - 1)
+        );
+        assert_eq!(body.len(), 3);
+        assert_eq!(get(&format!("bytes={BIG}-")).0, 416);
+    }
+
+    #[test]
+    fn a_403_part_way_resolves_again_and_carries_on_from_the_same_byte() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        // `gen=1` stops working after the first chunk, like a URL whose Tor
+        // circuit was retired while the video played; `gen=2` is fresh.
+        let ytdlp = fake_ytdlp(&bin.0, &up.url("/big?gen="));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            rel(&base, &info.video),
+            &[("Range", "bytes=0-")],
+        );
+        assert_eq!(status, 206);
+        assert!(body == big_bytes(0, BIG), "the bytes differ");
+        assert_eq!(runs(&bin.0), 2, "one more resolve, not more");
+        let seen: Vec<_> = up
+            .requests()
+            .into_iter()
+            .map(|(t, r)| format!("{t} {}", r.unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                format!("/big?gen=1 bytes=0-{}", CHUNK - 1),
+                format!("/big?gen=1 bytes={CHUNK}-{}", 2 * CHUNK - 1),
+                format!("/big?gen=2 bytes={CHUNK}-{}", 2 * CHUNK - 1),
+                format!("/big?gen=2 bytes={}-{}", 2 * CHUNK, BIG - 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_403_part_way_that_persists_cuts_the_stream_short_after_one_resolve() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(&bin.0, &up.url("/big?stale="));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        let (status, headers, body) = fetch(
+            &base,
+            "GET",
+            rel(&base, &info.video),
+            &[("Range", "bytes=0-")],
+        );
+        // The player was promised the whole video and gets the first chunk,
+        // so it can tell the stream broke.
+        assert_eq!(status, 206);
+        assert_eq!(headers["content-length"], BIG.to_string());
+        assert!(body == big_bytes(0, CHUNK), "the bytes differ");
+        assert_eq!(runs(&bin.0), 2, "no resolve loop");
+    }
+
+    #[test]
+    fn a_connection_that_drops_part_way_is_picked_up_where_it_broke() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/big"));
+        *up.gauge.cuts.lock().unwrap() = 1;
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            &format!("s/{sid}/v"),
+            &[("Range", "bytes=0-")],
+        );
+        assert_eq!(status, 206);
+        assert!(body == big_bytes(0, BIG), "the bytes differ");
+        let half = CHUNK / 2;
+        assert_eq!(ranges(&up)[1], format!("bytes={half}-{}", half + CHUNK - 1));
+    }
+
+    #[test]
+    fn a_stream_that_keeps_breaking_is_cut_short_for_the_client() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url("/big?dead=1"));
+        let (status, headers, body) = fetch(
+            &base,
+            "GET",
+            &format!("s/{sid}/v"),
+            &[("Range", "bytes=0-")],
+        );
+        assert_eq!(status, 206);
+        assert_eq!(headers["content-length"], BIG.to_string());
+        assert!(body == big_bytes(0, CHUNK), "the bytes differ");
+        // The first chunk, then the second twice: one retry, not a loop.
+        assert_eq!(ranges(&up).len(), 3, "{:?}", ranges(&up));
+    }
+
+    /// Like `start_stream`, but expects a chunked relay's 206.
+    fn start_ranged(base: &str, sid: &str) -> TcpStream {
+        let mut c = TcpStream::connect(addr(base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            c,
+            "GET {} HTTP/1.1\r\nHost: x\r\nRange: bytes=0-\r\n\r\n",
+            path(base, &format!("s/{sid}/v"))
+        )
+        .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            assert_eq!(c.read(&mut b).unwrap(), 1, "the head ended early");
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 206"), "{head:?}");
+        c
+    }
+
+    /// Reads until the relay closes the connection, which must happen within 5 s.
+    fn wait_for_close(player: &mut TcpStream) {
+        let started = Instant::now();
+        let mut buf = vec![0u8; 256 << 10];
+        loop {
+            match player.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the stream carries on"
+                ),
+            }
+        }
+    }
+
+    /// Waits until the upstream has had no request and sent no byte for a
+    /// while, and returns how many requests it had.
+    fn settled(up: &Upstream) -> usize {
+        let snapshot = || (up.requests().len(), up.gauge.sent.load(Ordering::SeqCst));
+        let mut last = snapshot();
+        wait_for("the upstream to go quiet", Duration::from_secs(5), || {
+            std::thread::sleep(Duration::from_millis(300));
+            let now = snapshot();
+            std::mem::replace(&mut last, now) == now
+        });
+        last.0
+    }
+
+    #[test]
+    fn a_route_switch_ends_a_chunked_stream_part_way_through_a_chunk() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        // Slow enough that the switch lands in the middle of the first chunk.
+        let sid = add_session(&s, up.url("/big?pace=5"));
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0;
+        while got < 100 << 10 {
+            got += player.read(&mut buf).unwrap();
+        }
+        switch_to_tor(&base);
+        wait_for_close(&mut player);
+        wait_for(
+            "the upstream connection to close",
+            Duration::from_secs(5),
+            || up.gauge.live.load(Ordering::SeqCst) == 0,
+        );
+        assert_eq!(settled(&up), 1, "no further chunk was asked for");
+    }
+
+    #[test]
+    fn a_route_switch_ends_a_chunked_stream_whose_player_has_paused() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let sid = add_session(&s, up.url(&format!("/big?size={}", 5 * CHUNK)));
+        // The player reads the head and then nothing. The relay fetches a
+        // chunk ahead and waits for room, with nothing being read upstream.
+        let mut paused = start_ranged(&base, &sid);
+        let requests = settled(&up);
+        assert!(
+            requests <= 2,
+            "{requests} chunks fetched for a paused player"
+        );
+        switch_to_tor(&base);
+        wait_for_close(&mut paused);
+        assert_eq!(settled(&up), requests, "fetching went on after the switch");
+    }
+
+    #[test]
+    fn fetching_stops_when_the_player_goes_away() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        // At this pace the first chunk takes over 3 s to arrive.
+        let sid = add_session(&s, up.url("/big?pace=5"));
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0;
+        while got < 100 << 10 {
+            got += player.read(&mut buf).unwrap();
+        }
+        // The player seeks elsewhere and hangs up: the rest of the chunk is
+        // left unread, not fetched for nobody.
+        drop(player);
+        wait_for(
+            "the upstream connection to close",
+            Duration::from_secs(1),
+            || up.gauge.live.load(Ordering::SeqCst) == 0,
+        );
+        assert_eq!(settled(&up), 1, "no further chunk was asked for");
     }
 }
