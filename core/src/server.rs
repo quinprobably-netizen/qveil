@@ -603,8 +603,7 @@ impl Server {
         }
         let url = format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg");
         let fetched = rt
-            .net
-            .client()
+            .web_client()
             .and_then(|c| Ok(c.get(url).send()?.error_for_status()?.bytes()?));
         match fetched {
             Ok(bytes) => {

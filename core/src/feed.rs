@@ -3,11 +3,10 @@
 //! intermittently returns 404/500), fall back to the channel's Videos tab via
 //! yt-dlp and date new uploads by when qveil first saw them.
 
+use crate::app::Runtime;
 use crate::ids::is_video_id;
-use crate::net::Net;
 use crate::subs::Sub;
 use crate::video::Video;
-use crate::ytdlp::Ytdlp;
 use anyhow::{Context, Result, bail};
 use rand::seq::SliceRandom;
 use roxmltree::Node;
@@ -68,12 +67,11 @@ pub struct Fetch {
     pub skipped: usize,
 }
 
-/// Fetches the channels' feeds on `net`. `current` says whether `net` is
+/// Fetches the channels' feeds on `rt`'s route. `current` says whether it is
 /// still the route in use: once it isn't, no further channel is started,
 /// because every request would go out over the route the user just left.
 pub fn fetch_all(
-    net: &Net,
-    yt: &Ytdlp,
+    rt: &Runtime,
     subs: &[Sub],
     workers: usize,
     current: &(dyn Fn() -> bool + Sync),
@@ -91,7 +89,7 @@ pub fn fetch_all(
                     let Some(sub) = queue.lock().unwrap().pop() else {
                         break;
                     };
-                    let r = fetch_one(net, yt, sub, current);
+                    let r = fetch_one(rt, sub, current);
                     let mut res = results.lock().unwrap();
                     match r {
                         Ok(f) => res.fetched.push(f),
@@ -109,7 +107,7 @@ pub fn fetch_all(
     res
 }
 
-fn fetch_one(net: &Net, yt: &Ytdlp, sub: &Sub, current: &dyn Fn() -> bool) -> Result<Fetched> {
+fn fetch_one(rt: &Runtime, sub: &Sub, current: &dyn Fn() -> bool) -> Result<Fetched> {
     let mut rss_err = None;
     for _ in 0..2 {
         // Each attempt is a request of its own, and the fallback below is a
@@ -117,7 +115,7 @@ fn fetch_one(net: &Net, yt: &Ytdlp, sub: &Sub, current: &dyn Fn() -> bool) -> Re
         if !current() {
             bail!("the route changed");
         }
-        match fetch_rss(net, &sub.id) {
+        match fetch_rss(rt, &sub.id) {
             Ok(videos) => return Ok(fetched(sub, videos, Source::Rss)),
             Err(e) => rss_err = Some(e),
         }
@@ -125,7 +123,8 @@ fn fetch_one(net: &Net, yt: &Ytdlp, sub: &Sub, current: &dyn Fn() -> bool) -> Re
     if !current() {
         bail!("the route changed");
     }
-    let videos = yt
+    let videos = rt
+        .yt
         .channel_videos(&sub.id, FALLBACK_LIMIT)
         .with_context(|| {
             format!(
@@ -148,9 +147,14 @@ fn fetched(sub: &Sub, mut videos: Vec<Video>, source: Source) -> Fetched {
     }
 }
 
-fn fetch_rss(net: &Net, channel_id: &str) -> Result<Vec<Video>> {
+fn fetch_rss(rt: &Runtime, channel_id: &str) -> Result<Vec<Video>> {
     let url = format!("https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}");
-    let body = net.client()?.get(url).send()?.error_for_status()?.text()?;
+    let body = rt
+        .web_client()?
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .text()?;
     parse_rss(&body)
 }
 
