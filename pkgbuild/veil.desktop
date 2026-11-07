@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=veil
+Comment=Watch YouTube privately, without an account
+Exec=veil
+Icon=veil
+Terminal=false
+Categories=AudioVideo;Video;Player;Network;
+Keywords=youtube;video;privacy;tor;
+StartupWMClass=veil

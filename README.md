@@ -1,19 +1,13 @@
 # veil
 
-A private, account-free YouTube frontend for the terminal. Search, subscribe
-and watch from a fuzzy picker straight into [mpv], with no Google account,
-no cookies and no browser, and an optional Tor route for every byte.
+A private, account-free YouTube app for Linux. Subscribe, search and watch
+in a native window with no Google account, no cookies and no browser, and
+optionally route every byte through Tor.
 
-> **Prototype.** Works day to day, but expect rough edges. Not affiliated with
-> YouTube or Google.
+![veil's feed, thumbnails veiled until hovered](docs/screenshot.png)
 
-```
-$ veil sub add @Fireship @NoBoilerplate
-$ veil feed            # latest uploads → fzf → mpv
-$ veil search rust in 100 seconds
-$ veil play 'https://youtu.be/5C_HPTJg5ek?si=tracking&t=30'   # si= dropped, t= kept
-$ veil --tor feed      # same thing, every request on its own Tor circuit
-```
+> **Prototype.** It works day to day, but expect rough edges. Not affiliated
+> with YouTube or Google.
 
 ## Privacy model
 
@@ -23,104 +17,105 @@ and to keep everything else on your machine.
 
 | | What veil does |
 |---|---|
-| **Account** | Never signs in. Subscriptions are a local list of channel IDs. |
-| **Cookies** | Never stored or sent. yt-dlp runs with `--ignore-config --no-cookies --no-cookies-from-browser`, so a cookie line in your yt-dlp config can't leak in, and its cache is separate from any logged-in yt-dlp use. |
-| **Subscription list** | Never sent as a whole. Each channel is fetched separately from the public RSS feed, in random order. With `--tor`, each fetch uses a different circuit, so YouTube sees unrelated exit IPs. |
-| **Tracking parameters** | Every URL is reduced to its video ID; `si=`, `pp=`, `feature=` and similar are dropped before any request. |
-| **Headers** | Feed requests send a common browser User-Agent and no Referer. |
-| **IP address** | Visible to YouTube unless you use a proxy. `--proxy` / `--tor` routes search, feeds, metadata **and video bytes**: with SOCKS, yt-dlp streams the video through the proxy into mpv, so nothing goes around it. `socks5://` is refused because it resolves DNS locally; use `socks5h://`. |
-| **Player state** | mpv runs with `--save-position-on-quit=no --save-watch-history=no`. |
-| **Local data** | Files are created `0600` in `0700` directories. Watch history is **off** by default. `veil wipe` deletes all of it. |
-| **Telemetry** | None. veil only talks to YouTube, through yt-dlp or the RSS endpoint. |
+| **One way out** | The window and its video player only ever talk to veil's engine on `127.0.0.1`, behind a random token. Every request that leaves your machine (search, feeds, thumbnails and the video bytes themselves) is made by the engine, through the route you pick. |
+| **Route** | *Direct*, *Tor*, or your own *Proxy*, always shown in the top bar: amber while YouTube can see your IP. With Tor, every feed, thumbnail and video gets its own circuit, and seeking still works because the engine relays Range requests. `socks5://` is refused (it leaks DNS); use `socks5h://`. |
+| **Account and cookies** | Never signed in, and no cookies stored or sent. yt-dlp runs with `--ignore-config --no-cookies --no-cookies-from-browser` and its own cache. The embedded player loads no mpv config or scripts. |
+| **Subscription list** | Never sent as a whole. Each channel's public feed is fetched on its own, in random order. |
+| **Tracking parameters** | Links are reduced to the video ID; `si=`, `pp=`, `feature=` and similar are dropped. |
+| **Player state** | No resume files, no watch history in mpv. |
+| **Local data** | Subscriptions and the feed cache live in `~/.local/share/veil` and `~/.cache/veil`, mode `0600`. Watch history is **off** by default. `veil wipe` deletes all of it. |
+| **Telemetry** | None. |
 
-**What YouTube can still see:** the IP you connect from (unless you use a
-proxy), each search and video you play, and the timing pattern of your
-requests. Even over Tor, a long session of related videos can be correlated
-by content. veil reduces linkability; it doesn't eliminate it.
+**What YouTube can still see:** the IP you connect from (on Direct), each
+search and video you play, and the timing of your requests. Even over Tor, a
+long session of related videos can be linked by content. veil reduces
+linkability; it doesn't eliminate it.
 
-`veil config` prints where your data lives and what is exposed with your
-current settings.
+## The app
+
+- **Feed**: latest uploads from your subscriptions. **Search** and **channel**
+  pages, **Subscriptions**, and an optional **History**.
+- Video plays inside the window (libmpv), with fullscreen.
+- **Veiled thumbnails**: thumbnails stay blurred and muted until you hover or
+  select them, so a wall of clickbait doesn't shout at you. You can switch
+  this off, or not load thumbnails at all.
+- **Moving from YouTube**: drop a Google Takeout `subscriptions.csv`, or a
+  NewPipe or FreeTube export, anywhere on the window. It's read offline.
+- Follows the Omarchy theme accent, window rounding and language, live.
+
+| Key | Action |
+|---|---|
+| `/` | Search |
+| `1` `2` `3` | Feed, subscriptions, history |
+| Arrows, `Enter` | Move and play |
+| `R` | Refresh |
+| `Space` | Play or pause |
+| `←` `→` / `J` `L` | Back or forward 5 / 10 seconds |
+| `↑` `↓` | Volume |
+| `M` | Mute |
+| `F` | Fullscreen |
+| `Esc` | Back |
+| `?` | All shortcuts |
+| `Q` | Quit |
 
 ## Install
 
-Needs [Rust], [yt-dlp] (kept up to date: it follows YouTube's changes), a JS
-runtime for yt-dlp ([deno] recommended), [mpv], ffmpeg, and optionally [fzf]
-for the picker (without it you get a numbered list).
+On Arch / Omarchy:
 
 ```sh
-cargo install --git https://github.com/quinprobably-netizen/veil
+git clone https://github.com/quinprobably-netizen/veil
+cd veil
+bin/install          # builds and installs the package; veil appears in the launcher
 ```
 
-For Tor, run the `tor` service. veil uses `127.0.0.1:9050`.
+It needs Qt 6, mpv (libmpv), yt-dlp (keep it updated: it follows YouTube's
+changes), ffmpeg, Rust to build, and [deno] for yt-dlp's YouTube support. For
+the Tor route, install and start `tor`.
 
-## Usage
+## Command line
 
-```
-veil search <query…>   [-n 20] [--list|--json]
-veil feed              [-n 80] [--no-shorts] [--offline] [--list|--json]
-veil play <url|id>
-veil sub add <@handle|channel URL|UC…>…
-veil sub rm <id|name>
-veil sub list
-veil sub import <subscriptions.csv | newpipe.json | freetube.db>
-veil sub export        > newpipe.json
-veil history [--clear]
-veil config
-veil wipe [--yes]
-```
-
-Global flags: `--proxy <url>`, `--tor`.
-
-`--json` output is stable enough to build a GUI on, so a desktop shell or
-launcher can sit on top of veil.
-
-**Importing:** Google Takeout's `subscriptions.csv`, NewPipe's export and
-FreeTube's `subscriptions.db` are parsed offline. Importing makes no network
-requests.
-
-## Configuration
-
-Optional: `~/.config/veil/config.toml`. See
-[`config.example.toml`](config.example.toml). Unknown keys are an error, so
-a typo such as `histroy = true` can't silently do nothing.
-
-## How it works
-
-- **Feeds:** YouTube's public RSS feed for each channel. That endpoint
-  sometimes returns 404/500, so veil retries once and then falls back to the
-  channel's Videos tab via yt-dlp with approximate dates (shown with `~`). A
-  channel's back catalogue is never shown as new.
-- **Search, channel lookup and stream URLs:** [yt-dlp]. YouTube's private API,
-  signature and n-parameter deciphering, and PO tokens change constantly.
-  Relying on yt-dlp means veil gets its fixes by updating one package.
-- **Playback:** direct stream URLs handed to mpv. Through a SOCKS proxy,
-  yt-dlp downloads and pipes into mpv instead, because mpv can't use SOCKS
-  and the stream URLs are tied to the IP that requested them.
+`veil` with a command runs the engine directly, so scripts and agents can use
+it without a display:
 
 ```
-src/
-  ids.rs     URL → video/channel ID; strips tracking parameters
-  net.rs     proxy validation, per-request Tor circuit isolation, HTTP client
-  feed.rs    RSS parsing, fallback, local feed cache and ordering
-  ytdlp.rs   isolated yt-dlp invocations
-  player.rs  mpv: direct or piped through the proxy
-  subs.rs    subscription store, Takeout/NewPipe/FreeTube import, export
-  store.rs   XDG paths, atomic 0600 writes
+veil feed --json
+veil search rust in 100 seconds --json
+veil sub add @handle
+veil sub import subscriptions.csv
+veil sub export > newpipe.json
+veil play <url>            # plays in a separate mpv window
+veil --tor feed --list
+veil config                # where data lives and what is exposed
+veil wipe
 ```
 
-## Known limitations
+## How it's built
 
-- Seeking is limited in SOCKS/Tor mode (it's a pipe).
-- No comments, playlists or thumbnails yet. Thumbnails would be another
-  request per video to YouTube's image CDN.
-- Feed dates from the fallback path are day-level approximations.
+```
+core/        veil-core, the engine (Rust)
+  server.rs    loopback API, thumbnail fetcher, Range-forwarding video relay
+  net.rs       route validation, per-request Tor circuit isolation
+  feed.rs      per-channel RSS with a yt-dlp fallback when RSS is down
+  ytdlp.rs     isolated yt-dlp calls: search, channels, stream resolution
+  ids.rs       URL → ID, dropping tracking parameters
+src/         the window (C++ / Qt Quick)
+  backend.*    starts veil-core and talks to it over loopback
+  mpvitem.*    libmpv rendered into the scene
+  *.qml        the interface
+```
+
+YouTube's private API, signature deciphering and PO tokens change
+constantly. veil leaves that to yt-dlp, so a fix there is a package update
+away. YouTube's RSS endpoint sometimes returns 404/500; the feed then falls
+back to the channel's Videos tab with approximate dates (shown with `~`).
+
+```sh
+bin/build    # engine + app into build/
+bin/test     # Rust and Qt tests
+```
 
 ## License
 
 MIT
 
-[mpv]: https://mpv.io
-[yt-dlp]: https://github.com/yt-dlp/yt-dlp
 [deno]: https://deno.com
-[fzf]: https://github.com/junegunn/fzf
-[Rust]: https://rustup.rs

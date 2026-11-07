@@ -1,0 +1,28 @@
+pkgname=veil
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Private, account-free YouTube app: no cookies, no account, optional Tor for every byte'
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'qt6-svg' 'mpv' 'yt-dlp' 'ffmpeg')
+optdepends=('deno: JavaScript runtime yt-dlp uses for YouTube'
+            'tor: hide your IP from YouTube, with a fresh circuit per request')
+makedepends=('cargo' 'gcc' 'make')
+# makepkg's -flto makes ring's C objects LTO bitcode, which the Rust linker can't read.
+options=('!lto' '!debug')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  ./bin/build
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 build/veil "$pkgdir/usr/bin/veil"
+  install -Dm755 build/veil-core "$pkgdir/usr/lib/veil/veil-core"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$startdir/veil.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/veil.svg"
+  install -Dm644 "$startdir/veil.desktop" "$pkgdir/usr/share/applications/veil.desktop"
+}

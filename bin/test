@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cargo test --locked --manifest-path "$ROOT/core/Cargo.toml"
+
+mkdir -p "$ROOT/build/tests"
+cd "$ROOT/build/tests"
+qmake6 "$ROOT/tests/veil_tests.pro"
+make -j"$(nproc)"
+QT_QPA_PLATFORM=offscreen ./veil_tests

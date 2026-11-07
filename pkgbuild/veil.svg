@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="14" fill="#FFD60A"/>
+  <path d="M25 19 L47 32 L25 45 Z" fill="#141418"/>
+  <!-- the veil: a translucent drape across the play mark -->
+  <path d="M8 22 C20 30, 44 14, 56 24 L56 40 C44 30, 20 46, 8 38 Z" fill="#ffffff" fill-opacity="0.55"/>
+</svg>

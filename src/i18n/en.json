@@ -1,0 +1,46 @@
+{
+  "%n min ago": {
+    "one": "%n min ago",
+    "other": "%n min ago"
+  },
+  "%n hours ago": {
+    "one": "%n hour ago",
+    "other": "%n hours ago"
+  },
+  "%n days ago": {
+    "one": "%n day ago",
+    "other": "%n days ago"
+  },
+  "%n months ago": {
+    "one": "%n month ago",
+    "other": "%n months ago"
+  },
+  "%n years ago": {
+    "one": "%n year ago",
+    "other": "%n years ago"
+  },
+  "%n channels": {
+    "one": "%n channel",
+    "other": "%n channels"
+  },
+  "Latest from %n channels": {
+    "one": "Latest from %n channel",
+    "other": "Latest from %n channels"
+  },
+  "dates marked ~ are approximate (RSS was down for %n)": {
+    "one": "dates marked ~ are approximate (RSS was down for %n)",
+    "other": "dates marked ~ are approximate (RSS was down for %n)"
+  },
+  "%n couldn't be fetched": {
+    "one": "%n couldn't be fetched",
+    "other": "%n couldn't be fetched"
+  },
+  "%n recent videos  ·  dates are approximate": {
+    "one": "%n recent video  ·  dates are approximate",
+    "other": "%n recent videos  ·  dates are approximate"
+  },
+  "Imported %n new channel(s), offline": {
+    "one": "Imported %n new channel, offline",
+    "other": "Imported %n new channels, offline"
+  }
+}

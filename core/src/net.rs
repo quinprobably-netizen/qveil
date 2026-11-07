@@ -68,18 +68,53 @@ impl Net {
         Some(format!("{scheme}://veil{user:016x}:x@{rest}"))
     }
 
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
+    }
+
+    pub fn isolates(&self) -> bool {
+        self.isolate && self.is_socks()
+    }
+
+    /// The same route with one fixed identity, for work that must keep a
+    /// single exit IP: stream URLs only work from the IP that resolved them,
+    /// so yt-dlp and the relay have to share a circuit.
+    pub fn pinned(&self) -> Net {
+        Net {
+            proxy: self.proxy_url(),
+            isolate: false,
+        }
+    }
+
     /// A fresh client: no cookie store, no Referer, browser UA, proxy applied.
     pub fn client(&self) -> Result<Client> {
+        self.build(Some(Duration::from_secs(20)))
+    }
+
+    /// Like `client`, but without a total timeout, because a relayed video
+    /// body can stream for an hour.
+    pub fn relay_client(&self) -> Result<Client> {
+        self.build(None)
+    }
+
+    fn build(&self, timeout: Option<Duration>) -> Result<Client> {
         let mut b = Client::builder()
             .user_agent(USER_AGENT)
             .referer(false)
             .https_only(true)
-            .timeout(Duration::from_secs(20));
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(timeout);
         if let Some(p) = self.proxy_url() {
             b = b.proxy(reqwest::Proxy::all(&p).context("invalid proxy URL")?);
         }
         Ok(b.build()?)
     }
+}
+
+/// Whether something is listening on Tor's default SOCKS port.
+pub fn tor_running() -> bool {
+    std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], 9050).into(), Duration::from_millis(300))
+        .is_ok()
 }
 
 fn redact(p: &str) -> String {
@@ -105,6 +140,12 @@ mod tests {
         let (a, b) = (n.proxy_url().unwrap(), n.proxy_url().unwrap());
         assert_ne!(a, b);
         assert!(a.starts_with("socks5h://veil") && a.ends_with(":x@127.0.0.1:9050"));
+        let pinned = n.pinned();
+        assert_eq!(
+            pinned.proxy_url(),
+            pinned.proxy_url(),
+            "a pinned route keeps one circuit"
+        );
     }
 
     #[test]

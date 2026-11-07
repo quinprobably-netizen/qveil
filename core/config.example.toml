@@ -14,6 +14,11 @@ max_height = 1080
 # Keep a local watch history. Nothing ever leaves this machine either way.
 history = false
 
+# Show thumbnails. They are fetched through the same route as everything else;
+# with Tor isolation each one gets its own circuit, so they never link your
+# subscriptions together.
+thumbnails = true
+
 # Channel feeds fetched at once.
 feed_workers = 4
 

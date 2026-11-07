@@ -18,6 +18,9 @@ pub struct Ytdlp {
 
 pub struct Streams {
     pub title: String,
+    pub channel: Option<String>,
+    pub channel_id: Option<String>,
+    pub duration: Option<u64>,
     pub video: String,
     pub audio: Option<String>,
     pub headers: Vec<(String, String)>,
@@ -123,6 +126,9 @@ impl Ytdlp {
             .unwrap_or_default();
         Ok(Streams {
             title,
+            channel: str_field(&v, &["channel", "uploader"]),
+            channel_id: str_field(&v, &["channel_id"]).filter(|c| ids::is_channel_id(c)),
+            duration: v["duration"].as_f64().map(|d| d as u64),
             video: video_fmt["url"]
                 .as_str()
                 .context("format has no URL")?

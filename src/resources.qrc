@@ -1,0 +1,27 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="Main.qml">Main.qml</file>
+        <file alias="SearchBox.qml">SearchBox.qml</file>
+        <file alias="VideoCard.qml">VideoCard.qml</file>
+        <file alias="VideoGrid.qml">VideoGrid.qml</file>
+        <file alias="VideoPage.qml">VideoPage.qml</file>
+        <file alias="PlayerView.qml">PlayerView.qml</file>
+        <file alias="RoutePopup.qml">RoutePopup.qml</file>
+        <file alias="SubsPage.qml">SubsPage.qml</file>
+        <file alias="HistoryPage.qml">HistoryPage.qml</file>
+        <file alias="HelpOverlay.qml">HelpOverlay.qml</file>
+        <file alias="Format.js">Format.js</file>
+        <file alias="i18n/en.json">i18n/en.json</file>
+        <file alias="icons/play.svg">icons/play.svg</file>
+        <file alias="icons/pause.svg">icons/pause.svg</file>
+        <file alias="icons/back.svg">icons/back.svg</file>
+        <file alias="icons/fullscreen.svg">icons/fullscreen.svg</file>
+        <file alias="icons/fullscreen-exit.svg">icons/fullscreen-exit.svg</file>
+        <file alias="icons/volume.svg">icons/volume.svg</file>
+        <file alias="icons/mute.svg">icons/mute.svg</file>
+        <file alias="icons/refresh.svg">icons/refresh.svg</file>
+        <file alias="icons/search.svg">icons/search.svg</file>
+        <file alias="icons/replay.svg">icons/replay.svg</file>
+        <file alias="icons/close.svg">icons/close.svg</file>
+    </qresource>
+</RCC>

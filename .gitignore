@@ -1,4 +1,9 @@
 /target
+/core/target
+/build/
+/pkgbuild/pkg/
+/pkgbuild/src/
+*.pkg.tar.*
 
 # Personal data must never be committed: exports, takeouts, local configs.
 *.csv

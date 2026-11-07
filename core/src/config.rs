@@ -15,6 +15,8 @@ pub struct Config {
     pub max_height: u32,
     /// Keep a local watch history. Off by default.
     pub history: bool,
+    /// Show thumbnails (fetched through the same route as everything else).
+    pub thumbnails: bool,
     /// How many channel feeds to fetch at once.
     pub feed_workers: usize,
     pub ytdlp: String,
@@ -30,6 +32,7 @@ impl Default for Config {
             isolate_circuits: true,
             max_height: 1080,
             history: false,
+            thumbnails: true,
             feed_workers: 4,
             ytdlp: "yt-dlp".into(),
             mpv: "mpv".into(),
@@ -45,6 +48,14 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let text = format!(
+            "# Written by veil when a setting changes in the app; comments are not kept.\n{}",
+            toml::to_string_pretty(self)?
+        );
+        crate::store::write_atomic(path, text.as_bytes())
     }
 
     pub fn format(&self) -> String {

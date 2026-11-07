@@ -8,6 +8,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Paths {
     pub config: PathBuf,
     pub data: PathBuf,
@@ -65,8 +66,12 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     }
 }
 
-/// Atomic write: a temp file created with mode 0600, synced, then renamed over the target.
 pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(value)?)
+}
+
+/// Atomic write: a temp file created with mode 0600, synced, then renamed over the target.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("path has no parent")?;
     ensure_dir(dir)?;
     let tmp = path.with_extension("tmp");
@@ -77,7 +82,7 @@ pub fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .mode(0o600)
         .open(&tmp)
         .with_context(|| format!("writing {}", tmp.display()))?;
-    f.write_all(&serde_json::to_vec_pretty(value)?)?;
+    f.write_all(bytes)?;
     f.sync_all()?;
     fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
 }
