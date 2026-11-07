@@ -133,19 +133,28 @@ pub fn parse_video(input: &str) -> Option<VideoRef> {
     })
 }
 
+/// What follows the `@`: something, without whitespace or control characters.
+fn is_handle(h: &str) -> bool {
+    !h.is_empty() && !h.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 pub fn parse_channel(input: &str) -> Option<ChannelRef> {
     let input = input.trim();
     if is_channel_id(input) {
         return Some(ChannelRef::Id(input.into()));
     }
     if let Some(handle) = input.strip_prefix('@') {
-        return (!handle.is_empty() && !handle.contains('/'))
+        // A pasted handle can carry a share query, a fragment or a tab:
+        // `@foo?si=x`, `@foo/videos`. Only the handle goes into the URL, so
+        // none of that reaches the network.
+        let handle = handle.split(['?', '#', '/']).next().unwrap_or_default();
+        return is_handle(handle)
             .then(|| ChannelRef::Url(format!("https://www.youtube.com/@{handle}")));
     }
     let url = parse_url(input)?;
     match url.path.as_slice() {
         ["channel", id, ..] if is_channel_id(id) => Some(ChannelRef::Id((*id).into())),
-        [h, ..] if h.starts_with('@') => {
+        [h, ..] if h.strip_prefix('@').is_some_and(is_handle) => {
             Some(ChannelRef::Url(format!("https://www.youtube.com/{h}")))
         }
         [kind @ ("c" | "user"), name, ..] => Some(ChannelRef::Url(format!(
@@ -234,6 +243,24 @@ mod tests {
             ))
         );
         assert_eq!(parse_channel("https://example.com/@x"), None);
-        assert_eq!(parse_channel("@a/b"), None);
+        assert_eq!(parse_channel("https://youtube.com/@"), None);
+    }
+
+    #[test]
+    fn bare_handles_drop_queries_fragments_and_paths() {
+        let handle = |h: &str| Some(ChannelRef::Url(format!("https://www.youtube.com/{h}")));
+        for input in [
+            "@foo?si=TRACKME",
+            "@foo?si=x&feature=share#t=3",
+            "@foo#top",
+            "@foo/videos",
+            "@foo/videos?view=0&si=x",
+            "  @foo  ",
+        ] {
+            assert_eq!(parse_channel(input), handle("@foo"), "{input}");
+        }
+        for input in ["@", "@?si=x", "@/videos", "@ foo", "@foo bar"] {
+            assert_eq!(parse_channel(input), None, "{input}");
+        }
     }
 }

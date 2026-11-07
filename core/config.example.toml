@@ -14,9 +14,11 @@ max_height = 1080
 # Keep a local watch history. Nothing ever leaves this machine either way.
 history = false
 
-# Show thumbnails. They are fetched through the same route as everything else;
-# with Tor isolation each one gets its own circuit, so they never link your
-# subscriptions together.
+# Show thumbnails. They are fetched through the same route as everything else.
+# With Tor isolation each one gets its own circuit, so separate requests can't
+# be linked by IP address. A refresh is still a burst of requests for exactly
+# the videos your channels uploaded, though, so timing and the set of IDs can
+# still tie them together.
 thumbnails = true
 
 # Channel feeds fetched at once.
