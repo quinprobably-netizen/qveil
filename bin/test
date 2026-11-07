@@ -6,6 +6,6 @@ cargo test --locked --manifest-path "$ROOT/core/Cargo.toml"
 
 mkdir -p "$ROOT/build/tests"
 cd "$ROOT/build/tests"
-qmake6 "$ROOT/tests/veil_tests.pro"
+qmake6 "$ROOT/tests/qveil_tests.pro"
 make -j"$(nproc)"
-QT_QPA_PLATFORM=offscreen ./veil_tests
+QT_QPA_PLATFORM=offscreen ./qveil_tests

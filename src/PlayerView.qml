@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
-import Veil
+import Qveil
 import "Format.js" as Format
 
 // The video, with controls that fade out while it plays.

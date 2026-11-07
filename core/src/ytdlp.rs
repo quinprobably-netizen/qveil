@@ -1,5 +1,5 @@
 //! yt-dlp does the work that breaks every few weeks (InnerTube parsing,
-//! signature/n-param deciphering, PO tokens), so veil follows its fixes for free.
+//! signature/n-param deciphering, PO tokens), so qveil follows its fixes for free.
 //! Every invocation is sandboxed from the user's own yt-dlp setup.
 
 use crate::errors::friendly;

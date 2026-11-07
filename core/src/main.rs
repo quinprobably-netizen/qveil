@@ -1,5 +1,5 @@
-//! veil-core: the engine behind the veil desktop app, and a command line of
-//! its own. `veil-core serve` runs the loopback server the app talks to.
+//! qveil-core: the engine behind the qveil desktop app, and a command line of
+//! its own. `qveil-core serve` runs the loopback server the app talks to.
 
 mod app;
 mod config;
@@ -31,12 +31,12 @@ use video::Video;
 
 #[derive(Parser)]
 #[command(
-    name = "veil",
-    // The binary is veil-core, started by `veil`; help should show the name people type.
-    bin_name = "veil",
+    name = "qveil",
+    // The binary is qveil-core, started by `qveil`; help should show the name people type.
+    bin_name = "qveil",
     version,
     about = "A private, account-free YouTube frontend",
-    after_help = "Run `veil` with no command (or `veil open`) to open the app window."
+    after_help = "Run `qveil` with no command (or `qveil open`) to open the app window."
 )]
 struct Cli {
     /// Route all traffic through this proxy (http://, https://, socks5h://). Overrides the config.
@@ -90,7 +90,7 @@ enum Cmd {
     },
     /// Show file locations, effective settings and what is exposed
     Config,
-    /// Delete all local veil data: subscriptions, history and caches
+    /// Delete all local qveil data: subscriptions, history and caches
     Wipe {
         /// Don't ask for confirmation
         #[arg(long)]
@@ -137,7 +137,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("veil: {}", friendly(&format!("{e:#}")));
+            eprintln!("qveil: {}", friendly(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -182,7 +182,7 @@ fn run() -> Result<()> {
             let r = app::feed(&rt, paths, !offline, no_shorts, limit)?;
             if r.channels == 0 {
                 anyhow::bail!(
-                    "no subscriptions yet: try `veil sub add @handle` or `veil sub import subscriptions.csv`"
+                    "no subscriptions yet: try `qveil sub add @handle` or `qveil sub import subscriptions.csv`"
                 );
             }
             if r.fallbacks > 0 {
@@ -254,7 +254,7 @@ fn browse(
             start: None,
         };
         if let Err(e) = server.open(&r).and_then(|info| player::play(cfg, &info)) {
-            eprintln!("veil: {}", friendly(&format!("{e:#}")));
+            eprintln!("qveil: {}", friendly(&format!("{e:#}")));
         }
     }
     Ok(())

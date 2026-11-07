@@ -1,14 +1,14 @@
 [package]
-name = "veil"
+name = "qveil"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
-description = "The engine behind veil, a private, account-free YouTube app (prototype)"
+description = "The engine behind qveil, a private, account-free YouTube app (prototype)"
 license = "MIT"
 publish = false
 
 [[bin]]
-name = "veil-core"
+name = "qveil-core"
 path = "src/main.rs"
 
 [dependencies]

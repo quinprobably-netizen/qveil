@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=veil
+Name=qveil
 Comment=Watch YouTube privately, without an account
-Exec=veil
-Icon=veil
+Exec=qveil
+Icon=qveil
 Terminal=false
 Categories=AudioVideo;Video;Player;
 Keywords=youtube;video;privacy;tor;
-StartupWMClass=veil
+StartupWMClass=qveil

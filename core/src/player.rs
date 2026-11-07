@@ -1,5 +1,5 @@
 //! Command-line playback in a separate mpv window. mpv only ever connects to
-//! veil's loopback relay, so it needs no proxy, cookies or headers, and it
+//! qveil's loopback relay, so it needs no proxy, cookies or headers, and it
 //! keeps no player state.
 //!
 //! The relay URLs carry the server token and the title says what you watch,
@@ -49,6 +49,14 @@ fn mpv_args(staged: &Staged) -> Vec<OsString> {
         // contact YouTube directly.
         "--config=no",
         "--load-scripts=no",
+        "--load-stats-overlay=no",
+        "--load-console=no",
+        "--load-osd-console=no",
+        "--load-select=no",
+        "--load-commands=no",
+        "--load-context-menu=no",
+        "--load-positioning=no",
+        "--load-auto-profiles=no",
         "--no-ytdl",
         "--save-position-on-quit=no", // no watch_later files naming what you watched
         "--save-watch-history=no",
@@ -138,7 +146,7 @@ fn private_dir() -> Result<PathBuf> {
     sweep_stale(&base);
     for _ in 0..8 {
         let name = format!(
-            "veil-mpv-{}-{:016x}",
+            "qveil-mpv-{}-{:016x}",
             std::process::id(),
             rand::random::<u64>()
         );
@@ -156,7 +164,7 @@ fn private_dir() -> Result<PathBuf> {
     )
 }
 
-/// Ctrl+C takes veil down along with mpv, and a process that is killed can't
+/// Ctrl+C takes qveil down along with mpv, and a process that is killed can't
 /// clean up after itself. So each run removes the directories of runs whose
 /// process is gone, which keeps a title from lingering in the temp dir.
 fn sweep_stale(base: &Path) {
@@ -167,7 +175,7 @@ fn sweep_stale(base: &Path) {
         let name = entry.file_name();
         let pid = name
             .to_str()
-            .and_then(|n| n.strip_prefix("veil-mpv-"))
+            .and_then(|n| n.strip_prefix("qveil-mpv-"))
             .and_then(|rest| rest.split('-').next())
             .and_then(|pid| pid.parse::<u32>().ok());
         if let Some(pid) = pid
@@ -265,9 +273,9 @@ mod tests {
     fn directories_of_dead_runs_are_swept() {
         let base = crate::store::testing::TempDir::new();
         let (dead, mine, other) = (
-            base.0.join("veil-mpv-999999999-0123456789abcdef"),
+            base.0.join("qveil-mpv-999999999-0123456789abcdef"),
             base.0
-                .join(format!("veil-mpv-{}-0123456789abcdef", std::process::id())),
+                .join(format!("qveil-mpv-{}-0123456789abcdef", std::process::id())),
             base.0.join("unrelated"),
         );
         for d in [&dead, &mine, &other] {
@@ -277,7 +285,7 @@ mod tests {
         sweep_stale(&base.0);
         assert!(!dead.exists(), "a run whose process is gone leaves nothing");
         assert!(mine.exists(), "a live run keeps its files");
-        assert!(other.exists(), "only veil's own directories are touched");
+        assert!(other.exists(), "only qveil's own directories are touched");
     }
 
     #[test]

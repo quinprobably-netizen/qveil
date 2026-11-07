@@ -3,7 +3,7 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 
-// How veil reaches YouTube, and what it keeps.
+// How qveil reaches YouTube, and what it keeps.
 Popup {
     id: popup
 

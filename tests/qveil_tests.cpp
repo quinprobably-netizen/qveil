@@ -11,7 +11,7 @@
 #include "theme.h"
 #include "translator.h"
 
-class VeilTests : public QObject {
+class QveilTests : public QObject {
     Q_OBJECT
 
 private slots:
@@ -30,7 +30,7 @@ private slots:
     {
         // A stand-in engine: prints a base URL, then serves one config reply.
         QTemporaryDir dir;
-        const QString fake = dir.filePath("veil-core");
+        const QString fake = dir.filePath("qveil-core");
         write(fake, "#!/bin/sh\n"
                     "python3 -c 'import http.server,json,sys\n"
                     "class H(http.server.BaseHTTPRequestHandler):\n"
@@ -160,7 +160,7 @@ private slots:
 
     void reportsAMissingEngine()
     {
-        Backend backend(QProcessEnvironment::systemEnvironment(), "/nonexistent/veil-core");
+        Backend backend(QProcessEnvironment::systemEnvironment(), "/nonexistent/qveil-core");
         backend.start();
         QTRY_VERIFY(!backend.error().isEmpty());
         QVERIFY(!backend.ready());
@@ -259,11 +259,11 @@ private slots:
     }
 
 private:
-    // A stand-in veil-core: a Python script that prints a ready line and then
+    // A stand-in qveil-core: a Python script that prints a ready line and then
     // does whatever the test needs.
     static QString engine(const QTemporaryDir &dir, const QByteArray &python)
     {
-        const QString path = dir.filePath("veil-core");
+        const QString path = dir.filePath("qveil-core");
         write(path, "#!/usr/bin/env python3\n" + python);
         QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
         return path;
@@ -277,5 +277,5 @@ private:
     }
 };
 
-QTEST_MAIN(VeilTests)
-#include "veil_tests.moc"
+QTEST_MAIN(QveilTests)
+#include "qveil_tests.moc"

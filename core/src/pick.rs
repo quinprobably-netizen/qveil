@@ -27,7 +27,7 @@ fn fzf(lines: &[String]) -> Result<Option<usize>> {
             "--no-sort",
             "--layout=reverse",
             "--height=70%",
-            "--prompt=veil> ",
+            "--prompt=qveil> ",
             "--header=enter: play   esc: quit",
         ])
         .stdin(Stdio::piped())

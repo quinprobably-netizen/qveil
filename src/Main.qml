@@ -11,7 +11,7 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 500
     visible: true
-    title: player.active && player.info.title ? player.info.title + " · veil" : "veil"
+    title: player.active && player.info.title ? player.info.title + " · qveil" : "qveil"
     color: "#0d0d10"
 
     Material.theme: Material.Dark
@@ -184,7 +184,7 @@ ApplicationWindow {
                     spacing: 6
 
                     Label {
-                        text: "veil"
+                        text: "qveil"
                         font.pixelSize: 22
                         font.weight: Font.Bold
                         font.letterSpacing: 0.5

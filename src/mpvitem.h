@@ -30,7 +30,7 @@ struct MpvShared {
 
 // libmpv rendered into the Qt Quick scene. mpv runs without any user config
 // or scripts, keeps no resume or history state, and is only ever handed
-// loopback URLs from veil-core.
+// loopback URLs from qveil-core.
 class MpvItem : public QQuickFramebufferObject {
     Q_OBJECT
     Q_PROPERTY(double position READ position NOTIFY positionChanged)

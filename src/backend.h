@@ -13,7 +13,7 @@
 
 #include <functional>
 
-// The window's view of veil-core. It starts `veil-core serve`, then talks to
+// The window's view of qveil-core. It starts `qveil-core serve`, then talks to
 // it over loopback HTTP; every result lands in a property QML binds to.
 class Backend : public QObject {
     Q_OBJECT
@@ -36,9 +36,9 @@ public:
                      const QString &core = {}, QObject *parent = nullptr);
     ~Backend() override;
 
-    // veil-core next to this binary (a build tree), else the installed one.
+    // qveil-core next to this binary (a build tree), else the installed one.
     static QString corePath();
-    // The base URL from `veil-core serve`'s first line, or empty.
+    // The base URL from `qveil-core serve`'s first line, or empty.
     static QString parseReady(const QByteArray &line);
 
     // Starts the engine. Also how it is brought back after it dies.

@@ -1,4 +1,4 @@
-//! What veil can do, shared by the command line and the local server that the
+//! What qveil can do, shared by the command line and the local server that the
 //! desktop app talks to.
 
 use crate::config::Config;

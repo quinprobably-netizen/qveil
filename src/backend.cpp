@@ -23,7 +23,7 @@ Backend::Backend(const QProcessEnvironment &environment, const QString &core, QO
             return;
         m_base = parseReady(m_coreStdout.left(newline));
         if (m_base.isEmpty()) {
-            setError(tr("The veil engine sent an unexpected reply."));
+            setError(tr("The qveil engine sent an unexpected reply."));
             return;
         }
         onEngineReady();
@@ -33,7 +33,7 @@ Backend::Backend(const QProcessEnvironment &environment, const QString &core, QO
     });
     connect(&m_core, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
         if (e == QProcess::FailedToStart)
-            setError(tr("Couldn't start the veil engine (%1).").arg(m_corePath));
+            setError(tr("Couldn't start the qveil engine (%1).").arg(m_corePath));
     });
     connect(&m_core, &QProcess::finished, this, [this] { onEngineStopped(); });
 }
@@ -51,10 +51,10 @@ Backend::~Backend() {
 
 QString Backend::corePath() {
     const QString self = QFileInfo("/proc/self/exe").canonicalFilePath();
-    const QString beside = QFileInfo(self).absolutePath() + "/veil-core";
+    const QString beside = QFileInfo(self).absolutePath() + "/qveil-core";
     if (QFileInfo(beside).isExecutable())
         return beside;
-    return "/usr/lib/veil/veil-core";
+    return "/usr/lib/qveil/qveil-core";
 }
 
 QString Backend::parseReady(const QByteArray &line) {
@@ -109,8 +109,8 @@ void Backend::onEngineStopped() {
     }
 
     const QString detail = QString::fromUtf8(m_coreStderr).trimmed().section('\n', -1);
-    m_fatal = detail.isEmpty() ? tr("The veil engine stopped again. Close and reopen veil to continue.")
-                               : tr("The veil engine stopped again: %1. Close and reopen veil to continue.").arg(detail);
+    m_fatal = detail.isEmpty() ? tr("The qveil engine stopped again. Close and reopen qveil to continue.")
+                               : tr("The qveil engine stopped again: %1. Close and reopen qveil to continue.").arg(detail);
     setError(m_fatal);
 }
 

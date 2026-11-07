@@ -819,6 +819,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "qveil"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "rand 0.9.5",
+ "reqwest",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "toml",
+ "url",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1365,22 +1381,6 @@ name = "utf_types"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
-
-[[package]]
-name = "veil"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "jiff",
- "rand 0.9.5",
- "reqwest",
- "roxmltree",
- "serde",
- "serde_json",
- "toml",
- "url",
-]
 
 [[package]]
 name = "want"

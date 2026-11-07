@@ -1,12 +1,16 @@
-pkgname=veil
+pkgname=qveil
 pkgver=0.2.0
 pkgrel=1
 pkgdesc='Private, account-free YouTube app: no cookies, no account, optional Tor for every byte'
 arch=('x86_64')
-url='https://github.com/quinprobably-netizen/veil'
+url='https://github.com/quinprobably-netizen/qveil'
 license=('MIT')
 # yt-dlp needs a JavaScript runtime to read YouTube, hence the hard dependency on deno.
 depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'qt6-svg' 'mpv' 'yt-dlp' 'deno')
+# The app was called veil before.
+provides=('veil')
+conflicts=('veil')
+replaces=('veil')
 optdepends=('tor: hide your IP from YouTube, with a fresh circuit per request')
 makedepends=('cargo' 'gcc' 'make')
 # makepkg's -flto makes ring's C objects LTO bitcode, which the Rust linker can't read.
@@ -23,10 +27,10 @@ build() {
 
 package() {
   cd "$startdir/.."
-  install -Dm755 build/veil "$pkgdir/usr/bin/veil"
-  install -Dm755 build/veil-core "$pkgdir/usr/lib/veil/veil-core"
+  install -Dm755 build/qveil "$pkgdir/usr/bin/qveil"
+  install -Dm755 build/qveil-core "$pkgdir/usr/lib/qveil/qveil-core"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 core/config.example.toml "$pkgdir/usr/share/doc/$pkgname/config.example.toml"
-  install -Dm644 "$startdir/veil.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/veil.svg"
-  install -Dm644 "$startdir/veil.desktop" "$pkgdir/usr/share/applications/veil.desktop"
+  install -Dm644 "$startdir/qveil.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/qveil.svg"
+  install -Dm644 "$startdir/qveil.desktop" "$pkgdir/usr/share/applications/qveil.desktop"
 }

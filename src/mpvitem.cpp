@@ -127,6 +127,15 @@ MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mp
         // among them), no input bindings, no resume files, no history.
         {"config", "no"},
         {"load-scripts", "no"},
+        // load-scripts doesn't cover mpv's built-in scripts; turn those off too.
+        {"load-stats-overlay", "no"},
+        {"load-console", "no"},
+        {"load-osd-console", "no"},
+        {"load-select", "no"},
+        {"load-commands", "no"},
+        {"load-context-menu", "no"},
+        {"load-positioning", "no"},
+        {"load-auto-profiles", "no"},
         {"ytdl", "no"},
         {"osc", "no"},
         {"input-default-bindings", "no"},
@@ -141,7 +150,7 @@ MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mp
         {"demuxer-max-bytes", "256MiB"},
         {"demuxer-readahead-secs", "90"},
         {"network-timeout", "60"},
-        {"audio-client-name", "veil"},
+        {"audio-client-name", "qveil"},
     };
     for (const auto &[name, value] : options)
         mpv_set_option_string(m_mpv, name, value);

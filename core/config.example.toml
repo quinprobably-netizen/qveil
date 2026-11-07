@@ -1,4 +1,4 @@
-# veil config: copy to ~/.config/veil/config.toml
+# qveil config: copy to ~/.config/qveil/config.toml
 # Every key is optional; these are the defaults unless noted.
 
 # Route ALL traffic (search, feeds, metadata and the video bytes) through a proxy.

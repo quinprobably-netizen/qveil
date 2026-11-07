@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use std::time::Duration;
 
-/// A common desktop browser UA, so requests don't announce "veil" or "reqwest".
+/// A common desktop browser UA, so requests don't announce "qveil" or "reqwest".
 pub const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0";
 
@@ -89,7 +89,7 @@ impl Net {
             return Some(p.clone()); // the user set their own credentials
         }
         let user: u64 = rand::random();
-        Some(format!("{scheme}://veil{user:016x}:x@{rest}"))
+        Some(format!("{scheme}://qveil{user:016x}:x@{rest}"))
     }
 
     pub fn proxy(&self) -> Option<&str> {
@@ -173,7 +173,7 @@ mod tests {
         let n = Net::new(Some(TOR_PROXY.into()), true).unwrap();
         let (a, b) = (n.proxy_url().unwrap(), n.proxy_url().unwrap());
         assert_ne!(a, b);
-        assert!(a.starts_with("socks5h://veil") && a.ends_with(":x@127.0.0.1:9050"));
+        assert!(a.starts_with("socks5h://qveil") && a.ends_with(":x@127.0.0.1:9050"));
         let pinned = n.pinned();
         assert_eq!(
             pinned.proxy_url(),

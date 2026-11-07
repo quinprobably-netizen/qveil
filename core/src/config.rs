@@ -52,7 +52,7 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = format!(
-            "# Written by veil when a setting changes in the app; comments are not kept.\n{}",
+            "# Written by qveil when a setting changes in the app; comments are not kept.\n{}",
             toml::to_string_pretty(self)?
         );
         crate::store::write_atomic(path, text.as_bytes())

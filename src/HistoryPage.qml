@@ -32,7 +32,7 @@ FocusScope {
                 Label {
                     Layout.fillWidth: true
                     text: page.enabled_ ? qsTr("Stored only on this computer.")
-                                        : qsTr("Off. veil doesn't remember what you watch.")
+                                        : qsTr("Off. qveil doesn't remember what you watch.")
                     wrapMode: Text.Wrap
                     font.pixelSize: 13
                     color: "#8d8d98"

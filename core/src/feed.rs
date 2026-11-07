@@ -1,7 +1,7 @@
 //! Subscription feed without an account: one public RSS request per channel,
 //! fetched in random order. If RSS is down (YouTube's feed endpoint
 //! intermittently returns 404/500), fall back to the channel's Videos tab via
-//! yt-dlp and date new uploads by when veil first saw them.
+//! yt-dlp and date new uploads by when qveil first saw them.
 
 use crate::ids::is_video_id;
 use crate::net::Net;
@@ -26,7 +26,7 @@ pub struct FeedCache {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Seen {
     pub video: Video,
-    /// When veil first saw it; 0 = it was already there when the channel was first fetched.
+    /// When qveil first saw it; 0 = it was already there when the channel was first fetched.
     pub first_seen: i64,
     pub last_seen: i64,
 }
@@ -36,7 +36,7 @@ pub struct Entry {
     #[serde(flatten)]
     pub video: Video,
     pub date: i64,
-    /// `date` is when veil first saw the video, not the real upload time.
+    /// `date` is when qveil first saw the video, not the real upload time.
     pub estimated: bool,
 }
 

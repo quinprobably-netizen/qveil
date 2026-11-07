@@ -1,14 +1,14 @@
 #!/bin/sh
-# Builds the Rust engine (veil-core) and the Qt app (veil) into build/.
+# Builds the Rust engine (qveil-core) and the Qt app (qveil) into build/.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cargo build --release --locked --manifest-path "$ROOT/core/Cargo.toml"
 mkdir -p "$ROOT/build"
-install -m755 "$ROOT/core/target/release/veil-core" "$ROOT/build/veil-core"
+install -m755 "$ROOT/core/target/release/qveil-core" "$ROOT/build/qveil-core"
 
 cd "$ROOT/build"
-qmake6 "$ROOT/veil.pro"
+qmake6 "$ROOT/qveil.pro"
 make -j"$(nproc)"
 
-echo "Built $ROOT/build/veil"
+echo "Built $ROOT/build/qveil"

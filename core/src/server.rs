@@ -295,7 +295,7 @@ impl Server {
                 // A client that hangs up (mpv does, whenever it seeks) isn't
                 // news, but a stream that broke upstream is.
                 if e.downcast_ref::<StreamBroke>().is_some() {
-                    eprintln!("veil: {e:#}");
+                    eprintln!("qveil: {e:#}");
                 }
             }
         });
@@ -560,7 +560,7 @@ impl Server {
                 out,
                 502,
                 "text/plain",
-                b"the stream is a playlist (HLS or DASH), which veil can't relay through your route",
+                b"the stream is a playlist (HLS or DASH), which qveil can't relay through your route",
             );
         }
         let mut head = format!(

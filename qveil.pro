@@ -2,7 +2,7 @@ QT += core gui qml quick quickcontrols2 network opengl svg
 
 CONFIG += c++17 release link_pkgconfig
 PKGCONFIG += mpv
-TARGET = veil
+TARGET = qveil
 TEMPLATE = app
 
 HEADERS += \

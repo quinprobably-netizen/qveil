@@ -19,11 +19,12 @@ impl Paths {
     pub fn from_env() -> Result<Self> {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
         let xdg = |var: &str, fallback: &str| {
-            std::env::var_os(var)
+            let base = std::env::var_os(var)
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| Path::new(&home).join(fallback))
-                .join("veil")
+                .unwrap_or_else(|| Path::new(&home).join(fallback));
+            migrate(&base.join("veil"), &base.join("qveil"));
+            base.join("qveil")
         };
         Ok(Self {
             config: xdg("XDG_CONFIG_HOME", ".config").join("config.toml"),
@@ -49,6 +50,27 @@ impl Paths {
     /// machine, so nothing from a logged-in session can bleed in.
     pub fn ytdlp_cache(&self) -> PathBuf {
         self.cache.join("yt-dlp")
+    }
+}
+
+/// The app was called veil before it was qveil. Its directories move over
+/// once, so subscriptions and settings survive the rename; a qveil directory
+/// that already exists is never touched.
+fn migrate(old: &Path, new: &Path) {
+    if old.is_dir()
+        && !new.exists()
+        && let Err(e) = fs::rename(old, new)
+    {
+        eprintln!(
+            "qveil: couldn't move {} to {}: {e}",
+            old.display(),
+            new.display()
+        );
+    }
+    // The window's own settings file was named after the app too.
+    let (old_conf, new_conf) = (new.join("veil.conf"), new.join("qveil.conf"));
+    if old_conf.is_file() && !new_conf.exists() {
+        let _ = fs::rename(old_conf, new_conf);
     }
 }
 
@@ -78,7 +100,7 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 pub fn load_cache<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match load(path) {
         Err(e) if e.root_cause().is::<serde_json::Error>() => {
-            eprintln!("veil: ignoring unreadable cache ({e:#}); it will be rebuilt");
+            eprintln!("qveil: ignoring unreadable cache ({e:#}); it will be rebuilt");
             Ok(T::default())
         }
         other => other,
@@ -160,7 +182,7 @@ pub mod testing {
 
     impl TempDir {
         pub fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("veil-test-{:016x}", rand::random::<u64>()));
+            let p = std::env::temp_dir().join(format!("qveil-test-{:016x}", rand::random::<u64>()));
             std::fs::create_dir_all(&p).unwrap();
             TempDir(p)
         }
@@ -292,5 +314,32 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn the_old_veil_directories_move_over_once() {
+        let root =
+            std::env::temp_dir().join(format!("qveil-migrate-{:016x}", rand::random::<u64>()));
+        let (old, new) = (root.join("veil"), root.join("qveil"));
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("subscriptions.json"), "{}").unwrap();
+        fs::write(old.join("veil.conf"), "x").unwrap();
+        migrate(&old, &new);
+        assert!(!old.exists());
+        assert!(new.join("subscriptions.json").is_file());
+        assert!(
+            new.join("qveil.conf").is_file(),
+            "the window's settings file is renamed too"
+        );
+
+        // An existing qveil directory is never overwritten.
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("subscriptions.json"), "stale").unwrap();
+        migrate(&old, &new);
+        assert_eq!(
+            fs::read_to_string(new.join("subscriptions.json")).unwrap(),
+            "{}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
