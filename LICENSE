@@ -28,3 +28,4 @@ src/theme.* and src/translator.* follow Omacut and Monologue
 The icons in src/icons are Material Design icon paths
 (Copyright Google LLC), used under the Apache License, Version 2.0:
 https://www.apache.org/licenses/LICENSE-2.0
+A copy of its text is in LICENSE-APACHE-2.0, next to this file.

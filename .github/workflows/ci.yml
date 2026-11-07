@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel qt6-base qt6-declarative qt6-svg qt6-wayland qt6-shadertools mpv rust python desktop-file-utils
+      - run: pacman -Syu --noconfirm --needed base-devel git qt6-base qt6-declarative qt6-svg qt6-wayland qt6-shadertools mpv rust python desktop-file-utils
       - uses: actions/checkout@v4
       - run: desktop-file-validate pkgbuild/qveil.desktop
       # makepkg refuses to run as root, and root would hide mistakes a real
@@ -44,24 +44,29 @@ jobs:
         run: |
           useradd --create-home builder
           chown -R builder "$GITHUB_WORKSPACE"
+      # The release recipe downloads a tag that a pull request doesn't have, so
+      # this builds the same recipe from the checkout (PKGBUILD.local), engine
+      # tests (check()) included. That the release recipe itself still parses
+      # is checked separately.
+      - name: Check the release recipe
+        run: su builder -c 'cd "$GITHUB_WORKSPACE/pkgbuild" && makepkg --printsrcinfo > /dev/null'
       - name: Build the package
-        run: su builder -c 'cd "$GITHUB_WORKSPACE/pkgbuild" && makepkg --nodeps --force'
+        run: su builder -c 'cd "$GITHUB_WORKSPACE/pkgbuild" && makepkg -p PKGBUILD.local --nodeps --force'
       - name: Test
         run: su builder -c 'cd "$GITHUB_WORKSPACE" && ./bin/test'
 
   # Whether yt-dlp can still read YouTube with a fresh checkout: it breaks
   # whenever YouTube changes something, and nothing else here would notice
-  # until a user did. It runs weekly and on request, not on every push.
+  # until a user did. It runs weekly and on request, not on every push, so a
+  # failure (YouTube may well ask a CI runner's address to sign in, "confirm
+  # you're not a bot", which says nothing about qveil or yt-dlp) blocks no
+  # push or pull request: it is a prompt to look.
   canary:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     container: archlinux:latest
-    # YouTube may well ask a CI runner's address to sign in ("confirm you're
-    # not a bot"), which says nothing about qveil or yt-dlp, so a failure here
-    # is a prompt to look, not a failed build.
-    continue-on-error: true
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel rust yt-dlp deno jq
+      - run: pacman -Syu --noconfirm --needed base-devel rust yt-dlp deno jq curl
       - uses: actions/checkout@v4
       - run: cargo build --release --locked --manifest-path core/Cargo.toml
       - name: Search through the built engine
@@ -69,3 +74,27 @@ jobs:
           export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_DATA_HOME="$RUNNER_TEMP/data" XDG_CACHE_HOME="$RUNNER_TEMP/cache"
           core/target/release/qveil-core search "rust" -n 3 --json | tee "$RUNNER_TEMP/search.json"
           jq -e 'length > 0' "$RUNNER_TEMP/search.json"
+      # Resolving a video is a different path from searching (the player
+      # clients, the JavaScript challenge, the stream formats), and it is the
+      # one that breaks most. `play` does all of it, up to the engine's relay;
+      # mpv is replaced by a script that fetches the first kilobyte of the
+      # video from the relay URL it is given, which proves the stream resolved
+      # and that the engine's relay can read it. The video is the first one
+      # ever uploaded to YouTube, which has no reason to go away.
+      - name: Resolve and relay a video through the built engine
+        run: |
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_DATA_HOME="$RUNNER_TEMP/data" XDG_CACHE_HOME="$RUNNER_TEMP/cache"
+          cat > "$RUNNER_TEMP/fake-mpv" <<'EOF'
+          #!/bin/sh
+          for arg in "$@"; do
+            case $arg in --playlist=*) playlist=${arg#--playlist=} ;; esac
+          done
+          url=$(head -n 1 "$playlist")
+          curl --fail --silent --show-error --max-time 60 --range 0-1023 \
+            --output "$RUNNER_TEMP/first-kilobyte" "$url"
+          [ "$(wc -c < "$RUNNER_TEMP/first-kilobyte")" -eq 1024 ]
+          EOF
+          chmod +x "$RUNNER_TEMP/fake-mpv"
+          mkdir -p "$XDG_CONFIG_HOME/qveil"
+          printf 'mpv = "%s"\n' "$RUNNER_TEMP/fake-mpv" > "$XDG_CONFIG_HOME/qveil/config.toml"
+          core/target/release/qveil-core play jNQXAC9IVRw

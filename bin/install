@@ -1,7 +1,10 @@
 #!/bin/sh
+# Builds this checkout, working-tree edits included, and installs it as a
+# package. For a release, run `makepkg -si` in pkgbuild/ instead: that builds
+# the tag from GitHub (see the README).
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-# makepkg runs bin/build itself (see pkgbuild/PKGBUILD), so it is not run here too.
+# makepkg runs bin/build itself, in a copy of the tree (see pkgbuild/PKGBUILD.local).
 cd "$ROOT/pkgbuild"
-exec makepkg -fsi "$@"
+exec makepkg -fsi -p PKGBUILD.local "$@"

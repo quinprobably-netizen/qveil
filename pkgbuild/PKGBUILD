@@ -1,12 +1,14 @@
 pkgname=qveil
-# The version lives in core/Cargo.toml; pkgver() below reads it from there and
-# makepkg keeps this line in step with it, so it never needs editing by hand.
+# A release is the tag `v$pkgver` of the repository, and core/Cargo.toml in it
+# has the same version: prepare() refuses to build when they disagree, so a
+# tag and this file can't drift apart unnoticed. (README: "Releasing".)
 pkgver=0.2.0
 pkgrel=1
 pkgdesc='Private, account-free YouTube app: no cookies, no account, optional Tor for every byte'
 arch=('x86_64')
 url='https://github.com/quinprobably-netizen/qveil'
-license=('MIT')
+# The icons in src/icons are Apache-2.0 (Material Design); everything else is MIT.
+license=('MIT' 'Apache-2.0')
 # yt-dlp needs a JavaScript runtime to read YouTube, hence the hard dependency on deno.
 depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'qt6-svg' 'mpv' 'yt-dlp' 'deno')
 # The app was called veil before.
@@ -14,31 +16,62 @@ provides=('veil')
 conflicts=('veil')
 replaces=('veil')
 optdepends=('tor: hide your IP from YouTube, with a fresh circuit per request')
-makedepends=('cargo' 'gcc' 'make' 'qt6-shadertools')
+makedepends=('cargo' 'gcc' 'git' 'make' 'qt6-shadertools')
 # makepkg's -flto makes ring's C objects LTO bitcode, which the Rust linker can't read.
 options=('!lto' '!debug')
-# This builds from the local checkout (the parent of this directory), not from a
-# downloaded archive, so there is nothing to fetch and nothing to checksum.
-source=()
-sha256sums=()
+# A git source pinned to the tag, rather than GitHub's tag tarball: the tag
+# doesn't exist before it is made, so a checksum can't be written ahead of it,
+# and GitHub doesn't promise that a tarball it generates keeps its checksum.
+# git checks what it fetches by object id, and `#tag=` makes the build refuse
+# anything but that tag. (If tags get signed, add `?signed` to the URL and the
+# key to `validpgpkeys`.) Hence 'SKIP'.
+source=("$pkgname::git+https://github.com/quinprobably-netizen/qveil.git#tag=v$pkgver")
+sha256sums=('SKIP')
 
-pkgver() {
-  # The package's own `version = "x.y.z"`, the first such line in the file.
-  # pkgver may not contain a hyphen, which a Cargo pre-release (1.0.0-rc.1) does.
-  sed -n 's/^version *= *"\(.*\)"/\1/p' "$startdir/../core/Cargo.toml" | head -n 1 | tr - _
+# The part of prepare() that PKGBUILD.local shares: it runs in the checkout.
+_prepare_tree() {
+  cd "$srcdir/$pkgname"
+  # The package's own `version = "x.y.z"`, the first such line in the file,
+  # compared the way pkgver is spelled (it may not contain a hyphen, which a
+  # Cargo pre-release such as 1.0.0-rc.1 does).
+  local version
+  version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' core/Cargo.toml | head -n 1 | tr - _)
+  if [[ $version != "$pkgver" ]]; then
+    error "core/Cargo.toml has version $version, but pkgver is $pkgver: tag v$pkgver and this file disagree"
+    return 1
+  fi
+  # Fetch the crates here, so that build() and check() can run offline and
+  # nothing is downloaded while compiling (Arch's Rust packaging guideline).
+  cargo fetch --locked --manifest-path core/Cargo.toml \
+    --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+prepare() {
+  _prepare_tree
 }
 
 build() {
-  cd "$startdir/.."
+  cd "$srcdir/$pkgname"
+  export CARGO_NET_OFFLINE=true
   ./bin/build
 }
 
+check() {
+  cd "$srcdir/$pkgname"
+  export CARGO_NET_OFFLINE=true
+  # The engine's tests only. The window's need a display server (they run
+  # offscreen in bin/test), which a package build shouldn't depend on.
+  cargo test --locked --manifest-path core/Cargo.toml
+}
+
 package() {
-  cd "$startdir/.."
+  cd "$srcdir/$pkgname"
   install -Dm755 build/qveil "$pkgdir/usr/bin/qveil"
   install -Dm755 build/qveil-core "$pkgdir/usr/lib/qveil/qveil-core"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # The notice for the icons: the Apache License's text, which it asks to be passed on.
+  install -Dm644 LICENSE-APACHE-2.0 "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE-2.0"
   install -Dm644 core/config.example.toml "$pkgdir/usr/share/doc/$pkgname/config.example.toml"
-  install -Dm644 "$startdir/qveil.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/qveil.svg"
-  install -Dm644 "$startdir/qveil.desktop" "$pkgdir/usr/share/applications/qveil.desktop"
+  install -Dm644 pkgbuild/qveil.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/qveil.svg"
+  install -Dm644 pkgbuild/qveil.desktop "$pkgdir/usr/share/applications/qveil.desktop"
 }

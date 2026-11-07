@@ -1,0 +1,28 @@
+# The release recipe (PKGBUILD), built from a snapshot of your working tree
+# instead of a tag. `bin/install` runs it: `makepkg -p PKGBUILD.local`, from
+# this directory. Everything else (the build, the engine's tests, what is
+# installed) is the release recipe's own, so what you install here is what a
+# release would install.
+. "$startdir/PKGBUILD"
+
+source=()
+sha256sums=()
+# What is checked out has the version in core/Cargo.toml, not the release recipe's.
+pkgver=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$startdir/../core/Cargo.toml" | head -n 1 | tr - _)
+
+prepare() {
+  local from="$startdir/.." to="$srcdir/$pkgname"
+  mkdir -p "$to"
+  # The snapshot is rebuilt from scratch, so that a file you deleted doesn't
+  # linger. The compiled output is kept, so the next build is incremental: the
+  # files that come back have their old modification times, which is what
+  # cargo and make go by.
+  find "$to" -mindepth 1 \( -path "$to/build" -o -path "$to/core/target" \) -prune \
+    -o -type f -exec rm -f {} +
+  # What git tracks or would track: edits you haven't committed are included,
+  # and what it ignores (build/, core/target/, a previous package) is not.
+  git -C "$from" ls-files -z --cached --others --exclude-standard \
+    | tar -C "$from" --null -T - --ignore-failed-read -cf - \
+    | tar -C "$to" -xf -
+  _prepare_tree
+}
