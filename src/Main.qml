@@ -21,6 +21,8 @@ ApplicationWindow {
 
     property string page: "feed"
     property string returnPage: "feed"
+    // Whether the first engine start has loaded the window yet.
+    property bool started: false
     readonly property bool fullscreen: visibility === Window.FullScreen
     readonly property var pages: ({ feed: feedPage, search: searchPage, channel: channelPage,
                                     subs: subsPage, history: historyPage })
@@ -96,9 +98,13 @@ ApplicationWindow {
 
     Connections {
         target: backend
+        // Only the first start loads things here: if the engine has to be
+        // restarted, Backend reloads what the window shows by itself, and a
+        // full refresh would be unasked for.
         function onReadyChanged() {
-            if (!backend.ready)
+            if (!backend.ready || win.started)
                 return
+            win.started = true
             backend.refreshFeed(false, prefs.showShorts)
             backend.refreshFeed(true, prefs.showShorts)
             backend.loadSubs()

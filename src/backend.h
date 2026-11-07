@@ -41,6 +41,7 @@ public:
     // The base URL from `veil-core serve`'s first line, or empty.
     static QString parseReady(const QByteArray &line);
 
+    // Starts the engine. Also how it is brought back after it dies.
     void start();
 
     bool ready() const { return !m_base.isEmpty(); }
@@ -93,6 +94,10 @@ private:
               const QString &task, Done done);
     void setError(const QString &message);
     void setBusy(const QString &task, int delta);
+    void onEngineReady();
+    void onEngineStopped();
+    // The feed request itself, without the one-refresh-at-a-time guard of refreshFeed().
+    void loadFeed(bool network, bool shorts);
 
     QProcessEnvironment m_environment;
     QString m_corePath;
@@ -106,6 +111,17 @@ private:
     QHash<QString, quint64> m_latest;
     quint64 m_sequence = 0;
     bool m_quitting = false;
+
+    // The engine is restarted once if it dies; a second death is final.
+    static constexpr int MaxRestarts = 1;
+    int m_restarts = 0;
+    bool m_hadReady = false;
+    // Counts engine lives, so an answer from a dead engine can be told apart.
+    quint64 m_generation = 0;
+    // Set once the engine is gone for good; later requests show it again.
+    QString m_fatal;
+    // The Shorts choice of the last feed request, for reloading after a restart.
+    bool m_shorts = false;
 
     QVariantMap m_config;
     QVariantList m_feed;

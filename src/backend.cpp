@@ -26,8 +26,7 @@ Backend::Backend(const QProcessEnvironment &environment, const QString &core, QO
             setError(tr("The veil engine sent an unexpected reply."));
             return;
         }
-        emit readyChanged();
-        loadConfig();
+        onEngineReady();
     });
     connect(&m_core, &QProcess::readyReadStandardError, this, [this] {
         m_coreStderr = (m_coreStderr + m_core.readAllStandardError()).right(2000);
@@ -36,16 +35,7 @@ Backend::Backend(const QProcessEnvironment &environment, const QString &core, QO
         if (e == QProcess::FailedToStart)
             setError(tr("Couldn't start the veil engine (%1).").arg(m_corePath));
     });
-    connect(&m_core, &QProcess::finished, this, [this] {
-        if (m_quitting)
-            return;
-        const QString detail = QString::fromUtf8(m_coreStderr).trimmed().section('\n', -1);
-        setError(detail.isEmpty() ? tr("The veil engine stopped.") : tr("The veil engine stopped: %1").arg(detail));
-        if (ready()) {
-            m_base.clear();
-            emit readyChanged();
-        }
-    });
+    connect(&m_core, &QProcess::finished, this, [this] { onEngineStopped(); });
 }
 
 Backend::~Backend() {
@@ -74,10 +64,54 @@ QString Backend::parseReady(const QByteArray &line) {
 }
 
 void Backend::start() {
+    if (m_core.state() != QProcess::NotRunning)
+        return;
+    // A restarted engine must not inherit the last one's ready line or last words.
+    m_coreStdout.clear();
+    m_coreStderr.clear();
     m_core.setProcessEnvironment(m_environment);
     m_core.setProgram(m_corePath);
     m_core.setArguments({"serve"});
     m_core.start();
+}
+
+void Backend::onEngineReady() {
+    // Only an engine that came back has lost the window's state: the first
+    // one is loaded by the page that asked for it.
+    const bool recovered = m_hadReady;
+    m_hadReady = true;
+    emit readyChanged();
+    loadConfig();
+    if (recovered) {
+        loadSubs();
+        loadFeed(false, m_shorts);
+    }
+}
+
+void Backend::onEngineStopped() {
+    if (m_quitting)
+        return;
+    const bool wasReady = ready();
+    // Whatever was in flight belonged to the dead engine; its answers are
+    // dropped, not shown as connection errors.
+    ++m_generation;
+    m_base.clear();
+    if (wasReady)
+        emit readyChanged();
+
+    if (m_restarts < MaxRestarts) {
+        ++m_restarts;
+        // Clears an error caused by the death itself, such as a dropped connection.
+        setError({});
+        // Queued, so the process isn't restarted from inside its own signal.
+        QMetaObject::invokeMethod(this, &Backend::start, Qt::QueuedConnection);
+        return;
+    }
+
+    const QString detail = QString::fromUtf8(m_coreStderr).trimmed().section('\n', -1);
+    m_fatal = detail.isEmpty() ? tr("The veil engine stopped again. Close and reopen veil to continue.")
+                               : tr("The veil engine stopped again: %1. Close and reopen veil to continue.").arg(detail);
+    setError(m_fatal);
 }
 
 void Backend::setError(const QString &message) {
@@ -101,8 +135,14 @@ void Backend::setBusy(const QString &task, int delta) {
 
 void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
                    const QString &task, Done done) {
-    if (!ready())
+    if (!ready()) {
+        // While the engine restarts, requests are dropped and the restart
+        // reloads what the window shows. Once it is gone for good, say so
+        // instead of ignoring the click.
+        if (!m_fatal.isEmpty())
+            setError(m_fatal);
         return;
+    }
     QUrl url(m_base + "/" + path);
     url.setQuery(query);
     QNetworkRequest request(url);
@@ -111,12 +151,15 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
 
     const quint64 id = ++m_sequence;
+    const quint64 generation = m_generation;
     m_latest.insert(task, id);
     setBusy(task, +1);
     QNetworkReply *reply = m_net.sendCustomRequest(request, verb, body);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, task, id, done] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, task, id, generation, done] {
         reply->deleteLater();
         setBusy(task, -1);
+        if (generation != m_generation)
+            return;
         const QByteArray data = reply->readAll();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const QJsonDocument doc = QJsonDocument::fromJson(data);
@@ -148,6 +191,16 @@ void Backend::setConfig(const QVariantMap &patch) {
 }
 
 void Backend::refreshFeed(bool network, bool shorts) {
+    m_shorts = shorts;
+    // A refresh fetches every channel and can take minutes over Tor, so a
+    // second one while it runs would only repeat the work. Every caller
+    // (the button, the R shortcut) gets this guard.
+    if (network && m_busy.contains("feed"))
+        return;
+    loadFeed(network, shorts);
+}
+
+void Backend::loadFeed(bool network, bool shorts) {
     QUrlQuery q;
     q.addQueryItem("refresh", network ? "1" : "0");
     q.addQueryItem("shorts", shorts ? "1" : "0");
@@ -214,7 +267,8 @@ void Backend::subscribe(const QString &input) {
             emit channelChanged();
         }
         loadSubs();
-        refreshFeed(true, false);
+        // The running refresh, if any, started with the old list.
+        loadFeed(true, m_shorts);
     });
 }
 
@@ -228,7 +282,7 @@ void Backend::unsubscribe(const QString &id) {
             emit channelChanged();
         }
         loadSubs();
-        refreshFeed(false, false);
+        loadFeed(false, m_shorts);
     });
 }
 
@@ -246,7 +300,7 @@ void Backend::importFile(const QUrl &file) {
         const int added = v.toObject().value("added").toInt();
         emit notice(tr("Imported %n new channel(s), offline", "", added));
         loadSubs();
-        refreshFeed(true, false);
+        loadFeed(true, m_shorts);
     });
 }
 
