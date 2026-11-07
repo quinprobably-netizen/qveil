@@ -58,8 +58,6 @@ pub struct Server {
     base: OnceLock<String>,
     sessions: Mutex<VecDeque<(String, Arc<Session>)>>,
     thumbs: Mutex<HashMap<String, Arc<Vec<u8>>>>,
-    /// Serializes read-modify-write of the subscription, feed and history files.
-    store: Mutex<()>,
     /// Serializes settings changes.
     settings: Mutex<()>,
     /// Connections being served right now (see `MAX_CONNECTIONS`).
@@ -176,7 +174,6 @@ impl Server {
             base: OnceLock::new(),
             sessions: Mutex::new(VecDeque::new()),
             thumbs: Mutex::new(HashMap::new()),
-            store: Mutex::new(()),
             settings: Mutex::new(()),
             connections: Arc::new(AtomicUsize::new(0)),
         })
@@ -236,7 +233,6 @@ impl Server {
         };
         let sid = self.register(&rt, session)?;
         if rt.cfg.history {
-            let _g = lock(&self.store);
             app::record_history(
                 &self.paths,
                 Watched {
@@ -374,7 +370,6 @@ impl Server {
                 json!(app::search(&rt, req.param("q")?, req.num("n", 40))?)
             }
             ("GET", ["api", "feed"]) => {
-                let _g = lock(&self.store);
                 json!(app::feed(
                     &rt,
                     paths,
@@ -386,16 +381,13 @@ impl Server {
             ("GET", ["api", "channel"]) => json!(app::channel(&rt, paths, req.param("id")?)?),
             ("GET", ["api", "subs"]) => json!(app::load_subs(paths)?.channels),
             ("POST", ["api", "subs", "add"]) => {
-                let _g = lock(&self.store);
                 let (sub, added) = app::add_sub(&rt, paths, req.param("c")?)?;
                 json!({ "sub": sub, "added": added })
             }
             ("POST", ["api", "subs", "rm"]) => {
-                let _g = lock(&self.store);
                 json!(app::remove_sub(paths, req.param("id")?)?)
             }
             ("POST", ["api", "subs", "import"]) => {
-                let _g = lock(&self.store);
                 let text = std::str::from_utf8(&req.body).context("the file isn't text")?;
                 let (added, total) = app::import_subs(paths, text)?;
                 json!({ "added": added, "total": total })
@@ -406,7 +398,6 @@ impl Server {
                 json!(w)
             }
             ("POST", ["api", "history", "clear"]) => {
-                let _g = lock(&self.store);
                 app::clear_history(paths)?;
                 json!({})
             }
@@ -903,15 +894,16 @@ fn respond_cached(out: &mut TcpStream, jpeg: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::store::testing::TempDir;
 
-    fn server() -> (Arc<Server>, String, tempdir::Dir) {
+    fn server() -> (Arc<Server>, String, TempDir) {
         server_with(Config::default())
     }
 
     /// A server whose clients may talk plain http, so a local upstream can
     /// stand in for googlevideo.
-    fn server_with(cfg: Config) -> (Arc<Server>, String, tempdir::Dir) {
-        let dir = tempdir::Dir::new();
+    fn server_with(cfg: Config) -> (Arc<Server>, String, TempDir) {
+        let dir = TempDir::new();
         let paths = Paths {
             config: dir.0.join("config.toml"),
             data: dir.0.join("data"),
@@ -1445,7 +1437,7 @@ EOF
     #[test]
     fn a_403_resolves_again_once_and_retries() {
         let up = Upstream::start();
-        let bin = tempdir::Dir::new();
+        let bin = TempDir::new();
         // The first resolve gives `…?gen=1`, which the upstream rejects with a
         // 403 like a URL from a retired circuit; the second gives `…?gen=2`.
         let ytdlp = fake_ytdlp(&bin.0, &up.url("/video?gen="));
@@ -1483,7 +1475,7 @@ EOF
     #[test]
     fn a_403_that_persists_is_passed_on_after_one_retry() {
         let up = Upstream::start();
-        let bin = tempdir::Dir::new();
+        let bin = TempDir::new();
         let ytdlp = fake_ytdlp(&bin.0, &up.url("/video?stale="));
         let (s, base, _d) = server_with(Config {
             ytdlp,
@@ -1498,7 +1490,7 @@ EOF
     #[test]
     fn a_stream_is_not_resolved_again_on_a_route_the_user_left() {
         let up = Upstream::start();
-        let bin = tempdir::Dir::new();
+        let bin = TempDir::new();
         let ytdlp = fake_ytdlp(&bin.0, &up.url("/video?gen="));
         let (s, base, _d) = server_with(Config {
             ytdlp,
@@ -1552,21 +1544,5 @@ EOF
         // Anything else replaces it.
         post(r#"{"route":"proxy","proxy":"http://10.0.0.1:8080"}"#);
         assert_eq!(saved(&s).as_deref(), Some("http://10.0.0.1:8080"));
-    }
-
-    mod tempdir {
-        pub struct Dir(pub std::path::PathBuf);
-        impl Dir {
-            pub fn new() -> Self {
-                let p = std::env::temp_dir().join(format!("veil-test-{}", super::random_hex()));
-                std::fs::create_dir_all(&p).unwrap();
-                Dir(p)
-            }
-        }
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
     }
 }
