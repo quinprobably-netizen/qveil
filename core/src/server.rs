@@ -20,14 +20,35 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_BODY: usize = 8 << 20;
 const MAX_SESSIONS: usize = 4;
 const MAX_THUMBS: usize = 800;
+
+// Limits that apply before a client has proven it holds the token, so that a
+// local program (or a web page that guessed the port) can't tie up threads or
+// memory just by connecting.
+const MAX_REQUEST_LINE: u64 = 8 << 10;
+const MAX_HEADERS: u64 = 32 << 10;
+const MAX_HEADER_COUNT: usize = 100;
+const MAX_CONNECTIONS: usize = 64;
+/// A client has this long, in total, to send its whole request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ordinary responses are small, so a client that doesn't read them is stuck.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A relayed body is different: mpv stops reading while a paused video's
+/// cache is full, so a short write timeout would kill a paused video.
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long, and how much, to read from a refused client before closing (see `refuse`).
+const LINGER: Duration = Duration::from_secs(1);
+const LINGER_BYTES: u64 = 64 << 10;
+/// Pause after a failed `accept`, so running out of file descriptors doesn't spin a core.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 pub struct Server {
     runtime: RwLock<Arc<Runtime>>,
@@ -38,6 +59,8 @@ pub struct Server {
     thumbs: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     /// Serializes read-modify-write of the subscription, feed and history files.
     store: Mutex<()>,
+    /// Connections being served right now (see `MAX_CONNECTIONS`).
+    connections: Arc<AtomicUsize>,
 }
 
 struct Session {
@@ -132,6 +155,7 @@ impl Server {
             sessions: Mutex::new(VecDeque::new()),
             thumbs: Mutex::new(HashMap::new()),
             store: Mutex::new(()),
+            connections: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -155,11 +179,11 @@ impl Server {
         );
         let server = Arc::clone(self);
         std::thread::spawn(move || {
-            for conn in listener.incoming().flatten() {
-                let server = Arc::clone(&server);
-                std::thread::spawn(move || {
-                    let _ = server.handle(conn);
-                });
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(conn) => server.accept(conn),
+                    Err(_) => std::thread::sleep(ACCEPT_BACKOFF),
+                }
             }
         });
         Ok(self.base.get_or_init(|| base).clone())
@@ -218,17 +242,54 @@ impl Server {
             .map(|(_, s)| Arc::clone(s))
     }
 
-    fn handle(self: &Arc<Self>, mut stream: TcpStream) -> Result<()> {
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        let req = read_request(&stream)?;
-        let rest = req
-            .path
-            .strip_prefix('/')
-            .and_then(|p| p.strip_prefix(self.token.as_str()))
-            .and_then(|p| p.strip_prefix('/'));
-        let Some(rest) = rest else {
-            return respond(&mut stream, 404, "text/plain", b"not found");
+    /// Serves one connection on its own thread, unless too many are open.
+    fn accept(self: &Arc<Self>, mut conn: TcpStream) {
+        let Some(slot) = Slot::take(&self.connections) else {
+            let _ = conn.set_write_timeout(Some(Duration::from_secs(1)));
+            let _ = respond(&mut conn, 503, "text/plain", b"too many connections");
+            return;
         };
+        let server = Arc::clone(self);
+        // If the thread can't be created, the closure is dropped with the
+        // connection and the slot, so nothing is leaked.
+        let _ = std::thread::Builder::new().spawn(move || {
+            let _slot = slot;
+            if let Err(e) = server.handle(conn) {
+                // A client that hangs up (mpv does, whenever it seeks) isn't
+                // news, but a stream that broke upstream is.
+                if e.downcast_ref::<StreamBroke>().is_some() {
+                    eprintln!("veil: {e:#}");
+                }
+            }
+        });
+    }
+
+    /// The path after `/<token>/`, if the token is right. Compared without
+    /// stopping at the first wrong byte, so response timing says nothing about it.
+    fn token_rest<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let p = path.strip_prefix('/')?;
+        let (given, rest) = p.split_at_checked(self.token.len())?;
+        let rest = rest.strip_prefix('/')?;
+        constant_time_eq(given.as_bytes(), self.token.as_bytes()).then_some(rest)
+    }
+
+    fn handle(self: &Arc<Self>, mut stream: TcpStream) -> Result<()> {
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        let mut r = BufReader::new(Deadline::new(stream.try_clone()?, REQUEST_TIMEOUT));
+        let line = match read_request_line(&mut r) {
+            Ok(line) => line,
+            Err(reject) => return refuse(&mut stream, &mut r, reject),
+        };
+        // The token is checked before a single header is read, so a client
+        // without it can make us read one short line and nothing more.
+        if self.token_rest(&line.path).is_none() {
+            return refuse(&mut stream, &mut r, Reject::new(404, "not found"));
+        }
+        let req = match read_request_rest(&mut r, line) {
+            Ok(req) => req,
+            Err(reject) => return refuse(&mut stream, &mut r, reject),
+        };
+        let rest = self.token_rest(&req.path).unwrap_or_default();
         let segs: Vec<&str> = rest.split('/').collect();
         match (req.method.as_str(), segs.as_slice()) {
             ("GET" | "HEAD", ["s", sid, kind @ ("v" | "a")]) => {
@@ -466,10 +527,29 @@ impl Server {
         );
         out.write_all(head.as_bytes())?;
         if req.method != "HEAD" {
-            // mpv drops the connection whenever it seeks; that's not an error.
-            let _ = std::io::copy(&mut up, out);
+            out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
+            copy_body(&mut up, out)?;
         }
         Ok(())
+    }
+}
+
+/// Streams the body to the client. mpv drops the connection whenever it
+/// seeks, so a failed write ends the copy quietly. A failed *read* from
+/// upstream is returned instead: the connection is then closed short of the
+/// Content-Length, which mpv reports, rather than looking like a complete body.
+fn copy_body(up: &mut impl Read, out: &mut impl Write) -> Result<()> {
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = match up.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(StreamBroke(e).into()),
+        };
+        if out.write_all(&buf[..n]).is_err() {
+            return Ok(());
+        }
     }
 }
 
@@ -479,60 +559,201 @@ fn is_playlist_type(content_type: &str) -> bool {
     t.contains("mpegurl") || t.contains("dash+xml")
 }
 
-fn read_request(stream: &TcpStream) -> Result<Request> {
-    let mut r = BufReader::new(stream.try_clone()?);
+/// A request the server refuses to read on, with the status to say so.
+struct Reject {
+    status: u16,
+    msg: &'static str,
+}
+
+impl Reject {
+    const fn new(status: u16, msg: &'static str) -> Self {
+        Self { status, msg }
+    }
+}
+
+/// Answers a request we stopped reading, then closes politely. Closing a
+/// socket that still holds unread bytes resets the connection, and the client
+/// may then lose the answer we just wrote, so first read (and drop) a bounded
+/// amount of what it is still sending.
+fn refuse(stream: &mut TcpStream, r: &mut BufReader<Deadline>, reject: Reject) -> Result<()> {
+    respond(stream, reject.status, "text/plain", reject.msg.as_bytes())?;
+    stream.shutdown(Shutdown::Write)?;
+    r.get_mut().until = Instant::now() + LINGER;
+    let _ = io::copy(&mut r.by_ref().take(LINGER_BYTES), &mut io::sink());
+    Ok(())
+}
+
+impl From<io::Error> for Reject {
+    fn from(e: io::Error) -> Self {
+        match e.kind() {
+            // What a socket read timeout looks like, depending on the platform.
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                Reject::new(408, "request timed out")
+            }
+            _ => Reject::new(400, "bad request"),
+        }
+    }
+}
+
+/// Reads from a socket, but gives up at a fixed deadline for the whole
+/// request, so a client can't hold a thread by sending one byte at a time.
+struct Deadline {
+    stream: TcpStream,
+    until: Instant,
+}
+
+impl Deadline {
+    fn new(stream: TcpStream, within: Duration) -> Self {
+        Self {
+            stream,
+            until: Instant::now() + within,
+        }
+    }
+}
+
+impl Read for Deadline {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self
+            .until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+struct RequestLine {
+    method: String,
+    path: String,
+    query: HashMap<String, String>,
+}
+
+fn read_request_line(r: &mut impl BufRead) -> Result<RequestLine, Reject> {
     let mut line = String::new();
-    r.read_line(&mut line)?;
+    // `take` is what bounds this: read_line alone would buffer an endless line.
+    r.by_ref().take(MAX_REQUEST_LINE).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(if line.len() as u64 >= MAX_REQUEST_LINE {
+            Reject::new(414, "request line too long")
+        } else {
+            Reject::new(400, "malformed request line")
+        });
+    }
     let mut parts = line.split_whitespace();
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
-        bail!("malformed request line");
+        return Err(Reject::new(400, "malformed request line"));
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let query = url::form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect();
+    Ok(RequestLine {
+        method: method.into(),
+        path: path.into(),
+        query,
+    })
+}
+
+fn read_request_rest(r: &mut impl BufRead, line: RequestLine) -> Result<Request, Reject> {
     let mut headers = Vec::new();
+    let mut budget = r.by_ref().take(MAX_HEADERS);
     loop {
         let mut h = String::new();
-        if r.read_line(&mut h)? == 0 {
-            break;
+        budget.read_line(&mut h)?;
+        if !h.ends_with('\n') {
+            return Err(if budget.limit() == 0 {
+                Reject::new(431, "headers too large")
+            } else {
+                Reject::new(400, "incomplete headers")
+            });
         }
         let h = h.trim_end();
         if h.is_empty() {
             break;
         }
-        if headers.len() > 100 {
-            bail!("too many headers");
+        if headers.len() >= MAX_HEADER_COUNT {
+            return Err(Reject::new(431, "too many headers"));
         }
         if let Some((k, v)) = h.split_once(':') {
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
-    let len: usize = headers
+    let len = match headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
+    {
+        None => 0,
+        Some((_, v)) => v
+            .parse::<usize>()
+            .map_err(|_| Reject::new(400, "bad Content-Length"))?,
+    };
     if len > MAX_BODY {
-        bail!("body too large");
+        return Err(Reject::new(413, "body too large"));
     }
-    let mut body = vec![0; len];
-    r.read_exact(&mut body)?;
+    // Grown as the bytes arrive rather than allocated up front, so a
+    // Content-Length that is never fulfilled costs nothing.
+    let mut body = Vec::new();
+    r.by_ref().take(len as u64).read_to_end(&mut body)?;
+    if body.len() != len {
+        return Err(Reject::new(400, "body shorter than Content-Length"));
+    }
     Ok(Request {
-        method: method.into(),
-        path: path.into(),
-        query,
+        method: line.method,
+        path: line.path,
+        query: line.query,
         headers,
         body,
     })
 }
 
+/// One of the `MAX_CONNECTIONS` places; given back when dropped.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(counter: &Arc<AtomicUsize>) -> Option<Slot> {
+        if counter.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+            counter.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Slot(Arc::clone(counter)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The upstream side of a relayed stream failed part-way through the body.
+#[derive(Debug)]
+struct StreamBroke(io::Error);
+
+impl std::fmt::Display for StreamBroke {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the stream broke upstream: {}", self.0)
+    }
+}
+
+impl std::error::Error for StreamBroke {}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
 fn respond(out: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> Result<()> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
+        413 => "Content Too Large",
+        414 => "URI Too Long",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Bad Gateway",
     };
     write!(
@@ -572,13 +793,15 @@ mod tests {
         (s, base, dir)
     }
 
-    fn http(base: &str, method: &str, path: &str, body: &str) -> (u16, String) {
-        let addr = base
-            .trim_start_matches("http://")
+    fn addr(base: &str) -> &str {
+        base.trim_start_matches("http://")
             .split('/')
             .next()
-            .unwrap();
-        let mut c = TcpStream::connect(addr).unwrap();
+            .unwrap()
+    }
+
+    fn http(base: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+        let mut c = TcpStream::connect(addr(base)).unwrap();
         write!(
             c,
             "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
@@ -669,6 +892,108 @@ mod tests {
         );
         assert_eq!(status, 500);
         assert!(body.contains("isn't a YouTube video"));
+    }
+
+    /// Sends raw bytes and returns the status line's code (0 if none came
+    /// back). The server may hang up before reading everything, so write and
+    /// read errors are ignored: what matters is what the client got.
+    fn raw(base: &str, request: &[u8]) -> u16 {
+        let mut c = TcpStream::connect(addr(base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = c.write_all(request);
+        let mut resp = Vec::new();
+        let _ = c.read_to_end(&mut resp);
+        std::str::from_utf8(resp.get(9..12).unwrap_or_default())
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_client_without_the_token_gets_nothing_more_than_one_line() {
+        let (_s, base, _d) = server();
+        // The request line alone is enough to be refused: the server doesn't
+        // wait for headers that, here, never come.
+        assert_eq!(raw(&base, b"GET /nope/api/config HTTP/1.1\r\n"), 404);
+    }
+
+    #[test]
+    fn request_line_and_header_sizes_are_capped() {
+        let (_s, base, _d) = server();
+        let long = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(9000));
+        assert_eq!(raw(&base, long.as_bytes()), 414);
+
+        let token = base.rsplit('/').next().unwrap();
+        let head = format!("GET /{token}/api/config HTTP/1.1\r\n");
+        // 40 headers of 1 KiB: few enough to count, too many bytes to read.
+        let big = format!(
+            "{head}{}\r\n",
+            format!("X-Pad: {}\r\n", "a".repeat(1000)).repeat(40)
+        );
+        assert_eq!(raw(&base, big.as_bytes()), 431);
+        // Many tiny headers hit the count limit instead.
+        let many = format!("{head}{}\r\n", "X: y\r\n".repeat(150));
+        assert_eq!(raw(&base, many.as_bytes()), 431);
+        // A body bigger than any request the app sends is refused unread.
+        let body = format!("POST /{token}/api/config HTTP/1.1\r\nContent-Length: 99999999\r\n\r\n");
+        assert_eq!(raw(&base, body.as_bytes()), 413);
+        // The caps leave ordinary requests alone.
+        let fine = format!("{head}Host: x\r\n\r\n");
+        assert_eq!(raw(&base, fine.as_bytes()), 200);
+    }
+
+    #[test]
+    fn connections_are_capped_and_released() {
+        let (_s, base, _d) = server();
+        let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS)
+            .map(|_| TcpStream::connect(addr(&base)).unwrap())
+            .collect();
+        // Every slot is taken by a client that says nothing at all.
+        assert_eq!(raw(&base, b"GET / HTTP/1.1\r\n\r\n"), 503);
+        drop(idle);
+        // Hanging up frees the slots again.
+        let started = Instant::now();
+        let status = loop {
+            let status = raw(&base, b"GET / HTTP/1.1\r\n\r\n");
+            if status != 503 || started.elapsed() > Duration::from_secs(5) {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(status, 404, "slots were not released");
+    }
+
+    #[test]
+    fn a_trickling_client_cannot_outlast_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let trickler = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            // One byte every 50 ms never trips a per-read timeout of 300 ms.
+            for _ in 0..40 {
+                if c.write_all(b"a").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (peer, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let mut reader = Deadline::new(peer, Duration::from_millis(300));
+        let mut buf = [0u8; 1];
+        let err = loop {
+            if let Err(e) = reader.read(&mut buf) {
+                break e;
+            }
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(reader);
+        trickler.join().unwrap();
     }
 
     mod tempdir {
