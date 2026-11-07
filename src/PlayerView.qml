@@ -16,6 +16,9 @@ FocusScope {
     readonly property color stage: "#000000"
 
     property bool active: false
+    // Opened on a click, before the engine has looked the video up: the
+    // player shows its poster and title until the streams arrive.
+    property bool pending: false
     property var info: ({})
     // Whether the controls, and the window's top bar with them, are showing.
     property bool chrome: true
@@ -35,7 +38,25 @@ FocusScope {
     // Letting go of the controls' hold restarts their countdown.
     onHoldChanged: if (!hold) reveal()
 
+    // Shows the player for `video` (a card's data: id, title, channel) at
+    // once, while the engine looks it up; `open` follows with the streams.
+    function prepare(video) {
+        if (mpv.loaded)
+            mpv.stop()
+        info = {
+            id: video.id,
+            title: video.title || "",
+            channel: video.channel || "",
+            channelId: video.channel_id || video.channelId || ""
+        }
+        pending = true
+        active = true
+        reveal()
+        forceActiveFocus()
+    }
+
     function open(i) {
+        pending = false
         info = i
         active = true
         mpv.volume = savedVolume
@@ -45,6 +66,9 @@ FocusScope {
     }
 
     function close() {
+        if (pending)
+            backend.cancelPlay()
+        pending = false
         mpv.stop()
         active = false
         info = ({})
@@ -70,9 +94,45 @@ FocusScope {
         onPausedChanged: view.reveal()
     }
 
+    // The video's thumbnail until its first frame: the engine has it cached
+    // from the grid, so this is no new request for anything not already shown.
+    Image {
+        id: poster
+        anchors.fill: parent
+        fillMode: Image.PreserveAspectFit
+        asynchronous: true
+        source: view.active && view.info.id && backend.thumbBase ? backend.thumbBase + view.info.id : ""
+        opacity: view.active && !mpv.started ? 0.55 : 0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: 180 } }
+    }
+
     BusyIndicator {
+        id: spinner
         anchors.centerIn: parent
-        running: view.active && mpv.buffering
+        running: view.active && (view.pending || mpv.buffering)
+    }
+
+    Label {
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: spinner.bottom
+        anchors.topMargin: 14
+        visible: view.pending
+        text: backend.config.route === "tor" ? qsTr("Opening the video over Tor…") : qsTr("Opening the video…")
+        color: "#c0c0ca"
+    }
+
+    // A lookup that fails says why in the window's error, and leaves nothing to show.
+    Connections {
+        target: backend
+        function onTaskFailed(task) {
+            if (task === "play" && view.pending)
+                view.close()
+        }
+        function onReadyChanged() {
+            if (!backend.ready && view.pending)
+                view.close()
+        }
     }
 
     Timer {

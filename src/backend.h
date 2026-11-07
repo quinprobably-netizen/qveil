@@ -72,6 +72,9 @@ public:
     Q_INVOKABLE void loadConfig();
     Q_INVOKABLE void setConfig(const QVariantMap &patch);
     Q_INVOKABLE void play(const QString &video);
+    // Drops the answer of a video still being looked up: the player it was
+    // for has been closed.
+    Q_INVOKABLE void cancelPlay();
     Q_INVOKABLE void reportError(const QString &message);
     Q_INVOKABLE void clearError();
 
@@ -93,16 +96,25 @@ signals:
     // The route or proxy was changed, so whatever plays over the old one must stop.
     void routeChanged();
     void playReady(const QVariantMap &info);
+    // The latest request of `task` failed (the error itself is in `error`).
+    void taskFailed(const QString &task);
     void notice(const QString &text);
 
 private:
     using Done = std::function<void(const QJsonValue &)>;
+    using Batch = std::function<void(const QVariantList &)>;
     // One request to the engine. `task` drives the busy state. Reads deliver
     // only the newest answer per task, so a slow old search can't overwrite a
     // newer one; a write (`everyAnswer`) delivers each answer, because every
     // one of them changed something the window must hear about.
     void call(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
               const QString &task, Done done, bool everyAnswer = false);
+    // A GET whose answer is one JSON object per line, sent as they are ready
+    // (see qveil-core's streamed search). `batch` gets them a few at a time.
+    void stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch);
+    // Lines that arrive together are handed on together, so a page of
+    // results is one update of the grid rather than twenty.
+    static constexpr int BatchMs = 100;
     void setError(const QString &message);
     void setBusy(const QString &task, int delta);
     void onEngineReady();

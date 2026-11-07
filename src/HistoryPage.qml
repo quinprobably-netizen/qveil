@@ -10,7 +10,7 @@ FocusScope {
     readonly property bool enabled_: !!backend.config.history
     // Where focus belongs when the page is shown.
     readonly property Item content: list
-    signal playRequested(string id)
+    signal playRequested(var video)
 
     ColumnLayout {
         anchors.fill: parent
@@ -64,7 +64,7 @@ FocusScope {
                 required property var modelData
                 width: ListView.view.width
                 height: 52
-                onClicked: page.playRequested(modelData.id)
+                onClicked: page.playRequested(modelData)
                 contentItem: RowLayout {
                     spacing: 12
                     ColumnLayout {

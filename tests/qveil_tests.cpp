@@ -348,6 +348,120 @@ private slots:
         QCOMPARE(moved.size(), 3);
     }
 
+    void aClosedPlayerDropsTheAnswerOfItsVideo()
+    {
+        QTemporaryDir dir;
+        const QString log = dir.filePath("requests");
+        Backend backend(logged(log), requestLogger(dir, "time.sleep(0.4)"));
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QSignalSpy ready(&backend, &Backend::playReady);
+
+        // The player is closed while the video is looked up: its answer
+        // must not open it again.
+        backend.play("dQw4w9WgXcQ");
+        backend.cancelPlay();
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("play"), 5000);
+        QCOMPARE(ready.count(), 0);
+
+        backend.play("dQw4w9WgXcQ");
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+    }
+
+    void aFailedLookupSaysSoOnlyForTheLatestVideo()
+    {
+        QTemporaryDir dir;
+        // Every lookup fails, the first one slowly.
+        const QString fake = engine(dir, "import http.server,json,time\n"
+                                         "n=[0]\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def do_GET(s): s.reply(200,{})\n"
+                                         "  def do_POST(s):\n"
+                                         "    n[0]+=1\n"
+                                         "    if n[0]==1: time.sleep(0.6)\n"
+                                         "    s.reply(500,{'error':'no such video %d'%n[0]})\n"
+                                         "  def reply(s,code,body):\n"
+                                         "    b=json.dumps(body).encode()\n"
+                                         "    s.send_response(code);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+
+        // The first video is still being looked up when the second is asked
+        // for; only the second one's failure is the player's business.
+        backend.play("aaaaaaaaaaa");
+        QTest::qWait(150);
+        backend.play("bbbbbbbbbbb");
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        QCOMPARE(failed.at(0).at(0).toString(), QString("play"));
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("play"), 5000);
+        QCOMPARE(failed.count(), 1);
+        QVERIFY(backend.error().contains("no such video"));
+    }
+
+    void searchResultsArriveAPageAtATime()
+    {
+        QTemporaryDir dir;
+        // Two results, a pause, a third; a query of "fail" ends with an error
+        // line instead, and "slow" waits a second before its results.
+        const QString fake = engine(dir, "import http.server,json,time,urllib.parse\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def do_GET(s):\n"
+                                         "    q=urllib.parse.parse_qs(urllib.parse.urlparse(s.path).query)\n"
+                                         "    if 'stream' not in q:\n"
+                                         "      b=b'{}';s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b);return\n"
+                                         "    term=q['q'][0]\n"
+                                         "    s.send_response(200);s.send_header('Content-Type','application/x-ndjson');s.end_headers()\n"
+                                         "    if term=='slow': time.sleep(1)\n"
+                                         "    line=lambda i: s.wfile.write((json.dumps({'id':term[:4]+'%07d'%i,'title':term})+'\\n').encode()) or s.wfile.flush()\n"
+                                         "    line(1);line(2)\n"
+                                         "    time.sleep(0.8)\n"
+                                         "    if term=='fail': s.wfile.write(b'{\"error\":\"the route went down\"}\\n')\n"
+                                         "    else: line(3)\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
+                                         "srv.protocol_version='HTTP/1.0'\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+
+        // The first page shows before the second has come.
+        QElapsedTimer clock;
+        clock.start();
+        backend.search("rust");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results().size(), 2, 5000);
+        QVERIFY2(clock.elapsed() < 700, qPrintable(QString::number(clock.elapsed())));
+        QVERIFY(backend.busy().contains("search"));
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results().size(), 3, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+        QCOMPARE(backend.results().at(2).toMap().value("id").toString(), QString("rust0000003"));
+        QVERIFY(backend.error().isEmpty());
+
+        // A search that is replaced adds nothing to its successor's results.
+        backend.search("slow");
+        QTest::qWait(100);
+        backend.search("next");
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+        QCOMPARE(backend.results().size(), 3);
+        for (const QVariant &r : backend.results())
+            QCOMPARE(r.toMap().value("title").toString(), QString("next"));
+
+        // One that fails part-way keeps what it found and says what happened.
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+        backend.search("fail");
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+        QCOMPARE(backend.results().size(), 2);
+        QCOMPARE(backend.error(), QString("the route went down"));
+        QCOMPARE(failed.count(), 1);
+    }
+
     void reportsAMissingEngine()
     {
         Backend backend(QProcessEnvironment::systemEnvironment(), "/nonexistent/qveil-core");
@@ -443,8 +557,12 @@ private slots:
     {
         // The fake hyprctl lives apart from the theme directory: the theme
         // watches its directory and re-reads rounding on any change there,
-        // which would make rewriting the response look like a reload.
-        QTemporaryDir dir, tools;
+        // which would make rewriting the response look like a reload. It
+        // watches the directory's parent too, so that is a private one, not
+        // /tmp, which other programs change at any moment.
+        QTemporaryDir root, tools;
+        QVERIFY(QDir(root.path()).mkdir("theme"));
+        const QString themeDir = root.filePath("theme");
         const QString response = tools.filePath("response.json"), command = tools.filePath("hyprctl");
         auto write = [](const QString &path, const QByteArray &data) {
             QFile file(path);
@@ -460,7 +578,7 @@ private slots:
         QLocalServer hyprland;
         QVERIFY(hyprland.listen(sockets.filePath("events.sock")));
 
-        Theme theme(dir.path(), nullptr, command, sockets.filePath("events.sock"));
+        Theme theme(themeDir, nullptr, command, sockets.filePath("events.sock"));
         // The first query reads the rounding.
         QTRY_COMPARE(theme.radius(), 4);
         QTRY_VERIFY(hyprland.hasPendingConnections());

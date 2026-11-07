@@ -8,6 +8,10 @@
 #include <QNetworkProxy>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QTimer>
+
+#include <memory>
+#include <utility>
 
 Backend::Backend(const QProcessEnvironment &environment, const QString &core, QObject *parent)
     : QObject(parent), m_environment(environment), m_corePath(core.isEmpty() ? corePath() : core) {
@@ -183,6 +187,8 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
         if (status != 200) {
             const QString message = doc.object().value("error").toString();
             setError(message.isEmpty() ? reply->errorString() : message);
+            if (m_latest.value(task) == id)
+                emit taskFailed(task);
             return;
         }
         if (!everyAnswer && m_latest.value(task) != id)
@@ -273,9 +279,94 @@ void Backend::search(const QString &query) {
     emit resultsChanged();
     QUrlQuery params;
     params.addQueryItem("q", q);
-    call("GET", "api/search", params, {}, "search", [this](const QJsonValue &v) {
-        m_results = v.toArray().toVariantList();
+    // YouTube answers 20 results at a time; the first page is shown while
+    // the second is on its way.
+    params.addQueryItem("stream", "1");
+    stream("api/search", params, "search", [this](const QVariantList &batch) {
+        m_results.append(batch);
         emit resultsChanged();
+    });
+}
+
+void Backend::stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch) {
+    if (!ready()) {
+        if (!m_fatal.isEmpty())
+            setError(m_fatal);
+        return;
+    }
+    QUrl url(m_base + "/" + path);
+    url.setQuery(query);
+    QNetworkRequest request(url);
+    request.setTransferTimeout(300000);
+
+    const quint64 id = ++m_sequence;
+    const quint64 generation = m_generation;
+    m_latest.insert(task, id);
+    setBusy(task, +1);
+    QNetworkReply *reply = m_net.get(request);
+
+    struct State {
+        QByteArray buffer;
+        QVariantList lines;
+        QString error;
+    };
+    auto state = std::make_shared<State>();
+    auto *flush = new QTimer(reply);
+    flush->setSingleShot(true);
+    flush->setInterval(BatchMs);
+    // Only the latest request of the task, from the engine that is running, gets through.
+    auto current = [this, task, id, generation] { return generation == m_generation && m_latest.value(task) == id; };
+    auto deliver = [state, batch, current] {
+        QVariantList lines = std::exchange(state->lines, {});
+        if (!lines.isEmpty() && current())
+            batch(lines);
+    };
+    // Takes the complete lines out of the buffer; `all` takes a last one without a newline too.
+    auto parse = [state](bool all) {
+        for (;;) {
+            qsizetype end = state->buffer.indexOf('\n');
+            if (end < 0 && !(all && !state->buffer.trimmed().isEmpty()))
+                return;
+            if (end < 0)
+                end = state->buffer.size();
+            const QJsonObject o = QJsonDocument::fromJson(state->buffer.left(end)).object();
+            state->buffer.remove(0, end + 1);
+            if (o.contains("error"))
+                state->error = o.value("error").toString();
+            else if (!o.isEmpty())
+                state->lines.append(o.toVariantMap());
+        }
+    };
+    connect(flush, &QTimer::timeout, this, deliver);
+    connect(reply, &QNetworkReply::readyRead, this, [reply, state, flush, parse] {
+        // An error comes whole, and is read when the reply has finished.
+        if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200)
+            return;
+        state->buffer += reply->readAll();
+        parse(false);
+        if (!state->lines.isEmpty() && !flush->isActive())
+            flush->start();
+    });
+    connect(reply, &QNetworkReply::finished, this, [this, reply, state, flush, parse, deliver, current, task] {
+        reply->deleteLater();
+        flush->stop();
+        setBusy(task, -1);
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (status != 200) {
+            if (!current())
+                return;
+            const QString message = QJsonDocument::fromJson(reply->readAll()).object().value("error").toString();
+            setError(message.isEmpty() ? reply->errorString() : message);
+            emit taskFailed(task);
+            return;
+        }
+        state->buffer += reply->readAll();
+        parse(true);
+        deliver();
+        if (!state->error.isEmpty() && current()) {
+            setError(state->error);
+            emit taskFailed(task);
+        }
     });
 }
 
@@ -377,6 +468,8 @@ void Backend::play(const QString &video) {
             loadHistory();
     });
 }
+
+void Backend::cancelPlay() { m_latest.insert("play", ++m_sequence); }
 
 QString Backend::thumbBase() const {
     if (!ready() || m_config.isEmpty() || !m_config.value("thumbnails", true).toBool())

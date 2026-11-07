@@ -10,12 +10,16 @@ use crate::subs::{self, Sub, Subs};
 use crate::video::Video;
 use crate::ytdlp::Ytdlp;
 use anyhow::{Context, Result, bail};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 pub struct Runtime {
     pub cfg: Config,
     pub net: Net,
     pub yt: Ytdlp,
+    /// The client short requests share where the route allows it (see `web_client`).
+    shared: OnceLock<Client>,
 }
 
 impl Runtime {
@@ -32,7 +36,28 @@ impl Runtime {
             cache_dir: paths.ytdlp_cache(),
             net: net.clone(),
         };
-        Ok(Self { cfg, net, yt })
+        Ok(Self {
+            cfg,
+            net,
+            yt,
+            shared: OnceLock::new(),
+        })
+    }
+
+    /// The client for one short request: a feed or a thumbnail. Where the
+    /// route isolates requests (Tor), each gets a client of its own, and with
+    /// it a circuit of its own. Otherwise they share one and reuse its
+    /// connections: they leave from the same address either way, and a new
+    /// client's TLS handshake was most of what a thumbnail cost.
+    pub fn web_client(&self) -> Result<Client> {
+        if self.net.isolates() {
+            return self.net.client();
+        }
+        if let Some(c) = self.shared.get() {
+            return Ok(c.clone());
+        }
+        let c = self.net.client()?;
+        Ok(self.shared.get_or_init(|| c).clone())
     }
 
     /// yt-dlp on one fixed identity of the current route (see `Net::pinned`).
@@ -55,6 +80,21 @@ pub fn search(rt: &Runtime, query: &str, limit: usize) -> Result<Vec<Video>> {
         bail!("empty search");
     }
     rt.yt.search(query, limit)
+}
+
+/// `search`, with each result handed to `each` as soon as it is in (see
+/// `Ytdlp::search_each`).
+pub fn search_each(
+    rt: &Runtime,
+    query: &str,
+    limit: usize,
+    each: &mut dyn FnMut(Video) -> bool,
+) -> Result<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("empty search");
+    }
+    rt.yt.search_each(query, limit, each)
 }
 
 #[derive(Serialize)]
@@ -123,7 +163,7 @@ pub fn feed(
     let cache: FeedCache = if !due.is_empty() {
         // The slow part, with nothing locked: the network can take minutes
         // over Tor, and other commands must not wait for it.
-        let fetch = feed::fetch_all(&rt.net, &rt.yt, &due, rt.cfg.feed_workers, current);
+        let fetch = feed::fetch_all(rt, &due, rt.cfg.feed_workers, current);
         fallbacks = fetch
             .fetched
             .iter()
@@ -289,6 +329,99 @@ mod tests {
             ..Config::default()
         };
         Runtime::new(cfg, paths, Some("http://127.0.0.1:1".into()), false).unwrap()
+    }
+
+    /// A SOCKS5 proxy that records the user name each connection
+    /// authenticates with, then refuses it.
+    fn socks_spy() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let users = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&users);
+        std::thread::spawn(move || {
+            for mut c in listener.incoming().flatten() {
+                // Greeting: version, method count, methods. Ask for a password.
+                let mut head = [0u8; 2];
+                if c.read_exact(&mut head).is_err() {
+                    continue;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                let _ = c.read_exact(&mut methods);
+                let _ = c.write_all(&[5, 2]);
+                // Version 1, the user name, then the password.
+                let mut len = [0u8; 2];
+                if c.read_exact(&mut len).is_err() {
+                    continue;
+                }
+                let mut user = vec![0u8; len[1] as usize];
+                let _ = c.read_exact(&mut user);
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&user).into_owned());
+                let _ = c.write_all(&[1, 1]);
+            }
+        });
+        (port, users)
+    }
+
+    #[test]
+    fn short_requests_on_an_isolating_route_each_get_their_own_identity() {
+        let dir = TempDir::new();
+        let (port, users) = socks_spy();
+        let cfg = Config {
+            proxy: Some(format!("socks5h://127.0.0.1:{port}")),
+            ..Config::default()
+        };
+        let rt = Runtime::new(cfg, &dir.paths(), None, false).unwrap();
+        assert!(rt.net.isolates());
+        for _ in 0..3 {
+            let c = rt.web_client().unwrap();
+            assert!(
+                c.get("https://i.ytimg.com/vi/x/mqdefault.jpg")
+                    .send()
+                    .is_err()
+            );
+        }
+        let users = users.lock().unwrap().clone();
+        let distinct: std::collections::HashSet<_> = users.iter().collect();
+        // With Tor, each would be a circuit of its own.
+        assert_eq!((users.len(), distinct.len()), (3, 3), "{users:?}");
+    }
+
+    #[test]
+    fn short_requests_on_other_routes_reuse_one_connection() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for c in listener.incoming().flatten() {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut w = c.try_clone().unwrap();
+                    let mut r = BufReader::new(c);
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            let _ = w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                        }
+                    }
+                });
+            }
+        });
+        let dir = TempDir::new();
+        let mut rt = Runtime::new(Config::default(), &dir.paths(), None, false).unwrap();
+        rt.net = rt.net.allowing_http();
+        for _ in 0..3 {
+            let body = rt.web_client().unwrap().get(&url).send().unwrap().text();
+            assert_eq!(body.unwrap(), "ok");
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn channel(n: u32) -> String {

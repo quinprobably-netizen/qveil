@@ -33,6 +33,12 @@ const LIVE_UNSUPPORTED: &str =
     "Live streams aren't supported yet: they can't be relayed through your route.";
 const MANIFEST_ONLY: &str = "This video is only offered as an HLS/DASH stream, which can't be relayed through your route yet.";
 
+/// The format selector only takes plain downloads, so the HLS manifest that
+/// yt-dlp fetches for every video (a quarter of a second of a 1.3 s resolve,
+/// measured) is never used. Skipped when resolving; `explain_no_format` still
+/// fetches it, to tell a live stream from a video that has no plain download.
+const SKIP_MANIFESTS: &str = "youtube:skip=hls,dash";
+
 /// yt-dlp exited with an error. `raw` is its last stderr line; the message
 /// shown is the readable version of it.
 #[derive(Debug)]
@@ -91,10 +97,23 @@ impl Ytdlp {
     /// Runs yt-dlp on `target` (a URL or a `ytsearchN:` query) with `args`
     /// and parses its JSON. It is killed if it takes longer than `limit`.
     fn json(&self, args: &[&str], target: &str, limit: Duration) -> Result<Value> {
+        self.json_with(args, None, target, limit)
+    }
+
+    /// Like `json`, with `extractor_args` for yt-dlp's `--extractor-args`.
+    /// They go in the call's config file, not on the command line, because
+    /// they name the site the call is for.
+    fn json_with(
+        &self,
+        args: &[&str],
+        extractor_args: Option<&str>,
+        target: &str,
+        limit: Duration,
+    ) -> Result<Value> {
         // yt-dlp would create it with the default mode, and every directory
         // above it that doesn't exist yet along with it.
         crate::store::ensure_dir(&self.cache_dir)?;
-        let call = Call::new(&self.net, target)?;
+        let call = Call::new(&self.net, extractor_args, target)?;
         let out = output_within(self.command(&call).args(args), limit)
             .with_context(|| format!("running {:?} (is yt-dlp installed?)", self.bin))?;
         // The files are only needed while it runs.
@@ -106,27 +125,109 @@ impl Ytdlp {
             );
         };
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let line = err
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("unknown error")
-                .trim();
-            return Err(Failed {
-                raw: self
-                    .net
-                    .explain(line.strip_prefix("ERROR: ").unwrap_or(line)),
-            }
-            .into());
+            return Err(self.failure(&out.stderr));
         }
         serde_json::from_slice(&out.stdout).context("yt-dlp returned invalid JSON")
+    }
+
+    /// What a failed run says: its last line on stderr.
+    fn failure(&self, stderr: &[u8]) -> anyhow::Error {
+        let err = String::from_utf8_lossy(stderr);
+        let line = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("unknown error")
+            .trim();
+        Failed {
+            raw: self
+                .net
+                .explain(line.strip_prefix("ERROR: ").unwrap_or(line)),
+        }
+        .into()
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Video>> {
         let q = format!("ytsearch{limit}:{query}");
         let v = self.json(&["--flat-playlist", "-J"], &q, QUICK)?;
         Ok(entries(&v))
+    }
+
+    /// The same search, handing each result to `each` as soon as yt-dlp has
+    /// it: YouTube answers a search 20 results at a time, and the first
+    /// page needn't wait for the second. The requests are the same as
+    /// `search`'s. `each` returns false to stop (the window went away), and
+    /// yt-dlp is then killed. Returns how many results there were.
+    pub fn search_each(
+        &self,
+        query: &str,
+        limit: usize,
+        each: &mut dyn FnMut(Video) -> bool,
+    ) -> Result<usize> {
+        let q = format!("ytsearch{limit}:{query}");
+        crate::store::ensure_dir(&self.cache_dir)?;
+        let call = Call::new(&self.net, None, &q)?;
+        let mut child = self
+            .command(&call)
+            .args(["--flat-playlist", "--lazy-playlist", "-j"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running {:?} (is yt-dlp installed?)", self.bin))?;
+        let stdout = child.stdout.take().context("no stdout")?;
+        let stderr = drain(child.stderr.take());
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        // Kills yt-dlp at the deadline, or as soon as `done` is sent.
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let child = std::sync::Arc::clone(&child);
+            std::thread::spawn(move || {
+                let late = finished.recv_timeout(QUICK).is_err();
+                let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+                late
+            })
+        };
+        let (mut n, mut stopped) = (0, false);
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if let Some(video) = entry(&v, &None, &None) {
+                n += 1;
+                if !each(video) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        // Whether it finished, was stopped or ran out of time, it ends here.
+        let status = loop {
+            // Never blocks with the lock held, so the watchdog can always kill.
+            let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
+            if stopped {
+                let _ = child.kill();
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            drop(child);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = done.send(());
+        let late = watchdog.join().unwrap_or(false) && !status.success();
+        drop(call);
+        let stderr = stderr.join().unwrap_or_default();
+        if stopped || status.success() {
+            return Ok(n);
+        }
+        if late {
+            bail!(
+                "yt-dlp didn't finish within {} s and was stopped; the route may be slow or down",
+                QUICK.as_secs()
+            );
+        }
+        Err(self.failure(&stderr))
     }
 
     /// Returns (channel id, display name).
@@ -165,7 +266,8 @@ impl Ytdlp {
     /// manifest slipping through would make mpv fetch segments directly,
     /// around the route.
     pub fn resolve(&self, url: &str, format: &str) -> Result<Streams> {
-        match self.json(&["-J", "--no-playlist", "-f", format], url, RESOLVE) {
+        let args = ["-J", "--no-playlist", "-f", format];
+        match self.json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE) {
             Ok(v) => streams_from(&v, url),
             Err(e) if is_no_format(&e) => Err(self.explain_no_format(url, e)),
             Err(e) => Err(e),
@@ -198,7 +300,7 @@ struct Call {
 }
 
 impl Call {
-    fn new(net: &Net, target: &str) -> Result<Self> {
+    fn new(net: &Net, extractor_args: Option<&str>, target: &str) -> Result<Self> {
         // A target that began with `-` would be read as an option. Ours are
         // always `ytsearch…` or an https URL, so this can't happen.
         ensure!(
@@ -216,7 +318,11 @@ impl Call {
             .collect();
         // The byte order mark makes yt-dlp read the file as UTF-8 whatever
         // the locale is, so a search in any script arrives intact.
-        let text = format!("\u{feff}--proxy {}\n{}\n", quote(&proxy), quote(&target));
+        let mut text = format!("\u{feff}--proxy {}\n", quote(&proxy));
+        if let Some(e) = extractor_args {
+            text.push_str(&format!("--extractor-args {}\n", quote(e)));
+        }
+        text.push_str(&format!("{}\n", quote(&target)));
         let dir = PrivateDir::new("qveil-ytdlp-")?;
         let config = dir.write("yt-dlp.conf", text.as_bytes())?;
         Ok(Call { _dir: dir, config })
@@ -267,8 +373,12 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
 }
 
 fn is_no_format(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<Failed>()
-        .is_some_and(|f| f.raw.contains("Requested format is not available"))
+    e.downcast_ref::<Failed>().is_some_and(|f| {
+        // With the manifests skipped, a live stream has no formats at all,
+        // and yt-dlp says so in these words instead.
+        f.raw.contains("Requested format is not available")
+            || f.raw.contains("live stream recording is not available")
+    })
 }
 
 fn is_live(v: &Value) -> bool {
@@ -554,6 +664,33 @@ echo '{"entries":[]}'
     }
 
     #[test]
+    fn manifests_are_skipped_when_resolving_but_not_when_explaining_a_failure() {
+        let dir = TempDir::new();
+        // A live stream: without its HLS manifest yt-dlp finds no format at
+        // all, and with it, it reports the stream as live.
+        let yt = ytdlp(
+            script(
+                &dir.0.join("yt-dlp"),
+                r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+if grep -q "^--extractor-args 'youtube:skip=hls,dash'$" "$conf"; then
+  echo skipped >> "$(dirname "$0")/calls"
+  echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2; exit 1
+fi
+echo full >> "$(dirname "$0")/calls"
+echo '{"is_live":true}'"#,
+            ),
+            None,
+        );
+        let err = yt
+            .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
+            .unwrap_err();
+        assert_eq!(err.to_string(), LIVE_UNSUPPORTED);
+        let calls = spied(&dir, "calls");
+        let calls: Vec<_> = calls.lines().collect();
+        assert_eq!(calls, ["skipped", "full"]);
+    }
+
+    #[test]
     fn direct_says_so_instead_of_leaving_the_proxy_to_the_environment() {
         let dir = TempDir::new();
         let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
@@ -582,10 +719,10 @@ echo '{"entries":[]}'
         assert_eq!(quote(""), "''");
         assert_eq!(quote("a b #c"), "'a b #c'");
         assert_eq!(quote(r"it's \n"), r"'it'\''s \n'");
-        assert!(Call::new(&Net::default(), "--exec=evil").is_err());
+        assert!(Call::new(&Net::default(), None, "--exec=evil").is_err());
         // A newline or NUL can't end the value early or break the file.
         let net = Net::default();
-        let call = Call::new(&net, "ytsearch1:a\nb\0c").unwrap();
+        let call = Call::new(&net, None, "ytsearch1:a\nb\0c").unwrap();
         let text = std::fs::read_to_string(&call.config).unwrap();
         assert!(text.ends_with("'ytsearch1:a b c'\n"), "{text:?}");
     }
