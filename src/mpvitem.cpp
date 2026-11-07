@@ -222,6 +222,7 @@ void MpvItem::load(const QString &video, const QString &audio, double start) {
     m_loading = true;
     m_loaded = false;
     m_ended = false;
+    setStarted(false);
     m_position = m_duration = m_cached = 0;
     emit bufferingChanged();
     emit loadedChanged();
@@ -234,8 +235,16 @@ void MpvItem::load(const QString &video, const QString &audio, double start) {
 
 void MpvItem::stop() {
     m_loading = false;
+    setStarted(false);
     emit bufferingChanged();
     command({"stop"});
+}
+
+void MpvItem::setStarted(bool started) {
+    if (m_started == started)
+        return;
+    m_started = started;
+    emit startedChanged();
 }
 
 void MpvItem::togglePause() {
@@ -310,6 +319,11 @@ void MpvItem::handleEvents() {
         switch (event->event_id) {
         case MPV_EVENT_PROPERTY_CHANGE:
             onProperty(static_cast<mpv_event_property *>(event->data));
+            break;
+        case MPV_EVENT_PLAYBACK_RESTART:
+            // The first one after loading means the first frame is up; the
+            // ones after seeks change nothing.
+            setStarted(true);
             break;
         case MPV_EVENT_FILE_LOADED:
             m_loading = false;

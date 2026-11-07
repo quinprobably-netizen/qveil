@@ -41,6 +41,8 @@ class MpvItem : public QQuickFramebufferObject {
     Q_PROPERTY(bool buffering READ buffering NOTIFY bufferingChanged)
     Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
     Q_PROPERTY(bool ended READ ended NOTIFY endedChanged)
+    // Whether the current file has started playing: its first frame is up.
+    Q_PROPERTY(bool started READ started NOTIFY startedChanged)
     Q_PROPERTY(double volume READ volume WRITE setVolume NOTIFY volumeChanged)
     Q_PROPERTY(bool muted READ muted WRITE setMuted NOTIFY mutedChanged)
     // What mpv paints where there is no video: before the first frame and in
@@ -65,6 +67,7 @@ public:
     bool buffering() const { return m_loading || m_cachePaused || m_seeking; }
     bool loaded() const { return m_loaded; }
     bool ended() const { return m_ended; }
+    bool started() const { return m_started; }
     double volume() const { return m_volume; }
     bool muted() const { return m_muted; }
     void setVolume(double volume);
@@ -80,6 +83,7 @@ signals:
     void bufferingChanged();
     void loadedChanged();
     void endedChanged();
+    void startedChanged();
     void volumeChanged();
     void mutedChanged();
     void backgroundColorChanged();
@@ -91,11 +95,12 @@ private slots:
 private:
     void command(const QList<QByteArray> &args);
     void onProperty(const mpv_event_property *p);
+    void setStarted(bool started);
 
     mpv_handle *m_mpv = nullptr;
     std::shared_ptr<MpvShared> m_shared;
     double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
-    bool m_loaded = false, m_ended = false, m_muted = false;
+    bool m_loaded = false, m_ended = false, m_muted = false, m_started = false;
     QColor m_background = Qt::black;
 };

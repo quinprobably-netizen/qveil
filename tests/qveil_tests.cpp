@@ -348,6 +348,62 @@ private slots:
         QCOMPARE(moved.size(), 3);
     }
 
+    void aClosedPlayerDropsTheAnswerOfItsVideo()
+    {
+        QTemporaryDir dir;
+        const QString log = dir.filePath("requests");
+        Backend backend(logged(log), requestLogger(dir, "time.sleep(0.4)"));
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QSignalSpy ready(&backend, &Backend::playReady);
+
+        // The player is closed while the video is looked up: its answer
+        // must not open it again.
+        backend.play("dQw4w9WgXcQ");
+        backend.cancelPlay();
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("play"), 5000);
+        QCOMPARE(ready.count(), 0);
+
+        backend.play("dQw4w9WgXcQ");
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+    }
+
+    void aFailedLookupSaysSoOnlyForTheLatestVideo()
+    {
+        QTemporaryDir dir;
+        // Every lookup fails, the first one slowly.
+        const QString fake = engine(dir, "import http.server,json,time\n"
+                                         "n=[0]\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def do_GET(s): s.reply(200,{})\n"
+                                         "  def do_POST(s):\n"
+                                         "    n[0]+=1\n"
+                                         "    if n[0]==1: time.sleep(0.6)\n"
+                                         "    s.reply(500,{'error':'no such video %d'%n[0]})\n"
+                                         "  def reply(s,code,body):\n"
+                                         "    b=json.dumps(body).encode()\n"
+                                         "    s.send_response(code);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+
+        // The first video is still being looked up when the second is asked
+        // for; only the second one's failure is the player's business.
+        backend.play("aaaaaaaaaaa");
+        QTest::qWait(150);
+        backend.play("bbbbbbbbbbb");
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        QCOMPARE(failed.at(0).at(0).toString(), QString("play"));
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("play"), 5000);
+        QCOMPARE(failed.count(), 1);
+        QVERIFY(backend.error().contains("no such video"));
+    }
+
     void reportsAMissingEngine()
     {
         Backend backend(QProcessEnvironment::systemEnvironment(), "/nonexistent/qveil-core");

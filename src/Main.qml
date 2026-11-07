@@ -100,7 +100,14 @@ ApplicationWindow {
     function playCurrent() {
         const p = pages[page]
         if (p && p.grid && p.grid.currentIndex >= 0 && p.model.length > 0)
-            backend.play(p.model[p.grid.currentIndex].id)
+            win.play(p.model[p.grid.currentIndex])
+    }
+
+    // The player opens at once, with what the card knows, while the engine
+    // looks the video up.
+    function play(video) {
+        player.prepare(video)
+        backend.play(video.id)
     }
 
     function toggleFullscreen() {
@@ -308,7 +315,7 @@ ApplicationWindow {
                             onClicked: win.addChannel()
                         }
                     ]
-                    onActivated: video => backend.play(video.id)
+                    onActivated: video => win.play(video)
                     onChannelRequested: id => win.openChannel(id)
                     actions: [
                         CheckBox {
@@ -342,7 +349,7 @@ ApplicationWindow {
                     estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
                     loading: backend.busy.indexOf("search") >= 0
                     emptyText: backend.query ? qsTr("No results.") : ""
-                    onActivated: video => backend.play(video.id)
+                    onActivated: video => win.play(video)
                     onChannelRequested: id => win.openChannel(id)
                 }
 
@@ -358,7 +365,7 @@ ApplicationWindow {
                     estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
                     loading: backend.busy.indexOf("channel") >= 0
                     emptyText: qsTr("No videos.")
-                    onActivated: video => backend.play(video.id)
+                    onActivated: video => win.play(video)
                     actions: [
                         Button {
                             id: subscribe
@@ -399,26 +406,7 @@ ApplicationWindow {
                     id: historyPage
                     anchors.fill: parent
                     visible: win.page === "history" && !player.active
-                    onPlayRequested: id => backend.play(id)
-                }
-
-                // Shown while the engine resolves a video, which can take a
-                // few seconds (longer over Tor).
-                Rectangle {
-                    anchors.fill: parent
-                    visible: backend.busy.indexOf("play") >= 0 && !player.active
-                    color: "#b30d0d10"
-                    ColumnLayout {
-                        anchors.centerIn: parent
-                        spacing: 14
-                        BusyIndicator { Layout.alignment: Qt.AlignHCenter; running: parent.visible }
-                        Label {
-                            Layout.alignment: Qt.AlignHCenter
-                            text: backend.config.route === "tor" ? qsTr("Opening the video over Tor…") : qsTr("Opening the video…")
-                            color: "#c0c0ca"
-                        }
-                    }
-                    MouseArea { anchors.fill: parent }
+                    onPlayRequested: video => win.play(video)
                 }
 
                 ProgressBar {

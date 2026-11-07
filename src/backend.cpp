@@ -183,6 +183,8 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
         if (status != 200) {
             const QString message = doc.object().value("error").toString();
             setError(message.isEmpty() ? reply->errorString() : message);
+            if (m_latest.value(task) == id)
+                emit taskFailed(task);
             return;
         }
         if (!everyAnswer && m_latest.value(task) != id)
@@ -377,6 +379,8 @@ void Backend::play(const QString &video) {
             loadHistory();
     });
 }
+
+void Backend::cancelPlay() { m_latest.insert("play", ++m_sequence); }
 
 QString Backend::thumbBase() const {
     if (!ready() || m_config.isEmpty() || !m_config.value("thumbnails", true).toBool())

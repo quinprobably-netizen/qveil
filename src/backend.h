@@ -72,6 +72,9 @@ public:
     Q_INVOKABLE void loadConfig();
     Q_INVOKABLE void setConfig(const QVariantMap &patch);
     Q_INVOKABLE void play(const QString &video);
+    // Drops the answer of a video still being looked up: the player it was
+    // for has been closed.
+    Q_INVOKABLE void cancelPlay();
     Q_INVOKABLE void reportError(const QString &message);
     Q_INVOKABLE void clearError();
 
@@ -93,6 +96,8 @@ signals:
     // The route or proxy was changed, so whatever plays over the old one must stop.
     void routeChanged();
     void playReady(const QVariantMap &info);
+    // The latest request of `task` failed (the error itself is in `error`).
+    void taskFailed(const QString &task);
     void notice(const QString &text);
 
 private:
