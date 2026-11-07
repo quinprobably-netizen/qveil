@@ -12,3 +12,4 @@ subscriptions*.json
 newpipe*.json
 /config.toml
 .env*
+/pkgbuild/qveil/
