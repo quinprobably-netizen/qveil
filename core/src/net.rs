@@ -6,9 +6,10 @@ use std::time::Duration;
 
 /// The one browser identity qveil presents. The engine's own requests (feeds,
 /// thumbnails) send it, and every yt-dlp call is told to send it too, so the
-/// video bytes carry it as well: otherwise the engine would say Firefox while
-/// yt-dlp, which picks a random Chrome version for each call, said Chrome, and
-/// one circuit would show two browsers. It has the shape of yt-dlp's own
+/// video bytes carry it as well (yt-dlp's player lookups still name the
+/// YouTube client it is pretending to be): otherwise the engine would say
+/// Firefox while yt-dlp, which picks a random Chrome version for each call,
+/// said Chrome, and one circuit would show two browsers. It has the shape of yt-dlp's own
 /// default, with a Chrome major version inside the range yt-dlp currently
 /// picks from (145 to 151), so it is no more conspicuous than yt-dlp's
 /// traffic is anyway. Bump it when yt-dlp's range moves on.

@@ -67,10 +67,12 @@ and to keep everything else on your machine.
 **What YouTube can still see:** the IP you connect from (on Direct), each
 search and video you play, and the timing of your requests. Even over Tor, a
 long session of related videos can be linked by content. And qveil has a
-fingerprint of its own. Every request carries one browser User-Agent (the
-engine's and yt-dlp's are the same string, so it is one identity, not two),
-but it goes over rustls, in the engine's feeds, thumbnails and video bytes, or
-over yt-dlp's Python TLS stack, and neither is a real browser's TLS handshake.
+fingerprint of its own. The engine's requests and the video bytes carry one
+browser User-Agent (yt-dlp is told to send the engine's, so it is one identity,
+not two; only yt-dlp's player lookups name whichever YouTube client it is
+pretending to be), but it goes over rustls, in the engine's feeds, thumbnails
+and video bytes, or over yt-dlp's Python TLS stack, and neither is a real
+browser's TLS handshake.
 A browser User-Agent on a handshake no browser makes is likely to be rare, quite
 possibly unique to qveil, so a careful observer can link requests from separate
 Tor circuits by that fingerprint even though each circuit has its own IP.

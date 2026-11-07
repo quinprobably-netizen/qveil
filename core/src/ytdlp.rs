@@ -445,10 +445,14 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
         .find(|f| !is_video(f))
         .and_then(|f| f["url"].as_str())
         .map(String::from);
+    // yt-dlp attaches the cookies of its in-memory jar that match the URL.
+    // None of YouTube's is meant for a googlevideo host, but the relay
+    // promises to send no cookies, so that doesn't rest on yt-dlp's jar.
     let headers = video_fmt["http_headers"]
         .as_object()
         .map(|h| {
             h.iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("cookie"))
                 .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
                 .collect()
         })
@@ -523,6 +527,12 @@ mod tests {
             (s.video.as_str(), s.audio.as_deref()),
             ("https://gv.test/v", Some("https://gv.test/a"))
         );
+        assert_eq!(s.headers, [("User-Agent".to_string(), "x".to_string())]);
+        // A cookie yt-dlp would send is not relayed, whatever the case it is spelled in.
+        let s = resolved(
+            r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","http_headers":{"User-Agent":"x","Cookie":"a=b","cookie":"c=d"}}"#,
+        )
+        .unwrap();
         assert_eq!(s.headers, [("User-Agent".to_string(), "x".to_string())]);
         // A single combined format has its protocol at the top level.
         let s = resolved(
