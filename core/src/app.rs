@@ -12,7 +12,7 @@ use crate::ytdlp::Ytdlp;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub struct Runtime {
     pub cfg: Config,
@@ -20,6 +20,10 @@ pub struct Runtime {
     pub yt: Ytdlp,
     /// The client short requests share where the route allows it (see `web_client`).
     shared: OnceLock<Client>,
+    /// Where the engine's own requests go: the channel feeds and the
+    /// thumbnails. Only tests change them, to stand a local server in for YouTube.
+    pub feed_base: String,
+    pub thumb_base: String,
 }
 
 impl Runtime {
@@ -35,12 +39,15 @@ impl Runtime {
             bin: cfg.ytdlp.clone(),
             cache_dir: paths.ytdlp_cache(),
             net: net.clone(),
+            calls: Arc::default(),
         };
         Ok(Self {
             cfg,
             net,
             yt,
             shared: OnceLock::new(),
+            feed_base: "https://www.youtube.com".into(),
+            thumb_base: "https://i.ytimg.com".into(),
         })
     }
 
@@ -66,7 +73,16 @@ impl Runtime {
             bin: self.yt.bin.clone(),
             cache_dir: self.yt.cache_dir.clone(),
             net: self.net.pinned(),
+            calls: Arc::clone(&self.yt.calls),
         }
+    }
+
+    /// Carries the registry of running yt-dlp calls over from `from`, whose
+    /// route this one has: a settings change that keeps the route must not
+    /// lose track of the calls still running under the old runtime.
+    pub fn keeping_calls_of(mut self, from: &Runtime) -> Self {
+        self.yt.calls = Arc::clone(&from.yt.calls);
+        self
     }
 }
 
@@ -241,13 +257,23 @@ pub fn load_subs(paths: &Paths) -> Result<Subs> {
     store::load(&paths.subscriptions())
 }
 
-/// Returns the subscription and whether it is new.
-pub fn add_sub(rt: &Runtime, paths: &Paths, input: &str) -> Result<(Sub, bool)> {
+/// Returns the subscription and whether it is new. `current` says whether
+/// `rt`'s route is still the one in use: a lookup that came back from a route
+/// that has been left isn't added.
+pub fn add_sub(
+    rt: &Runtime,
+    paths: &Paths,
+    input: &str,
+    current: &dyn Fn() -> bool,
+) -> Result<(Sub, bool)> {
     let r = ids::parse_channel(input)
         .with_context(|| format!("{input:?} isn't a channel (@handle, channel URL or UC… ID)"))?;
     let (id, name) = rt.yt.channel_info(&r.url())?;
     // Only the file update is locked, not the lookup above.
     let _lock = store::lock(paths)?;
+    if !current() {
+        bail!(crate::inflight::ROUTE_CHANGED);
+    }
     let mut subs = load_subs(paths)?;
     let sub = Sub { id, name };
     let added = subs.add(sub.clone());

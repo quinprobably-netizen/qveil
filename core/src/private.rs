@@ -55,7 +55,6 @@ impl PrivateDir {
         )
     }
 
-    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.0
     }

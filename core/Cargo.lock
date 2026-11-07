@@ -825,6 +825,7 @@ dependencies = [
  "anyhow",
  "clap",
  "jiff",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "roxmltree",

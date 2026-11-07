@@ -6,11 +6,13 @@ mod config;
 mod errors;
 mod feed;
 mod ids;
+mod inflight;
 mod net;
 mod pick;
 mod player;
 mod private;
 mod server;
+mod signals;
 mod store;
 mod subs;
 mod video;
@@ -164,6 +166,12 @@ fn run() -> Result<()> {
     let server = Server::new(rt, paths);
     let rt = server.runtime();
     let paths = &server.paths;
+    // From here on yt-dlp processes may be started, and a signal must not
+    // leave them (and the files with the proxy's password) behind.
+    let stopping = Arc::clone(&server);
+    if let Err(e) = signals::on_stop(move || stopping.shutdown()) {
+        eprintln!("qveil: couldn't watch for Ctrl+C and the like: {e}");
+    }
 
     match cli.cmd {
         Cmd::Serve => serve(&server),
@@ -243,10 +251,12 @@ fn serve(server: &Arc<Server>) -> Result<()> {
     writeln!(out, "{}", serde_json::json!({ "base": base }))?;
     out.flush()?;
     drop(out);
-    // The app holds our stdin; when it exits, for any reason, so do we.
+    // The app holds our stdin; when it exits, for any reason, so do we. Its
+    // yt-dlp processes don't outlive it: they are killed and their files removed.
     let mut buf = [0u8; 256];
     let mut stdin = std::io::stdin();
     while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+    server.shutdown();
     Ok(())
 }
 
@@ -290,7 +300,7 @@ fn sub(rt: &Runtime, paths: &Paths, cmd: SubCmd) -> Result<()> {
     match cmd {
         SubCmd::Add { channels } => {
             for input in channels {
-                let (s, added) = app::add_sub(rt, paths, &input)?;
+                let (s, added) = app::add_sub(rt, paths, &input, &|| true)?;
                 let verb = if added {
                     "subscribed"
                 } else {

@@ -8,6 +8,7 @@
 
 use crate::errors::friendly;
 use crate::ids;
+use crate::inflight::{Inflight, Run, StartError};
 use crate::net::{Net, USER_AGENT};
 use crate::private::PrivateDir;
 use crate::video::Video;
@@ -17,6 +18,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -58,6 +60,9 @@ pub struct Ytdlp {
     pub bin: String,
     pub cache_dir: PathBuf,
     pub net: Net,
+    /// Every call is registered here, so that a route change or the engine's
+    /// exit can stop it (see `Inflight`).
+    pub calls: Arc<Inflight>,
 }
 
 #[derive(Debug)]
@@ -100,6 +105,55 @@ impl Ytdlp {
         c
     }
 
+    /// Starts `cmd` through the registry, which refuses once the route it
+    /// belongs to has been left.
+    fn start(&self, cmd: &mut Command, call: &Call) -> Result<Run> {
+        self.calls.start(cmd, call.dir.path()).map_err(|e| match e {
+            StartError::Closed(why) => anyhow!(why.message()),
+            StartError::Spawn(e) => anyhow::Error::new(e)
+                .context(format!("running {:?} (is yt-dlp installed?)", self.bin)),
+        })
+    }
+
+    /// Like `Command::output`, but kills the child once `limit` has passed and
+    /// returns `None`. The output is read on separate threads, so a child that
+    /// fills a pipe isn't left waiting for us. An error if the registry
+    /// stopped it, because what it printed belongs to a route that was left.
+    fn output_within(
+        &self,
+        cmd: &mut Command,
+        call: &Call,
+        limit: Duration,
+    ) -> Result<Option<Output>> {
+        let mut run = self.start(cmd, call)?;
+        let stdout = drain(run.stdout.take());
+        let stderr = drain(run.stderr.take());
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = run.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                run.kill();
+                let _ = run.wait();
+                // The readers end on their own now that the pipes are closed.
+                return match run.stopped() {
+                    Some(why) => Err(anyhow!(why.message())),
+                    None => Ok(None),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if let Some(why) = run.stopped() {
+            bail!(why.message());
+        }
+        Ok(Some(Output {
+            status,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        }))
+    }
+
     /// Runs yt-dlp on `target` (a URL or a `ytsearchN:` query) with `args`
     /// and parses its JSON. It is killed if it takes longer than `limit`.
     fn json(&self, args: &[&str], target: &str, limit: Duration) -> Result<Value> {
@@ -120,8 +174,7 @@ impl Ytdlp {
         // above it that doesn't exist yet along with it.
         crate::store::ensure_dir(&self.cache_dir)?;
         let call = Call::new(&self.net, extractor_args, target)?;
-        let out = output_within(self.command(&call).args(args), limit)
-            .with_context(|| format!("running {:?} (is yt-dlp installed?)", self.bin))?;
+        let out = self.output_within(self.command(&call).args(args), &call, limit)?;
         // The files are only needed while it runs.
         drop(call);
         let Some(out) = out else {
@@ -173,23 +226,20 @@ impl Ytdlp {
         let q = format!("ytsearch{limit}:{query}");
         crate::store::ensure_dir(&self.cache_dir)?;
         let call = Call::new(&self.net, None, &q)?;
-        let mut child = self
-            .command(&call)
-            .args(["--flat-playlist", "--lazy-playlist", "-j"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("running {:?} (is yt-dlp installed?)", self.bin))?;
-        let stdout = child.stdout.take().context("no stdout")?;
-        let stderr = drain(child.stderr.take());
-        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        let mut run = self.start(
+            self.command(&call)
+                .args(["--flat-playlist", "--lazy-playlist", "-j"]),
+            &call,
+        )?;
+        let stdout = run.stdout.take().context("no stdout")?;
+        let stderr = drain(run.stderr.take());
         // Kills yt-dlp at the deadline, or as soon as `done` is sent.
         let (done, finished) = std::sync::mpsc::channel::<()>();
         let watchdog = {
-            let child = std::sync::Arc::clone(&child);
+            let proc = run.handle();
             std::thread::spawn(move || {
                 let late = finished.recv_timeout(QUICK).is_err();
-                let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+                proc.kill();
                 late
             })
         };
@@ -208,22 +258,17 @@ impl Ytdlp {
             }
         }
         // Whether it finished, was stopped or ran out of time, it ends here.
-        let status = loop {
-            // Never blocks with the lock held, so the watchdog can always kill.
-            let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
-            if stopped {
-                let _ = child.kill();
-            }
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            drop(child);
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        if stopped {
+            run.kill();
+        }
+        let status = run.wait()?;
         let _ = done.send(());
         let late = watchdog.join().unwrap_or(false) && !status.success();
         drop(call);
         let stderr = stderr.join().unwrap_or_default();
+        if let Some(why) = run.stopped() {
+            bail!(why.message());
+        }
         if stopped || status.success() {
             return Ok(n);
         }
@@ -301,7 +346,7 @@ impl Ytdlp {
 /// would do for the target, but it treats ` #` as the start of a comment, and
 /// searches like "rust #shorts" are ordinary.)
 struct Call {
-    _dir: PrivateDir,
+    dir: PrivateDir,
     config: PathBuf,
 }
 
@@ -331,7 +376,7 @@ impl Call {
         text.push_str(&format!("{}\n", quote(&target)));
         let dir = PrivateDir::new("qveil-ytdlp-")?;
         let config = dir.write("yt-dlp.conf", text.as_bytes())?;
-        Ok(Call { _dir: dir, config })
+        Ok(Call { dir, config })
     }
 }
 
@@ -339,33 +384,6 @@ impl Call {
 /// backslashes are kept, and a quote is closed, escaped and reopened.
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
-}
-
-/// Like `Command::output`, but kills the child once `limit` has passed and
-/// returns `None`. The output is read on separate threads, so a child that
-/// fills a pipe isn't left waiting for us.
-fn output_within(cmd: &mut Command, limit: Duration) -> std::io::Result<Option<Output>> {
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + limit;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            // The readers end on their own now that the pipes are closed.
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    Ok(Some(Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
-    }))
 }
 
 fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
@@ -577,6 +595,7 @@ mod tests {
             cache_dir: Path::new(&bin).with_file_name("cache").join("qveil"),
             bin,
             net: Net::new(proxy.map(String::from), true).unwrap(),
+            calls: Arc::default(),
         }
     }
 

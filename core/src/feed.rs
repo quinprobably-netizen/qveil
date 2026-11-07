@@ -148,7 +148,7 @@ fn fetched(sub: &Sub, mut videos: Vec<Video>, source: Source) -> Fetched {
 }
 
 fn fetch_rss(rt: &Runtime, channel_id: &str) -> Result<Vec<Video>> {
-    let url = format!("https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}");
+    let url = format!("{}/feeds/videos.xml?channel_id={channel_id}", rt.feed_base);
     let body = rt
         .web_client()?
         .get(url)

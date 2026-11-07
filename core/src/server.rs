@@ -11,6 +11,7 @@ use crate::app::{self, Refresh, Runtime, Watched};
 use crate::config::Config;
 use crate::errors::friendly;
 use crate::ids::{self, VideoRef};
+use crate::inflight::{ROUTE_CHANGED, Why};
 use crate::net::{self, Net, TOR_PROXY};
 use crate::store::Paths;
 use crate::video::Video;
@@ -258,6 +259,37 @@ impl Server {
             .clone()
     }
 
+    /// Whether the route in use is still the one `rt` was made for. Work that
+    /// started on `rt` and finishes after this is false belongs to a route the
+    /// user left, and its result is dropped.
+    fn still_on(&self, rt: &Runtime) -> bool {
+        self.runtime().net.same_route(&rt.net)
+    }
+
+    /// `work`, which ran on `rt`, unless the route changed meanwhile: then it
+    /// is an error, whatever it was. A late reply could otherwise be shown (or
+    /// saved) as if it belonged to the route that is in use now.
+    fn guarded<T>(&self, rt: &Runtime, work: Result<T>) -> Result<T> {
+        if self.still_on(rt) {
+            work
+        } else {
+            bail!(ROUTE_CHANGED)
+        }
+    }
+
+    /// Ends everything that is running before the engine exits: the streams,
+    /// and every yt-dlp process, which is killed and waited for, and its
+    /// private directory (the proxy's password is in it) removed. The process
+    /// ends right after, so nothing else would do any of that.
+    pub fn shutdown(&self) {
+        // A settings change that is half-way would swap in a runtime after this.
+        let _one_at_a_time = lock(&self.settings);
+        for (_, session) in lock(&self.sessions).drain(..) {
+            session.cancel();
+        }
+        self.runtime().yt.calls.close(Why::Exiting);
+    }
+
     /// Starts listening (once) and returns the base URL, token included.
     pub fn listen(self: &Arc<Self>) -> Result<String> {
         if let Some(b) = self.base.get() {
@@ -459,7 +491,8 @@ impl Server {
                 // Each result is a line of yt-dlp's output and a card in the
                 // window, and `n` comes from the caller.
                 let n = req.num("n", 40).clamp(1, MAX_SEARCH);
-                json!(app::search(&rt, req.param("q")?, n)?)
+                let found = app::search(&rt, req.param("q")?, n);
+                json!(self.guarded(&rt, found)?)
             }
             ("GET", ["api", "feed"]) => {
                 // `refresh=1` fetches the channels not fetched recently,
@@ -481,10 +514,17 @@ impl Server {
                     &current
                 )?)
             }
-            ("GET", ["api", "channel"]) => json!(app::channel(&rt, paths, req.param("id")?)?),
+            ("GET", ["api", "channel"]) => {
+                let page = app::channel(&rt, paths, req.param("id")?);
+                json!(self.guarded(&rt, page)?)
+            }
             ("GET", ["api", "subs"]) => json!(app::load_subs(paths)?.channels),
             ("POST", ["api", "subs", "add"]) => {
-                let (sub, added) = app::add_sub(&rt, paths, req.param("c")?)?;
+                // Checked again under the store's lock, so a lookup that came
+                // back from the old route doesn't end up in the list.
+                let current = || self.still_on(&rt);
+                let added = app::add_sub(&rt, paths, req.param("c")?, &current);
+                let (sub, added) = self.guarded(&rt, added)?;
                 json!({ "sub": sub, "added": added })
             }
             ("POST", ["api", "subs", "rm"]) => {
@@ -576,9 +616,14 @@ impl Server {
             cfg.max_height = m.clamp(144, 4320);
         }
         // Validates the proxy before anything is saved.
-        let next = Runtime::new(cfg, &self.paths, None, false)?;
+        let mut next = Runtime::new(cfg, &self.paths, None, false)?;
         next.cfg.save(&self.paths.config)?;
         let route_changed = !next.net.same_route(&rt.net);
+        if !route_changed {
+            // The same route keeps its running calls (and the registry that
+            // can still stop them at exit); a new route starts with none.
+            next = next.keeping_calls_of(&rt);
+        }
         // Under the sessions lock (see `register`). Streams stay valid across
         // settings like thumbnails or quality, which don't touch the route; a
         // new route would make their upstream URLs play from the wrong address.
@@ -590,6 +635,12 @@ impl Server {
             for (_, session) in sessions.drain(..) {
                 session.cancel();
             }
+            drop(sessions);
+            // The same goes for a search, a lookup or a refresh's fallback
+            // that is running yt-dlp: it is killed, and its caller told to
+            // try again. Closed after the swap, so what starts from now on
+            // belongs to the new route.
+            rt.yt.calls.close(Why::RouteChanged);
         }
         Ok(())
     }
@@ -620,6 +671,9 @@ impl Server {
         let result = req
             .param("q")
             .and_then(|q| app::search_each(&rt, q, n, &mut each));
+        // A search that was running when the route changed ends with the same
+        // error as any other, whether or not some results were sent already.
+        let result = self.guarded(&rt, result);
         let error = |e: anyhow::Error| friendly(&format!("{e:#}"));
         match result {
             Err(e) if !started => {
@@ -647,10 +701,17 @@ impl Server {
         if !rt.cfg.thumbnails {
             return respond(out, 403, "text/plain", b"thumbnails are off");
         }
-        let url = format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg");
+        let url = format!("{}/vi/{id}/mqdefault.jpg", rt.thumb_base);
         let fetched = rt
             .web_client()
             .and_then(|c| Ok(c.get(url).send()?.error_for_status()?.bytes()?));
+        // A thumbnail that arrives after the route changed is neither shown nor
+        // kept: it was fetched over a route the user left.
+        let fetched = if self.still_on(&rt) {
+            fetched
+        } else {
+            return respond(out, 503, "text/plain", ROUTE_CHANGED.as_bytes());
+        };
         match fetched {
             Ok(bytes) => {
                 let bytes = Arc::new(bytes.to_vec());
@@ -1504,6 +1565,15 @@ mod tests {
     /// A server whose clients may talk plain http, so a local upstream can
     /// stand in for googlevideo.
     fn server_with(cfg: Config) -> (Arc<Server>, String, TempDir) {
+        server_tuned(cfg, |_| {})
+    }
+
+    /// `server_with`, after `tune` has changed the runtime (to point its
+    /// thumbnails at a local upstream, say).
+    fn server_tuned(
+        cfg: Config,
+        tune: impl FnOnce(&mut Runtime),
+    ) -> (Arc<Server>, String, TempDir) {
         let dir = TempDir::new();
         let paths = Paths {
             config: dir.0.join("config.toml"),
@@ -1513,6 +1583,7 @@ mod tests {
         let mut rt = Runtime::new(cfg, &paths, None, false).unwrap();
         rt.net = rt.net.allowing_http();
         rt.yt.net = rt.net.clone();
+        tune(&mut rt);
         let s = Server::new(rt, paths);
         let base = s.listen().unwrap();
         (s, base, dir)
@@ -2007,6 +2078,11 @@ echo '{"entries":[]}'"#,
         sent: AtomicUsize,
         /// How many more `/big` responses to cut off half-way.
         cuts: Mutex<usize>,
+        /// While set, a thumbnail (`/vi/…`) isn't answered, so that a test can
+        /// do something (switch routes) while the request is in flight.
+        hold: AtomicBool,
+        /// How many thumbnail requests are waiting on `hold`.
+        waiting: AtomicUsize,
     }
 
     /// A tiny stand-in for googlevideo on a local port. It records every
@@ -2069,6 +2145,20 @@ echo '{"entries":[]}'"#,
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         if path == "/big" {
             return big(conn, query, range.as_deref(), head_only, gauge);
+        }
+        if path.starts_with("/vi/") {
+            gauge.waiting.fetch_add(1, Ordering::SeqCst);
+            let started = Instant::now();
+            while gauge.hold.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            gauge.waiting.fetch_sub(1, Ordering::SeqCst);
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 6\r\nConnection: close\r\n\r\n"
+            );
+            let _ = conn.write_all(b"thumb!");
+            return;
         }
         if path == "/endless" {
             // A video that never ends, 16 KiB at a time, `pace` ms apart, until
@@ -2593,6 +2683,156 @@ echo '{"entries":[]}'"#,
         let v: Value = serde_json::from_str(&body).unwrap();
         let errors = v["errors"].to_string();
         assert!(errors.contains("route changed"), "{errors}");
+    }
+
+    /// A yt-dlp that records its process id and the private directory of its
+    /// files, then hangs: a search or lookup still waiting on YouTube.
+    fn hanging_ytdlp(dir: &std::path::Path) -> String {
+        crate::store::testing::script(
+            &dir.join("yt-dlp"),
+            r#"d=$(dirname "$0")
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && dirname "$2" > "$d/private-dir"; shift; done
+echo $$ > "$d/pid"
+exec sleep 60
+"#,
+        )
+    }
+
+    /// The process id and private directory that `hanging_ytdlp` recorded,
+    /// once it has recorded both.
+    fn hanging_started(dir: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
+        let pid = std::fs::read_to_string(dir.join("pid")).ok()?;
+        let private = std::fs::read_to_string(dir.join("private-dir")).ok()?;
+        (pid.ends_with('\n') && private.ends_with('\n'))
+            .then(|| (pid.trim().to_string(), private.trim().into()))
+    }
+
+    /// Waits until `hanging_ytdlp` is running, and returns what it recorded.
+    fn hanging_running(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+        let mut found = None;
+        wait_for("yt-dlp to start", Duration::from_secs(10), || {
+            found = hanging_started(dir);
+            found.is_some()
+        });
+        found.unwrap()
+    }
+
+    fn assert_stopped_and_cleaned_up(pid: &str, private: &std::path::Path) {
+        wait_for("yt-dlp to be gone", Duration::from_secs(5), || {
+            !std::path::Path::new("/proc").join(pid).exists()
+        });
+        wait_for(
+            "its private files to be removed",
+            Duration::from_secs(5),
+            || !private.exists(),
+        );
+    }
+
+    #[test]
+    fn a_route_switch_stops_work_that_started_on_the_old_route() {
+        // Each of these is a request that waits on yt-dlp.
+        let requests = [
+            ("GET", "api/search?q=a"),
+            ("GET", "api/search?q=a&stream=1"),
+            ("GET", "api/channel?id=UC0000000000000000000001"),
+            ("POST", "api/subs/add?c=@somebody"),
+            ("POST", "api/play?v=dQw4w9WgXcQ"),
+        ];
+        for (method, target) in requests {
+            let bin = TempDir::new();
+            let (_s, base, _d) = server_with(Config {
+                ytdlp: hanging_ytdlp(&bin.0),
+                ..Config::default()
+            });
+            let call = {
+                let base = base.clone();
+                std::thread::spawn(move || http(&base, method, &path(&base, target), ""))
+            };
+            let (pid, private) = hanging_running(&bin.0);
+            assert!(private.is_dir());
+
+            let switched = Instant::now();
+            switch_to_tor(&base);
+            let (status, body) = call.join().unwrap();
+            // It doesn't wait for the 60 s that yt-dlp would have been given.
+            assert!(
+                switched.elapsed() < Duration::from_secs(5),
+                "{target}: {:?}",
+                switched.elapsed()
+            );
+            assert_eq!(status, 500, "{target}: {body}");
+            let said: Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+            assert_eq!(said["error"], "The route changed; try again", "{target}");
+            assert_stopped_and_cleaned_up(&pid, &private);
+        }
+    }
+
+    #[test]
+    fn a_settings_change_that_keeps_the_route_leaves_running_work_alone_but_registered() {
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: hanging_ytdlp(&bin.0),
+            ..Config::default()
+        });
+        let search = {
+            let base = base.clone();
+            std::thread::spawn(move || http(&base, "GET", &path(&base, "api/search?q=a"), ""))
+        };
+        let (pid, private) = hanging_running(&bin.0);
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"history":true,"maxHeight":720}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            std::path::Path::new("/proc").join(&pid).exists(),
+            "a setting that isn't the route must not stop a search"
+        );
+        // The new runtime still knows about it: leaving the route stops it.
+        switch_to_tor(&base);
+        let (status, body) = search.join().unwrap();
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("The route changed; try again"), "{body}");
+        assert_stopped_and_cleaned_up(&pid, &private);
+    }
+
+    #[test]
+    fn a_thumbnail_that_arrives_after_a_route_switch_is_dropped_and_not_cached() {
+        let up = Upstream::start();
+        let base_url = up.url("");
+        let (s, base, _d) = server_tuned(Config::default(), |rt| {
+            rt.thumb_base = base_url.trim_end_matches('/').to_string();
+        });
+        let thumb = |base: &str| http(base, "GET", &path(base, "thumb/dQw4w9WgXcQ"), "");
+
+        // The control: on an unchanged route it is served and kept.
+        let (status, body) = thumb(&base);
+        assert_eq!((status, body.as_str()), (200, "thumb!"));
+        assert_eq!(lock(&s.thumbs).len(), 1);
+        lock(&s.thumbs).clear();
+
+        up.gauge.hold.store(true, Ordering::SeqCst);
+        let late = {
+            let base = base.clone();
+            std::thread::spawn(move || thumb(&base))
+        };
+        wait_for("the thumbnail request", Duration::from_secs(10), || {
+            up.gauge.waiting.load(Ordering::SeqCst) == 1
+        });
+        switch_to_tor(&base);
+        up.gauge.hold.store(false, Ordering::SeqCst);
+        let (status, body) = late.join().unwrap();
+        assert_eq!(
+            (status, body.as_str()),
+            (503, "The route changed; try again")
+        );
+        assert!(
+            lock(&s.thumbs).is_empty(),
+            "a late thumbnail must not be cached"
+        );
     }
 
     #[test]
