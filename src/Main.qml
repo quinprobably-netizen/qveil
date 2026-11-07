@@ -24,6 +24,10 @@ ApplicationWindow {
     // Whether the first engine start has loaded the window yet.
     property bool started: false
     readonly property bool fullscreen: visibility === Window.FullScreen
+    // Whether keys are going into a text field (the search box, the add field
+    // on the subscriptions page, the proxy field). Every Qt Quick text input
+    // has a cursor position and nothing else that takes focus does.
+    readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
     readonly property var pages: ({ feed: feedPage, search: searchPage, channel: channelPage,
                                     subs: subsPage, history: historyPage })
 
@@ -39,12 +43,24 @@ ApplicationWindow {
             player.close()
         if (p !== "channel")
             returnPage = p
+        // What was typed in the top bar belongs to the search page only.
+        if (p !== "search")
+            search.text = ""
         page = p
         if (p === "subs")
             backend.loadSubs()
         if (p === "history")
             backend.loadHistory()
-        Qt.callLater(() => pages[p].forceActiveFocus())
+        Qt.callLater(() => win.focusPage(p))
+    }
+
+    // Focus goes to what the page is about (its grid or list), never to
+    // whatever was clicked last: a focus scope would hand it back to a text
+    // field or a button the page had before.
+    function focusPage(p) {
+        const view = pages[p]
+        const target = view.content ? view.content : view
+        target.forceActiveFocus()
     }
 
     function openChannel(id) {
@@ -54,9 +70,10 @@ ApplicationWindow {
             player.close()
         if (page !== "channel")
             returnPage = page
+        search.text = ""
         page = "channel"
         backend.openChannel(id)
-        Qt.callLater(() => channelPage.forceActiveFocus())
+        Qt.callLater(() => win.focusPage("channel"))
     }
 
     function refresh() {
@@ -90,8 +107,8 @@ ApplicationWindow {
             showNormal()
         else if (player.active)
             player.close()
-        else if (search.activeFocus)
-            pages[page].forceActiveFocus()
+        else if (typing)
+            focusPage(page)
         else if (page === "channel")
             go(returnPage)
     }
@@ -331,7 +348,7 @@ ApplicationWindow {
                     onClosed: {
                         if (win.fullscreen)
                             win.showNormal()
-                        Qt.callLater(() => win.pages[win.page].forceActiveFocus())
+                        Qt.callLater(() => win.focusPage(win.page))
                     }
                     onChannelRequested: id => win.openChannel(id)
                     onFullscreenToggled: win.toggleFullscreen()

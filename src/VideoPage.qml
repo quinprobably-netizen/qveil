@@ -14,6 +14,8 @@ FocusScope {
     property bool loading: false
     property alias actions: actionRow.data
     property alias grid: grid
+    // Where focus belongs when the page is shown.
+    readonly property Item content: grid
     property alias veil: grid.veil
 
     signal activated(var video)

@@ -8,6 +8,8 @@ FocusScope {
     id: page
 
     readonly property bool enabled_: !!backend.config.history
+    // Where focus belongs when the page is shown.
+    readonly property Item content: list
     signal playRequested(string id)
 
     ColumnLayout {
@@ -51,6 +53,8 @@ FocusScope {
         }
 
         ListView {
+            id: list
+            focus: true
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true

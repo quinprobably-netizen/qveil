@@ -6,6 +6,8 @@ import QtQuick.Layouts
 FocusScope {
     id: page
 
+    // Where focus belongs when the page is shown.
+    readonly property Item content: list
     signal channelRequested(string id)
 
     function submit() {
@@ -40,7 +42,6 @@ FocusScope {
             spacing: 10
             TextField {
                 id: add
-                focus: true
                 Layout.preferredWidth: 380
                 placeholderText: qsTr("@handle, channel URL or ID")
                 onAccepted: page.submit()
@@ -71,6 +72,9 @@ FocusScope {
 
         ListView {
             id: list
+            // Focus starts on the list, not the field, so the global keys
+            // (1 3 ? R Q) work as soon as the page opens.
+            focus: true
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
