@@ -151,6 +151,13 @@ MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mp
         {"demuxer-readahead-secs", "90"},
         {"network-timeout", "60"},
         {"audio-client-name", "qveil"},
+        // mpv's default background is a grey checkerboard, which shows before
+        // the first frame and wherever the video doesn't reach. A plain colour
+        // instead (set from setBackgroundColor(), black until then), the same
+        // one for the letterbox and for the area before there is any picture.
+        {"background", "color"},
+        {"border-background", "color"},
+        {"background-color", "#ff000000"},
     };
     for (const auto &[name, value] : options)
         mpv_set_option_string(m_mpv, name, value);
@@ -252,6 +259,15 @@ void MpvItem::setVolume(double volume) {
 void MpvItem::setMuted(bool muted) {
     int flag = muted;
     mpv_set_property(m_mpv, "mute", MPV_FORMAT_FLAG, &flag);
+}
+
+void MpvItem::setBackgroundColor(const QColor &color) {
+    if (!color.isValid() || color == m_background)
+        return;
+    m_background = color;
+    // mpv reads #AARRGGBB, which is what Qt calls HexArgb.
+    mpv_set_property_string(m_mpv, "background-color", color.name(QColor::HexArgb).toUtf8().constData());
+    emit backgroundColorChanged();
 }
 
 void MpvItem::onProperty(const mpv_event_property *p) {

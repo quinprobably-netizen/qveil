@@ -10,6 +10,8 @@ FocusScope {
     readonly property Item content: list
     signal channelRequested(string id)
 
+    function focusAdd() { add.forceActiveFocus() }
+
     function submit() {
         if (add.text.trim() === "")
             return

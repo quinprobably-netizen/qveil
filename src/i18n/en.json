@@ -31,9 +31,9 @@
     "one": "%n couldn't be fetched",
     "other": "%n couldn't be fetched"
   },
-  "%n recent videos  ·  dates are approximate": {
-    "one": "%n recent video  ·  dates are approximate",
-    "other": "%n recent videos  ·  dates are approximate"
+  "%n recent videos": {
+    "one": "%n recent video",
+    "other": "%n recent videos"
   },
   "Imported %n new channel(s), offline": {
     "one": "Imported %n new channel, offline",

@@ -13,11 +13,13 @@ FocusScope {
     property string emptyText
     property bool loading: false
     property alias actions: actionRow.data
+    // What to offer instead of an empty grid, under `emptyText`.
+    property alias emptyActions: emptyActionRow.data
     property alias grid: grid
     // Where focus belongs when the page is shown.
     readonly property Item content: grid
     property alias veil: grid.veil
-    // Explains a "~" in a card's date, where the page knows why dates are estimated.
+    // Explains a "~" in a card's date: each page knows why its dates are approximate.
     property alias estimateNote: grid.estimateNote
 
     signal activated(var video)
@@ -73,15 +75,27 @@ FocusScope {
         }
     }
 
-    Label {
+    ColumnLayout {
         anchors.centerIn: parent
         width: Math.min(parent.width - 80, 520)
         visible: !page.loading && page.model.length === 0 && page.emptyText !== ""
-        text: page.emptyText
-        horizontalAlignment: Text.AlignHCenter
-        wrapMode: Text.Wrap
-        font.pixelSize: 15
-        lineHeight: 1.3
-        color: "#8d8d98"
+        spacing: 0
+
+        Label {
+            Layout.fillWidth: true
+            text: page.emptyText
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            font.pixelSize: 15
+            lineHeight: 1.3
+            color: "#8d8d98"
+        }
+
+        RowLayout {
+            id: emptyActionRow
+            Layout.alignment: Qt.AlignHCenter
+            // Room for the actions only when the page has any.
+            Layout.topMargin: children.length > 0 ? 20 : 0
+        }
     }
 }
