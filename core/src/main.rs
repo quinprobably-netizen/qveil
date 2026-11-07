@@ -3,6 +3,7 @@
 
 mod app;
 mod config;
+mod errors;
 mod feed;
 mod ids;
 mod net;

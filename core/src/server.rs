@@ -9,6 +9,7 @@
 
 use crate::app::{self, Runtime, Watched};
 use crate::config::Config;
+use crate::errors::friendly;
 use crate::ids::{self, VideoRef};
 use crate::net::{self, TOR_PROXY};
 use crate::store::Paths;
@@ -434,6 +435,22 @@ impl Server {
             Err(e) => return respond(out, 502, "text/plain", format!("{e:#}").as_bytes()),
         };
         let status = up.status();
+        // The format selector only picks plain downloads, but if a manifest
+        // still turns up, relaying it would hand mpv absolute segment URLs
+        // that it fetches itself, around the route. Refuse it instead.
+        if up
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_playlist_type)
+        {
+            return respond(
+                out,
+                502,
+                "text/plain",
+                b"the stream is a playlist (HLS or DASH), which veil can't relay through your route",
+            );
+        }
         let mut head = format!(
             "HTTP/1.1 {} {}\r\n",
             status.as_u16(),
@@ -456,19 +473,10 @@ impl Server {
     }
 }
 
-/// Makes the common failures readable in the app.
-fn friendly(err: &str) -> String {
-    if err.contains("127.0.0.1:9050")
-        || (err.contains("socks") && err.contains("onnection refused"))
-    {
-        return "Tor isn't running on 127.0.0.1:9050. Start it, or switch the route to Direct."
-            .into();
-    }
-    if err.contains("Sign in to confirm") {
-        return "YouTube is asking this IP to sign in (bot check). Try another route or try later."
-            .into();
-    }
-    err.to_string()
+/// HLS and DASH manifests, however the server spells the type.
+fn is_playlist_type(content_type: &str) -> bool {
+    let t = content_type.to_ascii_lowercase();
+    t.contains("mpegurl") || t.contains("dash+xml")
 }
 
 fn read_request(stream: &TcpStream) -> Result<Request> {

@@ -58,8 +58,14 @@ impl Config {
         crate::store::write_atomic(path, text.as_bytes())
     }
 
+    /// The yt-dlp format selector. Every branch is limited to plain https
+    /// downloads: the relay forwards one URL per stream, so an HLS or DASH
+    /// manifest (live streams, some formats) would hand mpv segment URLs that
+    /// it fetches directly, around the route. `protocol=https` is compared in
+    /// full because `protocol^=http` also matches `http_dash_segments`.
     pub fn format(&self) -> String {
-        format!("bv*[height<={h}]+ba/b[height<={h}]/b", h = self.max_height)
+        let (h, p) = (self.max_height, "[protocol=https]");
+        format!("bv*[height<={h}]{p}+ba{p}/b[height<={h}]{p}/b{p}")
     }
 }
 
@@ -75,5 +81,17 @@ mod tests {
             toml::from_str::<Config>("histroy = true").is_err(),
             "typos must not be silently ignored"
         );
+    }
+
+    #[test]
+    fn every_format_branch_is_a_plain_download() {
+        let format = Config::default().format();
+        assert_eq!(
+            format,
+            "bv*[height<=1080][protocol=https]+ba[protocol=https]/b[height<=1080][protocol=https]/b[protocol=https]"
+        );
+        for part in format.split(['/', '+']) {
+            assert!(part.contains("[protocol=https]"), "{part} is unfiltered");
+        }
     }
 }
