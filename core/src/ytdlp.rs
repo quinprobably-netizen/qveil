@@ -8,7 +8,7 @@
 
 use crate::errors::friendly;
 use crate::ids;
-use crate::net::Net;
+use crate::net::{Net, USER_AGENT};
 use crate::private::PrivateDir;
 use crate::video::Video;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -85,6 +85,12 @@ impl Ytdlp {
             "--no-warnings",
             "--socket-timeout",
             SOCKET_TIMEOUT,
+            // yt-dlp picks a random Chrome version for each call, which would
+            // put a second browser identity beside the engine's own on the
+            // same circuit. With qveil's, the video bytes (whose headers
+            // yt-dlp resolves) and the engine's requests agree.
+            "--user-agent",
+            USER_AGENT,
         ]);
         c.arg("--cache-dir").arg(&self.cache_dir);
         // Still honoured after `--ignore-config`, which only skips the
@@ -623,6 +629,10 @@ echo '{"entries":[]}'
         ] {
             assert!(argv.lines().any(|a| a == flag), "missing {flag}:\n{argv}");
         }
+        // The engine's own User-Agent, not one yt-dlp picks for itself.
+        let args: Vec<&str> = argv.lines().collect();
+        let at = args.iter().position(|a| *a == "--user-agent").unwrap();
+        assert_eq!(args[at + 1], USER_AGENT);
 
         // They are in a private file instead, quoted the way yt-dlp reads it.
         assert_eq!(

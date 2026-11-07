@@ -6,9 +6,12 @@
 # proxy = "socks5h://127.0.0.1:9050"
 
 # With a SOCKS proxy, use new random credentials for each request so Tor puts
-# each channel feed and each video on its own circuit. With Tor this is always
-# on: setting it to false there is refused. It is still read, so old config
-# files keep working, and it only matters for a SOCKS proxy that isn't Tor.
+# each channel feed and each video on its own circuit. qveil can't tell Tor from
+# another SOCKS proxy by its address, so this is always on for every SOCKS proxy:
+# setting it to false there is refused. The key is still read, so old config
+# files keep loading. A SOCKS proxy URL with its own credentials
+# (socks5h://user:password@host:port) is used as given, with every request
+# sharing them, and qveil then says the route is not isolated.
 isolate_circuits = true
 
 max_height = 1080

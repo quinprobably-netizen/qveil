@@ -4,9 +4,15 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use std::time::Duration;
 
-/// A common desktop browser UA, so requests don't announce "qveil" or "reqwest".
-pub const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0";
+/// The one browser identity qveil presents. The engine's own requests (feeds,
+/// thumbnails) send it, and every yt-dlp call is told to send it too, so the
+/// video bytes carry it as well: otherwise the engine would say Firefox while
+/// yt-dlp, which picks a random Chrome version for each call, said Chrome, and
+/// one circuit would show two browsers. It has the shape of yt-dlp's own
+/// default, with a Chrome major version inside the range yt-dlp currently
+/// picks from (145 to 151), so it is no more conspicuous than yt-dlp's
+/// traffic is anyway. Bump it when yt-dlp's range moves on.
+pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
 pub const TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
 
@@ -41,10 +47,19 @@ impl Net {
         }
         // Tor is only private enough with a circuit per request: one shared
         // circuit lets the exit link the feeds, searches and videos you
-        // watch. So that is not left to a setting.
-        if proxy.as_deref() == Some(TOR_PROXY) && !isolate {
+        // watch. So that is not left to a setting. Whether a SOCKS proxy is
+        // Tor can't be told from its address (Tor Browser listens on 9150, a
+        // system Tor may be reached as `localhost` or through a tunnel on any
+        // port), so the rule can't be tied to one address: it holds for every
+        // SOCKS proxy. A proxy URL that carries its own credentials is the
+        // deliberate way to share one identity, and `isolates` then says so.
+        if let Some(p) = &proxy
+            && !isolate
+            && is_socks_url(p)
+            && !has_credentials(p)
+        {
             bail!(
-                "isolate_circuits = false is not allowed with Tor: qveil always uses a fresh circuit per request. Remove the setting, or use another proxy"
+                "isolate_circuits = false is not allowed with a SOCKS proxy: qveil can't tell Tor from another proxy by its address, and one shared circuit lets the exit link your feeds, searches and videos. Remove the setting, or put your own user:password in the proxy URL to share one identity on purpose"
             );
         }
         Ok(Self {
@@ -68,38 +83,42 @@ impl Net {
     }
 
     pub fn is_socks(&self) -> bool {
-        self.proxy
-            .as_deref()
-            .is_some_and(|p| p.starts_with("socks"))
+        self.proxy.as_deref().is_some_and(is_socks_url)
     }
 
+    /// What the route does, for the top bar and `qveil config`. It only claims
+    /// what `proxy_url` really does.
     pub fn describe(&self) -> String {
-        match &self.proxy {
-            None => "none: YouTube sees your real IP".into(),
-            Some(p) => {
-                let p = redact(p);
-                if self.is_socks() && self.isolate {
-                    format!("{p} (fresh circuit per request)")
-                } else {
-                    p
-                }
-            }
+        let Some(p) = &self.proxy else {
+            return "none: YouTube sees your real IP".into();
+        };
+        let shown = redact(p);
+        if !self.is_socks() {
+            shown
+        } else if has_credentials(p) {
+            // The URL's own credentials go with every request, which is one
+            // identity for all of them: Tor would put them on one circuit.
+            format!(
+                "{shown} (not isolated: every request uses the credentials in the URL, so they share one circuit)"
+            )
+        } else if self.isolate {
+            format!("{shown} (fresh credentials per request; Tor gives each its own circuit)")
+        } else {
+            format!("{shown} (not isolated: one shared identity)")
         }
     }
 
     /// Proxy URL for one logical request. With isolation on, each call gets
     /// new random SOCKS credentials, so Tor (with IsolateSOCKSAuth, its
     /// default) builds a separate circuit and requests can't be linked by
-    /// exit IP.
+    /// exit IP. Credentials the user put in the URL are used as given, and
+    /// then every request shares them: `isolates` is false in that case.
     pub fn proxy_url(&self) -> Option<String> {
         let p = self.proxy.as_ref()?;
-        if !(self.isolate && self.is_socks()) {
+        if !self.isolates() {
             return Some(p.clone());
         }
         let (scheme, rest) = p.split_once("://")?;
-        if rest.contains('@') {
-            return Some(p.clone()); // the user set their own credentials
-        }
         let user: u64 = rand::random();
         Some(format!("{scheme}://qveil{user:016x}:x@{rest}"))
     }
@@ -125,8 +144,15 @@ impl Net {
         }
     }
 
+    /// Whether each request really gets an identity of its own: only over
+    /// SOCKS, and only when the proxy URL has no credentials of its own,
+    /// because those are sent with every request and make them all one.
     pub fn isolates(&self) -> bool {
-        self.isolate && self.is_socks()
+        self.isolate
+            && self
+                .proxy
+                .as_deref()
+                .is_some_and(|p| is_socks_url(p) && !has_credentials(p))
     }
 
     /// The same route with one fixed identity, for work that must keep a
@@ -183,6 +209,17 @@ pub fn tor_running() -> bool {
         .is_ok()
 }
 
+fn is_socks_url(proxy: &str) -> bool {
+    proxy.starts_with("socks")
+}
+
+/// Whether the proxy URL has a `user:password@` part of its own.
+fn has_credentials(proxy: &str) -> bool {
+    proxy
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.contains('@'))
+}
+
 /// The proxy URL without its credentials: `scheme://***@host:port`.
 pub fn redact(p: &str) -> String {
     match (p.split_once("://"), p.rsplit_once('@')) {
@@ -194,6 +231,7 @@ pub fn redact(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn rejects_dns_leaking_socks() {
@@ -202,12 +240,71 @@ mod tests {
     }
 
     #[test]
-    fn tor_always_isolates() {
-        let err = Net::new(Some(TOR_PROXY.into()), false).unwrap_err();
-        assert!(err.to_string().contains("not allowed with Tor"), "{err}");
-        // Any other SOCKS proxy may still opt out, and so may a route with no proxy.
-        assert!(Net::new(Some("socks5h://10.0.0.2:1080".into()), false).is_ok());
+    fn every_socks_proxy_isolates_and_cannot_opt_out() {
+        // Tor can't be told from another SOCKS proxy by its address, so none
+        // of these may turn isolation off: the preset, `localhost`, Tor
+        // Browser's port, a tunnel on any port, an IPv6 address.
+        for proxy in [
+            TOR_PROXY,
+            "socks5h://localhost:9050",
+            "socks5h://127.0.0.1:9150",
+            "socks5h://10.0.0.2:1080",
+            "socks5h://[::1]:9050",
+        ] {
+            let err = Net::new(Some(proxy.into()), false).unwrap_err();
+            assert!(
+                err.to_string().contains("not allowed with a SOCKS proxy"),
+                "{proxy}: {err}"
+            );
+            let net = Net::new(Some(proxy.into()), true).unwrap();
+            assert!(net.isolates(), "{proxy}");
+            assert!(
+                net.describe().contains("fresh credentials per request"),
+                "{proxy}: {}",
+                net.describe()
+            );
+        }
+        // Where isolation means nothing, switching it off is harmless.
+        assert!(Net::new(Some("http://10.0.0.1:3128".into()), false).is_ok());
         assert!(Net::new(None, false).is_ok());
+    }
+
+    #[test]
+    fn credentials_in_the_url_mean_no_isolation_and_say_so() {
+        for isolate in [true, false] {
+            let net = Net::new(Some("socks5h://me:pw@10.0.0.2:1080".into()), isolate).unwrap();
+            assert!(!net.isolates(), "isolate = {isolate}");
+            // Used as given, every time: one identity for everything.
+            let (a, b) = (net.proxy_url().unwrap(), net.proxy_url().unwrap());
+            assert_eq!(
+                (a.as_str(), a == b),
+                ("socks5h://me:pw@10.0.0.2:1080", true)
+            );
+            let said = net.describe();
+            assert!(
+                said.contains("not isolated") && said.contains("share one circuit"),
+                "{said}"
+            );
+            assert!(!said.contains("fresh") && !said.contains("pw"), "{said}");
+        }
+        // The same goes for Tor's own address with credentials added.
+        let tor = Net::new(Some("socks5h://me:pw@127.0.0.1:9050".into()), true).unwrap();
+        assert!(!tor.isolates() && tor.describe().contains("not isolated"));
+        // What the engine reports to the window agrees with the route.
+        assert!(!tor.same_route(&Net::new(Some(TOR_PROXY.into()), true).unwrap()));
+    }
+
+    #[test]
+    fn only_a_socks_proxy_without_credentials_has_isolation_to_describe() {
+        let plain = Net::new(Some("socks5h://10.0.0.2:1080".into()), true).unwrap();
+        assert!(plain.describe().starts_with("socks5h://10.0.0.2:1080 ("));
+        let http = Net::new(Some("http://u:pw@10.0.0.1:3128".into()), true).unwrap();
+        assert!(!http.isolates());
+        assert_eq!(http.describe(), "http://***@10.0.0.1:3128");
+        assert_eq!(
+            Net::new(None, true).unwrap().describe(),
+            "none: YouTube sees your real IP"
+        );
     }
 
     #[test]
@@ -258,6 +355,41 @@ mod tests {
             }
         });
         url
+    }
+
+    #[test]
+    fn every_client_sends_the_one_browser_identity() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 2) {}
+                let agent = line
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("user-agent: ")
+                            .or(l.strip_prefix("User-Agent: "))
+                    })
+                    .map(String::from);
+                log.lock().unwrap().push(agent);
+                let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let net = Net::new(None, true).unwrap().allowing_http();
+        net.client().unwrap().get(&url).send().unwrap();
+        net.relay_client().unwrap().get(&url).send().unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let want = Some(USER_AGENT.to_string());
+        assert_eq!(seen, [want.clone(), want]);
+        // The same string is what yt-dlp is told to send (see `Ytdlp::command`),
+        // and it has to look like a desktop browser, not like qveil or reqwest.
+        assert!(USER_AGENT.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"));
+        assert!(!USER_AGENT.to_ascii_lowercase().contains("qveil"));
     }
 
     #[test]
@@ -399,8 +531,11 @@ mod tests {
         let tor = || Net::new(Some(TOR_PROXY.into()), true).unwrap();
         assert!(tor().same_route(&tor()));
         assert!(!tor().same_route(&Net::new(None, true).unwrap()));
-        let socks = |isolate| Net::new(Some("socks5h://10.0.0.2:1080".into()), isolate).unwrap();
-        assert!(!socks(true).same_route(&socks(false)));
+        // Credentials of its own make a different route from the same proxy without.
+        let other = |p: &str| Net::new(Some(p.into()), true).unwrap();
+        assert!(
+            !other("socks5h://10.0.0.2:1080").same_route(&other("socks5h://a:b@10.0.0.2:1080"))
+        );
         let http = Net::new(Some("http://10.0.0.1:3128".into()), true).unwrap();
         assert!(!tor().same_route(&http));
         // Isolation only means something over SOCKS, so it can't tell two HTTP proxies apart.

@@ -1592,6 +1592,53 @@ mod tests {
     }
 
     #[test]
+    fn the_route_label_is_tor_only_for_the_preset_and_isolation_is_reported_truthfully() {
+        let (_s, base, _d) = server();
+        let set = |body: &str| {
+            let (status, body) = http(&base, "POST", &path(&base, "api/config"), body);
+            (status, serde_json::from_str::<Value>(&body).unwrap())
+        };
+        // Tor Browser's port is a proxy like any other: only the preset is "tor".
+        let (status, v) = set(r#"{"route":"proxy","proxy":"socks5h://127.0.0.1:9150"}"#);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(
+            (v["route"].as_str(), v["isolated"].as_bool()),
+            (Some("proxy"), Some(true))
+        );
+        let (_, v) = set(r#"{"route":"proxy","proxy":"socks5h://localhost:9050"}"#);
+        assert_eq!(
+            (v["route"].as_str(), v["isolated"].as_bool()),
+            (Some("proxy"), Some(true))
+        );
+        // The user's own credentials turn isolation off, and the description says so.
+        let (status, v) = set(r#"{"route":"proxy","proxy":"socks5h://me:pw@127.0.0.1:9050"}"#);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(
+            (v["route"].as_str(), v["isolated"].as_bool()),
+            (Some("proxy"), Some(false))
+        );
+        let said = v["describe"].as_str().unwrap();
+        assert!(
+            said.contains("not isolated") && !said.contains("pw"),
+            "{said}"
+        );
+        // Sending the redacted proxy back unchanged keeps the credentials.
+        let (_, v) = set(&format!(r#"{{"route":"proxy","proxy":{}}}"#, v["proxy"]));
+        assert_eq!(v["isolated"].as_bool(), Some(false));
+        let (_, v) = set(r#"{"route":"tor"}"#);
+        assert_eq!(
+            (v["route"].as_str(), v["isolated"].as_bool()),
+            (Some("tor"), Some(true))
+        );
+        assert!(
+            v["describe"]
+                .as_str()
+                .unwrap()
+                .contains("fresh credentials per request")
+        );
+    }
+
+    #[test]
     fn offline_endpoints() {
         let (_s, base, _d) = server();
         let csv = "UCsBjURrPoezykLs9EqgamOA,http://x,Fireship\n";
