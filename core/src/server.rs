@@ -290,8 +290,8 @@ impl Server {
             },
         );
         let sid = self.register(&rt, session)?;
-        if rt.cfg.history {
-            app::record_history(
+        if rt.cfg.history
+            && let Err(e) = app::record_history(
                 &self.paths,
                 Watched {
                     id: v.id.clone(),
@@ -299,7 +299,12 @@ impl Server {
                     channel: s.channel.clone(),
                     at: app::now(),
                 },
-            )?;
+            )
+        {
+            // The history is a convenience, and the video is resolved and
+            // registered by now: a full disk or a damaged history file
+            // is not a reason to refuse to play it.
+            eprintln!("qveil: couldn't add this video to the history: {e:#}");
         }
         Ok(PlayInfo {
             id: v.id.clone(),
@@ -1972,6 +1977,38 @@ EOF
         assert_eq!(fetch(&base, "GET", audio, &[]).0, 200);
         assert_eq!(fetch(&base, "GET", rel(&base, &info.video), &[]).0, 200);
         assert_eq!(runs(&bin.0), 2);
+    }
+
+    #[test]
+    fn a_history_that_cannot_be_written_does_not_stop_the_video() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(&bin.0, &up.url("/video?gen="));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            history: true,
+            ..Config::default()
+        });
+        // A directory where the history file should be: reading it fails, so
+        // recording the video does too.
+        std::fs::create_dir_all(s.paths.history()).unwrap();
+        assert!(app::record_history(&s.paths, watched()).is_err());
+        let info = s.open(&test_video()).unwrap();
+        assert_eq!(fetch(&base, "GET", rel(&base, &info.video), &[]).0, 200);
+
+        // With the file writable again, the same call does record it.
+        std::fs::remove_dir_all(s.paths.history()).unwrap();
+        s.open(&test_video()).unwrap();
+        assert_eq!(app::load_history(&s.paths).unwrap().watched.len(), 1);
+    }
+
+    fn watched() -> Watched {
+        Watched {
+            id: "dQw4w9WgXcQ".into(),
+            title: "T".into(),
+            channel: None,
+            at: 0,
+        }
     }
 
     #[test]

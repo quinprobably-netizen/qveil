@@ -91,6 +91,9 @@ impl Ytdlp {
     /// Runs yt-dlp on `target` (a URL or a `ytsearchN:` query) with `args`
     /// and parses its JSON. It is killed if it takes longer than `limit`.
     fn json(&self, args: &[&str], target: &str, limit: Duration) -> Result<Value> {
+        // yt-dlp would create it with the default mode, and every directory
+        // above it that doesn't exist yet along with it.
+        crate::store::ensure_dir(&self.cache_dir)?;
         let call = Call::new(&self.net, target)?;
         let out = output_within(self.command(&call).args(args), limit)
             .with_context(|| format!("running {:?} (is yt-dlp installed?)", self.bin))?;
@@ -452,10 +455,11 @@ mod tests {
     use crate::net::TOR_PROXY;
     use crate::store::testing::{TempDir, script};
 
+    /// `bin` is in a directory of its own (a `TempDir`), and so is the cache.
     fn ytdlp(bin: String, proxy: Option<&str>) -> Ytdlp {
         Ytdlp {
+            cache_dir: Path::new(&bin).with_file_name("cache").join("qveil"),
             bin,
-            cache_dir: std::env::temp_dir().join("qveil-test-yt-dlp-cache"),
             net: Net::new(proxy.map(String::from), true).unwrap(),
         }
     }
@@ -519,6 +523,20 @@ echo '{"entries":[]}'
         assert_eq!(spied(&dir, "dir-mode").trim(), "700");
         // And the directory is gone once yt-dlp has run.
         assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
+    }
+
+    #[test]
+    fn the_cache_directories_are_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
+        // Neither the cache nor the directory above it exists yet, and yt-dlp
+        // would create both with the default mode.
+        yt.search("x", 1).unwrap();
+        for d in [&yt.cache_dir, yt.cache_dir.parent().unwrap()] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", d.display());
+        }
     }
 
     #[test]

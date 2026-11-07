@@ -18,19 +18,36 @@ pub struct Paths {
 impl Paths {
     pub fn from_env() -> Result<Self> {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
-        let xdg = |var: &str, fallback: &str| {
+        let xdg = |var: &str, fallback: &str, held: Held| {
             let base = std::env::var_os(var)
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
                 .unwrap_or_else(|| Path::new(&home).join(fallback));
-            migrate(&base.join("veil"), &base.join("qveil"));
+            migrate(&base.join("veil"), &base.join("qveil"), held);
             base.join("qveil")
         };
         Ok(Self {
-            config: xdg("XDG_CONFIG_HOME", ".config").join("config.toml"),
-            data: xdg("XDG_DATA_HOME", ".local/share"),
-            cache: xdg("XDG_CACHE_HOME", ".cache"),
+            config: xdg("XDG_CONFIG_HOME", ".config", Held::Settings).join("config.toml"),
+            data: xdg("XDG_DATA_HOME", ".local/share", Held::Settings),
+            cache: xdg("XDG_CACHE_HOME", ".cache", Held::Cache),
         })
+    }
+
+    /// The directory the config file is in.
+    pub fn config_dir(&self) -> &Path {
+        self.config.parent().unwrap_or(&self.config)
+    }
+
+    /// What is left of the old name: `veil` directories beside qveil's own
+    /// that migration didn't empty (see `migrate`), and that are still there.
+    pub fn legacy(&self) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = [self.config_dir(), &self.data, &self.cache]
+            .into_iter()
+            .map(|dir| dir.with_file_name("veil"))
+            .filter(|old| fs::symlink_metadata(old).is_ok())
+            .collect();
+        found.dedup();
+        found
     }
 
     pub fn subscriptions(&self) -> PathBuf {
@@ -53,25 +70,104 @@ impl Paths {
     }
 }
 
+/// What an old `veil` directory held, which decides what becomes of it.
+#[derive(Clone, Copy, PartialEq)]
+enum Held {
+    /// Subscriptions and settings: kept, moved over to qveil.
+    Settings,
+    /// A cache: regenerable, so never moved on top of an existing qveil one.
+    Cache,
+}
+
 /// The app was called veil before it was qveil. Its directories move over
-/// once, so subscriptions and settings survive the rename; a qveil directory
-/// that already exists is never touched.
-fn migrate(old: &Path, new: &Path) {
-    if old.is_dir()
-        && !new.exists()
-        && let Err(e) = fs::rename(old, new)
-    {
-        eprintln!(
-            "qveil: couldn't move {} to {}: {e}",
-            old.display(),
-            new.display()
-        );
+/// once, so subscriptions and settings survive the rename.
+///
+/// The window starts first and creates its own qveil directories (with its
+/// settings file in the config one), so by the time the engine runs a qveil
+/// directory often exists already. Settings are then merged: whatever the old
+/// directory has that the new one hasn't is moved, and nothing is overwritten.
+/// An old cache is deleted instead: it can be rebuilt, and it records what
+/// was browsed and watched, which is not worth keeping around.
+fn migrate(old: &Path, new: &Path, held: Held) {
+    let is_dir = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let exists = |p: &Path| fs::symlink_metadata(p).is_ok();
+    let warn = |what: &str, path: &Path, e: std::io::Error| {
+        eprintln!("qveil: couldn't {what} {}: {e}", path.display());
+    };
+    if is_dir(old) {
+        if !exists(new) {
+            if let Err(e) = fs::rename(old, new) {
+                warn("move", old, e);
+            }
+        } else if held == Held::Cache {
+            if let Err(e) = fs::remove_dir_all(old) {
+                warn("remove the old cache", old, e);
+            }
+        } else if let Ok(entries) = fs::read_dir(old) {
+            for entry in entries.flatten() {
+                // The window's own settings file was named after the app too.
+                let name = match entry.file_name().to_str() {
+                    Some("veil.conf") => "qveil.conf".into(),
+                    _ => entry.file_name(),
+                };
+                let target = new.join(name);
+                if !exists(&target)
+                    && let Err(e) = fs::rename(entry.path(), &target)
+                {
+                    warn("move", &entry.path(), e);
+                }
+            }
+            // Only succeeds if nothing was left behind.
+            let _ = fs::remove_dir(old);
+        }
     }
-    // The window's own settings file was named after the app too.
     let (old_conf, new_conf) = (new.join("veil.conf"), new.join("qveil.conf"));
-    if old_conf.is_file() && !new_conf.exists() {
+    if old_conf.is_file() && !exists(&new_conf) {
         let _ = fs::rename(old_conf, new_conf);
     }
+}
+
+/// Brings qveil's directories to mode 0700, and the files directly in them to
+/// 0600. `ensure_dir` only sets a mode on directories it creates itself, and
+/// the window creates `~/.cache/qveil` and `~/.config/qveil` first, with the
+/// default 0755 and 0644, which would let any local user read what you
+/// subscribe to and what you watch. Symbolic links are left alone: what they
+/// point at isn't qveil's to change.
+pub fn secure(paths: &Paths) {
+    for dir in [paths.config_dir(), &paths.data, &paths.cache] {
+        if !restrict(dir, 0o700) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            restrict(&entry.path(), 0o600);
+        }
+    }
+}
+
+/// Sets the mode of a directory (when `mode` is 0700) or a regular file (any
+/// other). Returns whether there was one to set; says so if it can't.
+fn restrict(path: &Path, mode: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    let right_kind = if mode == 0o700 {
+        meta.is_dir()
+    } else {
+        meta.is_file()
+    };
+    if !right_kind {
+        return false;
+    }
+    if meta.permissions().mode() & 0o7777 != mode
+        && let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    {
+        eprintln!("qveil: couldn't restrict {}: {e}", path.display());
+    }
+    true
 }
 
 pub fn ensure_dir(dir: &Path) -> Result<()> {
@@ -361,13 +457,12 @@ mod tests {
 
     #[test]
     fn the_old_veil_directories_move_over_once() {
-        let root =
-            std::env::temp_dir().join(format!("qveil-migrate-{:016x}", rand::random::<u64>()));
-        let (old, new) = (root.join("veil"), root.join("qveil"));
+        let root = TempDir::new();
+        let (old, new) = (root.0.join("veil"), root.0.join("qveil"));
         fs::create_dir_all(&old).unwrap();
         fs::write(old.join("subscriptions.json"), "{}").unwrap();
         fs::write(old.join("veil.conf"), "x").unwrap();
-        migrate(&old, &new);
+        migrate(&old, &new, Held::Settings);
         assert!(!old.exists());
         assert!(new.join("subscriptions.json").is_file());
         assert!(
@@ -375,14 +470,128 @@ mod tests {
             "the window's settings file is renamed too"
         );
 
-        // An existing qveil directory is never overwritten.
+        // An existing qveil file is never overwritten.
         fs::create_dir_all(&old).unwrap();
         fs::write(old.join("subscriptions.json"), "stale").unwrap();
-        migrate(&old, &new);
+        migrate(&old, &new, Held::Settings);
         assert_eq!(
             fs::read_to_string(new.join("subscriptions.json")).unwrap(),
             "{}"
         );
-        let _ = fs::remove_dir_all(&root);
+        assert!(
+            old.join("subscriptions.json").exists(),
+            "and isn't lost either"
+        );
+    }
+
+    #[test]
+    fn settings_are_merged_into_a_directory_the_window_created_first() {
+        let root = TempDir::new();
+        let (old, new) = (root.0.join("veil"), root.0.join("qveil"));
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("config.toml"), "proxy").unwrap();
+        fs::write(old.join("veil.conf"), "old window settings").unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("qveil.conf"), "new window settings").unwrap();
+        migrate(&old, &new, Held::Settings);
+        assert_eq!(
+            fs::read_to_string(new.join("config.toml")).unwrap(),
+            "proxy"
+        );
+        assert_eq!(
+            fs::read_to_string(new.join("qveil.conf")).unwrap(),
+            "new window settings"
+        );
+
+        // Nothing left to move means nothing left behind.
+        let (old, new) = (root.0.join("veil2"), root.0.join("qveil2"));
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("subscriptions.json"), "{}").unwrap();
+        fs::create_dir_all(&new).unwrap();
+        migrate(&old, &new, Held::Settings);
+        assert!(new.join("subscriptions.json").is_file() && !old.exists());
+    }
+
+    #[test]
+    fn an_old_cache_is_deleted_when_the_new_one_exists_and_moved_otherwise() {
+        let root = TempDir::new();
+        let (old, new) = (root.0.join("veil"), root.0.join("qveil"));
+        fs::create_dir_all(old.join("thumbs")).unwrap();
+        fs::write(old.join("thumbs").join("watched.jpg"), "x").unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("feed.json"), "{}").unwrap();
+        migrate(&old, &new, Held::Cache);
+        assert!(!old.exists(), "the old cache records what was watched");
+        assert!(new.join("feed.json").is_file(), "the new one is untouched");
+
+        // With no new cache yet, the old one is moved, as before.
+        let (old, new) = (root.0.join("veil-b"), root.0.join("qveil-b"));
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("feed.json"), "{}").unwrap();
+        migrate(&old, &new, Held::Cache);
+        assert!(new.join("feed.json").is_file() && !old.exists());
+    }
+
+    #[test]
+    fn the_directories_and_their_files_are_made_private() {
+        let root = TempDir::new();
+        let paths = root.paths();
+        let config_dir = paths.config_dir().to_path_buf();
+        let shared = |p: &Path, mode| {
+            if p.extension().is_some() {
+                fs::write(p, "x").unwrap();
+            } else {
+                fs::create_dir_all(p).unwrap();
+            }
+            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        // What the window leaves behind: world-readable.
+        shared(&config_dir, 0o755);
+        shared(&paths.data, 0o755);
+        shared(&paths.cache, 0o750);
+        shared(&paths.config, 0o644);
+        shared(&config_dir.join("qveil.conf"), 0o664);
+        shared(&paths.subscriptions(), 0o644);
+        // A symbolic link is not followed to change what it points at.
+        let outside = root.0.join("dotfiles.toml");
+        shared(&outside, 0o644);
+        std::os::unix::fs::symlink(&outside, config_dir.join("linked.toml")).unwrap();
+
+        secure(&paths);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        for dir in [&config_dir, &paths.data, &paths.cache] {
+            assert_eq!(mode(dir), 0o700, "{}", dir.display());
+        }
+        for file in [
+            &paths.config,
+            &config_dir.join("qveil.conf"),
+            &paths.subscriptions(),
+        ] {
+            assert_eq!(mode(file), 0o600, "{}", file.display());
+        }
+        assert_eq!(mode(&outside), 0o644);
+        // Missing directories are left missing, and a second run changes nothing.
+        let nothing = TempDir::new();
+        secure(&nothing.paths());
+        assert!(!nothing.paths().data.exists());
+        secure(&paths);
+        assert_eq!(mode(&config_dir), 0o700);
+    }
+
+    #[test]
+    fn leftover_veil_directories_are_found_beside_the_new_ones() {
+        let root = TempDir::new();
+        let paths = Paths {
+            config: root.0.join("config/qveil/config.toml"),
+            data: root.0.join("data/qveil"),
+            cache: root.0.join("cache/qveil"),
+        };
+        assert!(paths.legacy().is_empty());
+        fs::create_dir_all(root.0.join("config/veil")).unwrap();
+        fs::create_dir_all(root.0.join("cache/veil")).unwrap();
+        assert_eq!(
+            paths.legacy(),
+            [root.0.join("config/veil"), root.0.join("cache/veil")]
+        );
     }
 }

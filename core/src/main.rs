@@ -149,7 +149,16 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // The app's route is a setting it can change at any time. A flag given
+    // here would be lost the first time it did, and the app would carry on
+    // over a route nobody chose.
+    if matches!(cli.cmd, Cmd::Serve) && (cli.proxy.is_some() || cli.tor) {
+        anyhow::bail!(
+            "`serve` doesn't take --proxy or --tor: the app's route is a setting, saved in its config file"
+        );
+    }
     let paths = Paths::from_env()?;
+    store::secure(&paths);
     let cfg = Config::load(&paths.config)?;
     let rt = Runtime::new(cfg, &paths, cli.proxy, cli.tor)?;
     let server = Server::new(rt, paths);
@@ -383,8 +392,11 @@ fn wipe(paths: &Paths, yes: bool) -> Result<()> {
     let present: Vec<_> = [&paths.data, &paths.cache]
         .into_iter()
         .filter(|p| p.exists())
+        .cloned()
         .collect();
-    if present.is_empty() {
+    // What the old name left behind, which holds the same kind of data.
+    let legacy = paths.legacy();
+    if present.is_empty() && legacy.is_empty() {
         println!("nothing to wipe");
         return Ok(());
     }
@@ -392,6 +404,12 @@ fn wipe(paths: &Paths, yes: bool) -> Result<()> {
         println!("this permanently deletes:");
         for p in &present {
             println!("  {}", p.display());
+        }
+        for p in &legacy {
+            println!(
+                "  {}  (left over from when qveil was called veil)",
+                p.display()
+            );
         }
         print!("type 'wipe' to confirm: ");
         std::io::stdout().flush()?;
@@ -401,7 +419,7 @@ fn wipe(paths: &Paths, yes: bool) -> Result<()> {
             anyhow::bail!("aborted");
         }
     }
-    for p in present {
+    for p in present.iter().chain(&legacy) {
         std::fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))?;
     }
     println!("wiped (config file kept: {})", paths.config.display());
