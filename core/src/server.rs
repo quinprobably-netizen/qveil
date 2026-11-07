@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 const MAX_BODY: usize = 8 << 20;
 const MAX_SESSIONS: usize = 4;
 const MAX_THUMBS: usize = 800;
+const MAX_SEARCH: usize = 60;
 
 // Limits that apply before a client has proven it holds the token, so that a
 // local program (or a web page that guessed the port) can't tie up threads or
@@ -36,8 +37,14 @@ const MAX_THUMBS: usize = 800;
 const MAX_REQUEST_LINE: u64 = 8 << 10;
 const MAX_HEADERS: u64 = 32 << 10;
 const MAX_HEADER_COUNT: usize = 100;
+/// How many connections that have presented the token are served at once.
 const MAX_CONNECTIONS: usize = 64;
-/// A client has this long, in total, to send its whole request.
+/// How many connections that haven't yet are kept open (see `Unverified`).
+const MAX_UNVERIFIED: usize = 64;
+/// A client has this long to send a request line, and so to show it has the
+/// token. The real client sends it the moment it connects.
+const REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Once the token is shown, the client has this long to send the rest of its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Ordinary responses are small, so a client that doesn't read them is stuck.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,8 +66,10 @@ pub struct Server {
     thumbs: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     /// Serializes settings changes.
     settings: Mutex<()>,
-    /// Connections being served right now (see `MAX_CONNECTIONS`).
+    /// Connections with the token being served right now (see `MAX_CONNECTIONS`).
     connections: Arc<AtomicUsize>,
+    /// Connections that haven't shown the token yet.
+    unverified: Arc<Unverified>,
 }
 
 /// One relayed stream. What mpv fetches goes through `live`, which is
@@ -225,6 +234,7 @@ impl Server {
             thumbs: Mutex::new(HashMap::new()),
             settings: Mutex::new(()),
             connections: Arc::new(AtomicUsize::new(0)),
+            unverified: Arc::new(Unverified::default()),
         })
     }
 
@@ -328,19 +338,18 @@ impl Server {
             .map(|(_, s)| Arc::clone(s))
     }
 
-    /// Serves one connection on its own thread, unless too many are open.
-    fn accept(self: &Arc<Self>, mut conn: TcpStream) {
-        let Some(slot) = Slot::take(&self.connections) else {
-            let _ = conn.set_write_timeout(Some(Duration::from_secs(1)));
-            let _ = respond(&mut conn, 503, "text/plain", b"too many connections");
+    /// Serves one connection on its own thread. Until it has shown the token
+    /// it only counts against the pool of unverified connections, whose
+    /// oldest member is closed to make room for a newcomer.
+    fn accept(self: &Arc<Self>, conn: TcpStream) {
+        let Ok(pending) = Pending::admit(&self.unverified, &conn) else {
             return;
         };
         let server = Arc::clone(self);
         // If the thread can't be created, the closure is dropped with the
-        // connection and the slot, so nothing is leaked.
+        // connection and its place, so nothing is leaked.
         let _ = std::thread::Builder::new().spawn(move || {
-            let _slot = slot;
-            if let Err(e) = server.handle(conn) {
+            if let Err(e) = server.handle(conn, pending) {
                 // A client that hangs up (mpv does, whenever it seeks) isn't
                 // news, but a stream that broke upstream is.
                 if e.downcast_ref::<StreamBroke>().is_some() {
@@ -359,9 +368,9 @@ impl Server {
         constant_time_eq(given.as_bytes(), self.token.as_bytes()).then_some(rest)
     }
 
-    fn handle(self: &Arc<Self>, mut stream: TcpStream) -> Result<()> {
+    fn handle(self: &Arc<Self>, mut stream: TcpStream, pending: Pending) -> Result<()> {
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        let mut r = BufReader::new(Deadline::new(stream.try_clone()?, REQUEST_TIMEOUT));
+        let mut r = BufReader::new(Deadline::new(stream.try_clone()?, REQUEST_LINE_TIMEOUT));
         let line = match read_request_line(&mut r) {
             Ok(line) => line,
             Err(reject) => return refuse(&mut stream, &mut r, reject),
@@ -371,6 +380,17 @@ impl Server {
         if self.token_rest(&line.path).is_none() {
             return refuse(&mut stream, &mut r, Reject::new(404, "not found"));
         }
+        // It has the token, so it moves from the pool of strangers to the
+        // main one, which only holders of the token can fill.
+        let Some(_slot) = Slot::take(&self.connections) else {
+            return refuse(
+                &mut stream,
+                &mut r,
+                Reject::new(503, "too many connections"),
+            );
+        };
+        drop(pending);
+        r.get_mut().until = Instant::now() + REQUEST_TIMEOUT;
         let req = match read_request_rest(&mut r, line) {
             Ok(req) => req,
             Err(reject) => return refuse(&mut stream, &mut r, reject),
@@ -415,7 +435,10 @@ impl Server {
                 self.config_json()
             }
             ("GET", ["api", "search"]) => {
-                json!(app::search(&rt, req.param("q")?, req.num("n", 40))?)
+                // Each result is a line of yt-dlp's output and a card in the
+                // window, and `n` comes from the caller.
+                let n = req.num("n", 40).clamp(1, MAX_SEARCH);
+                json!(app::search(&rt, req.param("q")?, n)?)
             }
             ("GET", ["api", "feed"]) => {
                 // `refresh=1` fetches the channels not fetched recently,
@@ -911,6 +934,46 @@ fn read_request_rest(r: &mut impl BufRead, line: RequestLine) -> Result<Request,
     })
 }
 
+/// The connections that haven't shown the token, kept apart from the main
+/// pool so that a program that merely connects can't use up the places the
+/// app needs. A full pool doesn't turn the newcomer away, because the app's own
+/// connection is a newcomer too: the oldest stranger is closed instead. A
+/// connection that has been served ends up out of here within microseconds,
+/// so the one that is closed is nearly always one that is just sitting there.
+#[derive(Default)]
+struct Unverified(Mutex<VecDeque<(u64, TcpStream)>>);
+
+/// A place in `Unverified`, given up when dropped (or when it is closed to make room).
+struct Pending {
+    pool: Arc<Unverified>,
+    id: u64,
+}
+
+impl Pending {
+    fn admit(pool: &Arc<Unverified>, conn: &TcpStream) -> io::Result<Pending> {
+        let id = rand::random();
+        let mine = conn.try_clone()?;
+        let mut waiting = lock(&pool.0);
+        if waiting.len() >= MAX_UNVERIFIED
+            && let Some((_, oldest)) = waiting.pop_front()
+        {
+            // Wakes the thread serving it, which then ends.
+            let _ = oldest.shutdown(Shutdown::Both);
+        }
+        waiting.push_back((id, mine));
+        Ok(Pending {
+            pool: Arc::clone(pool),
+            id,
+        })
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        lock(&self.pool.0).retain(|(id, _)| *id != self.id);
+    }
+}
+
 /// One of the `MAX_CONNECTIONS` places; given back when dropped.
 struct Slot(Arc<AtomicUsize>);
 
@@ -1155,25 +1218,122 @@ mod tests {
         assert_eq!(raw(&base, fine.as_bytes()), 200);
     }
 
+    /// Connects `n` clients that never say a word.
+    fn idle_clients(base: &str, n: usize) -> Vec<TcpStream> {
+        (0..n)
+            .map(|_| TcpStream::connect(addr(base)).unwrap())
+            .collect()
+    }
+
     #[test]
-    fn connections_are_capped_and_released() {
+    fn clients_without_the_token_cannot_lock_the_app_out() {
         let (_s, base, _d) = server();
-        let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS)
-            .map(|_| TcpStream::connect(addr(&base)).unwrap())
+        // More silent connections than the server has places for.
+        let idle = idle_clients(&base, MAX_UNVERIFIED + MAX_CONNECTIONS + 16);
+        // The app, which has the token, is served all the same, and at once.
+        let started = Instant::now();
+        let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
+        assert_eq!(status, 200, "{body}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // And the silent ones don't linger: each is closed, within the short
+        // deadline for a request line, not left for the full 15 s.
+        let started = Instant::now();
+        for mut c in idle {
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut said = Vec::new();
+            let _ = c.read_to_end(&mut said);
+            let said = String::from_utf8_lossy(&said);
+            // Closed to make room, or told it was too slow.
+            assert!(
+                said.is_empty() || said.starts_with("HTTP/1.1 408"),
+                "{said}"
+            );
+        }
+        assert!(
+            started.elapsed() < REQUEST_LINE_TIMEOUT + Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_connections_with_the_token_are_capped_and_released() {
+        let (s, base, _d) = server();
+        let token = base.rsplit('/').next().unwrap();
+        // Connections that show the token but never finish their request,
+        // each given time to be moved to the main pool.
+        let held: Vec<TcpStream> = (1..=MAX_CONNECTIONS)
+            .map(|n| {
+                let mut c = TcpStream::connect(addr(&base)).unwrap();
+                write!(c, "GET /{token}/api/config HTTP/1.1\r\n").unwrap();
+                wait_for(
+                    "the connection to be served",
+                    Duration::from_secs(5),
+                    || s.connections.load(Ordering::Acquire) == n,
+                );
+                c
+            })
             .collect();
-        // Every slot is taken by a client that says nothing at all.
-        assert_eq!(raw(&base, b"GET / HTTP/1.1\r\n\r\n"), 503);
-        drop(idle);
-        // Hanging up frees the slots again.
+        let probe = || {
+            raw(
+                &base,
+                format!("GET /{token}/api/config HTTP/1.1\r\n\r\n").as_bytes(),
+            )
+        };
+        // The main pool is full, so the next one is turned away.
+        assert_eq!(probe(), 503);
+        drop(held);
+        // Hanging up frees the places again.
         let started = Instant::now();
         let status = loop {
-            let status = raw(&base, b"GET / HTTP/1.1\r\n\r\n");
+            let status = probe();
             if status != 503 || started.elapsed() > Duration::from_secs(5) {
                 break status;
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert_eq!(status, 404, "slots were not released");
+        assert_eq!(status, 200, "places were not released");
+    }
+
+    #[test]
+    fn the_rest_of_a_request_has_longer_than_the_request_line() {
+        let (_s, base, _d) = server();
+        let token = base.rsplit('/').next().unwrap();
+        let mut c = TcpStream::connect(addr(&base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(c, "GET /{token}/api/config HTTP/1.1\r\n").unwrap();
+        // Slower than a stranger is allowed to be, but it has shown the token.
+        std::thread::sleep(REQUEST_LINE_TIMEOUT + Duration::from_millis(500));
+        write!(c, "Host: x\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    }
+
+    #[test]
+    fn search_results_are_capped() {
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: crate::store::testing::script(
+                &bin.0.join("yt-dlp"),
+                // The target is the last thing in the config file.
+                r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" > "$(dirname "$0")/asked"; shift; done
+echo '{"entries":[]}'"#,
+            ),
+            ..Config::default()
+        });
+        for (n, asked) in [("1000", "60"), ("0", "1"), ("x", "40"), ("25", "25")] {
+            let (status, body) = http(
+                &base,
+                "GET",
+                &path(&base, &format!("api/search?q=a&n={n}")),
+                "",
+            );
+            assert_eq!(status, 200, "{body}");
+            let target = std::fs::read_to_string(bin.0.join("asked")).unwrap();
+            assert_eq!(target.trim(), format!("'ytsearch{asked}:a'"), "n={n}");
+        }
     }
 
     #[test]
