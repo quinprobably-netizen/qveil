@@ -10,6 +10,9 @@ class Theme : public QObject {
     Q_PROPERTY(QString accent READ accent NOTIFY changed)
     Q_PROPERTY(QString accentForeground READ accentForeground NOTIFY changed)
     Q_PROPERTY(int radius READ radius NOTIFY changed)
+    // The colour of a protected route (Tor, proxy): a muted green that is the
+    // same on every theme, so "protected" never reads as the decorative accent.
+    Q_PROPERTY(QString protectedColor READ protectedColor CONSTANT)
 
 public:
     explicit Theme(const QString &currentDirectory = {}, QObject *parent = nullptr, const QString &hyprctl = {});
@@ -18,6 +21,7 @@ public:
     QString accent() const { return m_accent; }
     QString accentForeground() const;
     int radius() const { return m_radius; }
+    QString protectedColor() const { return "#5fae83"; }
 
     static QString readAccent(const QString &path);
 

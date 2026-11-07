@@ -81,7 +81,7 @@ Popup {
                 : qsTr("Tor isn't running. Install and start it: omarchy-pkg-add tor, then sudo systemctl enable --now tor")
             wrapMode: Text.Wrap
             font.pixelSize: 12
-            color: popup.config.torRunning ? theme.accent : "#ff8a80"
+            color: popup.config.torRunning ? theme.protectedColor : "#ff8a80"
         }
         RouteOption {
             value: "proxy"

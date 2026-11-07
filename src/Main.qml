@@ -481,11 +481,13 @@ ApplicationWindow {
         }
     }
 
-    // The route, always in view: amber while YouTube can see your IP.
+    // The route, always in view: amber while YouTube can see your IP, a
+    // steady green once it can't. Neither follows the theme accent, which
+    // tabs, rings and buttons use.
     component RouteChip: AbstractButton {
         id: chip
         readonly property string route: backend.config.route || "direct"
-        readonly property color tone: route === "direct" ? "#e0a93b" : theme.accent
+        readonly property color tone: route === "direct" ? "#e0a93b" : theme.protectedColor
         Layout.preferredHeight: 34
         leftPadding: 12
         rightPadding: 14
