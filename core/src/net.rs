@@ -10,6 +10,10 @@ pub const USER_AGENT: &str =
 
 pub const TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
 
+/// Precedes the proxy's address where `Net::explain` adds it to an error;
+/// `errors::friendly` reads it back.
+pub const PROXY_MARK: &str = "[proxy ";
+
 /// How long a relayed stream may go without receiving a single byte.
 pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -34,6 +38,14 @@ impl Net {
                 ),
                 _ => bail!("unsupported proxy {p:?}; use http://, https:// or socks5h://"),
             }
+        }
+        // Tor is only private enough with a circuit per request: one shared
+        // circuit lets the exit link the feeds, searches and videos you
+        // watch. So that is not left to a setting.
+        if proxy.as_deref() == Some(TOR_PROXY) && !isolate {
+            bail!(
+                "isolate_circuits = false is not allowed with Tor: qveil always uses a fresh circuit per request. Remove the setting, or use another proxy"
+            );
         }
         Ok(Self {
             proxy,
@@ -96,6 +108,23 @@ impl Net {
         self.proxy.as_deref()
     }
 
+    /// Names the proxy in an error that says a connection was refused.
+    /// Neither reqwest nor yt-dlp say which proxy they were talking to, and
+    /// `friendly` has to tell "Tor isn't running" from "your own proxy is
+    /// down" from an error that has nothing to do with the route.
+    pub fn explain(&self, err: &str) -> String {
+        let addr = self.proxy.as_deref().map(|p| {
+            let rest = p.split_once("://").map_or(p, |(_, rest)| rest);
+            rest.rsplit_once('@').map_or(rest, |(_, host)| host)
+        });
+        match addr {
+            Some(addr) if err.to_ascii_lowercase().contains("connection refused") => {
+                format!("{err} {PROXY_MARK}{addr}]")
+            }
+            _ => err.to_string(),
+        }
+    }
+
     pub fn isolates(&self) -> bool {
         self.isolate && self.is_socks()
     }
@@ -136,7 +165,11 @@ impl Net {
             .referer(false)
             .https_only(!self.allow_http)
             .connect_timeout(Duration::from_secs(20))
-            .timeout(timeout);
+            .timeout(timeout)
+            // The route is the one chosen in qveil, never HTTP_PROXY or
+            // ALL_PROXY from the environment: on Direct, the app tells you
+            // YouTube sees your IP, and that has to be true.
+            .no_proxy();
         if let Some(p) = self.proxy_url() {
             b = b.proxy(reqwest::Proxy::all(&p).context("invalid proxy URL")?);
         }
@@ -166,6 +199,30 @@ mod tests {
     fn rejects_dns_leaking_socks() {
         assert!(Net::new(Some("socks5://127.0.0.1:9050".into()), true).is_err());
         assert!(Net::new(Some("ftp://x".into()), true).is_err());
+    }
+
+    #[test]
+    fn tor_always_isolates() {
+        let err = Net::new(Some(TOR_PROXY.into()), false).unwrap_err();
+        assert!(err.to_string().contains("not allowed with Tor"), "{err}");
+        // Any other SOCKS proxy may still opt out, and so may a route with no proxy.
+        assert!(Net::new(Some("socks5h://10.0.0.2:1080".into()), false).is_ok());
+        assert!(Net::new(None, false).is_ok());
+    }
+
+    #[test]
+    fn refused_connections_name_the_proxy() {
+        let tor = Net::new(Some(TOR_PROXY.into()), true).unwrap();
+        assert_eq!(
+            tor.explain("socks connect error: Connection refused"),
+            "socks connect error: Connection refused [proxy 127.0.0.1:9050]"
+        );
+        let creds = Net::new(Some("http://me:pw@10.0.0.1:3128".into()), true).unwrap();
+        let named = creds.explain("tunnel error: connection refused");
+        assert!(named.ends_with("[proxy 10.0.0.1:3128]") && !named.contains("pw"));
+        assert_eq!(tor.explain("HTTP Error 404"), "HTTP Error 404");
+        let direct = Net::new(None, true).unwrap();
+        assert_eq!(direct.explain("Connection refused"), "Connection refused");
     }
 
     #[test]
@@ -230,6 +287,71 @@ mod tests {
         assert!(pinned.client().unwrap().get(&url).send().is_ok());
     }
 
+    /// Run in a child process by `direct_ignores_the_proxy_environment`,
+    /// because the environment can't be changed in a test binary whose other
+    /// threads are building clients; a test that isn't called that way does nothing.
+    #[test]
+    fn child_of_direct_ignores_the_proxy_environment() {
+        let (Ok(url), Ok(mode)) = (
+            std::env::var("QVEIL_TEST_URL"),
+            std::env::var("QVEIL_TEST_MODE"),
+        ) else {
+            return;
+        };
+        if mode == "plain" {
+            // What a client does unless told otherwise: it follows the environment.
+            let client = Client::builder()
+                .timeout(Duration::from_millis(700))
+                .build()
+                .unwrap();
+            let _ = client.get(&url).send();
+        } else {
+            let net = Net::new(None, true).unwrap().allowing_http();
+            for client in [net.client().unwrap(), net.relay_client().unwrap()] {
+                assert_eq!(client.get(&url).send().unwrap().text().unwrap(), "hi");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_ignores_the_proxy_environment() {
+        // The proxy named in the environment is a listener that just counts
+        // who connects to it.
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let url = upstream(&[(0, "hi")]);
+        let run = |mode: &str| {
+            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+            c.args([
+                "--exact",
+                "net::tests::child_of_direct_ignores_the_proxy_environment",
+            ])
+            .env("QVEIL_TEST_URL", &url)
+            .env("QVEIL_TEST_MODE", mode)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy");
+            for var in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+                c.env(var, &proxy_url);
+            }
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            proxy.accept().is_ok()
+        };
+        assert!(
+            run("plain"),
+            "the control: an ordinary client does use the proxy from the environment"
+        );
+        assert!(
+            !run("direct"),
+            "the Direct route must not use the proxy from the environment"
+        );
+    }
+
     #[test]
     fn the_relay_times_out_when_idle_but_not_in_total() {
         use std::io::Read;
@@ -277,7 +399,8 @@ mod tests {
         let tor = || Net::new(Some(TOR_PROXY.into()), true).unwrap();
         assert!(tor().same_route(&tor()));
         assert!(!tor().same_route(&Net::new(None, true).unwrap()));
-        assert!(!tor().same_route(&Net::new(Some(TOR_PROXY.into()), false).unwrap()));
+        let socks = |isolate| Net::new(Some("socks5h://10.0.0.2:1080".into()), isolate).unwrap();
+        assert!(!socks(true).same_route(&socks(false)));
         let http = Net::new(Some("http://10.0.0.1:3128".into()), true).unwrap();
         assert!(!tor().same_route(&http));
         // Isolation only means something over SOCKS, so it can't tell two HTTP proxies apart.

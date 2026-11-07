@@ -9,6 +9,7 @@ mod ids;
 mod net;
 mod pick;
 mod player;
+mod private;
 mod server;
 mod store;
 mod subs;

@@ -1,16 +1,32 @@
 //! yt-dlp does the work that breaks every few weeks (InnerTube parsing,
 //! signature/n-param deciphering, PO tokens), so qveil follows its fixes for free.
 //! Every invocation is sandboxed from the user's own yt-dlp setup.
+//!
+//! What it is asked for (a search, the video being watched) and the proxy's
+//! password would be readable by every local user in /proc/*/cmdline, so they
+//! never go on the command line: see `Call`.
 
 use crate::errors::friendly;
 use crate::ids;
 use crate::net::Net;
+use crate::private::PrivateDir;
 use crate::video::Video;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 use std::fmt;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// How long a search or a channel listing may take before yt-dlp is killed.
+const QUICK: Duration = Duration::from_secs(60);
+/// Resolving a video does more (player requests, the JavaScript challenge), so it gets longer.
+const RESOLVE: Duration = Duration::from_secs(90);
+/// yt-dlp's own limit for one connection. The deadlines above bound the whole
+/// call, and this keeps a single dead connection from using up all of it.
+const SOCKET_TIMEOUT: &str = "20";
 
 /// Why a live stream is refused: the relay can only carry a plain download.
 const LIVE_UNSUPPORTED: &str =
@@ -50,29 +66,42 @@ pub struct Streams {
 }
 
 impl Ytdlp {
-    pub fn cmd(&self) -> Command {
+    /// The options every call shares. None of them is private, and none is
+    /// what makes a call different: that is in the call's config file.
+    fn command(&self, call: &Call) -> Command {
         let mut c = Command::new(&self.bin);
         c.args([
-            "--ignore-config", // a user config could add cookies or a browser profile
+            "--ignore-config",  // a user config could add cookies or a browser profile
+            "--no-plugin-dirs", // a plugin is code with its own network access, around the route
             "--no-cookies",
             "--no-cookies-from-browser",
             "--no-mark-watched",
             "--no-warnings",
+            "--socket-timeout",
+            SOCKET_TIMEOUT,
         ]);
         c.arg("--cache-dir").arg(&self.cache_dir);
-        if let Some(p) = self.net.proxy_url() {
-            c.arg("--proxy").arg(p);
-        }
+        // Still honoured after `--ignore-config`, which only skips the
+        // default locations.
+        c.arg("--config-locations").arg(&call.config);
         c.stdin(Stdio::null());
         c
     }
 
-    fn json(&self, args: &[&str]) -> Result<Value> {
-        let out = self
-            .cmd()
-            .args(args)
-            .output()
+    /// Runs yt-dlp on `target` (a URL or a `ytsearchN:` query) with `args`
+    /// and parses its JSON. It is killed if it takes longer than `limit`.
+    fn json(&self, args: &[&str], target: &str, limit: Duration) -> Result<Value> {
+        let call = Call::new(&self.net, target)?;
+        let out = output_within(self.command(&call).args(args), limit)
             .with_context(|| format!("running {:?} (is yt-dlp installed?)", self.bin))?;
+        // The files are only needed while it runs.
+        drop(call);
+        let Some(out) = out else {
+            bail!(
+                "yt-dlp didn't finish within {} s and was stopped; the route may be slow or down",
+                limit.as_secs()
+            );
+        };
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             let line = err
@@ -82,7 +111,9 @@ impl Ytdlp {
                 .unwrap_or("unknown error")
                 .trim();
             return Err(Failed {
-                raw: line.strip_prefix("ERROR: ").unwrap_or(line).into(),
+                raw: self
+                    .net
+                    .explain(line.strip_prefix("ERROR: ").unwrap_or(line)),
             }
             .into());
         }
@@ -91,13 +122,13 @@ impl Ytdlp {
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Video>> {
         let q = format!("ytsearch{limit}:{query}");
-        let v = self.json(&["--flat-playlist", "-J", "--", &q])?;
+        let v = self.json(&["--flat-playlist", "-J"], &q, QUICK)?;
         Ok(entries(&v))
     }
 
     /// Returns (channel id, display name).
     pub fn channel_info(&self, url: &str) -> Result<(String, String)> {
-        let v = self.json(&["--flat-playlist", "-J", "-I", "0", "--", url])?;
+        let v = self.json(&["--flat-playlist", "-J", "-I", "0"], url, QUICK)?;
         let id = str_field(&v, &["channel_id", "id"])
             .filter(|id| ids::is_channel_id(id))
             .with_context(|| format!("{url} doesn't look like a channel"))?;
@@ -111,16 +142,18 @@ impl Ytdlp {
     pub fn channel_videos(&self, channel_id: &str, limit: usize) -> Result<Vec<Video>> {
         let url = format!("https://www.youtube.com/channel/{channel_id}/videos");
         let range = format!("1:{limit}");
-        let v = self.json(&[
-            "--flat-playlist",
-            "--extractor-args",
-            "youtubetab:approximate_date",
-            "-J",
-            "-I",
-            &range,
-            "--",
+        let v = self.json(
+            &[
+                "--flat-playlist",
+                "--extractor-args",
+                "youtubetab:approximate_date",
+                "-J",
+                "-I",
+                &range,
+            ],
             &url,
-        ])?;
+            QUICK,
+        )?;
         Ok(entries(&v))
     }
 
@@ -129,7 +162,7 @@ impl Ytdlp {
     /// manifest slipping through would make mpv fetch segments directly,
     /// around the route.
     pub fn resolve(&self, url: &str, format: &str) -> Result<Streams> {
-        match self.json(&["-J", "--no-playlist", "-f", format, "--", url]) {
+        match self.json(&["-J", "--no-playlist", "-f", format], url, RESOLVE) {
             Ok(v) => streams_from(&v, url),
             Err(e) if is_no_format(&e) => Err(self.explain_no_format(url, e)),
             Err(e) => Err(e),
@@ -141,12 +174,93 @@ impl Ytdlp {
     /// its default selector, which does return something, to say why. This
     /// costs a second request, but only on a path that was failing anyway.
     fn explain_no_format(&self, url: &str, original: anyhow::Error) -> anyhow::Error {
-        match self.json(&["-J", "--no-playlist", "--", url]) {
+        match self.json(&["-J", "--no-playlist"], url, RESOLVE) {
             Ok(v) if is_live(&v) => anyhow!(LIVE_UNSUPPORTED),
             Ok(v) if !chosen_formats(&v).iter().all(|f| is_plain(f)) => anyhow!(MANIFEST_ONLY),
             _ => original,
         }
     }
+}
+
+/// The private files of one yt-dlp call, removed when it is dropped.
+///
+/// yt-dlp reads one config file, and the proxy and the target go in it: one
+/// option per line, and a bare word is a URL to fetch. It is split the way a
+/// shell would split it, which is why every value is quoted. (A batch file
+/// would do for the target, but it treats ` #` as the start of a comment, and
+/// searches like "rust #shorts" are ordinary.)
+struct Call {
+    _dir: PrivateDir,
+    config: PathBuf,
+}
+
+impl Call {
+    fn new(net: &Net, target: &str) -> Result<Self> {
+        // A target that began with `-` would be read as an option. Ours are
+        // always `ytsearch…` or an https URL, so this can't happen.
+        ensure!(
+            !target.starts_with('-'),
+            "refusing to pass {target:?} to yt-dlp"
+        );
+        // An explicit empty proxy is what makes Direct direct: left unset,
+        // yt-dlp would use HTTP_PROXY or ALL_PROXY from the environment.
+        let proxy = net.proxy_url().unwrap_or_default();
+        // The file is read as text, so a control character (a newline in a
+        // search, say) has no business in it.
+        let target: String = target
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        // The byte order mark makes yt-dlp read the file as UTF-8 whatever
+        // the locale is, so a search in any script arrives intact.
+        let text = format!("\u{feff}--proxy {}\n{}\n", quote(&proxy), quote(&target));
+        let dir = PrivateDir::new("qveil-ytdlp-")?;
+        let config = dir.write("yt-dlp.conf", text.as_bytes())?;
+        Ok(Call { _dir: dir, config })
+    }
+}
+
+/// Shell-style single quotes: nothing inside is special, so `#`, spaces and
+/// backslashes are kept, and a quote is closed, escaped and reopened.
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Like `Command::output`, but kills the child once `limit` has passed and
+/// returns `None`. The output is read on separate threads, so a child that
+/// fills a pipe isn't left waiting for us.
+fn output_within(cmd: &mut Command, limit: Duration) -> std::io::Result<Option<Output>> {
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            // The readers end on their own now that the pipes are closed.
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Some(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    }))
+}
+
+fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    })
 }
 
 fn is_no_format(e: &anyhow::Error) -> bool {
@@ -251,6 +365,7 @@ fn entry(e: &Value, channel: &Option<String>, channel_id: &Option<String>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn resolved(json: &str) -> Result<Streams> {
         streams_from(
@@ -332,5 +447,184 @@ mod tests {
         assert_eq!(es[0].duration, Some(149));
         assert!(es[1].short);
         assert_eq!(es[1].channel.as_deref(), Some("Other"));
+    }
+
+    use crate::net::TOR_PROXY;
+    use crate::store::testing::{TempDir, script};
+
+    fn ytdlp(bin: String, proxy: Option<&str>) -> Ytdlp {
+        Ytdlp {
+            bin,
+            cache_dir: std::env::temp_dir().join("qveil-test-yt-dlp-cache"),
+            net: Net::new(proxy.map(String::from), true).unwrap(),
+        }
+    }
+
+    /// A yt-dlp that records what anyone on the machine could see of it
+    /// (its real command line from /proc) and what is in its config file,
+    /// then answers with an empty listing.
+    const SPY: &str = r#"dir=$(dirname "$0")
+tr '\0' '\n' < /proc/$$/cmdline > "$dir/argv"
+while [ $# -gt 0 ]; do
+  if [ "$1" = --config-locations ]; then
+    cp "$2" "$dir/config"
+    stat -c %a "$2" > "$dir/file-mode"
+    stat -c %a "$(dirname "$2")" > "$dir/dir-mode"
+    dirname "$2" > "$dir/private-dir"
+  fi
+  shift
+done
+echo '{"entries":[]}'
+"#;
+
+    fn spied(dir: &TempDir, name: &str) -> String {
+        std::fs::read_to_string(dir.0.join(name)).unwrap()
+    }
+
+    #[test]
+    fn what_you_search_and_the_proxy_password_stay_out_of_argv() {
+        let dir = TempDir::new();
+        let yt = ytdlp(
+            script(&dir.0.join("yt-dlp"), SPY),
+            Some("http://user:SECRETPW@127.0.0.1:3128"),
+        );
+        yt.search("secret query #1 it's", 5).unwrap();
+
+        let argv = spied(&dir, "argv");
+        for needle in [
+            "SECRETPW",
+            "127.0.0.1:3128",
+            "secret",
+            "ytsearch",
+            "youtube.com",
+        ] {
+            assert!(!argv.contains(needle), "{needle} is in argv:\n{argv}");
+        }
+        for flag in [
+            "--ignore-config",
+            "--no-plugin-dirs",
+            "--no-cookies",
+            "--socket-timeout",
+            "--config-locations",
+        ] {
+            assert!(argv.lines().any(|a| a == flag), "missing {flag}:\n{argv}");
+        }
+
+        // They are in a private file instead, quoted the way yt-dlp reads it.
+        assert_eq!(
+            spied(&dir, "config"),
+            "\u{feff}--proxy 'http://user:SECRETPW@127.0.0.1:3128'\n'ytsearch5:secret query #1 it'\\''s'\n"
+        );
+        assert_eq!(spied(&dir, "file-mode").trim(), "600");
+        assert_eq!(spied(&dir, "dir-mode").trim(), "700");
+        // And the directory is gone once yt-dlp has run.
+        assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
+    }
+
+    #[test]
+    fn the_watched_url_stays_out_of_argv_too() {
+        let dir = TempDir::new();
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
+        // The empty listing isn't a playable video, which is beside the point.
+        let _ = yt.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b");
+        let argv = spied(&dir, "argv");
+        assert!(
+            !argv.contains("dQw4w9WgXcQ") && !argv.contains("youtube"),
+            "{argv}"
+        );
+        assert!(spied(&dir, "config").contains("'https://www.youtube.com/watch?v=dQw4w9WgXcQ'"));
+    }
+
+    #[test]
+    fn direct_says_so_instead_of_leaving_the_proxy_to_the_environment() {
+        let dir = TempDir::new();
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
+        yt.search("x", 1).unwrap();
+        assert!(
+            spied(&dir, "config").starts_with("\u{feff}--proxy ''\n"),
+            "{}",
+            spied(&dir, "config")
+        );
+    }
+
+    #[test]
+    fn tor_gets_a_fresh_identity_in_every_call() {
+        let dir = TempDir::new();
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), Some(TOR_PROXY));
+        yt.search("x", 1).unwrap();
+        let first = spied(&dir, "config");
+        yt.search("x", 1).unwrap();
+        assert_ne!(first, spied(&dir, "config"));
+        assert!(first.contains("socks5h://qveil"), "{first}");
+        assert!(!spied(&dir, "argv").contains("qveil0"));
+    }
+
+    #[test]
+    fn quoting_keeps_every_character_literal() {
+        assert_eq!(quote(""), "''");
+        assert_eq!(quote("a b #c"), "'a b #c'");
+        assert_eq!(quote(r"it's \n"), r"'it'\''s \n'");
+        assert!(Call::new(&Net::default(), "--exec=evil").is_err());
+        // A newline or NUL can't end the value early or break the file.
+        let net = Net::default();
+        let call = Call::new(&net, "ytsearch1:a\nb\0c").unwrap();
+        let text = std::fs::read_to_string(&call.config).unwrap();
+        assert!(text.ends_with("'ytsearch1:a b c'\n"), "{text:?}");
+    }
+
+    #[test]
+    fn a_hung_yt_dlp_is_killed_and_cleaned_up() {
+        let dir = TempDir::new();
+        // `exec` so that the process that is killed is the sleeper itself.
+        let hang = format!(
+            "{}\nexec sleep 60\n",
+            r#"echo $$ > "$(dirname "$0")/pid"
+while [ $# -gt 0 ]; do
+  [ "$1" = --config-locations ] && dirname "$2" > "$(dirname "$0")/private-dir"
+  shift
+done"#
+        );
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), &hang), None);
+        let started = Instant::now();
+        let err = yt
+            .json(&["-J"], "https://x.test/", Duration::from_millis(400))
+            .unwrap_err();
+        assert!(err.to_string().contains("didn't finish within"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = spied(&dir, "pid");
+        assert!(
+            !Path::new("/proc").join(pid.trim()).exists(),
+            "yt-dlp was left running"
+        );
+        assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
+    }
+
+    #[test]
+    fn a_lot_of_output_does_not_stall_the_deadline() {
+        let dir = TempDir::new();
+        // Far more than a pipe holds, written before the JSON.
+        let loud = "head -c 3000000 /dev/zero | tr '\\0' ' '\necho '{\"entries\":[]}'\n";
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), loud), None);
+        assert!(yt.search("x", 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_refused_proxy_is_explained_for_the_route_in_use() {
+        let dir = TempDir::new();
+        let refused = "echo \"ERROR: [youtube] x: Unable to download API page: SocksHTTPSConnection(host='www.youtube.com', port=443): Failed to establish a new connection: [Errno 111] Connection refused\" >&2\nexit 1\n";
+        let bin = script(&dir.0.join("yt-dlp"), refused);
+        let tor = ytdlp(bin.clone(), Some(TOR_PROXY));
+        let msg = tor.search("x", 1).unwrap_err().to_string();
+        assert!(msg.contains("Tor listens on 127.0.0.1:9050"), "{msg}");
+        let other = ytdlp(bin.clone(), Some("socks5h://10.0.0.2:1080"));
+        let msg = other.search("x", 1).unwrap_err().to_string();
+        assert!(
+            msg.contains("10.0.0.2:1080") && !msg.contains("Tor"),
+            "{msg}"
+        );
+        // On Direct a refusal isn't the proxy's.
+        let direct = ytdlp(bin, None);
+        let msg = direct.search("x", 1).unwrap_err().to_string();
+        assert!(msg.contains("Connection refused"), "{msg}");
     }
 }

@@ -307,15 +307,12 @@ mod tests {
 
     #[test]
     fn the_store_is_not_locked_while_feeds_are_being_fetched() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new();
         let paths = dir.paths();
         import_subs(&paths, &channel(1)).unwrap();
         // A yt-dlp that takes a couple of seconds and then fails.
-        let slow = dir.0.join("slow-yt-dlp");
-        fs::write(&slow, "#!/bin/sh\nsleep 2\nexit 1\n").unwrap();
-        fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
-        let rt = offline(&paths, slow.to_str().unwrap());
+        let slow = crate::store::testing::script(&dir.0.join("slow-yt-dlp"), "sleep 2\nexit 1\n");
+        let rt = offline(&paths, &slow);
 
         let refresh = {
             let paths = paths.clone();

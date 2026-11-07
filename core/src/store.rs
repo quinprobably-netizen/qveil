@@ -196,6 +196,33 @@ pub mod testing {
         }
     }
 
+    /// Writes an executable shell script and returns its path. Exec'ing a
+    /// file that another thread's `fork` still holds open for writing fails
+    /// with ETXTBSY, which tests running in parallel can cause, so the script
+    /// is tried out (it answers `--qveil-probe` at once) until it can run.
+    pub fn script(path: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let text = format!("#!/bin/sh\n[ \"$1\" = --qveil-probe ] && exit 0\n{body}");
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            match std::process::Command::new(path)
+                .arg("--qveil-probe")
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(26) && started.elapsed().as_secs() < 5 => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => {
+                    other.unwrap();
+                    break;
+                }
+            }
+        }
+        path.display().to_string()
+    }
+
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);

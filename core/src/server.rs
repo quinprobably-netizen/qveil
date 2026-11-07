@@ -1410,9 +1410,7 @@ mod tests {
     /// A yt-dlp that answers with a URL on the local upstream, numbered by how
     /// often it has run (`<url>1`, `<url>2`, …), and counts its runs.
     fn fake_ytdlp(dir: &std::path::Path, url: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-        let script = r#"#!/bin/sh
-n=$(cat '@COUNT@' 2>/dev/null || echo 0)
+        let script = r#"n=$(cat '@COUNT@' 2>/dev/null || echo 0)
 n=$((n + 1))
 echo $n > '@COUNT@'
 cat <<EOF
@@ -1423,10 +1421,7 @@ EOF
 "#
         .replace("@COUNT@", &dir.join("runs").display().to_string())
         .replace("@URL@", url);
-        let bin = dir.join("yt-dlp");
-        std::fs::write(&bin, script).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin.display().to_string()
+        crate::store::testing::script(&dir.join("yt-dlp"), &script)
     }
 
     fn runs(dir: &std::path::Path) -> u32 {

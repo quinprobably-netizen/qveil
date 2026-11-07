@@ -8,13 +8,11 @@
 //! instead, which is removed once mpv exits.
 
 use crate::config::Config;
+use crate::private::PrivateDir;
 use crate::server::PlayInfo;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub fn play(cfg: &Config, info: &PlayInfo) -> Result<()> {
@@ -77,32 +75,24 @@ fn mpv_args(staged: &Staged) -> Vec<OsString> {
     args
 }
 
-/// A fresh directory (mode 0700) with the video URL as a playlist and the
-/// remaining options as a config file (both mode 0600).
+/// A private directory with the video URL as a playlist and the remaining
+/// options as a config file, removed when this is dropped.
 struct Staged {
-    dir: PathBuf,
+    _dir: PrivateDir,
     playlist: PathBuf,
     options: PathBuf,
 }
 
-impl Drop for Staged {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
 impl Staged {
     fn new(info: &PlayInfo) -> Result<Self> {
-        let dir = private_dir()?;
-        // From here on, `Drop` removes the directory if a write fails.
-        let staged = Staged {
-            playlist: dir.join("video.m3u"),
-            options: dir.join("options.conf"),
-            dir,
-        };
-        write_private(&staged.playlist, format!("{}\n", info.video).as_bytes())?;
-        write_private(&staged.options, options_file(info).as_bytes())?;
-        Ok(staged)
+        let dir = PrivateDir::new("qveil-mpv-")?;
+        let playlist = dir.write("video.m3u", format!("{}\n", info.video).as_bytes())?;
+        let options = dir.write("options.conf", options_file(info).as_bytes())?;
+        Ok(Staged {
+            _dir: dir,
+            playlist,
+            options,
+        })
     }
 }
 
@@ -136,71 +126,12 @@ fn single_line(s: &str) -> String {
         .to_string()
 }
 
-/// Prefers `$XDG_RUNTIME_DIR`: per-user, mode 0700 and on tmpfs, so nothing
-/// reaches disk. Falls back to the system temp dir.
-fn private_dir() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    sweep_stale(&base);
-    for _ in 0..8 {
-        let name = format!(
-            "qveil-mpv-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        );
-        let dir = base.join(name);
-        // Not recursive: it must fail if the name is taken, so the directory is ours alone.
-        match DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
-        }
-    }
-    bail!(
-        "couldn't create a private directory under {}",
-        base.display()
-    )
-}
-
-/// Ctrl+C takes qveil down along with mpv, and a process that is killed can't
-/// clean up after itself. So each run removes the directories of runs whose
-/// process is gone, which keeps a title from lingering in the temp dir.
-fn sweep_stale(base: &Path) {
-    let Ok(entries) = fs::read_dir(base) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let pid = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("qveil-mpv-"))
-            .and_then(|rest| rest.split('-').next())
-            .and_then(|pid| pid.parse::<u32>().ok());
-        if let Some(pid) = pid
-            && !Path::new("/proc").join(pid.to_string()).exists()
-        {
-            // Doesn't follow symlinks; one with this name would just be unlinked.
-            let _ = fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut f| f.write_all(bytes))
-        .with_context(|| format!("writing {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     fn info() -> PlayInfo {
         PlayInfo {
@@ -222,7 +153,7 @@ mod tests {
     #[test]
     fn secrets_go_through_private_files_not_argv() {
         let staged = Staged::new(&info()).unwrap();
-        assert_eq!(mode(&staged.dir), 0o700);
+        assert_eq!(mode(staged._dir.path()), 0o700);
         assert_eq!(mode(&staged.playlist), 0o600);
         assert_eq!(mode(&staged.options), 0o600);
 
@@ -263,29 +194,10 @@ mod tests {
     #[test]
     fn files_are_removed_afterwards() {
         let staged = Staged::new(&info()).unwrap();
-        let dir = staged.dir.clone();
+        let dir = staged._dir.path().to_path_buf();
         assert!(dir.is_dir());
         drop(staged);
         assert!(!dir.exists());
-    }
-
-    #[test]
-    fn directories_of_dead_runs_are_swept() {
-        let base = crate::store::testing::TempDir::new();
-        let (dead, mine, other) = (
-            base.0.join("qveil-mpv-999999999-0123456789abcdef"),
-            base.0
-                .join(format!("qveil-mpv-{}-0123456789abcdef", std::process::id())),
-            base.0.join("unrelated"),
-        );
-        for d in [&dead, &mine, &other] {
-            fs::create_dir(d).unwrap();
-            fs::write(d.join("options.conf"), "x").unwrap();
-        }
-        sweep_stale(&base.0);
-        assert!(!dead.exists(), "a run whose process is gone leaves nothing");
-        assert!(mine.exists(), "a live run keeps its files");
-        assert!(other.exists(), "only qveil's own directories are touched");
     }
 
     #[test]
