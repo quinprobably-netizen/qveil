@@ -47,7 +47,9 @@ FocusScope {
             id: video.id,
             title: video.title || "",
             channel: video.channel || "",
-            channelId: video.channel_id || video.channelId || ""
+            channelId: video.channel_id || video.channelId || "",
+            // The card's page, so the poster is the thumbnail it already has.
+            batch: video.batch || 0
         }
         pending = true
         active = true
@@ -57,7 +59,7 @@ FocusScope {
 
     function open(i) {
         pending = false
-        info = i
+        info = Object.assign({ batch: info.batch || 0 }, i)
         active = true
         mpv.volume = savedVolume
         mpv.load(i.video, i.audio || "", i.start || 0)
@@ -101,7 +103,7 @@ FocusScope {
         anchors.fill: parent
         fillMode: Image.PreserveAspectFit
         asynchronous: true
-        source: view.active && view.info.id && backend.thumbBase ? backend.thumbBase + view.info.id : ""
+        source: view.active ? Format.thumb(backend.thumbBase, view.info.id, view.info.batch) : ""
         opacity: view.active && !mpv.started ? 0.55 : 0
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 180 } }

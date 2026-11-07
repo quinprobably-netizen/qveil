@@ -12,6 +12,7 @@ layout(std140, binding = 0) uniform buf {
     float drift;     // moves the swirl; animated only while the dye drains
     float vignette;  // 0 = solid, 1 = fades out toward the edges
     float zoom;      // pattern scale: below 1 gives broader swirls (small items)
+    float variety;   // 0 = the theme's dye, 1 = a dye of this seed's own (hue and contrast)
     vec4 accent;
     vec4 deep;
 };
@@ -30,6 +31,13 @@ float fbm(vec2 p) {
     return v;
 }
 
+// Turns a colour around the grey axis: its hue changes, its lightness doesn't.
+vec3 turnHue(vec3 c, float a) {
+    const vec3 k = vec3(0.57735027);
+    float ca = cos(a), sa = sin(a);
+    return clamp(c * ca + cross(k, c) * sa + k * dot(k, c) * (1.0 - ca), 0.0, 1.0);
+}
+
 void main() {
     vec2 uv = qt_TexCoord0;
     vec4 src = texture(source, uv);
@@ -40,10 +48,22 @@ void main() {
     vec2 q = vec2(fbm(p + drift * 0.6), fbm(p + vec2(5.2, 1.3) - drift * 0.4));
     vec2 r = vec2(fbm(p + 4.0 * q + vec2(1.7, 9.2) + drift * 0.3), fbm(p + 4.0 * q + vec2(8.3, 2.8)));
     float f = fbm(p + 4.0 * r);
-    vec3 dye = mix(deep.rgb, accent.rgb, smoothstep(0.25, 0.85, f));
-    dye = mix(dye, vec3(0.96, 0.82, 0.52), smoothstep(0.72, 0.98, f) * 0.4);
+    // A dye of this seed's own: the hue turns up to 25 degrees (0.436 rad)
+    // either way, the bands between the dyes sit higher or lower and are
+    // sharper or softer, and the dye is a little lighter or darker. The
+    // picture is as blurred as ever, so it stays only light and shade.
+    float around = hash(vec2(seed, 17.0)) - 0.5;
+    float low = hash(vec2(seed, 31.0)) - 0.5;
+    float wide = hash(vec2(seed, 47.0)) - 0.5;
+    float lift = hash(vec2(seed, 59.0)) - 0.5;
+    float turn = around * 2.0 * 0.436 * variety;
+    float from = 0.25 + low * 0.2 * variety;
+    float to = from + 0.6 + wide * 0.3 * variety;
+    float glow = 1.0 + lift * 0.35 * variety;
+    vec3 dye = mix(turnHue(deep.rgb, turn), turnHue(accent.rgb, turn), smoothstep(from, to, f));
+    dye = mix(dye, turnHue(vec3(0.96, 0.82, 0.52), turn), smoothstep(0.72, 0.98, f) * 0.4);
 
-    vec3 col = mix(rgb, dye * (0.35 + 1.05 * lum), strength);
+    vec3 col = mix(rgb, dye * (0.35 + 1.05 * lum) * glow, strength);
     float edge = 1.0;
     if (vignette > 0.0) {
         vec2 d = (uv - 0.5) * 2.0;

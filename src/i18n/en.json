@@ -35,8 +35,8 @@
     "one": "%n recent video",
     "other": "%n recent videos"
   },
-  "Imported %n new channel(s), offline": {
-    "one": "Imported %n new channel, offline",
-    "other": "Imported %n new channels, offline"
+  "Imported %n new channel(s)": {
+    "one": "Imported %n new channel",
+    "other": "Imported %n new channels"
   }
 }

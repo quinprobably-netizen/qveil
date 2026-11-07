@@ -36,6 +36,7 @@ Popup {
                 ["← → ↑ ↓", qsTr("Move between videos")],
                 ["Enter  Space", qsTr("Play the selected video")],
                 ["R", qsTr("Refresh")],
+                ["P", qsTr("Route & privacy")],
                 ["Esc", qsTr("Back")],
                 ["?", qsTr("This help")],
                 ["Q", qsTr("Quit")],

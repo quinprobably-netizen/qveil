@@ -17,6 +17,7 @@ DEFINES += QVEIL_VERSION=\\\"$$QVEIL_VERSION\\\"
 HEADERS += \
     src/backend.h \
     src/datadirs.h \
+    src/launch.h \
     src/mpvitem.h \
     src/theme.h \
     src/translator.h \

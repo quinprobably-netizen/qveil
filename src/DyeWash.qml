@@ -12,6 +12,10 @@ ShaderEffect {
     property real drift: 0
     property real vignette: 0
     property real zoom: 1
+    // How far the dye departs from the theme's for this `seed`: 0 is the
+    // theme's dye as it is, 1 turns its hue by up to 25 degrees either way and
+    // moves the bands between the two dyes, so each seed has its own.
+    property real variety: 0
     readonly property real aspect: width / Math.max(1, height)
     // The two dyes the swirl runs between. By default the accent and a deep
     // shade of it sunk toward the window's near-black; small bright items like

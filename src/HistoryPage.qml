@@ -21,6 +21,9 @@ FocusScope {
 
         RowLayout {
             Layout.fillWidth: true
+            // The list below may be hidden (history off), and then nothing
+            // takes the rest of the height: the header would drift to the middle.
+            Layout.alignment: Qt.AlignTop
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 3
@@ -31,18 +34,19 @@ FocusScope {
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: page.enabled_ ? qsTr("Stored only on this computer.")
-                                        : qsTr("Off. qveil doesn't remember what you watch.")
+                    // When it is off, the engine's words about that are on the page itself.
+                    visible: page.enabled_ && text !== ""
+                    text: backend.privacy.pages.history_on
                     wrapMode: Text.Wrap
                     font.pixelSize: 13
                     color: "#8d8d98"
                 }
             }
             Button {
-                text: page.enabled_ ? qsTr("Turn off") : qsTr("Turn on")
-                // Flat both ways: turning tracking on is no call to action.
+                visible: page.enabled_
+                text: qsTr("Turn off")
                 flat: true
-                onClicked: backend.setConfig({ history: !page.enabled_ })
+                onClicked: backend.setConfig({ history: false })
             }
             Button {
                 visible: backend.history.length > 0
@@ -54,6 +58,7 @@ FocusScope {
 
         QuietList {
             id: list
+            visible: page.enabled_
             focus: true
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -93,5 +98,21 @@ FocusScope {
                 }
             }
         }
+    }
+
+    // Off is the first run's empty state: the same cloud of dye, and one flat
+    // button, since turning tracking on is no call to action.
+    EmptyState {
+        anchors.fill: parent
+        visible: !page.enabled_
+        wash: true
+        text: backend.privacy.pages.history_off
+        actions: [
+            Button {
+                text: qsTr("Turn on")
+                flat: true
+                onClicked: backend.setConfig({ history: true })
+            }
+        ]
     }
 }

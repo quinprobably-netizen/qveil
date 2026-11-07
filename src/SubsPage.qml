@@ -38,7 +38,8 @@ FocusScope {
         }
         Label {
             Layout.fillWidth: true
-            text: qsTr("Kept only on this computer. Each channel is fetched on its own, in random order, so YouTube never sees the whole list.")
+            visible: text !== ""
+            text: backend.privacy.pages.subscriptions
             wrapMode: Text.Wrap
             font.pixelSize: 13
             color: "#8d8d98"
@@ -71,7 +72,7 @@ FocusScope {
 
         Label {
             Layout.fillWidth: true
-            text: qsTr("Moving from YouTube? Drop your Google Takeout subscriptions.csv, or a NewPipe or FreeTube export, anywhere on this window. It's read offline.")
+            text: qsTr("Moving from YouTube? Drop your Google Takeout subscriptions.csv, or a NewPipe or FreeTube export, anywhere on this window.")
             wrapMode: Text.Wrap
             font.pixelSize: 12
             color: "#6f6f7b"

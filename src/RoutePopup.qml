@@ -4,7 +4,9 @@ import QtQuick.Controls.Material
 import QtQuick.Layouts
 
 // How qveil reaches YouTube, and what it keeps. A route applies as soon as it
-// is chosen; only a proxy waits, for its address.
+// is chosen; only a proxy waits, for its address. Every word about privacy
+// here is the engine's (backend.privacy), shown as it comes: the window has
+// no copy of its own to fall out of step with what the engine does.
 Popup {
     id: popup
 
@@ -106,6 +108,7 @@ Popup {
                 Layout.fillWidth: true
                 Layout.leftMargin: 32
                 Layout.topMargin: -10
+                visible: text !== ""
                 text: option.detail
                 wrapMode: Text.Wrap
                 font.pixelSize: 12
@@ -116,12 +119,12 @@ Popup {
         RouteOption {
             value: "direct"
             label: qsTr("Direct")
-            detail: qsTr("YouTube sees your IP address.")
+            detail: backend.privacy.routes.direct
         }
         RouteOption {
             value: "tor"
             label: qsTr("Tor")
-            detail: qsTr("Every request, thumbnail and video takes its own circuit, so YouTube can't link them by IP.")
+            detail: backend.privacy.routes.tor
         }
         Label {
             Layout.fillWidth: true
@@ -136,7 +139,7 @@ Popup {
         RouteOption {
             value: "proxy"
             label: qsTr("Proxy")
-            detail: qsTr("An HTTP or SOCKS proxy you trust, such as a VPN's.")
+            detail: backend.privacy.routes.proxy
         }
         TextField {
             id: proxyField
@@ -164,34 +167,25 @@ Popup {
         }
         Switch {
             Layout.leftMargin: -8
-            text: qsTr("Keep a watch history on this computer")
+            text: qsTr("Keep a watch history")
             checked: !!popup.config.history
             onToggled: backend.setConfig({ history: checked })
         }
 
-        RowLayout {
-            Layout.fillWidth: true
-            Label {
+        // What the engine says about what it does and keeps, sentence by sentence.
+        Repeater {
+            model: backend.privacy.points
+            delegate: Label {
+                required property string modelData
+                required property int index
                 Layout.fillWidth: true
-                text: qsTr("Highest quality")
+                Layout.topMargin: index === 0 ? 8 : 0
+                text: modelData
+                wrapMode: Text.Wrap
+                font.pixelSize: 12
+                lineHeight: 1.25
+                color: "#8d8d98"
             }
-            ComboBox {
-                id: quality
-                readonly property var heights: [480, 720, 1080, 1440, 2160]
-                model: heights.map(h => h + "p")
-                currentIndex: Math.max(0, heights.indexOf(popup.config.maxHeight || 1080))
-                onActivated: index => backend.setConfig({ maxHeight: heights[index] })
-            }
-        }
-
-        Label {
-            Layout.fillWidth: true
-            Layout.topMargin: 8
-            text: qsTr("Never sent: cookies, a Google account, or tracking parameters. Subscriptions and history are stored only on this computer.")
-            wrapMode: Text.Wrap
-            font.pixelSize: 12
-            lineHeight: 1.25
-            color: "#8d8d98"
         }
     }
 }
