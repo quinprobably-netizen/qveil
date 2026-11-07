@@ -404,6 +404,64 @@ private slots:
         QVERIFY(backend.error().contains("no such video"));
     }
 
+    void searchResultsArriveAPageAtATime()
+    {
+        QTemporaryDir dir;
+        // Two results, a pause, a third; a query of "fail" ends with an error
+        // line instead, and "slow" waits a second before its results.
+        const QString fake = engine(dir, "import http.server,json,time,urllib.parse\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def do_GET(s):\n"
+                                         "    q=urllib.parse.parse_qs(urllib.parse.urlparse(s.path).query)\n"
+                                         "    if 'stream' not in q:\n"
+                                         "      b=b'{}';s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b);return\n"
+                                         "    term=q['q'][0]\n"
+                                         "    s.send_response(200);s.send_header('Content-Type','application/x-ndjson');s.end_headers()\n"
+                                         "    if term=='slow': time.sleep(1)\n"
+                                         "    line=lambda i: s.wfile.write((json.dumps({'id':term[:4]+'%07d'%i,'title':term})+'\\n').encode()) or s.wfile.flush()\n"
+                                         "    line(1);line(2)\n"
+                                         "    time.sleep(0.8)\n"
+                                         "    if term=='fail': s.wfile.write(b'{\"error\":\"the route went down\"}\\n')\n"
+                                         "    else: line(3)\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
+                                         "srv.protocol_version='HTTP/1.0'\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+
+        // The first page shows before the second has come.
+        QElapsedTimer clock;
+        clock.start();
+        backend.search("rust");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results().size(), 2, 5000);
+        QVERIFY2(clock.elapsed() < 700, qPrintable(QString::number(clock.elapsed())));
+        QVERIFY(backend.busy().contains("search"));
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results().size(), 3, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+        QCOMPARE(backend.results().at(2).toMap().value("id").toString(), QString("rust0000003"));
+        QVERIFY(backend.error().isEmpty());
+
+        // A search that is replaced adds nothing to its successor's results.
+        backend.search("slow");
+        QTest::qWait(100);
+        backend.search("next");
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+        QCOMPARE(backend.results().size(), 3);
+        for (const QVariant &r : backend.results())
+            QCOMPARE(r.toMap().value("title").toString(), QString("next"));
+
+        // One that fails part-way keeps what it found and says what happened.
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+        backend.search("fail");
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+        QCOMPARE(backend.results().size(), 2);
+        QCOMPARE(backend.error(), QString("the route went down"));
+        QCOMPARE(failed.count(), 1);
+    }
+
     void reportsAMissingEngine()
     {
         Backend backend(QProcessEnvironment::systemEnvironment(), "/nonexistent/qveil-core");
