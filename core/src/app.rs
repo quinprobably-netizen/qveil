@@ -2,7 +2,7 @@
 //! desktop app talks to.
 
 use crate::config::Config;
-use crate::feed::{self, Entry, FeedCache, Source};
+use crate::feed::{self, Entry, FeedCache};
 use crate::ids;
 use crate::net::{self, Net};
 use crate::store::{self, Paths};
@@ -178,13 +178,15 @@ pub fn feed(
     };
     let cache: FeedCache = if !due.is_empty() {
         // The slow part, with nothing locked: the network can take minutes
-        // over Tor, and other commands must not wait for it.
-        let fetch = feed::fetch_all(rt, &due, rt.cfg.feed_workers, current);
-        fallbacks = fetch
-            .fetched
-            .iter()
-            .filter(|f| f.source == Source::Fallback)
-            .count();
+        // over Tor, and other commands must not wait for it. Each channel is
+        // merged and saved as it arrives, and only for that moment is the
+        // store locked, so a refresh that is cut off has kept what it got.
+        let keep = |f: feed::Fetched| {
+            update_feed_cache(paths, |cache| cache.merge(std::slice::from_ref(&f), now()))
+                .map(|_| ())
+        };
+        let fetch = feed::fetch_all(rt, &due, rt.cfg.feed_workers, current, &keep);
+        fallbacks = fetch.fallbacks;
         errors = fetch.errors;
         if fetch.skipped > 0 {
             errors.push(format!(
@@ -192,17 +194,10 @@ pub fn feed(
                 fetch.skipped
             ));
         }
-        // Merge into what is on disk now, not what was there when this
-        // started: another process may have refreshed in the meantime.
-        let _lock = store::lock(paths)?;
-        let mut cache: FeedCache = store::load_cache(&paths.feed_cache())?;
-        cache.merge(&fetch.fetched, now());
-        // Channels that are no longer subscribed to have no use for a timestamp.
-        cache
-            .fetched_at
-            .retain(|id, _| subs.channels.iter().any(|s| s.id == *id));
-        store::save(&paths.feed_cache(), &cache)?;
-        cache
+        // Once more, with nothing to add: it rebuilds a cache that couldn't
+        // be read, drops what is no longer subscribed to, and is the state
+        // the answer is made from.
+        update_feed_cache(paths, |_| {})?
     } else {
         store::load_cache(&paths.feed_cache())?
     };
@@ -213,6 +208,24 @@ pub fn feed(
         channels: subs.channels.len(),
         fresh,
     })
+}
+
+/// Changes the feed cache as it is on disk now, not as it was when a refresh
+/// began (another process may have refreshed in the meantime), and saves it.
+fn update_feed_cache(paths: &Paths, change: impl FnOnce(&mut FeedCache)) -> Result<FeedCache> {
+    let _lock = store::lock(paths)?;
+    let mut cache: FeedCache = store::load_cache(&paths.feed_cache())?;
+    change(&mut cache);
+    // Channels that are no longer subscribed to have no use for a timestamp.
+    // Read now rather than at the start of the refresh, which can be long
+    // ago: a channel added since must keep its own.
+    if let Ok(subs) = load_subs(paths) {
+        cache
+            .fetched_at
+            .retain(|id, _| subs.channels.iter().any(|s| s.id == *id));
+    }
+    store::save(&paths.feed_cache(), &cache)?;
+    Ok(cache)
 }
 
 #[derive(Serialize)]
@@ -345,6 +358,7 @@ mod tests {
     use super::*;
     use crate::store::testing::{TempDir, listing_runs, listing_ytdlp};
     use std::fs;
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     /// A runtime whose every request fails at once (nothing listens on the
@@ -650,13 +664,15 @@ mod tests {
             1,
             "no channel was started after the change"
         );
-        assert_eq!(r.entries.len(), 1, "what was fetched is kept");
+        // The one channel that was started finished after the change, so what
+        // it fetched came over the route that was left: it isn't kept either.
+        assert!(r.entries.is_empty(), "{:?}", r.entries.len());
         assert_eq!(
             r.errors,
-            ["The route changed during the refresh; 4 channel(s) were not fetched."]
+            ["The route changed during the refresh; 5 channel(s) were not fetched."]
         );
         let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
-        assert_eq!(cache.fetched_at.len(), 1, "the others are still due");
+        assert!(cache.fetched_at.is_empty(), "all of them are still due");
     }
 
     fn rt_cfg(ytdlp: &str) -> Config {
@@ -664,5 +680,151 @@ mod tests {
             ytdlp: ytdlp.into(),
             ..Config::default()
         }
+    }
+
+    /// A runtime on Direct whose channel feeds come from `rss_base`, a local
+    /// stand-in for YouTube, and whose yt-dlp is `ytdlp`.
+    fn with_feeds_at(paths: &Paths, rss_base: &str, ytdlp: &str) -> Runtime {
+        let mut rt = Runtime::new(rt_cfg(ytdlp), paths, None, false).unwrap();
+        rt.net = rt.net.allowing_http();
+        rt.yt.net = rt.net.clone();
+        rt.feed_base = rss_base.to_string();
+        rt
+    }
+
+    #[test]
+    fn a_refresh_that_is_cut_off_has_kept_the_channels_it_got() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=4 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        // The third channel's lookup hangs for a while: the refresh is
+        // "interrupted" there, as if the engine were killed.
+        let runs = dir.0.join("runs");
+        let ytdlp = listing_ytdlp(
+            &dir.0,
+            &format!(
+                "if [ \"$(wc -l < '{}')\" -eq 3 ]; then sleep 2; fi",
+                runs.display()
+            ),
+        );
+        let rt = Runtime {
+            cfg: Config {
+                feed_workers: 1,
+                ..rt_cfg(&ytdlp)
+            },
+            ..offline(&paths, &ytdlp)
+        };
+        let refresh = {
+            let paths = paths.clone();
+            std::thread::spawn(move || feed(&rt, &paths, Refresh::Stale, false, 10, &|| true))
+        };
+        let saved =
+            || store::load::<FeedCache>(&paths.feed_cache()).map_or(0, |c| c.fetched_at.len());
+        let started = Instant::now();
+        while saved() < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "nothing was saved while the refresh was running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !refresh.is_finished(),
+            "the first two must be on disk before the refresh is over"
+        );
+        let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
+        assert_eq!(
+            cache.seen.len(),
+            2,
+            "their videos too, not just the timestamps"
+        );
+
+        let r = refresh.join().unwrap().unwrap();
+        assert_eq!((r.entries.len(), saved(), listing_runs(&dir.0)), (4, 4, 4));
+    }
+
+    #[test]
+    fn rss_is_left_out_for_the_rest_of_a_refresh_once_it_keeps_failing() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=8 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        // An RSS endpoint that is down, and a fallback that works.
+        let (base, rss_requests) = crate::store::testing::rss_upstream(usize::MAX);
+        let ytdlp = listing_ytdlp(&dir.0, "");
+        let rt = Runtime {
+            cfg: Config {
+                feed_workers: 1,
+                ..rt_cfg(&ytdlp)
+            },
+            ..with_feeds_at(&paths, &base, &ytdlp)
+        };
+        let r = feed(&rt, &paths, Refresh::Force, false, 20, &|| true).unwrap();
+        // Three channels asked RSS twice each; the other five went straight
+        // to the fallback.
+        assert_eq!(rss_requests.load(Ordering::SeqCst), 6);
+        assert_eq!(listing_runs(&dir.0), 8);
+        assert_eq!((r.fallbacks, r.errors.len(), r.entries.len()), (8, 0, 8));
+
+        // The next refresh starts over: RSS is asked again, as it may be up.
+        feed(&rt, &paths, Refresh::Force, false, 20, &|| true).unwrap();
+        assert_eq!(rss_requests.load(Ordering::SeqCst), 12);
+    }
+
+    #[test]
+    fn a_working_rss_is_used_for_every_channel_and_needs_no_fallback() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=4 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        // The first two requests fail (the first channel's), then it recovers.
+        let (base, rss_requests) = crate::store::testing::rss_upstream(2);
+        let ytdlp = listing_ytdlp(&dir.0, "");
+        let rt = Runtime {
+            cfg: Config {
+                feed_workers: 1,
+                ..rt_cfg(&ytdlp)
+            },
+            ..with_feeds_at(&paths, &base, &ytdlp)
+        };
+        let r = feed(&rt, &paths, Refresh::Force, false, 20, &|| true).unwrap();
+        assert_eq!(rss_requests.load(Ordering::SeqCst), 5, "2 + 1 + 1 + 1");
+        assert_eq!((r.fallbacks, listing_runs(&dir.0)), (1, 1));
+        assert_eq!(r.entries.len(), 4);
+    }
+
+    #[test]
+    fn an_rss_reply_that_arrives_after_the_route_changed_is_dropped() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=3 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let (base, rss_requests) = crate::store::testing::rss_upstream(0);
+        let ytdlp = listing_ytdlp(&dir.0, "");
+        let rt = Runtime {
+            cfg: Config {
+                feed_workers: 1,
+                ..rt_cfg(&ytdlp)
+            },
+            ..with_feeds_at(&paths, &base, &ytdlp)
+        };
+        // "The route changes" while the first reply is on its way: it is
+        // current until the upstream has been asked.
+        let current = || rss_requests.load(Ordering::SeqCst) == 0;
+        let r = feed(&rt, &paths, Refresh::Stale, false, 20, &current).unwrap();
+        assert_eq!(rss_requests.load(Ordering::SeqCst), 1);
+        assert!(r.entries.is_empty(), "the late reply was not used");
+        assert_eq!(
+            r.errors,
+            ["The route changed during the refresh; 3 channel(s) were not fetched."]
+        );
+        let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
+        assert!(cache.fetched_at.is_empty() && cache.seen.is_empty());
+        assert_eq!(listing_runs(&dir.0), 0);
     }
 }

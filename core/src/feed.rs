@@ -13,6 +13,7 @@ use roxmltree::Node;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const RETENTION_SECS: i64 = 86_400 * 180;
 const FALLBACK_LIMIT: usize = 15;
@@ -59,44 +60,119 @@ pub struct Fetched {
     pub source: Source,
 }
 
+/// How a refresh went, apart from the videos themselves, which were handed
+/// to the sink one channel at a time (see `fetch_all`).
 #[derive(Default)]
 pub struct Fetch {
-    pub fetched: Vec<Fetched>,
+    /// Channels fetched and kept.
+    pub fetched: usize,
+    /// Of those, the ones whose RSS feed was down, so their dates are approximate.
+    pub fallbacks: usize,
     pub errors: Vec<String>,
     /// Channels not fetched because the route changed meanwhile.
     pub skipped: usize,
 }
 
-/// Fetches the channels' feeds on `rt`'s route. `current` says whether it is
-/// still the route in use: once it isn't, no further channel is started,
-/// because every request would go out over the route the user just left.
+/// What became of one channel's fetch.
+enum Outcome {
+    Kept {
+        fallback: bool,
+    },
+    /// The route changed meanwhile, so there is nothing to keep.
+    Late,
+    Failed(anyhow::Error),
+    /// Fetched, but `keep` couldn't store it.
+    Unsaved(anyhow::Error),
+}
+
+/// After this many channels in a row that RSS failed for, the rest of the
+/// refresh doesn't ask RSS again. YouTube's feed endpoint is often down for
+/// everyone, and trying it twice per channel before each fallback is two
+/// more requests for exactly your channels, each of which may wait out its
+/// timeout (and, over Tor, a circuit of its own).
+const RSS_GIVE_UP: usize = 3;
+
+/// How RSS is doing during one refresh.
+#[derive(Default)]
+struct RssHealth {
+    failed_in_a_row: AtomicUsize,
+}
+
+impl RssHealth {
+    fn usable(&self) -> bool {
+        self.failed_in_a_row.load(Ordering::Relaxed) < RSS_GIVE_UP
+    }
+
+    fn worked(&self) {
+        self.failed_in_a_row.store(0, Ordering::Relaxed);
+    }
+
+    fn failed(&self) {
+        self.failed_in_a_row.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Fetches the channels' feeds on `rt`'s route, handing each channel's
+/// result to `keep` as soon as it is in, so that a refresh that is cut off
+/// (the engine is killed, say) has kept what it got and the next one
+/// doesn't start over. `current` says whether the route is still the one in
+/// use: once it isn't, no further channel is started, because every request
+/// would go out over the route the user just left, and what is still on its
+/// way is dropped instead of kept. A `keep` that fails (the disk is full)
+/// stops the refresh too, since everything after it would be lost.
 pub fn fetch_all(
     rt: &Runtime,
     subs: &[Sub],
     workers: usize,
     current: &(dyn Fn() -> bool + Sync),
+    keep: &(dyn Fn(Fetched) -> Result<()> + Sync),
 ) -> Fetch {
     let mut order: Vec<&Sub> = subs.iter().collect();
     order.shuffle(&mut rand::rng());
     let queue = Mutex::new(order);
     let results = Mutex::new(Fetch::default());
+    let rss = RssHealth::default();
+    let broken = AtomicBool::new(false);
     std::thread::scope(|s| {
         for _ in 0..workers.clamp(1, 16).min(subs.len().max(1)) {
             s.spawn(|| {
                 // Checked before each channel, so a channel that has been
                 // started is not abandoned half-way.
-                while current() {
+                while current() && !broken.load(Ordering::Relaxed) {
                     let Some(sub) = queue.lock().unwrap().pop() else {
                         break;
                     };
-                    let r = fetch_one(rt, sub, current);
-                    let mut res = results.lock().unwrap();
-                    match r {
-                        Ok(f) => res.fetched.push(f),
+                    // Not under the results lock: saving waits on the store.
+                    let outcome = match fetch_one(rt, sub, current, &rss) {
+                        // It arrived after the route changed: dropped, not kept.
+                        Ok(_) if !current() => Outcome::Late,
+                        Ok(f) => {
+                            let fallback = f.source == Source::Fallback;
+                            match keep(f) {
+                                Ok(()) => Outcome::Kept { fallback },
+                                Err(e) => {
+                                    broken.store(true, Ordering::Relaxed);
+                                    Outcome::Unsaved(e)
+                                }
+                            }
+                        }
                         // A failure after the route changed is probably that
                         // change cutting it off, and its result is moot.
-                        Err(_) if !current() => res.skipped += 1,
-                        Err(e) => res.errors.push(format!("{}: {e:#}", sub.name)),
+                        Err(_) if !current() => Outcome::Late,
+                        Err(e) => Outcome::Failed(e),
+                    };
+                    let mut res = results.lock().unwrap();
+                    match outcome {
+                        Outcome::Kept { fallback } => {
+                            res.fetched += 1;
+                            res.fallbacks += usize::from(fallback);
+                        }
+                        Outcome::Late => res.skipped += 1,
+                        Outcome::Failed(e) => res.errors.push(format!("{}: {e:#}", sub.name)),
+                        Outcome::Unsaved(e) => res.errors.push(format!(
+                            "{}: couldn't save what was fetched: {e:#}",
+                            sub.name
+                        )),
                     }
                 }
             });
@@ -107,18 +183,31 @@ pub fn fetch_all(
     res
 }
 
-fn fetch_one(rt: &Runtime, sub: &Sub, current: &dyn Fn() -> bool) -> Result<Fetched> {
+fn fetch_one(
+    rt: &Runtime,
+    sub: &Sub,
+    current: &dyn Fn() -> bool,
+    rss: &RssHealth,
+) -> Result<Fetched> {
     let mut rss_err = None;
-    for _ in 0..2 {
-        // Each attempt is a request of its own, and the fallback below is a
-        // slow one, so the route is looked at again before every step.
-        if !current() {
-            bail!("the route changed");
+    if rss.usable() {
+        for _ in 0..2 {
+            // Each attempt is a request of its own, and the fallback below is a
+            // slow one, so the route is looked at again before every step.
+            if !current() {
+                bail!("the route changed");
+            }
+            match fetch_rss(rt, &sub.id) {
+                // It came over a route that is no longer in use.
+                Ok(_) if !current() => bail!("the route changed"),
+                Ok(videos) => {
+                    rss.worked();
+                    return Ok(fetched(sub, videos, Source::Rss));
+                }
+                Err(e) => rss_err = Some(e),
+            }
         }
-        match fetch_rss(rt, &sub.id) {
-            Ok(videos) => return Ok(fetched(sub, videos, Source::Rss)),
-            Err(e) => rss_err = Some(e),
-        }
+        rss.failed();
     }
     if !current() {
         bail!("the route changed");
@@ -126,11 +215,9 @@ fn fetch_one(rt: &Runtime, sub: &Sub, current: &dyn Fn() -> bool) -> Result<Fetc
     let videos = rt
         .yt
         .channel_videos(&sub.id, FALLBACK_LIMIT)
-        .with_context(|| {
-            format!(
-                "RSS failed ({:#}), fallback failed too",
-                rss_err.expect("loop ran")
-            )
+        .with_context(|| match &rss_err {
+            Some(e) => format!("RSS failed ({e:#}), fallback failed too"),
+            None => "RSS was left out (it kept failing), and the fallback failed".to_string(),
         })?;
     Ok(fetched(sub, videos, Source::Fallback))
 }
@@ -422,5 +509,23 @@ mod tests {
         cache.merge(&[fetched(&s, parse_rss(RSS).unwrap(), Source::Rss)], 0);
         cache.merge(&[], RETENTION_SECS + 1);
         assert!(cache.seen.is_empty());
+    }
+
+    #[test]
+    fn rss_is_left_out_after_three_channels_in_a_row_that_it_failed_for() {
+        let rss = RssHealth::default();
+        assert!(rss.usable());
+        rss.failed();
+        rss.failed();
+        assert!(rss.usable(), "two failures are not yet a pattern");
+        // A success in between starts the count again.
+        rss.worked();
+        rss.failed();
+        rss.failed();
+        assert!(rss.usable());
+        rss.failed();
+        assert!(!rss.usable());
+        // Once it is left out, a stray success doesn't matter: nothing asks it.
+        assert!(!rss.usable());
     }
 }

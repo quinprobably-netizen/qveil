@@ -330,6 +330,44 @@ pub mod testing {
         script(&dir.join("yt-dlp"), &body)
     }
 
+    /// A stand-in for YouTube's feed endpoint on a local port: the first
+    /// `fail` requests get a 500 and the rest a feed with one video, named
+    /// after the request's number. Returns its base URL (for
+    /// `Runtime::feed_base`) and the number of requests it has had.
+    pub fn rss_upstream(fail: usize) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                while r.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+                let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                let channel = line.split("channel_id=").nth(1).unwrap_or("");
+                let channel = channel.split_whitespace().next().unwrap_or("");
+                let (status, body) = if n <= fail {
+                    ("500 Internal Server Error", String::new())
+                } else {
+                    let feed = format!(
+                        "<feed xmlns:yt=\"http://www.youtube.com/xml/schemas/2015\" xmlns=\"http://www.w3.org/2005/Atom\"><entry><yt:videoId>v{n:010}</yt:videoId><yt:channelId>{channel}</yt:channelId><title>t{n}</title><published>2024-01-01T00:00:00+00:00</published></entry></feed>"
+                    );
+                    ("200 OK", feed)
+                };
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base, hits)
+    }
+
     /// How often `listing_ytdlp` has run.
     pub fn listing_runs(dir: &std::path::Path) -> usize {
         std::fs::read_to_string(dir.join("runs")).map_or(0, |s| s.lines().count())
