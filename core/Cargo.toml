@@ -1,9 +1,9 @@
 [package]
 name = "veil"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A private, account-free YouTube frontend for the terminal (prototype)"
+description = "The engine behind veil, a private, account-free YouTube app (prototype)"
 license = "MIT"
 publish = false
 

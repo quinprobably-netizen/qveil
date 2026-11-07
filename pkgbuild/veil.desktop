@@ -5,6 +5,6 @@ Comment=Watch YouTube privately, without an account
 Exec=veil
 Icon=veil
 Terminal=false
-Categories=AudioVideo;Video;Player;Network;
+Categories=AudioVideo;Video;Player;
 Keywords=youtube;video;privacy;tor;
 StartupWMClass=veil

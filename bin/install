@@ -2,6 +2,6 @@
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-"$ROOT/bin/build"
+# makepkg runs bin/build itself (see pkgbuild/PKGBUILD), so it is not run here too.
 cd "$ROOT/pkgbuild"
 exec makepkg -fsi "$@"

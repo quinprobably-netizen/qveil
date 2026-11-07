@@ -32,8 +32,11 @@ use video::Video;
 #[derive(Parser)]
 #[command(
     name = "veil",
+    // The binary is veil-core, started by `veil`; help should show the name people type.
+    bin_name = "veil",
     version,
-    about = "A private, account-free YouTube frontend"
+    about = "A private, account-free YouTube frontend",
+    after_help = "Run `veil` with no command (or `veil open`) to open the app window."
 )]
 struct Cli {
     /// Route all traffic through this proxy (http://, https://, socks5h://). Overrides the config.
@@ -345,11 +348,16 @@ fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
     );
     println!("max height     {}p", rt.cfg.max_height);
     println!();
-    println!("Never sent: cookies, a Google account, your subscription list in one request,");
-    println!("tracking URL parameters, Referer headers, or player state (mpv resume/history off).");
-    if !rt.net.is_socks() {
-        println!("Visible to YouTube: your IP, the videos you search and play, and (one request");
-        println!("per channel) the feeds you poll. Use --tor or a proxy to hide your IP.");
+    println!("Never sent: cookies, a Google account, tracking URL parameters, Referer headers,");
+    println!("or player state (mpv resume/history off).");
+    println!("Feeds are fetched one channel per request, in random order, but a refresh is still");
+    println!("a burst of requests for exactly your channels, so timing can link them.");
+    if rt.net.proxy().is_none() {
+        println!("Visible to YouTube: your IP, the videos you search and play, and when.");
+        println!("Use --tor or a proxy to hide your IP.");
+    } else {
+        println!("Visible to YouTube: the route's IP instead of yours, the videos you search and");
+        println!("play, and when.");
     }
     Ok(())
 }

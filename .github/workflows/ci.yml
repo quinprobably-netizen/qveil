@@ -27,7 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel qt6-base qt6-declarative qt6-svg qt6-wayland mpv rust python
+      - run: pacman -Syu --noconfirm --needed base-devel qt6-base qt6-declarative qt6-svg qt6-wayland mpv rust python desktop-file-utils
       - uses: actions/checkout@v4
+      - run: desktop-file-validate pkgbuild/veil.desktop
       - run: ./bin/build
       - run: ./bin/test
