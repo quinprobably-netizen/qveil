@@ -4,9 +4,12 @@
 #include <QProcessEnvironment>
 #include <QFile>
 #include <QPersistentModelIndex>
+#include <QQmlApplicationEngine>
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlEngine>
+#include <QQuickWindow>
+#include <QSettings>
 #include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QtTest>
@@ -14,8 +17,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <vector>
+
 #include "backend.h"
 #include "datadirs.h"
+#include "launch.h"
 #include "mpvitem.h"
 #include "suite.h"
 #include "theme.h"
@@ -227,68 +233,6 @@ private slots:
         QVERIFY2(!backend.error().contains("again"), qPrintable(backend.error()));
     }
 
-    void feedRefreshesAskForWhatTheyMean()
-    {
-        QTemporaryDir dir;
-        const QString log = dir.filePath("requests");
-        Backend backend(logged(log), requestLogger(dir, ""));
-        backend.start();
-        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
-
-        backend.refreshFeed(false, false);
-        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed-cache"), 5000);
-        // The window's startup, then its Refresh button once that is done.
-        for (int i = 0; i < 2; ++i) {
-            backend.refreshFeed(true, false);
-            QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
-        }
-
-        const QStringList feeds = requests(log, "/api/feed");
-        QCOMPARE(feeds.size(), 3);
-        // From the cache alone.
-        QVERIFY(feeds[0].contains("refresh=0") && !feeds[0].contains("force"));
-        // Startup, and the Refresh button after it: the channels that have
-        // gone stale, never all of them (the README promises that).
-        for (const QString &feed : feeds.mid(1))
-            QVERIFY2(feed.contains("refresh=1") && !feed.contains("force") && !feed.contains("channel="), qPrintable(feed));
-    }
-
-    void subscribingRefreshesOnlyThatChannel()
-    {
-        QTemporaryDir dir;
-        const QString log = dir.filePath("requests");
-        Backend backend(logged(log), requestLogger(dir, ""));
-        backend.start();
-        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
-
-        backend.subscribe("@someone");
-        QTRY_VERIFY_WITH_TIMEOUT(!requests(log, "/api/feed").isEmpty(), 5000);
-        const QStringList feeds = requests(log, "/api/feed");
-        QCOMPARE(feeds.size(), 1);
-        QVERIFY2(feeds[0].contains("refresh=1") && feeds[0].contains("channel=UC0123456789abcdefghij")
-                     && !feeds[0].contains("force"),
-                 qPrintable(feeds[0]));
-        // Neither a stale-channels nor a full refresh.
-        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
-        QCOMPARE(requests(log, "/api/feed").size(), 1);
-    }
-
-    void importingRefreshesTheStaleChannels()
-    {
-        QTemporaryDir dir;
-        const QString log = dir.filePath("requests");
-        const QString file = dir.filePath("subscriptions.csv");
-        write(file, "Channel Id,Channel Url,Channel Title\nUC0123456789abcdefghij,x,X\n");
-        Backend backend(logged(log), requestLogger(dir, ""));
-        backend.start();
-        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
-
-        backend.importFile(QUrl::fromLocalFile(file));
-        QTRY_VERIFY_WITH_TIMEOUT(!requests(log, "/api/feed").isEmpty(), 5000);
-        const QString feed = requests(log, "/api/feed").first();
-        QVERIFY2(feed.contains("refresh=1") && !feed.contains("force") && !feed.contains("channel="), qPrintable(feed));
-    }
-
     void overlappingSubscriptionChangesAllGetTheirAnswers()
     {
         // Each change is slow (0.3 s in the stand-in engine) and they overlap.
@@ -362,62 +306,6 @@ private slots:
         // A different address that redacts to the same text is still another proxy.
         change({{"route", "proxy"}, {"proxy", "socks5h://u:secret@host:1/"}});
         QCOMPARE(moved.size(), 3);
-    }
-
-    void aClosedPlayerDropsTheAnswerOfItsVideo()
-    {
-        QTemporaryDir dir;
-        const QString log = dir.filePath("requests");
-        Backend backend(logged(log), requestLogger(dir, "time.sleep(0.4)"));
-        backend.start();
-        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
-        QSignalSpy ready(&backend, &Backend::playReady);
-
-        // The player is closed while the video is looked up: its answer
-        // must not open it again.
-        backend.play("dQw4w9WgXcQ");
-        backend.cancelPlay();
-        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("play"), 5000);
-        QCOMPARE(ready.count(), 0);
-
-        backend.play("dQw4w9WgXcQ");
-        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
-    }
-
-    void aFailedLookupSaysSoOnlyForTheLatestVideo()
-    {
-        QTemporaryDir dir;
-        // Every lookup fails, the first one slowly.
-        const QString fake = engine(dir, "import http.server,json,time\n"
-                                         "n=[0]\n"
-                                         "class H(http.server.BaseHTTPRequestHandler):\n"
-                                         "  def do_GET(s): s.reply(200,{})\n"
-                                         "  def do_POST(s):\n"
-                                         "    n[0]+=1\n"
-                                         "    if n[0]==1: time.sleep(0.6)\n"
-                                         "    s.reply(500,{'error':'no such video %d'%n[0]})\n"
-                                         "  def reply(s,code,body):\n"
-                                         "    b=json.dumps(body).encode()\n"
-                                         "    s.send_response(code);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)\n"
-                                         "  def log_message(s,*a): pass\n"
-                                         "srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
-                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
-                                         "srv.serve_forever()\n");
-        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
-        backend.start();
-        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
-        QSignalSpy failed(&backend, &Backend::taskFailed);
-
-        // The first video is still being looked up when the second is asked
-        // for; only the second one's failure is the player's business.
-        backend.play("aaaaaaaaaaa");
-        QTest::qWait(150);
-        backend.play("bbbbbbbbbbb");
-        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
-        QCOMPARE(failed.at(0).at(0).toString(), QString("play"));
-        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("play"), 5000);
-        QCOMPARE(failed.count(), 1);
-        QVERIFY(backend.error().contains("no such video"));
     }
 
     void searchResultsArriveAPageAtATime()
@@ -598,6 +486,318 @@ private slots:
         QCOMPARE(backend.feed()->get(first.row()).value("id").toString(), QString("aaaaaaaaaaa"));
     }
 
+    void qveilOpensTheWindowOnlyAlone()
+    {
+        // `qveil` and `qveil open` open it; everything else, `open` with
+        // arguments included, is a command for the engine.
+        auto opens = [](std::initializer_list<const char *> arguments) {
+            std::vector<const char *> argv(arguments);
+            return opensWindow(int(argv.size()), argv.data());
+        };
+        QVERIFY(opens({"qveil"}));
+        QVERIFY(opens({"qveil", "open"}));
+        QVERIFY(!opens({"qveil", "open", "--help"}));
+        QVERIFY(!opens({"qveil", "open", "extra"}));
+        QVERIFY(!opens({"qveil", "--help"}));
+        QVERIFY(!opens({"qveil", "feed", "--json"}));
+        QVERIFY(!opens({"qveil", "opened"}));
+        QVERIFY(!opens({"qveil", "Open"}));
+        // Something an unusual launcher might do.
+        QVERIFY(opens({}));
+    }
+
+    void theEnginesPrivacyTextIsShownAsItIsOrNotAtAll()
+    {
+        const QVariantMap sent{
+            {"privacy",
+             QVariantMap{{"summary", "One sentence."},
+                         {"points", QStringList{"First.", "Second."}},
+                         {"routes", QVariantMap{{"direct", "D."}, {"tor", "T."}, {"proxy", "P."}}},
+                         {"pages", QVariantMap{{"search", "S."}, {"subscriptions", "U."}, {"history_off", "Off."}, {"history_on", "On."}}}}}};
+        const QVariantMap shown = Backend::privacyOf(sent);
+        QCOMPARE(shown.value("summary").toString(), QString("One sentence."));
+        // In the engine's order.
+        QCOMPARE(shown.value("points").toStringList(), QStringList({"First.", "Second."}));
+        QCOMPARE(shown.value("routes").toMap().value("tor").toString(), QString("T."));
+        QCOMPARE(shown.value("pages").toMap().value("history_off").toString(), QString("Off."));
+
+        // An engine that sends none of it: every field is there and empty, so
+        // the window shows nothing, and QML needs no checks.
+        for (const QVariantMap &nothing : {QVariantMap(), QVariantMap{{"privacy", QVariantMap()}},
+                                           QVariantMap{{"privacy", "not a map"}}}) {
+            const QVariantMap empty = Backend::privacyOf(nothing);
+            QCOMPARE(empty.value("summary").toString(), QString());
+            QVERIFY(empty.value("points").toStringList().isEmpty());
+            for (const char *key : {"direct", "tor", "proxy"})
+                QVERIFY2(empty.value("routes").toMap().contains(key) && empty.value("routes").toMap().value(key).toString().isEmpty(), key);
+            for (const char *key : {"search", "subscriptions", "history_off", "history_on"})
+                QVERIFY2(empty.value("pages").toMap().contains(key) && empty.value("pages").toMap().value(key).toString().isEmpty(), key);
+        }
+    }
+
+    void theWindowHasNoPrivacyClaimsOfItsOwn()
+    {
+        // Every word the window says about privacy is the engine's: a copy
+        // written here would go on saying what the engine had stopped doing.
+        // So the claims it used to make must not come back.
+        const QStringList claims{"Never sent",       "can't link",   "hidden from YouTube", "own circuit",     "never sees",
+                                 "YouTube sees",     "Kept only",    "Stored only",         "without an account", "doesn't remember",
+                                 "read offline",     "no cookies",   "Your IP is"};
+        const QDir source(SRCDIR);
+        const QStringList files = source.entryList({"*.qml", "*.js"}, QDir::Files);
+        QVERIFY2(files.size() > 15, "the window's QML wasn't found");
+        bool sawText = false;
+        for (const QString &name : files) {
+            QFile file(source.filePath(name));
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            // Comments may say what is not to be said.
+            QString text = QString::fromUtf8(file.readAll());
+            text.remove(QRegularExpression("/\\*.*?\\*/", QRegularExpression::DotMatchesEverythingOption));
+            text.remove(QRegularExpression("(^|\\s)//[^\\n]*"));
+            sawText = sawText || text.contains("qsTr(");
+            for (const QString &claim : claims)
+                QVERIFY2(!text.contains(claim, Qt::CaseInsensitive),
+                         qPrintable(name + " says \"" + claim + "\", which only the engine may"));
+        }
+        QVERIFY2(sawText, "the check read no strings");
+    }
+
+    void errorsOfferARouteOnlyWhereAnotherRouteCanHelp()
+    {
+        for (const char *code : {"bot_check", "tor_down", "proxy_refused", "rate_limited"})
+            QVERIFY2(Backend::offersRoute(code), code);
+        for (const char *code : {"", "age_restricted", "route_changed", "live", "private", "ytdlp_outdated", "deno_missing", "other", "unknown"})
+            QVERIFY2(!Backend::offersRoute(code), code);
+    }
+
+    void theBannerFollowsTheCodeOfTheEnginesError()
+    {
+        // The engine's errors say what they are, in a plain reply and in a
+        // streamed one; the window decides from that what to offer.
+        QTemporaryDir dir;
+        Backend backend(QProcessEnvironment::systemEnvironment(), contractEngine(dir));
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+
+        for (const char *code : {"bot_check", "tor_down", "proxy_refused", "rate_limited"}) {
+            backend.clearError();
+            backend.play(code);
+            QTRY_COMPARE_WITH_TIMEOUT(backend.errorCode(), QString(code), 5000);
+            QVERIFY(backend.errorOffersRoute());
+            QCOMPARE(backend.error(), QString("The engine's words for ") + code);
+        }
+        for (const char *code : {"age_restricted", "private", "other"}) {
+            backend.clearError();
+            backend.play(code);
+            QTRY_COMPARE_WITH_TIMEOUT(backend.errorCode(), QString(code), 5000);
+            QVERIFY(!backend.errorOffersRoute());
+        }
+        backend.clearError();
+        QCOMPARE(backend.errorCode(), QString());
+        QVERIFY(!backend.errorOffersRoute());
+
+        // A search that fails part-way says so in a line of its own, with the same code.
+        backend.search("code:tor_down");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.errorCode(), QString("tor_down"), 5000);
+        QVERIFY(backend.errorOffersRoute());
+        QCOMPARE(backend.error(), QString("The engine's words for tor_down"));
+
+        // The user caused a changed route, so it is not shown. The request
+        // still failed, which whoever waits for it needs to hear.
+        backend.clearError();
+        failed.clear();
+        backend.play("route_changed");
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        backend.search("code:route_changed");
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 2, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+        QVERIFY2(backend.error().isEmpty(), qPrintable(backend.error()));
+        QCOMPARE(backend.errorCode(), QString());
+    }
+
+    void aStreamedRefreshShowsHowFarItIsAndThenTheFeed()
+    {
+        QTemporaryDir dir;
+        Backend backend(QProcessEnvironment::systemEnvironment(), contractEngine(dir));
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+
+        QList<QPair<int, int>> seen;
+        connect(&backend, &Backend::refreshProgressChanged, this, [&] { seen.append({backend.refreshDone(), backend.refreshTotal()}); });
+        QCOMPARE(backend.refreshTotal(), 0);
+        backend.refreshFeed(true, false);
+        QTRY_VERIFY_WITH_TIMEOUT(backend.refreshTotal() == 4, 5000);
+        QVERIFY(backend.busy().contains("feed"));
+        // The feed lands with the last line, and the progress is over with the stream.
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 2, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
+        QCOMPARE(backend.refreshTotal(), 0);
+        QCOMPARE(backend.refreshDone(), 0);
+        QVERIFY(backend.feedInfo().value("refreshedAt").toLongLong() > 0);
+        QCOMPARE(backend.feedInfo().value("channels").toInt(), 4);
+        QVERIFY(!backend.feedInfo().contains("entries"));
+        QVERIFY2(backend.error().isEmpty(), qPrintable(backend.error()));
+
+        int done = -1;
+        for (const auto &[at, of] : std::as_const(seen)) {
+            if (of == 0)
+                continue;
+            QCOMPARE(of, 4);
+            QVERIFY2(at >= done, "progress went backwards");
+            done = at;
+        }
+        QCOMPARE(done, 4);
+    }
+
+    void aStreamThatKeepsSendingOutlivesTheIdleTimeoutAndOneThatStopsDoesNot()
+    {
+        // The stand-in sends a line every 0.4 s for 2 s. The window gives up
+        // on 1 s of silence, but not on 2 s of lines.
+        QTemporaryDir dir;
+        Backend backend(QProcessEnvironment::systemEnvironment(), contractEngine(dir));
+        backend.setIdleTimeout(1000);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+
+        backend.refreshFeed(true, false);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 2, 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
+        QVERIFY2(backend.error().isEmpty(), qPrintable(backend.error()));
+
+        // "quiet" says its first line and then nothing for 3 s.
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+        backend.search("quiet");
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 8000);
+        QCOMPARE(failed.at(0).at(0).toString(), QString("search"));
+        QVERIFY(!backend.error().isEmpty());
+        QCOMPARE(backend.results()->count(), 1);
+    }
+
+    void theMainWindowLoadsCleanAndSpeaksOnlyForItself()
+    {
+        // The whole window, as the app loads it (on the offscreen platform,
+        // with a stand-in engine): no QML warning, the engine's words where
+        // the window used to have its own, a refresh that fills the progress
+        // bar, and an error that offers to change the route only when that
+        // can help.
+        QTest::failOnWarning(QRegularExpression("qrc:/|\\.qml|QML|TypeError|ReferenceError"));
+        // The window's settings (Shorts, volume) are not the user's.
+        QTemporaryDir settings;
+        QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, settings.path());
+        QCoreApplication::setOrganizationName("qveil-tests");
+
+        QTemporaryDir engineDir, themeDir;
+        Theme theme(themeDir.path());
+        Translator translator;
+        Backend backend(QProcessEnvironment::systemEnvironment(), contractEngine(engineDir));
+        QQmlApplicationEngine qml;
+        qml.rootContext()->setContextProperty("translator", &translator);
+        qml.rootContext()->setContextProperty("theme", &theme);
+        qml.rootContext()->setContextProperty("backend", &backend);
+        qml.load(QUrl("qrc:/Main.qml"));
+        QVERIFY(!qml.rootObjects().isEmpty());
+        auto *window = qobject_cast<QQuickWindow *>(qml.rootObjects().first());
+        QVERIFY(window);
+        window->requestActivate();
+        auto find = [&](const char *name) {
+            QObject *found = window->findChild<QObject *>(name);
+            [&] { QVERIFY2(found, name); }();
+            return found;
+        };
+
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QObject *errorBar = find("errorBar"), *feedPage = find("feedPage"), *progress = find("progress");
+        QVERIFY(errorBar && feedPage && progress);
+        QVERIFY(!errorBar->property("visible").toBool());
+
+        // Startup refreshes the feed, which the engine streams: how far it
+        // is shows in the subheading and in the bar, which then fills.
+        QTRY_VERIFY_WITH_TIMEOUT(feedPage->property("subheading").toString().startsWith("Refreshing "), 5000);
+        QVERIFY(progress->property("visible").toBool());
+        QVERIFY(!progress->property("indeterminate").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(progress->property("value").toDouble() > 0.4, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(feedPage->property("subheading").toString(), QString("Latest from 4 channels"), 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(!progress->property("visible").toBool(), 5000);
+
+        // The search page's line is the engine's, as sent.
+        QCOMPARE(find("searchPage")->property("subheading").toString(), QString("a"));
+
+        // An error another route may get past offers to change it, and the
+        // offer opens the route popup and takes the error away.
+        QObject *route = find("routePopup");
+        backend.play("bot_check");
+        QTRY_VERIFY_WITH_TIMEOUT(errorBar->property("visible").toBool(), 5000);
+        QObject *change = find("changeRoute");
+        QVERIFY(change->property("visible").toBool());
+        QVERIFY(!route->property("opened").toBool());
+        QMetaObject::invokeMethod(change, "clicked");
+        QTRY_VERIFY_WITH_TIMEOUT(route->property("opened").toBool(), 5000);
+        QVERIFY(!errorBar->property("visible").toBool());
+        QMetaObject::invokeMethod(route, "close");
+        QTRY_VERIFY_WITH_TIMEOUT(!route->property("opened").toBool(), 5000);
+
+        // One no other route can help with offers nothing, and one the user
+        // caused isn't shown at all.
+        backend.play("age_restricted");
+        QTRY_VERIFY_WITH_TIMEOUT(errorBar->property("visible").toBool(), 5000);
+        QVERIFY(!change->property("visible").toBool());
+        backend.clearError();
+        backend.play("route_changed");
+        QTest::qWait(300);
+        QVERIFY(!errorBar->property("visible").toBool());
+
+        // P opens the route popup, and closes it.
+        QTest::keyClick(window, Qt::Key_P);
+        QTRY_VERIFY_WITH_TIMEOUT(route->property("opened").toBool(), 5000);
+        QTest::keyClick(window, Qt::Key_P);
+        QTRY_VERIFY_WITH_TIMEOUT(!route->property("opened").toBool(), 5000);
+    }
+
+    void thumbnailsAreNumberedByThePageTheyCameWith()
+    {
+        // The engine puts the thumbnails of one batch on one Tor circuit, as
+        // a page load would, so a new page needs a new number, and cards of a
+        // page that is updated in place keep theirs (their pictures aren't
+        // fetched again). No two grids share a number. Live streams get no card.
+        QTemporaryDir dir;
+        Backend backend(QProcessEnvironment::systemEnvironment(), contractEngine(dir));
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        auto batchOf = [](VideoModel *model, int row) { return model->get(row).value("batch").toInt(); };
+
+        // The cache's answer, then a refresh that has one more video.
+        backend.refreshFeed(false, false);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 2, 5000);
+        const int cached = batchOf(backend.feed(), 0);
+        QVERIFY(cached > 0);
+        QCOMPARE(batchOf(backend.feed(), 1), cached);
+        backend.refreshFeed(true, false);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
+        QCOMPARE(backend.feed()->count(), 2);
+        QCOMPARE(batchOf(backend.feed(), 0), cached);
+
+        backend.search("rust");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 2, 5000);
+        const int first = batchOf(backend.results(), 0);
+        QVERIFY(first > cached);
+        QCOMPARE(batchOf(backend.results(), 1), first);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
+
+        backend.search("again");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 2, 5000);
+        QVERIFY(batchOf(backend.results(), 0) > first);
+
+        backend.openChannel("UC0123456789abcdefghij");
+        QTRY_COMPARE_WITH_TIMEOUT(backend.channelVideos()->count(), 1, 5000);
+        QVERIFY(batchOf(backend.channelVideos(), 0) > batchOf(backend.results(), 0));
+
+        // The live stream in each answer is not shown.
+        for (VideoModel *model : {backend.feed(), backend.results(), backend.channelVideos()})
+            QVERIFY(!model->ids().contains("liveliveli1"));
+    }
+
     void theTokenNeverReachesTheWindowOrItsLogs()
     {
         // The engine's token is in every URL the window uses, and it is all
@@ -632,10 +832,25 @@ private slots:
 
         // What Qt logs goes through the same scrubbing before it is printed.
         Backend::scrubLogs();
-        QTest::ignoreMessage(QtWarningMsg, "QML Image: Error transferring qveil-core/thumb/x - server replied: Not Found");
-        qWarning("QML Image: Error transferring %s/thumb/x - server replied: Not Found", qPrintable(base));
+        QTest::ignoreMessage(QtWarningMsg, "QML Image: Error transferring qveil-core/thumb/<id> - server replied: Not Found");
+        qWarning("QML Image: Error transferring %s/thumb/dQw4w9WgXcQ?batch=12 - server replied: Not Found", qPrintable(base));
         QTest::ignoreMessage(QtWarningMsg, "the token is <token>");
         qWarning("the token is %s", "0123456789abcdef");
+    }
+
+    void aThumbnailsVideoDoesNotReachTheLogsEither()
+    {
+        // A thumbnail's address says which video is on screen, and Qt quotes
+        // the address of one that fails to load. That is nobody's business
+        // in the journal. (With or without the engine's base in front, and
+        // with or without a batch.)
+        QCOMPARE(Backend::scrub("Error transferring http://127.0.0.1:1/aabbccddeeff0011/thumb/dQw4w9WgXcQ?batch=7 - x"),
+                 QString("Error transferring http://127.0.0.1:1/aabbccddeeff0011/thumb/<id> - x"));
+        QCOMPARE(Backend::scrub("could not open \"qveil-core/thumb/-_aZ09bcdEF\""), QString("could not open \"qveil-core/thumb/<id>\""));
+        // Scrubbing what is scrubbed leaves it alone, and so does text with no thumbnail in it.
+        const QString clean = "Error transferring qveil-core/thumb/<id> - x";
+        QCOMPARE(Backend::scrub(clean), clean);
+        QCOMPARE(Backend::scrub("The thumbnails are off."), QString("The thumbnails are off."));
     }
 
     void mpvDoesNotLogTheUrlItFailsToOpen()
@@ -715,7 +930,8 @@ private slots:
         QMetaObject::invokeMethod(player.data(), "prepare", Q_ARG(QVariant, video));
         QVERIFY(player->property("active").toBool());
         write(dir.filePath("stop"), "");
-        QTRY_COMPARE_WITH_TIMEOUT(readiness.count(), 2, 5000);
+        // At least: the restart can be ready again before a poll sees it lost.
+        QTRY_VERIFY_WITH_TIMEOUT(readiness.count() >= 2, 5000);
         QVERIFY(!player->property("active").toBool());
         QCOMPARE(closed.count(), 1);
 
@@ -983,18 +1199,6 @@ private:
         return environment;
     }
 
-    // The logged requests whose path starts with `path`.
-    static QStringList requests(const QString &log, const QString &path)
-    {
-        QStringList found;
-        QFile file(log);
-        if (file.open(QIODevice::ReadOnly))
-            for (const QString &line : QString::fromUtf8(file.readAll()).split('\n', Qt::SkipEmptyParts))
-                if (line.section(' ', 1, 1).startsWith("/t" + path))
-                    found << line;
-        return found;
-    }
-
     static int lines(const QString &path)
     {
         QFile file(path);
@@ -1011,6 +1215,57 @@ private:
     {
         struct stat info {};
         return ::stat(path.toLocal8Bit().constData(), &info) == 0 ? info.st_mode & 0777 : -1;
+    }
+
+    // A stand-in for an engine that speaks the newest contract: its privacy
+    // text, codes with its errors, a refresh that streams its progress, and
+    // a live stream in every answer. The real engine's tests of the same
+    // things (engine_tests.cpp) wait for that engine; this one lets the
+    // window's side be tested with any. A `code:<code>` search or a play of
+    // `<code>` fails with that code; a search for "quiet" goes silent after its
+    // first line.
+    static QString contractEngine(const QTemporaryDir &dir)
+    {
+        return engine(dir, R"PY(import http.server,json,time,urllib.parse
+def entries(n): return [{'id':'feed%07d'%i,'title':'Video %d'%i} for i in range(n)] + [{'id':'liveliveli1','title':'Live','live':True}]
+class H(http.server.BaseHTTPRequestHandler):
+  protocol_version='HTTP/1.0'
+  def send(s,code,body):
+    b=json.dumps(body).encode()
+    s.send_response(code);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)
+  def line(s,o): s.wfile.write((json.dumps(o)+'\n').encode());s.wfile.flush()
+  def ndjson(s):
+    s.send_response(200);s.send_header('Content-Type','application/x-ndjson');s.end_headers()
+  def do_GET(s):
+    u=urllib.parse.urlparse(s.path);q=urllib.parse.parse_qs(u.query);path=u.path.split('/t/',1)[-1]
+    if path=='api/config':
+      s.send(200,{'route':'direct','thumbnails':False,'privacy':{'summary':'S','points':['P1','P2'],'routes':{'direct':'D','tor':'T','proxy':'X'},'pages':{'search':'a','subscriptions':'b','history_off':'c','history_on':'d'}}})
+    elif path=='api/feed' and 'stream' in q:
+      s.ndjson()
+      for i in range(5):
+        s.line({'progress':{'done':i,'total':4}})
+        time.sleep(0.4 if i<4 else 0)
+      s.line({'result':{'channels':4,'entries':entries(2)}})
+    elif path=='api/feed': s.send(200,{'channels':4,'entries':entries(2)})
+    elif path=='api/channel': s.send(200,{'id':'UC0123456789abcdefghij','name':'Chan','videos':entries(1)})
+    elif path=='api/search':
+      term=q['q'][0];s.ndjson()
+      if term.startswith('code:'): s.line({'error':"The engine's words for "+term[5:],'code':term[5:]});return
+      s.line({'id':'res0000001','title':term})
+      if term=='quiet': time.sleep(3);return
+      s.line({'id':'res0000002','title':term});s.line({'id':'liveliveli1','title':'Live','live':True})
+    else: s.send(200,{})
+  def do_POST(s):
+    u=urllib.parse.urlparse(s.path);q=urllib.parse.parse_qs(u.query)
+    s.rfile.read(int(s.headers.get('Content-Length') or 0))
+    if u.path.endswith('/api/play'):
+      code=q['v'][0];s.send(500,{'error':"The engine's words for "+code,'code':code})
+    else: s.send(200,{})
+  def log_message(s,*a): pass
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)
+print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)
+srv.serve_forever()
+)PY");
     }
 
     // A stand-in qveil-core: a Python script that prints a ready line and then

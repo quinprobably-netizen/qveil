@@ -18,7 +18,8 @@ Item {
     readonly property bool selected: GridView.isCurrentItem && view.activeFocus && view.navigating
     readonly property bool lit: hover.hovered || selected
     readonly property bool veiled: view.veil && !lit
-    readonly property string thumb: backend.thumbBase ? backend.thumbBase + model.id : ""
+    // The batch is the page the card came with: its thumbnails share one circuit on Tor.
+    readonly property string thumb: Format.thumb(backend.thumbBase, model.id, model.batch)
     // How steeped in dye the thumbnail is: 1 veiled, 0 clear.
     property real steep: veiled ? 1 : 0
     Behavior on steep { NumberAnimation { duration: 420; easing.type: Easing.InOutCubic } }
@@ -117,6 +118,9 @@ Item {
                 // making a wall of one swirl.
                 strength: 0.85 * card.steep
                 seed: card.seed
+                // Every card steeps in a dye of its own, so a full grid doesn't
+                // read as one tile repeated.
+                variety: 1
                 drift: (1 - card.steep) * 1.4
             }
 

@@ -11,7 +11,8 @@ namespace {
 // in the entry for get(), and a change in one of them tells no view anything.
 const QList<QByteArray> &roleKeys() {
     static const QList<QByteArray> keys{"id",       "title",    "channel",  "channel_id", "published",
-                                        "date",     "estimated", "duration", "views",      "short"};
+                                        "date",     "estimated", "duration", "views",      "short",
+                                        "batch"};
     return keys;
 }
 
@@ -72,7 +73,7 @@ QVector<QVariantMap> VideoModel::distinct(const QVariantList &entries) {
     for (const QVariant &entry : entries) {
         const QVariantMap map = entry.toMap();
         const QString id = idOf(map);
-        if (id.isEmpty() || seen.contains(id))
+        if (id.isEmpty() || seen.contains(id) || map.value(QStringLiteral("live")).toBool())
             continue;
         seen.insert(id);
         found.append(map);
@@ -185,14 +186,21 @@ void VideoModel::move(int from, int to) {
 
 void VideoModel::insertRange(int at, const QVector<QVariantMap> &entries) {
     beginInsertRows({}, at, at + entries.size() - 1);
-    for (int i = 0; i < entries.size(); ++i)
-        m_rows.insert(at + i, entries.at(i));
+    for (int i = 0; i < entries.size(); ++i) {
+        QVariantMap row = entries.at(i);
+        if (m_batch > 0)
+            row.insert(QStringLiteral("batch"), m_batch);
+        m_rows.insert(at + i, row);
+    }
     endInsertRows();
     emit countChanged();
 }
 
-void VideoModel::update(int row, const QVariantMap &entry) {
+void VideoModel::update(int row, QVariantMap entry) {
     const QVariantMap &old = m_rows.at(row);
+    // The engine doesn't know the page a row came with.
+    if (old.contains(QStringLiteral("batch")))
+        entry.insert(QStringLiteral("batch"), old.value(QStringLiteral("batch")));
     if (old == entry)
         return;
     QVector<int> changed;

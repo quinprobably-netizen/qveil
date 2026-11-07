@@ -9,6 +9,8 @@
 #include <QNetworkProxy>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QSet>
 #include <QTimer>
 
@@ -41,7 +43,11 @@ void remember(const QString &base) {
 } // namespace
 
 Backend::Backend(const QProcessEnvironment &environment, const QString &core, QObject *parent)
-    : QObject(parent), m_environment(environment), m_corePath(core.isEmpty() ? corePath() : core) {
+    : QObject(parent), m_environment(environment), m_corePath(core.isEmpty() ? corePath() : core),
+      // Pages count up from a random start, so that a window started later
+      // doesn't name its first page like this one did: the engine puts the
+      // thumbnails of one name on one circuit, and two runs would share it.
+      m_batch(int(QRandomGenerator::global()->bounded(1, 1 << 30))) {
     // Only loopback traffic leaves this process; see main.cpp.
     m_net.setProxy(QNetworkProxy::NoProxy);
 
@@ -100,10 +106,41 @@ QString Backend::parseReady(const QByteArray &line) {
 }
 
 QString Backend::scrub(QString text) {
-    QMutexLocker lock(&secretsLock);
-    for (const QString &secret : std::as_const(secrets))
-        text.replace(secret, secret.contains('/') ? QStringLiteral("qveil-core") : QStringLiteral("<token>"));
+    {
+        QMutexLocker lock(&secretsLock);
+        for (const QString &secret : std::as_const(secrets))
+            text.replace(secret, secret.contains('/') ? QStringLiteral("qveil-core") : QStringLiteral("<token>"));
+    }
+    // A thumbnail's address names its video, and so does its batch. Qt quotes
+    // the address of one that fails to load, and the journal would then say
+    // what was on screen. (At least one character, so that scrubbing what has
+    // been scrubbed leaves it alone.)
+    static const QRegularExpression thumb(QStringLiteral("thumb/[^\\s\"'<>)]+"));
+    text.replace(thumb, QStringLiteral("thumb/<id>"));
     return text;
+}
+
+QVariantMap Backend::privacyOf(const QVariantMap &config) {
+    const QVariantMap sent = config.value("privacy").toMap();
+    auto text = [](const QVariantMap &from, const char *key) { return from.value(key).toString(); };
+    QVariantMap routes, pages;
+    const QVariantMap sentRoutes = sent.value("routes").toMap(), sentPages = sent.value("pages").toMap();
+    for (const char *key : {"direct", "tor", "proxy"})
+        routes.insert(key, text(sentRoutes, key));
+    for (const char *key : {"search", "subscriptions", "history_off", "history_on"})
+        pages.insert(key, text(sentPages, key));
+    QStringList points;
+    for (const QVariant &point : sent.value("points").toList())
+        if (!point.toString().isEmpty())
+            points << point.toString();
+    return {{"summary", text(sent, "summary")}, {"points", points}, {"routes", routes}, {"pages", pages}};
+}
+
+bool Backend::offersRoute(const QString &code) {
+    // The ones a different route may get past: YouTube refusing this IP, a
+    // route that isn't there, and YouTube slowing this IP down.
+    static const QSet<QString> codes{"bot_check", "tor_down", "proxy_refused", "rate_limited"};
+    return codes.contains(code);
 }
 
 void Backend::scrubLogs() {
@@ -186,11 +223,20 @@ void Backend::onEngineStopped() {
     setError(m_fatal);
 }
 
-void Backend::setError(const QString &message) {
-    if (m_error == message)
+void Backend::setError(const QString &message, const QString &code) {
+    if (m_error == message && m_errorCode == code)
         return;
     m_error = message;
+    m_errorCode = message.isEmpty() ? QString() : code;
     emit errorChanged();
+}
+
+void Backend::fail(const QString &message, const QString &code, const QString &fallback) {
+    // The user caused this one: they changed the route while the request ran,
+    // and the engine ended it. They know.
+    if (code == "route_changed")
+        return;
+    setError(message.isEmpty() ? fallback : message, code);
 }
 
 void Backend::reportError(const QString &message) { setError(message); }
@@ -236,8 +282,9 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
     QUrl url(m_base + "/" + path);
     url.setQuery(query);
     QNetworkRequest request(url);
-    // Feeds over Tor can take minutes; a stuck request still ends eventually.
-    request.setTransferTimeout(300000);
+    // A stuck request still ends eventually. The slow ones (a feed refresh
+    // over Tor) are streamed, which keeps this from running out (see stream()).
+    request.setTransferTimeout(m_idleTimeout);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
 
     const quint64 id = supersede(task);
@@ -260,8 +307,8 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const QJsonDocument doc = QJsonDocument::fromJson(data);
         if (status != 200) {
-            const QString message = doc.object().value("error").toString();
-            setError(message.isEmpty() ? failure(reply) : message);
+            const QJsonObject body = doc.object();
+            fail(body.value("error").toString(), body.value("code").toString(), failure(reply));
             if (m_latest.value(task) == id)
                 emit taskFailed(task);
             return;
@@ -328,20 +375,69 @@ void Backend::loadFeed(bool network, bool shorts, const QString &channel) {
     if (network && !channel.isEmpty())
         q.addQueryItem("channel", channel);
     q.addQueryItem("shorts", shorts ? "1" : "0");
+
+    // Refreshing every stale channel is a job of minutes over Tor, one request
+    // for each channel. The engine runs it once however many windows ask, says
+    // how far it is as it goes, and ends with the feed. A refresh of one
+    // channel is a single request and answers like any other.
+    if (network && channel.isEmpty()) {
+        q.addQueryItem("stream", "1");
+        stream(
+            "api/feed", q, "feed",
+            [this, shorts](const QVariantList &lines) {
+                for (const QVariant &line : lines) {
+                    const QVariantMap o = line.toMap();
+                    if (o.contains("progress")) {
+                        const QVariantMap progress = o.value("progress").toMap();
+                        setRefreshProgress(progress.value("done").toInt(), progress.value("total").toInt());
+                    } else if (o.contains("result")) {
+                        applyFeed(o.value("result").toMap(), true, shorts);
+                    } else if (o.contains("entries")) {
+                        // An engine that doesn't stream a refresh answers with the feed itself.
+                        applyFeed(o, true, shorts);
+                    }
+                }
+            },
+            [this] { setRefreshProgress(0, 0); });
+        return;
+    }
+
     // The cached feed and the network refresh are separate tasks, so the quick
     // cached answer shows while the refresh is still running.
-    call("GET", "api/feed", q, {}, network ? "feed" : "feed-cache", [this, network](const QJsonValue &v) {
-        if (!network && m_busy.contains("feed") && m_feed->count() > 0)
-            return;
-        const QJsonObject o = v.toObject();
-        m_feed->assign(o.value("entries").toArray().toVariantList());
-        m_feedInfo = o.toVariantMap();
-        m_feedInfo.remove("entries");
-        if (network)
-            m_feedInfo.insert("refreshedAt", QDateTime::currentSecsSinceEpoch());
-        emit feedChanged();
+    call("GET", "api/feed", q, {}, network ? "feed" : "feed-cache", [this, network, shorts](const QJsonValue &v) {
+        applyFeed(v.toObject().toVariantMap(), network, shorts);
     });
 }
+
+void Backend::applyFeed(const QVariantMap &answer, bool network, bool shorts) {
+    // Asked for before the Shorts choice changed, so its videos are the wrong
+    // ones. A refresh that was still running has saved what it fetched, though,
+    // so the cache has that now, for the choice that stands.
+    if (shorts != m_shorts) {
+        if (network)
+            loadFeed(false, m_shorts);
+        return;
+    }
+    newPage(m_feed);
+    m_feed->assign(answer.value("entries").toList());
+    m_feedInfo = answer;
+    m_feedInfo.remove("entries");
+    if (network)
+        m_feedInfo.insert("refreshedAt", QDateTime::currentSecsSinceEpoch());
+    emit feedChanged();
+}
+
+void Backend::setRefreshProgress(int done, int total) {
+    total = qMax(0, total);
+    done = qBound(0, done, total);
+    if (done == m_refreshDone && total == m_refreshTotal)
+        return;
+    m_refreshDone = done;
+    m_refreshTotal = total;
+    emit refreshProgressChanged();
+}
+
+void Backend::newPage(VideoModel *model) { model->setBatch(++m_batch); }
 
 void Backend::search(const QString &query) {
     const QString q = query.trimmed();
@@ -349,6 +445,7 @@ void Backend::search(const QString &query) {
         return;
     m_query = q;
     m_results->clear();
+    newPage(m_results);
     emit queryChanged();
     QUrlQuery params;
     params.addQueryItem("q", q);
@@ -358,15 +455,20 @@ void Backend::search(const QString &query) {
     stream("api/search", params, "search", [this](const QVariantList &batch) { m_results->append(batch); });
 }
 
-void Backend::stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch) {
+void Backend::stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch,
+                     std::function<void()> ended) {
     if (!ready()) {
         refuse(task);
+        if (ended)
+            ended();
         return;
     }
     QUrl url(m_base + "/" + path);
     url.setQuery(query);
     QNetworkRequest request(url);
-    request.setTransferTimeout(300000);
+    // Qt counts this from the last bytes received, so a stream that keeps
+    // sending (a refresh sends a line per channel) never runs into it.
+    request.setTransferTimeout(m_idleTimeout);
 
     const quint64 id = supersede(task);
     const quint64 generation = m_generation;
@@ -378,6 +480,7 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
         QByteArray buffer;
         QVariantList lines;
         QString error;
+        QString code;
     };
     auto state = std::make_shared<State>();
     auto *flush = new QTimer(reply);
@@ -400,9 +503,10 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
                 end = state->buffer.size();
             const QJsonObject o = QJsonDocument::fromJson(state->buffer.left(end)).object();
             state->buffer.remove(0, end + 1);
-            if (o.contains("error"))
+            if (o.contains("error")) {
                 state->error = o.value("error").toString();
-            else if (!o.isEmpty())
+                state->code = o.value("code").toString();
+            } else if (!o.isEmpty())
                 state->lines.append(o.toVariantMap());
         }
     };
@@ -416,11 +520,21 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
         if (!state->lines.isEmpty() && !flush->isActive())
             flush->start();
     });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, state, flush, parse, deliver, current, task] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, state, flush, parse, deliver, current, task, ended] {
         reply->deleteLater();
         if (m_replies.value(task) == reply)
             m_replies.remove(task);
         flush->stop();
+        // However this goes on, `ended` hears of it last: lines that were
+        // waiting to be handed on, a refresh's last progress among them, come
+        // before it.
+        struct Last {
+            std::function<void()> run;
+            ~Last() {
+                if (run)
+                    run();
+            }
+        } last{ended};
         setBusy(task, -1);
         // Hung up on by supersede(): what it had sent is no longer wanted,
         // and its device is closed.
@@ -430,16 +544,22 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
         if (status != 200) {
             if (!current())
                 return;
-            const QString message = QJsonDocument::fromJson(reply->readAll()).object().value("error").toString();
-            setError(message.isEmpty() ? failure(reply) : message);
+            const QJsonObject body = QJsonDocument::fromJson(reply->readAll()).object();
+            fail(body.value("error").toString(), body.value("code").toString(), failure(reply));
             emit taskFailed(task);
             return;
         }
-        state->buffer += reply->readAll();
+        // A request that timed out has been closed, and has nothing to read.
+        if (reply->isOpen())
+            state->buffer += reply->readAll();
         parse(true);
         deliver();
-        if (!state->error.isEmpty() && current()) {
-            setError(state->error);
+        if (!current())
+            return;
+        // The engine's own words if it said any; else the connection's (cut
+        // short, or silent for too long).
+        if (!state->error.isEmpty() || reply->error() != QNetworkReply::NoError) {
+            fail(state->error, state->code, failure(reply));
             emit taskFailed(task);
         }
     });
@@ -453,12 +573,16 @@ void Backend::openChannel(const QString &id) {
     if (m_channel.value("id").toString() != id) {
         m_channel = QVariantMap{{"id", id}, {"name", QString()}};
         m_channelVideos->clear();
+        newPage(m_channelVideos);
         emit channelChanged();
     }
     QUrlQuery q;
     q.addQueryItem("id", id);
     call("GET", "api/channel", q, {}, "channel", [this](const QJsonValue &v) {
         QJsonObject page = v.toObject();
+        // The videos of a channel opened again (refreshed) are a new page too;
+        // the cards that stay keep the thumbnails they have.
+        newPage(m_channelVideos);
         m_channelVideos->assign(page.take("videos").toArray().toVariantList());
         m_channel = page.toVariantMap();
         emit channelChanged();
@@ -519,7 +643,7 @@ void Backend::importFile(const QUrl &file) {
     }
     call("POST", "api/subs/import", {}, f.readAll(), "import", [this](const QJsonValue &v) {
         const int added = v.toObject().value("added").toInt();
-        emit notice(tr("Imported %n new channel(s), offline", "", added));
+        emit notice(tr("Imported %n new channel(s)", "", added));
         loadSubs();
         // The imported channels have never been fetched, so they count as stale.
         loadFeed(true, m_shorts);

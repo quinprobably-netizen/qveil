@@ -13,12 +13,12 @@
 
 #include <clocale>
 #include <cstdio>
-#include <cstring>
 #include <unistd.h>
 #include <vector>
 
 #include "backend.h"
 #include "datadirs.h"
+#include "launch.h"
 #include "mpvitem.h"
 #include "theme.h"
 #include "translator.h"
@@ -33,7 +33,7 @@ int main(int argc, char *argv[]) {
     // `qveil` and `qveil open` open the window. Anything else is a command for
     // the engine (`qveil feed --json`, `qveil sub add @x`), so scripts and agents
     // can drive qveil without a display.
-    if (argc > 1 && std::strcmp(argv[1], "open") != 0) {
+    if (!opensWindow(argc, argv)) {
         const QByteArray core = Backend::corePath().toLocal8Bit();
         std::vector<char *> args{const_cast<char *>(core.constData())};
         for (int i = 1; i < argc; ++i)

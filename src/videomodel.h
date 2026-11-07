@@ -14,6 +14,9 @@
 //
 // The roles are named like the engine's JSON keys, so a delegate reads
 // `model.title` or `model.channel_id`; `get(row)` returns the whole entry.
+//
+// Live streams are not shown (the engine marks them `"live": true`), because
+// qveil can't play them: no grid has a card for one.
 class VideoModel : public QAbstractListModel {
     Q_OBJECT
     Q_PROPERTY(int count READ count NOTIFY countChanged)
@@ -31,8 +34,17 @@ public:
     // The IDs in order, which is what the tests compare views against.
     QStringList ids() const;
 
+    // Names the page the rows added from now on belong to; 0 (the start) names none.
+    // A row keeps the number it was added with, so the cards of a page that
+    // is updated in place aren't told anything, and their thumbnails don't
+    // load again. The engine puts the thumbnails of one number on one Tor
+    // circuit (`?batch=<n>`), which is what a browser's page load looks like.
+    void setBatch(int batch) { m_batch = batch; }
+    int batch() const { return m_batch; }
+
     // Makes the rows exactly `entries`. An entry without an ID is skipped,
-    // and so is a repeat of an ID already seen: the first one counts.
+    // and so is a repeat of an ID already seen (the first one counts) and a
+    // live stream.
     void assign(const QVariantList &entries);
     // Adds the entries whose IDs aren't there yet, after the last row.
     void append(const QVariantList &entries);
@@ -48,7 +60,8 @@ private:
     void removeRange(int first, int last);
     void move(int from, int to);
     void insertRange(int at, const QVector<QVariantMap> &entries);
-    void update(int row, const QVariantMap &entry);
+    void update(int row, QVariantMap entry);
 
     QVector<QVariantMap> m_rows;
+    int m_batch = 0;
 };

@@ -52,3 +52,13 @@ function meta(video, date) {
         parts.push(v)
     return parts.join("  ·  ")
 }
+
+// A thumbnail's address: `base` is the engine's thumbnail base (empty while
+// thumbnails are off or unavailable), `batch` the page the card came with.
+// The engine puts the thumbnails of one batch on one Tor circuit, as a
+// browser's page load would; without one, a thumbnail has a circuit of its own.
+function thumb(base, id, batch) {
+    if (!base || !id)
+        return ""
+    return base + id + (batch > 0 ? "?batch=" + batch : "")
+}

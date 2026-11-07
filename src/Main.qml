@@ -111,6 +111,21 @@ ApplicationWindow {
         backend.play(video.id)
     }
 
+    // Over a video the route popup hangs from the top bar, which is hidden
+    // while the controls are: bring it back first.
+    function openRoute() {
+        if (player.active)
+            player.reveal()
+        route.open()
+    }
+
+    function toggleRoute() {
+        if (route.opened)
+            route.close()
+        else
+            win.openRoute()
+    }
+
     function toggleFullscreen() {
         if (fullscreen)
             showNormal()
@@ -167,6 +182,7 @@ ApplicationWindow {
     Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; onActivated: win.go("subs") }
     Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; onActivated: win.go("history") }
     Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !player.active; onActivated: win.refresh() }
+    Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; onActivated: win.toggleRoute() }
     Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: win.toggleFullscreen() }
     Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: player.mpv.muted = !player.mpv.muted }
     Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
@@ -189,7 +205,7 @@ ApplicationWindow {
         PlayerView {
             id: player
             anchors.fill: parent
-            topInset: topBar.visible ? topBar.height : 0
+            topInset: (topBar.visible ? topBar.height : 0) + (errorBar.visible ? errorBar.height : 0)
             // The bar goes with the controls, but not while it is in use.
             hold: barHover.hovered || win.typing || route.opened || help.opened
             savedVolume: prefs.volume
@@ -246,6 +262,10 @@ ApplicationWindow {
                         pixelSize: 25
                         Layout.rightMargin: 18
                         Layout.alignment: Qt.AlignVCenter
+                        // Over a video the dye would sit on the picture as a
+                        // muddy blotch. It keeps its place, so the tabs don't
+                        // move when a video opens.
+                        opacity: player.active ? 0 : 1
                     }
 
                     Repeater {
@@ -270,13 +290,70 @@ ApplicationWindow {
 
                     RouteChip {
                         Layout.leftMargin: 8
-                        onClicked: route.opened ? route.close() : route.open()
+                        onClicked: win.toggleRoute()
                         RoutePopup {
                             id: route
+                            objectName: "routePopup"
                             prefs: prefs
                             y: parent.height + 8
                             x: parent.width - width
                         }
+                    }
+                }
+            }
+
+            // Errors stay until dismissed; they say what went wrong. The bar
+            // is part of the column, so the page gets shorter instead of the
+            // bar sitting on the last row of videos or on the player's controls.
+            Rectangle {
+                id: errorBar
+                objectName: "errorBar"
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.max(52, errorText.implicitHeight + 24)
+                visible: backend.error !== ""
+                color: "#2b1417"
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: 1
+                    color: "#6b2a31"
+                }
+
+                Label {
+                    id: errorText
+                    anchors.left: parent.left
+                    anchors.right: errorActions.left
+                    anchors.leftMargin: 28
+                    anchors.rightMargin: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: backend.error
+                    wrapMode: Text.Wrap
+                    color: "#ffd9dc"
+                }
+                RowLayout {
+                    id: errorActions
+                    anchors.right: parent.right
+                    anchors.rightMargin: 14
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 4
+
+                    // The only thing an error offers to do: for the errors another
+                    // route may get past (a bot check, a route that is down).
+                    Button {
+                        objectName: "changeRoute"
+                        visible: backend.errorOffersRoute
+                        text: qsTr("Change route")
+                        flat: true
+                        onClicked: {
+                            backend.clearError()
+                            win.openRoute()
+                        }
+                    }
+                    ToolButton {
+                        icon.source: "qrc:/icons/close.svg"
+                        onClicked: backend.clearError()
                     }
                 }
             }
@@ -287,6 +364,7 @@ ApplicationWindow {
 
                 VideoPage {
                     id: feedPage
+                    objectName: "feedPage"
                     anchors.fill: parent
                     visible: win.page === "feed" && !player.active
                     focus: visible
@@ -295,6 +373,10 @@ ApplicationWindow {
                     washEmpty: win.noSubs
                     heading: qsTr("Feed")
                     subheading: {
+                        // While it runs, how far the refresh is; it says more than the
+                        // channel count, which it would only repeat.
+                        if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
+                            return qsTr("Refreshing %1 of %2").arg(backend.refreshDone).arg(backend.refreshTotal)
                         const info = backend.feedInfo
                         if (!info.channels)
                             return ""
@@ -342,11 +424,12 @@ ApplicationWindow {
 
                 VideoPage {
                     id: searchPage
+                    objectName: "searchPage"
                     anchors.fill: parent
                     visible: win.page === "search" && !player.active
                     veil: prefs.veilThumbnails
                     heading: backend.query ? qsTr("“%1”").arg(backend.query) : qsTr("Search")
-                    subheading: qsTr("Straight from YouTube's search, without an account, cookies or history.")
+                    subheading: backend.privacy.pages.search
                     model: backend.results
                     estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
                     loading: backend.busy.indexOf("search") >= 0
@@ -411,44 +494,20 @@ ApplicationWindow {
                     onPlayRequested: video => win.play(video)
                 }
 
+                // A thin bar along the top of the page while anything is loading.
+                // It fills as a feed refresh gets through its channels, and
+                // only then: anything else running at the same time makes it
+                // as long as that is.
                 ProgressBar {
+                    objectName: "progress"
+                    readonly property var tasks: backend.busy.filter(t => t !== "play" && t !== "config")
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top
-                    indeterminate: true
-                    visible: !player.active && backend.busy.some(t => t !== "play" && t !== "config")
+                    indeterminate: !(backend.refreshTotal > 0 && tasks.length === 1 && tasks[0] === "feed")
+                    value: backend.refreshTotal > 0 ? backend.refreshDone / backend.refreshTotal : 0
+                    visible: !player.active && tasks.length > 0
                 }
-            }
-        }
-
-        // Errors stay until dismissed; they say what went wrong.
-        Rectangle {
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: 18
-            width: Math.min(parent.width - 40, errorText.implicitWidth + 80)
-            height: errorText.implicitHeight + 24
-            visible: backend.error !== ""
-            radius: theme.radius
-            color: "#2b1417"
-            border.color: "#6b2a31"
-
-            Label {
-                id: errorText
-                anchors.left: parent.left
-                anchors.right: closeError.left
-                anchors.leftMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                text: backend.error
-                wrapMode: Text.Wrap
-                color: "#ffd9dc"
-            }
-            ToolButton {
-                id: closeError
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                icon.source: "qrc:/icons/close.svg"
-                onClicked: backend.clearError()
             }
         }
 
@@ -462,7 +521,7 @@ ApplicationWindow {
             }
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
-            anchors.bottomMargin: backend.error !== "" ? 90 : 24
+            anchors.bottomMargin: 24
             width: toastLabel.implicitWidth + 36
             height: 40
             radius: Math.min(20, theme.radius)
@@ -483,7 +542,7 @@ ApplicationWindow {
             }
         }
 
-        // Dropping an export imports it, offline.
+        // Dropping an export imports it.
         DropArea {
             id: drop
             anchors.fill: parent
@@ -499,7 +558,7 @@ ApplicationWindow {
                 border.color: theme.accent
                 Label {
                     anchors.centerIn: parent
-                    text: qsTr("Drop to import subscriptions (read offline)")
+                    text: qsTr("Drop to import subscriptions")
                     font.pixelSize: 18
                 }
             }
@@ -551,10 +610,10 @@ ApplicationWindow {
         leftPadding: 12
         rightPadding: 14
         hoverEnabled: true
-        ToolTip.visible: hovered
+        // What the engine says about this route, as it says it.
+        ToolTip.visible: hovered && ToolTip.text !== ""
         ToolTip.delay: 500
-        ToolTip.text: route === "direct" ? qsTr("YouTube sees your IP address. Click to change.")
-                                          : qsTr("Your IP is hidden from YouTube. Click for details.")
+        ToolTip.text: backend.privacy.summary
         contentItem: RowLayout {
             spacing: 8
             Rectangle {

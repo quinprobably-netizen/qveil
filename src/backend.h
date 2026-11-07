@@ -25,12 +25,24 @@ class Backend : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool ready READ ready NOTIFY readyChanged)
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
+    // The engine's code for the error (see errorOffersRoute), or empty.
+    Q_PROPERTY(QString errorCode READ errorCode NOTIFY errorChanged)
+    // Whether the error is one that another route may get past, so the window
+    // offers to change it.
+    Q_PROPERTY(bool errorOffersRoute READ errorOffersRoute NOTIFY errorChanged)
     Q_PROPERTY(QStringList busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QVariantMap config READ config NOTIFY configChanged)
+    // What the engine says about privacy, which the window shows as it is and
+    // never words itself (see privacyOf).
+    Q_PROPERTY(QVariantMap privacy READ privacy NOTIFY configChanged)
     // The videos of each page live in a model that is updated in place, so a
     // refresh landing in the background doesn't rebuild the grid showing it.
     Q_PROPERTY(VideoModel *feed READ feed CONSTANT)
     Q_PROPERTY(QVariantMap feedInfo READ feedInfo NOTIFY feedChanged)
+    // How far the running refresh is: channels done of channels to do. Both
+    // are 0 while no refresh runs, or one that hasn't said how many there are.
+    Q_PROPERTY(int refreshDone READ refreshDone NOTIFY refreshProgressChanged)
+    Q_PROPERTY(int refreshTotal READ refreshTotal NOTIFY refreshProgressChanged)
     Q_PROPERTY(VideoModel *results READ results CONSTANT)
     Q_PROPERTY(QString query READ query NOTIFY queryChanged)
     // The open channel's id, name and whether it is subscribed; its videos are `channelVideos`.
@@ -58,16 +70,27 @@ public:
     static QString scrub(QString text);
     // Makes everything Qt logs go through scrub().
     static void scrubLogs();
+    // The engine's privacy text from its config, in the shape QML reads
+    // without checking: every field is there, empty when the engine didn't
+    // send it, so the window shows nothing rather than words of its own.
+    static QVariantMap privacyOf(const QVariantMap &config);
+    // Whether another route may get past an error with this code.
+    static bool offersRoute(const QString &code);
 
     // Starts the engine. Also how it is brought back after it dies.
     void start();
 
     bool ready() const { return !m_base.isEmpty(); }
     QString error() const { return m_error; }
+    QString errorCode() const { return m_errorCode; }
+    bool errorOffersRoute() const { return offersRoute(m_errorCode); }
     QStringList busy() const { return m_busy.keys(); }
     QVariantMap config() const { return m_config; }
+    QVariantMap privacy() const { return privacyOf(m_config); }
     VideoModel *feed() const { return m_feed; }
     QVariantMap feedInfo() const { return m_feedInfo; }
+    int refreshDone() const { return m_refreshDone; }
+    int refreshTotal() const { return m_refreshTotal; }
     VideoModel *results() const { return m_results; }
     QString query() const { return m_query; }
     QVariantMap channel() const { return m_channel; }
@@ -101,6 +124,11 @@ public:
     // new failure rather than a repeat of the last one.
     static constexpr int StableAfterMs = 60000;
     void setStableAfter(int milliseconds) { m_stable.setInterval(milliseconds); }
+    // How long a request may go without receiving anything before it is given
+    // up on. A refresh sends a line for each channel it has done, so it only
+    // runs into this when the engine has stopped answering.
+    static constexpr int IdleTimeoutMs = 300000;
+    void setIdleTimeout(int milliseconds) { m_idleTimeout = milliseconds; }
 
 signals:
     void readyChanged();
@@ -108,6 +136,7 @@ signals:
     void busyChanged();
     void configChanged();
     void feedChanged();
+    void refreshProgressChanged();
     void queryChanged();
     void channelChanged();
     void subsChanged();
@@ -131,11 +160,17 @@ private:
               const QString &task, Done done, bool everyAnswer = false);
     // A GET whose answer is one JSON object per line, sent as they are ready
     // (see qveil-core's streamed search). `batch` gets them a few at a time.
-    void stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch);
+    // `ended` runs once the request is over, whatever became of it.
+    void stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch,
+                std::function<void()> ended = {});
     // Lines that arrive together are handed on together, so a page of
     // results is one update of the grid rather than twenty.
     static constexpr int BatchMs = 100;
-    void setError(const QString &message);
+    void setError(const QString &message, const QString &code = {});
+    // Shows what the engine said about a failed request, or `fallback` when it
+    // said nothing. An error whose cause is the user (they switched the route
+    // while the request ran) is not shown.
+    void fail(const QString &message, const QString &code, const QString &fallback);
     void setBusy(const QString &task, int delta);
     // A request that can't be sent because the engine isn't ready. Says why
     // when it is gone for good, and always says that `task` won't be answered,
@@ -157,6 +192,12 @@ private:
     // The feed request itself, without the one-refresh-at-a-time guard of
     // refreshFeed(). `channel` limits a refresh to that one channel.
     void loadFeed(bool network, bool shorts, const QString &channel = {});
+    // Shows a feed the engine answered with, unless it was asked for with
+    // another Shorts choice than the current one.
+    void applyFeed(const QVariantMap &answer, bool network, bool shorts);
+    void setRefreshProgress(int done, int total);
+    // Starts a new page of thumbnails for `model` (see VideoModel::setBatch).
+    void newPage(VideoModel *model);
     // Takes a config from the engine, and says so if it moved the route.
     // `routeSet` is true when the window itself just asked for that route.
     void adoptConfig(const QVariantMap &next, bool routeSet);
@@ -169,11 +210,17 @@ private:
     QNetworkAccessManager m_net;
     QString m_base;
     QString m_error;
+    QString m_errorCode;
     QHash<QString, int> m_busy;
     QHash<QString, quint64> m_latest;
     // The request in flight for each task that is newestOnly().
     QHash<QString, QPointer<QNetworkReply>> m_replies;
     quint64 m_sequence = 0;
+    int m_idleTimeout = IdleTimeoutMs;
+    // The number of the latest page of thumbnails; see newPage().
+    int m_batch;
+    int m_refreshDone = 0;
+    int m_refreshTotal = 0;
     bool m_quitting = false;
 
     // An engine that dies is restarted once. A second death in a row is final,
