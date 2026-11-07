@@ -82,6 +82,21 @@ pub fn search(rt: &Runtime, query: &str, limit: usize) -> Result<Vec<Video>> {
     rt.yt.search(query, limit)
 }
 
+/// `search`, with each result handed to `each` as soon as it is in (see
+/// `Ytdlp::search_each`).
+pub fn search_each(
+    rt: &Runtime,
+    query: &str,
+    limit: usize,
+    each: &mut dyn FnMut(Video) -> bool,
+) -> Result<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("empty search");
+    }
+    rt.yt.search_each(query, limit, each)
+}
+
 #[derive(Serialize)]
 pub struct FeedResult {
     pub entries: Vec<Entry>,

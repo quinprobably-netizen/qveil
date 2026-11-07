@@ -13,6 +13,7 @@ use crate::errors::friendly;
 use crate::ids::{self, VideoRef};
 use crate::net::{self, Net, TOR_PROXY};
 use crate::store::Paths;
+use crate::video::Video;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
@@ -419,6 +420,9 @@ impl Server {
                 self.relay(&mut stream, &req, sid, kind)
             }
             ("GET", ["thumb", id]) => self.thumb(&mut stream, id),
+            ("GET", ["api", "search"]) if req.flag("stream") => {
+                self.search_stream(&mut stream, &req)
+            }
             _ => match self.api(&req, &segs) {
                 Ok(Some(v)) => respond(
                     &mut stream,
@@ -588,6 +592,48 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    /// A search whose results are sent as they come in, one JSON object per
+    /// line, so the window can show YouTube's first page of results while
+    /// the second is still on its way. A search that fails before its first
+    /// result is an ordinary error; one that fails later ends with a line
+    /// `{"error": …}`.
+    fn search_stream(&self, out: &mut TcpStream, req: &Request) -> Result<()> {
+        let rt = self.runtime();
+        let n = req.num("n", 40).clamp(1, MAX_SEARCH);
+        let mut started = false;
+        let mut gone = false;
+        let mut each = |v: Video| {
+            let mut line = json!(v).to_string();
+            line.push('\n');
+            if !started {
+                started = true;
+                line.insert_str(
+                    0,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                );
+            }
+            gone = out.write_all(line.as_bytes()).is_err();
+            !gone
+        };
+        let result = req
+            .param("q")
+            .and_then(|q| app::search_each(&rt, q, n, &mut each));
+        let error = |e: anyhow::Error| friendly(&format!("{e:#}"));
+        match result {
+            Err(e) if !started => {
+                let body = json!({ "error": error(e) }).to_string();
+                respond(out, 500, "application/json", body.as_bytes())
+            }
+            Err(e) => {
+                let line = format!("{}\n", json!({ "error": error(e) }));
+                out.write_all(line.as_bytes())?;
+                Ok(())
+            }
+            Ok(_) if !started && !gone => respond(out, 200, "application/x-ndjson", b""),
+            Ok(_) => Ok(()),
+        }
     }
 
     fn thumb(&self, out: &mut TcpStream, id: &str) -> Result<()> {
@@ -1737,6 +1783,130 @@ echo '{"entries":[]}'"#,
             let target = std::fs::read_to_string(bin.0.join("asked")).unwrap();
             assert_eq!(target.trim(), format!("'ytsearch{asked}:a'"), "n={n}");
         }
+    }
+
+    /// A yt-dlp that prints search results one per line, the way
+    /// `--lazy-playlist -j` does: two, a pause, then a third. `tail` is shell
+    /// run after them.
+    fn streaming_ytdlp(dir: &std::path::Path, tail: &str) -> String {
+        let line =
+            |id: &str| format!("echo '{{\"id\":\"{id}\",\"title\":\"t\",\"channel\":\"c\"}}'");
+        crate::store::testing::script(
+            &dir.join("yt-dlp"),
+            &format!(
+                // Carries on when its output is closed, like a program that
+                // doesn't die of SIGPIPE: only being killed stops it.
+                "trap '' PIPE\necho \"$*\" > \"$(dirname \"$0\")/args\"\n{}\n{}\nsleep 1\n{}\n{tail}\n",
+                line("aaaaaaaaaaa"),
+                line("bbbbbbbbbbb"),
+                line("ccccccccccc")
+            ),
+        )
+    }
+
+    #[test]
+    fn a_streamed_search_sends_each_result_as_it_comes() {
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: streaming_ytdlp(&bin.0, ""),
+            ..Config::default()
+        });
+        let mut c = TcpStream::connect(addr(&base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let target = path(&base, "api/search?q=rust&stream=1");
+        write!(c, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let started = Instant::now();
+        let mut r = BufReader::new(c);
+        let mut head = String::new();
+        while !head.ends_with("\r\n\r\n") {
+            assert!(r.read_line(&mut head).unwrap() > 0);
+        }
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("application/x-ndjson"), "{head}");
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        r.read_line(&mut line).unwrap();
+        // The first two arrive before yt-dlp's pause is over.
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
+        let mut rest = String::new();
+        r.read_to_string(&mut rest).unwrap();
+        let ids: Vec<String> = line
+            .lines()
+            .chain(rest.lines())
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+        assert_eq!(ids, ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"]);
+        let args = std::fs::read_to_string(bin.0.join("args")).unwrap();
+        assert!(args.contains("--lazy-playlist"), "{args}");
+    }
+
+    #[test]
+    fn a_streamed_search_that_fails_says_so() {
+        let bin = TempDir::new();
+        // Fails after its results: the stream ends with the error.
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: streaming_ytdlp(&bin.0, "echo 'ERROR: the network went away' >&2; exit 1"),
+            ..Config::default()
+        });
+        let (status, body) = http(&base, "GET", &path(&base, "api/search?q=a&stream=1"), "");
+        assert_eq!(status, 200);
+        let last: Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert!(
+            last["error"]
+                .as_str()
+                .unwrap()
+                .contains("network went away"),
+            "{body}"
+        );
+        assert_eq!(body.lines().count(), 4, "{body}");
+
+        // Fails before any: an ordinary error.
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: crate::store::testing::script(
+                &bin.0.join("yt-dlp"),
+                "echo 'ERROR: nope' >&2; exit 1",
+            ),
+            ..Config::default()
+        });
+        let (status, body) = http(&base, "GET", &path(&base, "api/search?q=a&stream=1"), "");
+        assert_eq!(status, 500);
+        assert!(body.contains("nope"), "{body}");
+    }
+
+    #[test]
+    fn a_streamed_search_stops_yt_dlp_when_the_window_goes_away() {
+        let bin = TempDir::new();
+        let done = bin.0.join("finished");
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: streaming_ytdlp(
+                &bin.0,
+                &format!(
+                    "for i in 1 2 3 4 5; do echo '{{\"id\":\"ddddddddddd\",\"title\":\"t\"}}'; sleep 0.1; done; sleep 2; touch '{}'",
+                    done.display()
+                ),
+            ),
+            ..Config::default()
+        });
+        let mut c = TcpStream::connect(addr(&base)).unwrap();
+        let target = path(&base, "api/search?q=rust&stream=1");
+        write!(c, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut first = [0u8; 64];
+        let _ = c.read(&mut first).unwrap();
+        drop(c);
+        // The later results find nobody to read them, and yt-dlp is stopped
+        // instead of carrying on.
+        std::thread::sleep(Duration::from_millis(4500));
+        assert!(!done.exists(), "yt-dlp ran to the end");
     }
 
     #[test]

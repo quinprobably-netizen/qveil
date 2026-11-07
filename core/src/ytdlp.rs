@@ -125,27 +125,109 @@ impl Ytdlp {
             );
         };
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let line = err
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("unknown error")
-                .trim();
-            return Err(Failed {
-                raw: self
-                    .net
-                    .explain(line.strip_prefix("ERROR: ").unwrap_or(line)),
-            }
-            .into());
+            return Err(self.failure(&out.stderr));
         }
         serde_json::from_slice(&out.stdout).context("yt-dlp returned invalid JSON")
+    }
+
+    /// What a failed run says: its last line on stderr.
+    fn failure(&self, stderr: &[u8]) -> anyhow::Error {
+        let err = String::from_utf8_lossy(stderr);
+        let line = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("unknown error")
+            .trim();
+        Failed {
+            raw: self
+                .net
+                .explain(line.strip_prefix("ERROR: ").unwrap_or(line)),
+        }
+        .into()
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Video>> {
         let q = format!("ytsearch{limit}:{query}");
         let v = self.json(&["--flat-playlist", "-J"], &q, QUICK)?;
         Ok(entries(&v))
+    }
+
+    /// The same search, handing each result to `each` as soon as yt-dlp has
+    /// it: YouTube answers a search 20 results at a time, and the first
+    /// page needn't wait for the second. The requests are the same as
+    /// `search`'s. `each` returns false to stop (the window went away), and
+    /// yt-dlp is then killed. Returns how many results there were.
+    pub fn search_each(
+        &self,
+        query: &str,
+        limit: usize,
+        each: &mut dyn FnMut(Video) -> bool,
+    ) -> Result<usize> {
+        let q = format!("ytsearch{limit}:{query}");
+        crate::store::ensure_dir(&self.cache_dir)?;
+        let call = Call::new(&self.net, None, &q)?;
+        let mut child = self
+            .command(&call)
+            .args(["--flat-playlist", "--lazy-playlist", "-j"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running {:?} (is yt-dlp installed?)", self.bin))?;
+        let stdout = child.stdout.take().context("no stdout")?;
+        let stderr = drain(child.stderr.take());
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        // Kills yt-dlp at the deadline, or as soon as `done` is sent.
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let child = std::sync::Arc::clone(&child);
+            std::thread::spawn(move || {
+                let late = finished.recv_timeout(QUICK).is_err();
+                let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+                late
+            })
+        };
+        let (mut n, mut stopped) = (0, false);
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if let Some(video) = entry(&v, &None, &None) {
+                n += 1;
+                if !each(video) {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        // Whether it finished, was stopped or ran out of time, it ends here.
+        let status = loop {
+            // Never blocks with the lock held, so the watchdog can always kill.
+            let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
+            if stopped {
+                let _ = child.kill();
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            drop(child);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = done.send(());
+        let late = watchdog.join().unwrap_or(false) && !status.success();
+        drop(call);
+        let stderr = stderr.join().unwrap_or_default();
+        if stopped || status.success() {
+            return Ok(n);
+        }
+        if late {
+            bail!(
+                "yt-dlp didn't finish within {} s and was stopped; the route may be slow or down",
+                QUICK.as_secs()
+            );
+        }
+        Err(self.failure(&stderr))
     }
 
     /// Returns (channel id, display name).
