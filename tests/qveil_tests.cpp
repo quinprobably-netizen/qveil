@@ -557,8 +557,12 @@ private slots:
     {
         // The fake hyprctl lives apart from the theme directory: the theme
         // watches its directory and re-reads rounding on any change there,
-        // which would make rewriting the response look like a reload.
-        QTemporaryDir dir, tools;
+        // which would make rewriting the response look like a reload. It
+        // watches the directory's parent too, so that is a private one, not
+        // /tmp, which other programs change at any moment.
+        QTemporaryDir root, tools;
+        QVERIFY(QDir(root.path()).mkdir("theme"));
+        const QString themeDir = root.filePath("theme");
         const QString response = tools.filePath("response.json"), command = tools.filePath("hyprctl");
         auto write = [](const QString &path, const QByteArray &data) {
             QFile file(path);
@@ -574,7 +578,7 @@ private slots:
         QLocalServer hyprland;
         QVERIFY(hyprland.listen(sockets.filePath("events.sock")));
 
-        Theme theme(dir.path(), nullptr, command, sockets.filePath("events.sock"));
+        Theme theme(themeDir, nullptr, command, sockets.filePath("events.sock"));
         // The first query reads the rounding.
         QTRY_COMPARE(theme.radius(), 4);
         QTRY_VERIFY(hyprland.hasPendingConnections());
