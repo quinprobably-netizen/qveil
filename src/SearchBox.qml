@@ -2,12 +2,17 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 
-// A compact search field for the top bar (a Material TextField is 56px tall
-// and floats its placeholder).
+// A compact field for the top bar and the subscriptions page (a Material
+// TextField is 56px tall and floats its placeholder). It is the search box
+// unless told otherwise.
 FocusScope {
     id: box
 
     property alias text: input.text
+    property string placeholder: qsTr("Search YouTube")
+    property url icon: "qrc:/icons/search.svg"
+    // The key that focuses the field, shown while it is empty and unfocused.
+    property string hint: "/"
     signal submitted(string query)
 
     function selectAll() { input.selectAll() }
@@ -23,7 +28,8 @@ FocusScope {
 
     Image {
         id: glass
-        source: "qrc:/icons/search.svg"
+        source: box.icon
+        visible: box.icon.toString() !== ""
         sourceSize: Qt.size(18, 18)
         opacity: 0.5
         anchors.left: parent.left
@@ -33,9 +39,9 @@ FocusScope {
 
     TextInput {
         id: input
-        anchors.left: glass.right
+        anchors.left: glass.visible ? glass.right : parent.left
         anchors.right: parent.right
-        anchors.leftMargin: 10
+        anchors.leftMargin: glass.visible ? 10 : 14
         anchors.rightMargin: 12
         anchors.verticalCenter: parent.verticalCenter
         focus: true
@@ -50,7 +56,7 @@ FocusScope {
         Label {
             anchors.verticalCenter: parent.verticalCenter
             visible: input.text === ""
-            text: qsTr("Search YouTube")
+            text: box.placeholder
             font.pixelSize: 14
             color: "#6f6f7b"
         }
@@ -60,8 +66,8 @@ FocusScope {
         anchors.right: parent.right
         anchors.rightMargin: 10
         anchors.verticalCenter: parent.verticalCenter
-        visible: !input.activeFocus && input.text === ""
-        text: "/"
+        visible: !input.activeFocus && input.text === "" && box.hint !== ""
+        text: box.hint
         font.pixelSize: 12
         color: "#55555f"
     }

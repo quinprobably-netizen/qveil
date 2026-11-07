@@ -50,6 +50,10 @@ int main(int argc, char *argv[]) {
     // later and finds nothing left to move.
     DataDirs::prepare();
 
+    // Qt quotes the URL of a failed request in its warnings, and the engine's
+    // token is in every URL the window uses.
+    Backend::scrubLogs();
+
     // libmpv renders through OpenGL into the scene.
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
 

@@ -79,15 +79,16 @@ ApplicationWindow {
         Qt.callLater(() => win.focusPage("channel"))
     }
 
-    // What the Refresh button and R do. Asked for by hand, so every channel is
-    // fetched, not only the ones the engine thinks are stale.
+    // What the Refresh button and R do. Like startup, this fetches only the
+    // channels that have gone stale: pressing it again must not repeat the
+    // burst of requests for exactly your channels.
     function refresh() {
         if (page === "channel")
             backend.openChannel(backend.channel.id)
         else if (page === "search")
             backend.search(backend.query)
         else
-            backend.refreshFeed(true, prefs.showShorts, true)
+            backend.refreshFeed(true, prefs.showShorts)
     }
 
     // The first run's way in: Subscriptions, with the add field ready to type in.
@@ -99,8 +100,8 @@ ApplicationWindow {
 
     function playCurrent() {
         const p = pages[page]
-        if (p && p.grid && p.grid.currentIndex >= 0 && p.model.length > 0)
-            win.play(p.model[p.grid.currentIndex])
+        if (p && p.grid && p.grid.currentIndex >= 0 && p.model.count > 0)
+            win.play(p.model.get(p.grid.currentIndex))
     }
 
     // The player opens at once, with what the card knows, while the engine
@@ -242,7 +243,7 @@ ApplicationWindow {
 
                     Wordmark {
                         text: "qveil"
-                        pixelSize: 23
+                        pixelSize: 25
                         Layout.rightMargin: 18
                         Layout.alignment: Qt.AlignVCenter
                     }
@@ -306,7 +307,7 @@ ApplicationWindow {
                     estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
                     loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
                     emptyText: backend.feedInfo.channels === 0
-                               ? qsTr("Your feed is built from the channels you subscribe to, on this computer only. Add one below, or drop a Google Takeout subscriptions.csv here.")
+                               ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
                                : qsTr("Nothing here yet. Press R to refresh.")
                     emptyActions: [
                         Button {
@@ -360,9 +361,9 @@ ApplicationWindow {
                     visible: win.page === "channel" && !player.active
                     veil: prefs.veilThumbnails
                     heading: backend.channel.name || ""
-                    subheading: backend.channel.videos && backend.channel.videos.length
-                                ? qsTr("%n recent videos", "", backend.channel.videos.length) : ""
-                    model: backend.channel.videos || []
+                    subheading: backend.channelVideos.count
+                                ? qsTr("%n recent videos", "", backend.channelVideos.count) : ""
+                    model: backend.channelVideos
                     estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
                     loading: backend.busy.indexOf("channel") >= 0
                     emptyText: qsTr("No videos.")

@@ -144,7 +144,12 @@ MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mp
         {"resume-playback", "no"},
         {"save-watch-history", "no"},
         {"terminal", "no"},
-        {"msg-level", "all=error"},
+        // At error level mpv still names the URL it fails to open, and every
+        // URL it is given here holds the engine's token. `terminal` is off,
+        // which silences it too, but a log must not hang on one setting: with
+        // the terminal on, the URL goes to stdout and stderr and so to the
+        // journal. A failure still reaches the window as an event.
+        {"msg-level", "all=no"},
         {"keep-open", "yes"},
         {"cache", "yes"},
         {"demuxer-max-bytes", "256MiB"},

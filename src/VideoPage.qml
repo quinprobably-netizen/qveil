@@ -9,7 +9,8 @@ FocusScope {
 
     property string heading
     property string subheading
-    property var model: []
+    // A VideoModel.
+    property var model
     property string emptyText
     property bool loading: false
     property alias actions: actionRow.data
@@ -19,7 +20,8 @@ FocusScope {
     // Where focus belongs when the page is shown.
     readonly property Item content: grid
     property alias veil: grid.veil
-    // Explains a "~" in a card's date: each page knows why its dates are approximate.
+    // Explains in a tooltip over a card's date why it is approximate: each
+    // page knows why.
     property alias estimateNote: grid.estimateNote
 
     signal activated(var video)
@@ -99,8 +101,8 @@ FocusScope {
     ColumnLayout {
         id: emptyState
         anchors.centerIn: parent
-        width: Math.min(parent.width - 80, 520)
-        visible: !page.loading && page.model.length === 0 && page.emptyText !== ""
+        width: Math.min(parent.width - 80, 600)
+        visible: !page.loading && page.model.count === 0 && page.emptyText !== ""
         spacing: 0
 
         Label {

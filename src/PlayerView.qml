@@ -129,8 +129,11 @@ FocusScope {
             if (task === "play" && view.pending)
                 view.close()
         }
+        // mpv holds a port that nothing listens on once the engine is gone,
+        // and a restarted engine has a new one and a new token, so a video
+        // that was playing is lost too, not only one still being looked up.
         function onReadyChanged() {
-            if (!backend.ready && view.pending)
+            if (!backend.ready && view.active)
                 view.close()
         }
     }
