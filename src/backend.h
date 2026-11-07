@@ -4,6 +4,7 @@
 #include <QJsonValue>
 #include <QNetworkAccessManager>
 #include <QObject>
+#include <QPointer>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QTimer>
@@ -14,6 +15,10 @@
 
 #include <functional>
 
+#include "videomodel.h"
+
+class QNetworkReply;
+
 // The window's view of qveil-core. It starts `qveil-core serve`, then talks to
 // it over loopback HTTP; every result lands in a property QML binds to.
 class Backend : public QObject {
@@ -22,11 +27,15 @@ class Backend : public QObject {
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
     Q_PROPERTY(QStringList busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QVariantMap config READ config NOTIFY configChanged)
-    Q_PROPERTY(QVariantList feed READ feed NOTIFY feedChanged)
+    // The videos of each page live in a model that is updated in place, so a
+    // refresh landing in the background doesn't rebuild the grid showing it.
+    Q_PROPERTY(VideoModel *feed READ feed CONSTANT)
     Q_PROPERTY(QVariantMap feedInfo READ feedInfo NOTIFY feedChanged)
-    Q_PROPERTY(QVariantList results READ results NOTIFY resultsChanged)
-    Q_PROPERTY(QString query READ query NOTIFY resultsChanged)
+    Q_PROPERTY(VideoModel *results READ results CONSTANT)
+    Q_PROPERTY(QString query READ query NOTIFY queryChanged)
+    // The open channel's id, name and whether it is subscribed; its videos are `channelVideos`.
     Q_PROPERTY(QVariantMap channel READ channel NOTIFY channelChanged)
+    Q_PROPERTY(VideoModel *channelVideos READ channelVideos CONSTANT)
     Q_PROPERTY(QVariantList subs READ subs NOTIFY subsChanged)
     Q_PROPERTY(QVariantList history READ history NOTIFY historyChanged)
     // Thumbnail URLs are thumbBase + video ID; empty while unavailable or switched off.
@@ -41,6 +50,14 @@ public:
     static QString corePath();
     // The base URL from `qveil-core serve`'s first line, or empty.
     static QString parseReady(const QByteArray &line);
+    // `text` without the engine's base URL and token. The token is the only
+    // thing keeping other programs off the engine, and Qt quotes request URLs
+    // in its error text and warnings (a thumbnail that fails to load, say),
+    // which would carry it into the window's error banner, the terminal and
+    // the journal.
+    static QString scrub(QString text);
+    // Makes everything Qt logs go through scrub().
+    static void scrubLogs();
 
     // Starts the engine. Also how it is brought back after it dies.
     void start();
@@ -49,11 +66,12 @@ public:
     QString error() const { return m_error; }
     QStringList busy() const { return m_busy.keys(); }
     QVariantMap config() const { return m_config; }
-    QVariantList feed() const { return m_feed; }
+    VideoModel *feed() const { return m_feed; }
     QVariantMap feedInfo() const { return m_feedInfo; }
-    QVariantList results() const { return m_results; }
+    VideoModel *results() const { return m_results; }
     QString query() const { return m_query; }
     QVariantMap channel() const { return m_channel; }
+    VideoModel *channelVideos() const { return m_channelVideos; }
     QVariantList subs() const { return m_subs; }
     QVariantList history() const { return m_history; }
     QString thumbBase() const;
@@ -73,8 +91,8 @@ public:
     Q_INVOKABLE void loadConfig();
     Q_INVOKABLE void setConfig(const QVariantMap &patch);
     Q_INVOKABLE void play(const QString &video);
-    // Drops the answer of a video still being looked up: the player it was
-    // for has been closed.
+    // Drops the answer of a video still being looked up, and hangs up on the
+    // engine, which can then stop looking: the player it was for has been closed.
     Q_INVOKABLE void cancelPlay();
     Q_INVOKABLE void reportError(const QString &message);
     Q_INVOKABLE void clearError();
@@ -90,7 +108,7 @@ signals:
     void busyChanged();
     void configChanged();
     void feedChanged();
-    void resultsChanged();
+    void queryChanged();
     void channelChanged();
     void subsChanged();
     void historyChanged();
@@ -107,7 +125,8 @@ private:
     // One request to the engine. `task` drives the busy state. Reads deliver
     // only the newest answer per task, so a slow old search can't overwrite a
     // newer one; a write (`everyAnswer`) delivers each answer, because every
-    // one of them changed something the window must hear about.
+    // one of them changed something the window must hear about. When the
+    // engine isn't there, the request fails at once (see refuse()).
     void call(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
               const QString &task, Done done, bool everyAnswer = false);
     // A GET whose answer is one JSON object per line, sent as they are ready
@@ -118,6 +137,21 @@ private:
     static constexpr int BatchMs = 100;
     void setError(const QString &message);
     void setBusy(const QString &task, int delta);
+    // A request that can't be sent because the engine isn't ready. Says why
+    // when it is gone for good, and always says that `task` won't be answered,
+    // so a player waiting on a video doesn't spin forever.
+    void refuse(const QString &task);
+    // Whether only the newest request of `task` matters, so that starting one
+    // hangs up on the one before it. Not so for writes, or for tasks that
+    // mix reads and writes: dropping a write's answer is bad enough, and
+    // hanging up on it could stop it from happening at all.
+    static bool newestOnly(const QString &task);
+    // Makes the next request of `task` its latest, and hangs up on the reply
+    // still running for the one before it. The engine sees the disconnect,
+    // which ends its work for it if it can; the answer would be dropped anyway.
+    quint64 supersede(const QString &task);
+    // What went wrong with a failed request, as text that is safe to show.
+    static QString failure(const QNetworkReply *reply);
     void onEngineReady();
     void onEngineStopped();
     // The feed request itself, without the one-refresh-at-a-time guard of
@@ -137,6 +171,8 @@ private:
     QString m_error;
     QHash<QString, int> m_busy;
     QHash<QString, quint64> m_latest;
+    // The request in flight for each task that is newestOnly().
+    QHash<QString, QPointer<QNetworkReply>> m_replies;
     quint64 m_sequence = 0;
     bool m_quitting = false;
 
@@ -156,11 +192,12 @@ private:
     bool m_shorts = false;
 
     QVariantMap m_config;
-    QVariantList m_feed;
+    VideoModel *m_feed = new VideoModel(this);
     QVariantMap m_feedInfo;
-    QVariantList m_results;
+    VideoModel *m_results = new VideoModel(this);
     QString m_query;
     QVariantMap m_channel;
+    VideoModel *m_channelVideos = new VideoModel(this);
     QVariantList m_subs;
     QVariantList m_history;
 };

@@ -3,14 +3,21 @@
 #include <QLocalSocket>
 #include <QProcessEnvironment>
 #include <QFile>
+#include <QPersistentModelIndex>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
 #include <QtTest>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "backend.h"
 #include "datadirs.h"
 #include "mpvitem.h"
+#include "suite.h"
 #include "theme.h"
 #include "translator.h"
 
@@ -18,6 +25,12 @@ class QveilTests : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase()
+    {
+        // The player's QML imports it, as the app registers it.
+        qmlRegisterType<MpvItem>("Qveil", 1, 0, "MpvItem");
+    }
+
     void acceptsOnlyLoopbackEngines()
     {
         const QByteArray good = "{\"base\":\"http://127.0.0.1:4242/abc\"}";
@@ -86,7 +99,7 @@ private slots:
         backend.start();
         QTRY_COMPARE_WITH_TIMEOUT(backend.config().value("instance").toInt(), 2, 10000);
         QTRY_COMPARE_WITH_TIMEOUT(backend.subs().size(), 1, 5000);
-        QTRY_COMPARE_WITH_TIMEOUT(backend.feed().size(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 1, 5000);
         QVERIFY(backend.ready());
         QVERIFY2(backend.error().isEmpty(), qPrintable(backend.error()));
         // Ready, lost, ready again.
@@ -119,8 +132,10 @@ private slots:
         QVERIFY(starts.open(QIODevice::ReadOnly));
         QCOMPARE(starts.readAll().count('\n'), 2);
         backend.clearError();
+        QSignalSpy failed(&backend, &Backend::taskFailed);
         backend.loadSubs();
         QVERIFY(backend.error().contains("stopped again"));
+        QCOMPARE(failed.count(), 1);
     }
 
     void refreshesOneFeedAtATime()
@@ -437,12 +452,12 @@ private slots:
         QElapsedTimer clock;
         clock.start();
         backend.search("rust");
-        QTRY_COMPARE_WITH_TIMEOUT(backend.results().size(), 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 2, 5000);
         QVERIFY2(clock.elapsed() < 700, qPrintable(QString::number(clock.elapsed())));
         QVERIFY(backend.busy().contains("search"));
-        QTRY_COMPARE_WITH_TIMEOUT(backend.results().size(), 3, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 3, 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
-        QCOMPARE(backend.results().at(2).toMap().value("id").toString(), QString("rust0000003"));
+        QCOMPARE(backend.results()->get(2).value("id").toString(), QString("rust0000003"));
         QVERIFY(backend.error().isEmpty());
 
         // A search that is replaced adds nothing to its successor's results.
@@ -450,17 +465,273 @@ private slots:
         QTest::qWait(100);
         backend.search("next");
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
-        QCOMPARE(backend.results().size(), 3);
-        for (const QVariant &r : backend.results())
-            QCOMPARE(r.toMap().value("title").toString(), QString("next"));
+        QCOMPARE(backend.results()->count(), 3);
+        for (int row = 0; row < backend.results()->count(); ++row)
+            QCOMPARE(backend.results()->get(row).value("title").toString(), QString("next"));
 
         // One that fails part-way keeps what it found and says what happened.
         QSignalSpy failed(&backend, &Backend::taskFailed);
         backend.search("fail");
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
-        QCOMPARE(backend.results().size(), 2);
+        QCOMPARE(backend.results()->count(), 2);
         QCOMPARE(backend.error(), QString("the route went down"));
         QCOMPARE(failed.count(), 1);
+    }
+
+    void aRequestWithoutAnEngineFailsAtOnce()
+    {
+        // Nothing started the engine, so nothing can answer. Whoever waits
+        // for an answer must hear that now: the player's "Opening the
+        // video…" would spin for ever otherwise.
+        Backend backend(QProcessEnvironment::systemEnvironment(), "/nonexistent/qveil-core");
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+        backend.play("dQw4w9WgXcQ");
+        backend.search("rust");
+        backend.openChannel("UC0123456789abcdefghij");
+        backend.refreshFeed(true, false);
+        backend.loadSubs();
+        QStringList tasks;
+        for (const QList<QVariant> &signal : failed)
+            tasks << signal.at(0).toString();
+        QCOMPARE(tasks, QStringList({"play", "search", "channel", "feed", "subs"}));
+    }
+
+    void aReplacedRequestIsHungUpOn()
+    {
+        // A request whose path says "slow" is held open until the client
+        // hangs up, and the engine writes down whether that happened. A
+        // newer request of the same task, or a closed player, must hang up
+        // on it, so the engine can stop working for an answer nobody wants.
+        QTemporaryDir dir;
+        const QString log = dir.filePath("requests");
+        const QString fake = engine(dir, "import http.server,json,os\n"
+                                         "def note(text): open(os.environ['QVEIL_TEST_LOG'],'a').write(text+'\\n')\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def answer(s):\n"
+                                         "    if 'slow' in s.path:\n"
+                                         "      note('held '+s.path)\n"
+                                         "      s.connection.settimeout(8)\n"
+                                         "      try: gone=s.connection.recv(1)==b''\n"
+                                         "      except Exception: gone=False\n"
+                                         "      note(('hung up ' if gone else 'kept waiting ')+s.path)\n"
+                                         "      return\n"
+                                         "    body={'id':'UCfast','name':'Fast','videos':[]} if 'channel' in s.path else {}\n"
+                                         "    b=json.dumps(body).encode()\n"
+                                         "    s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)\n"
+                                         "  def do_GET(s): s.answer()\n"
+                                         "  def do_POST(s):\n"
+                                         "    s.rfile.read(int(s.headers.get('Content-Length') or 0))\n"
+                                         "    s.answer()\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        Backend backend(logged(log), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QSignalSpy failed(&backend, &Backend::taskFailed);
+        auto logged = [&](const QString &text) { return QString::fromUtf8(read(log)).contains(text); };
+
+        backend.search("slow");
+        QTRY_VERIFY_WITH_TIMEOUT(logged("held /t/api/search?q=slow"), 5000);
+        backend.search("next");
+        QTRY_VERIFY_WITH_TIMEOUT(logged("hung up /t/api/search?q=slow"), 5000);
+
+        backend.openChannel("UCslow");
+        QTRY_VERIFY_WITH_TIMEOUT(logged("held /t/api/channel?id=UCslow"), 5000);
+        backend.openChannel("UCfast");
+        QTRY_VERIFY_WITH_TIMEOUT(logged("hung up /t/api/channel?id=UCslow"), 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.channel().value("name").toString(), QString("Fast"), 5000);
+
+        backend.play("slow");
+        QTRY_VERIFY_WITH_TIMEOUT(logged("held /t/api/play?v=slow"), 5000);
+        backend.cancelPlay();
+        QTRY_VERIFY_WITH_TIMEOUT(logged("hung up /t/api/play?v=slow"), 5000);
+
+        backend.refreshFeed(false, false);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed-cache"), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search") && !backend.busy().contains("channel")
+                                     && !backend.busy().contains("play"),
+                                 5000);
+        // Hanging up is no failure: nobody is told, and nothing is shown.
+        QCOMPARE(failed.count(), 0);
+        QVERIFY2(backend.error().isEmpty(), qPrintable(backend.error()));
+    }
+
+    void aRefreshLandingUpdatesTheFeedInPlace()
+    {
+        // The second answer has one video more, at the front. The cards on
+        // screen must stay, so their rows are inserted into, not replaced.
+        QTemporaryDir dir;
+        const QString fake = engine(dir, "import http.server,json\n"
+                                         "n=[0]\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def do_GET(s):\n"
+                                         "    body={}\n"
+                                         "    if '/api/feed' in s.path:\n"
+                                         "      n[0]+=1\n"
+                                         "      ids=['aaaaaaaaaaa','bbbbbbbbbbb','ccccccccccc']\n"
+                                         "      if n[0]>1: ids=['xxxxxxxxxxx']+ids\n"
+                                         "      body={'channels':1,'entries':[{'id':i,'title':i} for i in ids]}\n"
+                                         "    b=json.dumps(body).encode()\n"
+                                         "    s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.HTTPServer(('127.0.0.1',0),H)\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        backend.refreshFeed(false, false);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 3, 5000);
+        QPersistentModelIndex first = backend.feed()->index(0);
+
+        QSignalSpy inserted(backend.feed(), &QAbstractItemModel::rowsInserted);
+        QSignalSpy removed(backend.feed(), &QAbstractItemModel::rowsRemoved);
+        QSignalSpy reset(backend.feed(), &QAbstractItemModel::modelReset);
+        backend.refreshFeed(true, false);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 4, 5000);
+        QCOMPARE(inserted.count(), 1);
+        QCOMPARE(inserted.at(0).at(1).toInt(), 0);
+        QCOMPARE(removed.count() + reset.count(), 0);
+        QCOMPARE(first.row(), 1);
+        QCOMPARE(backend.feed()->get(first.row()).value("id").toString(), QString("aaaaaaaaaaa"));
+    }
+
+    void theTokenNeverReachesTheWindowOrItsLogs()
+    {
+        // The engine's token is in every URL the window uses, and it is all
+        // that keeps other programs off the engine. Qt quotes the URL in the
+        // error text of a failed request and in its warnings (a thumbnail
+        // that doesn't load, say), and neither belongs in the error banner,
+        // a terminal or the journal.
+        QTemporaryDir dir;
+        const QString fake = engine(dir, "import http.server,json\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def do_GET(s):\n"
+                                         "    if s.path.endswith('/api/config'):\n"
+                                         "      b=json.dumps({'thumbnails':True}).encode()\n"
+                                         "      s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)\n"
+                                         "    else:\n"
+                                         "      s.send_response(404);s.send_header('Content-Length','0');s.end_headers()\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.HTTPServer(('127.0.0.1',0),H)\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/0123456789abcdef'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.thumbBase().isEmpty(), 5000);
+        const QString base = backend.thumbBase().chopped(QString("/thumb/").size());
+        QVERIFY(base.contains("0123456789abcdef"));
+
+        // Qt's words for a 404 are "Error transferring <URL> - server replied: Not Found".
+        backend.loadSubs();
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.error().isEmpty(), 5000);
+        QVERIFY2(!backend.error().contains("0123456789abcdef") && !backend.error().contains("127.0.0.1"),
+                 qPrintable(backend.error()));
+
+        // What Qt logs goes through the same scrubbing before it is printed.
+        Backend::scrubLogs();
+        QTest::ignoreMessage(QtWarningMsg, "QML Image: Error transferring qveil-core/thumb/x - server replied: Not Found");
+        qWarning("QML Image: Error transferring %s/thumb/x - server replied: Not Found", qPrintable(base));
+        QTest::ignoreMessage(QtWarningMsg, "the token is <token>");
+        qWarning("the token is %s", "0123456789abcdef");
+    }
+
+    void mpvDoesNotLogTheUrlItFailsToOpen()
+    {
+        // mpv names what it can't open in its log, and everything it is given
+        // here is a loopback URL with the engine's token in it. Stdout and
+        // stderr both end up in the journal, so both are pointed at a file
+        // while it fails to open one.
+        MpvItem item;
+        QSignalSpy failed(&item, &MpvItem::failed);
+        QTemporaryFile capture;
+        QVERIFY(capture.open());
+        std::fflush(stdout);
+        std::fflush(stderr);
+        const int savedOut = ::dup(1), savedErr = ::dup(2);
+        ::dup2(capture.handle(), 1);
+        ::dup2(capture.handle(), 2);
+        item.load("http://127.0.0.1:1/0123456789abcdef/s/x/v", "http://127.0.0.1:1/0123456789abcdef/s/x/a", 0);
+        QTRY_VERIFY_WITH_TIMEOUT(failed.count() > 0, 10000);
+        QTest::qWait(300);
+        std::fflush(stdout);
+        std::fflush(stderr);
+        ::dup2(savedOut, 1);
+        ::dup2(savedErr, 2);
+        ::close(savedOut);
+        ::close(savedErr);
+
+        capture.seek(0);
+        const QByteArray said = capture.readAll();
+        QVERIFY2(!said.contains("0123456789abcdef"), said.constData());
+        QVERIFY2(!said.contains("127.0.0.1"), said.constData());
+        QVERIFY(!failed.at(0).at(0).toString().contains("0123456789abcdef"));
+    }
+
+    void thePlayerClosesWhenTheEngineIsGone()
+    {
+        // An engine that goes away when a file called `stop` is written after
+        // it started. mpv holds the address of an engine that is gone, and a
+        // restarted one has another, so the player must not stay up: not
+        // while it looks a video up, and not while a video plays.
+        QTemporaryDir dir;
+        const QString fake = engine(dir, "import http.server,json,os,threading,time\n"
+                                         "stop=os.environ['QVEIL_TEST_DIR']+'/stop'\n"
+                                         "started=time.time()\n"
+                                         "def watch():\n"
+                                         "  while not (os.path.exists(stop) and os.path.getmtime(stop)>started): time.sleep(0.05)\n"
+                                         "  os._exit(3)\n"
+                                         "threading.Thread(target=watch,daemon=True).start()\n"
+                                         "class H(http.server.BaseHTTPRequestHandler):\n"
+                                         "  def do_GET(s):\n"
+                                         "    b=json.dumps({'thumbnails':False}).encode()\n"
+                                         "    s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)\n"
+                                         "  def log_message(s,*a): pass\n"
+                                         "srv=http.server.HTTPServer(('127.0.0.1',0),H)\n"
+                                         "print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)\n"
+                                         "srv.serve_forever()\n");
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert("QVEIL_TEST_DIR", dir.path());
+
+        QTemporaryDir themeDir;
+        Theme theme(themeDir.path());
+        Backend backend(environment, fake);
+        QQmlEngine qml;
+        qml.rootContext()->setContextProperty("backend", &backend);
+        qml.rootContext()->setContextProperty("theme", &theme);
+        QQmlComponent component(&qml, QUrl::fromLocalFile(QString(SRCDIR) + "/PlayerView.qml"));
+        QScopedPointer<QObject> player(component.create());
+        QVERIFY2(player, qPrintable(component.errorString()));
+        QSignalSpy closed(player.data(), SIGNAL(closed()));
+        QSignalSpy readiness(&backend, &Backend::readyChanged);
+
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        const QVariantMap video{{"id", "dQw4w9WgXcQ"}, {"title", "A video"}};
+
+        // While the engine looks the video up.
+        QMetaObject::invokeMethod(player.data(), "prepare", Q_ARG(QVariant, video));
+        QVERIFY(player->property("active").toBool());
+        write(dir.filePath("stop"), "");
+        QTRY_COMPARE_WITH_TIMEOUT(readiness.count(), 2, 5000);
+        QVERIFY(!player->property("active").toBool());
+        QCOMPARE(closed.count(), 1);
+
+        // While it plays. The engine has been restarted by then, and the
+        // restart doesn't bring the video back.
+        QTRY_COMPARE_WITH_TIMEOUT(readiness.count(), 3, 10000);
+        QVERIFY(backend.ready());
+        QVariantMap playing = video;
+        playing.insert("video", "http://127.0.0.1:1/t/s/x/v");
+        QMetaObject::invokeMethod(player.data(), "open", Q_ARG(QVariant, playing));
+        QVERIFY(player->property("active").toBool());
+        QVERIFY(!player->property("pending").toBool());
+        write(dir.filePath("stop"), "again");
+        QTRY_COMPARE_WITH_TIMEOUT(readiness.count(), 4, 5000);
+        QVERIFY(!player->property("active").toBool());
+        QCOMPARE(closed.count(), 2);
     }
 
     void reportsAMissingEngine()
@@ -760,5 +1031,5 @@ private:
     }
 };
 
-QTEST_MAIN(QveilTests)
+QVEIL_SUITE(QveilTests)
 #include "qveil_tests.moc"

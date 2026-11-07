@@ -19,7 +19,8 @@ HEADERS += \
     src/datadirs.h \
     src/mpvitem.h \
     src/theme.h \
-    src/translator.h
+    src/translator.h \
+    src/videomodel.h
 
 SOURCES += \
     src/main.cpp \
@@ -27,6 +28,7 @@ SOURCES += \
     src/datadirs.cpp \
     src/mpvitem.cpp \
     src/theme.cpp \
-    src/translator.cpp
+    src/translator.cpp \
+    src/videomodel.cpp
 
 include(src/resources.pri)

@@ -32,6 +32,6 @@ GridView {
         navigating = true
         event.accepted = false
     }
-    Keys.onReturnPressed: if (currentIndex >= 0) activated(model[currentIndex])
-    Keys.onEnterPressed: if (currentIndex >= 0) activated(model[currentIndex])
+    Keys.onReturnPressed: if (currentIndex >= 0) activated(model.get(currentIndex))
+    Keys.onEnterPressed: if (currentIndex >= 0) activated(model.get(currentIndex))
 }
