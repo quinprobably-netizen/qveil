@@ -2,9 +2,9 @@ pkgname=qveil
 # A release is the tag `v$pkgver` of the repository, and core/Cargo.toml in it
 # has the same version: prepare() refuses to build when they disagree, so a
 # tag and this file can't drift apart unnoticed. (README: "Releasing".)
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
-pkgdesc='Private, account-free YouTube app: no cookies, no account, optional Tor for every byte'
+pkgdesc='Private, account-free YouTube app: no account, no stored cookies, optional Tor for every byte'
 arch=('x86_64')
 url='https://github.com/quinprobably-netizen/qveil'
 # The icons in src/icons are Apache-2.0 (Material Design); everything else is MIT.
