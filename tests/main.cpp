@@ -8,6 +8,9 @@
 #include "suite.h"
 
 int main(int argc, char *argv[]) {
+    // The desktop's platform theme is of no use here, and the GTK one gives up
+    // when there is no display.
+    qputenv("QT_QPA_PLATFORMTHEME", "generic");
     // The tests that put a scene on screen do so on the offscreen platform,
     // where only the software renderer is sure to exist. (No test draws video.)
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
