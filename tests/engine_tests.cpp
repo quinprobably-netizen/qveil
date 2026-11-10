@@ -486,6 +486,189 @@ private slots:
         WAIT_FOR(!window.busy().contains("search"), 5000);
         QVERIFY2(window.error().isEmpty(), qPrintable(window.error()));
     }
+
+    void thePlayAnswerCarriesTheDetails() {
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+        QSignalSpy ready(&window, &Backend::playReady);
+        window.play("dQw4w9WgXcQ");
+        WAIT_FOR(ready.count() == 1, 10000);
+        const QVariantMap info = ready.first().first().toMap();
+        QVERIFY(info.value("description").toString().startsWith("About this video."));
+        QCOMPARE(info.value("views").toInt(), 59000);
+        const QVariantList chapters = info.value("chapters").toList();
+        QCOMPARE(chapters.size(), 2);
+        QCOMPARE(chapters.at(1).toMap().value("title").toString(), QString("Middle"));
+        QCOMPARE(chapters.at(1).toMap().value("start").toInt(), 60);
+    }
+
+    void commentsLoadOnRequestAndClosingHangsUp() {
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+        QVERIFY(window.comments().isEmpty());
+        QCOMPARE(rig.calls("comments"), 0);
+
+        window.loadComments("dQw4w9WgXcQ", "top", 40, false);
+        WAIT_FOR(!window.comments().isEmpty(), 10000);
+        const QVariantMap answer = window.comments();
+        QCOMPARE(answer.value("video").toString(), QString("dQw4w9WgXcQ"));
+        QCOMPARE(answer.value("sort").toString(), QString("top"));
+        QCOMPARE(answer.value("count").toInt(), 1204);
+        const QVariantList items = answer.value("items").toList();
+        QCOMPARE(items.size(), 3);
+        QVERIFY(items.first().toMap().value("pinned").toBool());
+        QVERIFY(items.first().toMap().value("byUploader").toBool());
+        QVERIFY(items.at(1).toMap().value("replies").toList().isEmpty());
+        QCOMPARE(rig.calls("comments"), 1);
+
+        // With replies, the thread that has one shows it.
+        window.loadComments("dQw4w9WgXcQ", "top", 40, true);
+        WAIT_FOR(window.comments().value("replies").toBool(), 10000);
+        QCOMPARE(window.comments().value("items").toList().at(1).toMap().value("replies").toList().size(), 1);
+
+        // Closed while a slow lookup runs: nothing is shown, and nothing is waited for.
+        QVERIFY(rig.steer("comments-delay", "5"));
+        window.loadComments("dQw4w9WgXcQ", "new", 40, false);
+        WAIT_FOR(window.busy().contains("comments"), 2000);
+        window.closeComments();
+        QVERIFY(window.comments().isEmpty());
+        WAIT_FOR(!window.busy().contains("comments"), 1000);
+        QTest::qWait(300);
+        QVERIFY(window.comments().isEmpty());
+        QVERIFY2(window.error().isEmpty(), qPrintable(window.error()));
+    }
+
+    void aPositionIsNotedOfferedAndForgotten() {
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+        QVERIFY(window.resume().isEmpty());
+        const QVariantMap video{{"id", "dQw4w9WgXcQ"}, {"title", "T"}, {"channel", "C"}};
+
+        // Before the length is known there is nothing to note, and nothing is asked.
+        window.noteResume(video, 845, 0);
+        window.noteResume(video, 845, 2463);
+        WAIT_FOR(window.resume().size() == 1, 5000);
+        const QVariantMap kept = window.resume().first().toMap();
+        QCOMPARE(kept.value("pos").toInt(), 845);
+        QCOMPARE(kept.value("title").toString(), QString("T"));
+        QVERIFY(kept.value("expires").toLongLong() > kept.value("at").toLongLong());
+
+        QSignalSpy ready(&window, &Backend::playReady);
+        window.play("dQw4w9WgXcQ");
+        WAIT_FOR(ready.count() == 1, 10000);
+        QCOMPARE(ready.first().first().toMap().value("resume").toInt(), 845);
+
+        // Watched to the end: it is forgotten without being asked to.
+        window.noteResume(video, 2460, 2463);
+        WAIT_FOR(window.resume().isEmpty(), 5000);
+        window.noteResume(video, 845, 2463);
+        WAIT_FOR(window.resume().size() == 1, 5000);
+        window.forgetResume("dQw4w9WgXcQ");
+        WAIT_FOR(window.resume().isEmpty(), 5000);
+        QVERIFY2(window.error().isEmpty(), qPrintable(window.error()));
+    }
+
+    void lensesAreAddedOpenedAndRemoved() {
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+        QSignalSpy added(&window, &Backend::lensAdded);
+        window.addLens("bread, sourdough");
+        WAIT_FOR(added.count() == 1 && window.lenses().size() == 1, 5000);
+        const QString id = added.first().first().toString();
+        QVERIFY(!id.isEmpty());
+        const QVariantMap lens = window.lenses().first().toMap();
+        QCOMPARE(lens.value("id").toString(), id);
+        QCOMPARE(lens.value("searches").toStringList(), QStringList({"bread", "sourdough"}));
+        // Adding one asks YouTube for nothing.
+        QCOMPARE(rig.calls("search"), 0);
+
+        QList<QPair<int, int>> seen;
+        connect(&window, &Backend::lensProgressChanged, this, [&] { seen.append({window.lensDone(), window.lensTotal()}); });
+        window.openLens(id, 1);
+        WAIT_FOR(window.lensVideos()->count() > 0, 10000);
+        QCOMPARE(rig.calls("search"), 2);
+        QCOMPARE(window.lensInfo().value("id").toString(), id);
+        QCOMPARE(window.lensInfo().value("text").toString(), QString("bread, sourdough"));
+        QVERIFY(window.lensInfo().value("fetchedAt").toLongLong() > 0);
+        const QStringList why = window.lensVideos()->get(0).value("why").toStringList();
+        QVERIFY2(!why.isEmpty() && (why.first() == "bread" || why.first() == "sourdough"), qPrintable(why.join(",")));
+        QVERIFY2(seen.contains({2, 2}), "the refresh said when both searches were done");
+        WAIT_FOR(window.lensTotal() == 0 && !window.busy().contains("lens"), 5000);
+        // Opened again while fresh: answered from what is stored.
+        window.openLens(id, 1);
+        WAIT_FOR(!window.busy().contains("lens"), 5000);
+        QCOMPARE(rig.calls("search"), 2);
+
+        // Rules alone are not a lens: the engine says what is missing.
+        window.addLens("no music");
+        WAIT_FOR(window.error().startsWith("Say what it should be about"), 5000);
+        QCOMPARE(window.lenses().size(), 1);
+        window.clearError();
+
+        window.removeLens(id);
+        WAIT_FOR(window.lenses().isEmpty(), 5000);
+        QVERIFY(window.lensInfo().isEmpty());
+        QCOMPARE(window.lensVideos()->count(), 0);
+    }
+
+    void readingFollowsTheNewestTextOnly() {
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+        window.read("talks over 30 min");
+        WAIT_FOR(window.reading().value("text").toString() == "talks over 30 min", 5000);
+        QVERIFY(window.reading().value("rules").toBool());
+        QCOMPARE(window.reading().value("tags").toList().size(), 2);
+        QCOMPARE(window.reading().value("searches").toStringList(), QStringList({"talks"}));
+
+        // Typed quickly: only the last text's reading is ever shown.
+        QStringList shown;
+        connect(&window, &Backend::readingChanged, this, [&] { shown << window.reading().value("text").toString(); });
+        window.read("a");
+        window.read("ab");
+        window.read("abc");
+        WAIT_FOR(window.reading().value("text").toString() == "abc", 5000);
+        QTest::qWait(200);
+        QCOMPARE(shown, QStringList({"abc"}));
+        QVERIFY(!window.reading().value("rules").toBool());
+
+        window.read("no music");
+        WAIT_FOR(window.reading().value("error").toString().startsWith("Say what it should be about"), 5000);
+        // Nothing to read: nothing shown, and nothing asked.
+        window.read("   ");
+        QVERIFY(window.reading().isEmpty());
+        QCOMPARE(rig.calls().size(), 0);
+    }
+
+    void theEnginesNewPrivacyLinesReachTheWindow() {
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        const QVariantMap pages = rig.window().privacy().value("pages").toMap();
+        QVERIFY(pages.value("resume").toString().contains("7 days"));
+        QVERIFY(pages.value("comments").toString().contains("only when you open them"));
+        QVERIFY(pages.value("lenses").toString().contains("one search per topic"));
+        QCOMPARE(rig.window().config().value("resumeDays").toInt(), 7);
+        // An engine that sends none of them leaves them empty, not missing.
+        const QVariantMap none = Backend::privacyOf({}).value("pages").toMap();
+        for (const char *key : {"resume", "comments", "lenses"})
+            QVERIFY(none.contains(key) && none.value(key).toString().isEmpty());
+    }
 };
 
 QVEIL_SUITE(EngineTests)

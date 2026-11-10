@@ -12,7 +12,7 @@ namespace {
 const QList<QByteArray> &roleKeys() {
     static const QList<QByteArray> keys{"id",       "title",    "channel",  "channel_id", "published",
                                         "date",     "estimated", "duration", "views",      "short",
-                                        "batch"};
+                                        "batch",    "why"};
     return keys;
 }
 
@@ -48,7 +48,11 @@ QVariant VideoModel::data(const QModelIndex &index, int role) const {
     const int key = role - Qt::UserRole - 1;
     if (!index.isValid() || index.row() >= m_rows.size() || key < 0 || key >= roleKeys().size())
         return {};
-    return m_rows.at(index.row()).value(QString::fromLatin1(roleKeys().at(key)));
+    const QVariant value = m_rows.at(index.row()).value(QString::fromLatin1(roleKeys().at(key)));
+    // The reasons a result was kept: a list of words, or none.
+    if (roleKeys().at(key) == "why")
+        return value.toStringList();
+    return value;
 }
 
 QHash<int, QByteArray> VideoModel::roleNames() const {

@@ -50,6 +50,21 @@ class Backend : public QObject {
     Q_PROPERTY(VideoModel *channelVideos READ channelVideos CONSTANT)
     Q_PROPERTY(QVariantList subs READ subs NOTIFY subsChanged)
     Q_PROPERTY(QVariantList history READ history NOTIFY historyChanged)
+    // Where unfinished videos were stopped: [{id, pos, dur, at, title, channel, expires}], newest first.
+    Q_PROPERTY(QVariantList resume READ resume NOTIFY resumeChanged)
+    // The comments last asked for: {video, sort, n, replies, count, items}, or
+    // empty while there are none to show.
+    Q_PROPERTY(QVariantMap comments READ comments NOTIFY commentsChanged)
+    // The lenses, as the engine lists them: {id, text, tags, searches, count, fetchedAt}.
+    Q_PROPERTY(QVariantList lenses READ lenses NOTIFY lensesChanged)
+    // The lens that is open: {id, text, tags, searches, fetchedAt}; its videos are `lensVideos`.
+    Q_PROPERTY(QVariantMap lensInfo READ lensInfo NOTIFY lensChanged)
+    Q_PROPERTY(VideoModel *lensVideos READ lensVideos CONSTANT)
+    // How far a lens's refresh is: searches done of searches to do, 0 of 0 while none runs.
+    Q_PROPERTY(int lensDone READ lensDone NOTIFY lensProgressChanged)
+    Q_PROPERTY(int lensTotal READ lensTotal NOTIFY lensProgressChanged)
+    // How the text last given to read() was understood: {text, tags, searches, rules, error}.
+    Q_PROPERTY(QVariantMap reading READ reading NOTIFY readingChanged)
     // Thumbnail URLs are thumbBase + video ID; empty while unavailable or switched off.
     Q_PROPERTY(QString thumbBase READ thumbBase NOTIFY configChanged)
 
@@ -97,6 +112,14 @@ public:
     VideoModel *channelVideos() const { return m_channelVideos; }
     QVariantList subs() const { return m_subs; }
     QVariantList history() const { return m_history; }
+    QVariantList resume() const { return m_resume; }
+    QVariantMap comments() const { return m_comments; }
+    QVariantList lenses() const { return m_lenses; }
+    QVariantMap lensInfo() const { return m_lensInfo; }
+    VideoModel *lensVideos() const { return m_lensVideos; }
+    int lensDone() const { return m_lensDone; }
+    int lensTotal() const { return m_lensTotal; }
+    QVariantMap reading() const { return m_reading; }
     QString thumbBase() const;
 
     // `network` asks the engine to fetch the channels not fetched in the last
@@ -117,6 +140,24 @@ public:
     // Drops the answer of a video still being looked up, and hangs up on the
     // engine, which can then stop looking: the player it was for has been closed.
     Q_INVOKABLE void cancelPlay();
+    Q_INVOKABLE void loadResume();
+    // Tells the engine where `video` (id, title, channel) is. Says nothing
+    // until the player knows how long the video is.
+    Q_INVOKABLE void noteResume(const QVariantMap &video, double position, double duration);
+    Q_INVOKABLE void forgetResume(const QString &id);
+    Q_INVOKABLE void clearResume();
+    // `n` threads in `sort` order ("top" or "new"), with replies if asked.
+    Q_INVOKABLE void loadComments(const QString &video, const QString &sort, int n, bool replies);
+    // Hangs up on a lookup still running and shows nothing: the tab was left.
+    Q_INVOKABLE void closeComments();
+    Q_INVOKABLE void loadLenses();
+    Q_INVOKABLE void addLens(const QString &text);
+    Q_INVOKABLE void editLens(const QString &id, const QString &text);
+    Q_INVOKABLE void removeLens(const QString &id);
+    // `refresh`: 0 shows what is stored, 1 fetches when that is stale, 2 always fetches.
+    Q_INVOKABLE void openLens(const QString &id, int refresh);
+    // Asks how `text` reads. Nothing leaves the machine for it.
+    Q_INVOKABLE void read(const QString &text);
     Q_INVOKABLE void reportError(const QString &message);
     Q_INVOKABLE void clearError();
 
@@ -141,6 +182,14 @@ signals:
     void channelChanged();
     void subsChanged();
     void historyChanged();
+    void resumeChanged();
+    void commentsChanged();
+    void lensesChanged();
+    void lensChanged();
+    void lensProgressChanged();
+    void readingChanged();
+    // A lens was added; `id` is its.
+    void lensAdded(const QString &id);
     // The route or proxy was changed, so whatever plays over the old one must stop.
     void routeChanged();
     void playReady(const QVariantMap &info);
@@ -196,6 +245,9 @@ private:
     // another Shorts choice than the current one.
     void applyFeed(const QVariantMap &answer, bool network, bool shorts);
     void setRefreshProgress(int done, int total);
+    void setLensProgress(int done, int total);
+    // Forgets the lens that is open: it was removed, or another is being opened.
+    void closeLens();
     // Starts a new page of thumbnails for `model` (see VideoModel::setBatch).
     void newPage(VideoModel *model);
     // Takes a config from the engine, and says so if it moved the route.
@@ -247,4 +299,12 @@ private:
     VideoModel *m_channelVideos = new VideoModel(this);
     QVariantList m_subs;
     QVariantList m_history;
+    QVariantList m_resume;
+    QVariantMap m_comments;
+    QVariantList m_lenses;
+    QVariantMap m_lensInfo;
+    VideoModel *m_lensVideos = new VideoModel(this);
+    int m_lensDone = 0;
+    int m_lensTotal = 0;
+    QVariantMap m_reading;
 };

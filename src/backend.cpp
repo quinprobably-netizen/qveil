@@ -127,7 +127,7 @@ QVariantMap Backend::privacyOf(const QVariantMap &config) {
     const QVariantMap sentRoutes = sent.value("routes").toMap(), sentPages = sent.value("pages").toMap();
     for (const char *key : {"direct", "tor", "proxy"})
         routes.insert(key, text(sentRoutes, key));
-    for (const char *key : {"search", "subscriptions", "history_off", "history_on"})
+    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses"})
         pages.insert(key, text(sentPages, key));
     QStringList points;
     for (const QVariant &point : sent.value("points").toList())
@@ -182,6 +182,8 @@ void Backend::onEngineReady() {
     if (recovered) {
         loadSubs();
         loadFeed(false, m_shorts);
+        loadResume();
+        loadLenses();
     }
 }
 
@@ -261,7 +263,7 @@ void Backend::refuse(const QString &task) {
 }
 
 bool Backend::newestOnly(const QString &task) {
-    static const QSet<QString> tasks{"search", "channel", "play", "feed", "feed-cache"};
+    static const QSet<QString> tasks{"search", "channel", "play", "feed", "feed-cache", "comments", "lens", "read"};
     return tasks.contains(task);
 }
 
@@ -676,6 +678,193 @@ void Backend::play(const QString &video) {
 }
 
 void Backend::cancelPlay() { supersede("play"); }
+
+void Backend::loadResume() {
+    call("GET", "api/resume", {}, {}, "resume", [this](const QJsonValue &v) {
+        m_resume = v.toArray().toVariantList();
+        emit resumeChanged();
+    });
+}
+
+void Backend::noteResume(const QVariantMap &video, double position, double duration) {
+    const QString id = video.value("id").toString();
+    // Until the player knows the length there is nothing to judge a position by.
+    if (id.isEmpty() || !(duration > 0) || position < 0)
+        return;
+    QJsonObject body{{"v", id},
+                     {"pos", qint64(position)},
+                     {"dur", qint64(duration)},
+                     {"title", video.value("title").toString()}};
+    if (!video.value("channel").toString().isEmpty())
+        body.insert("channel", video.value("channel").toString());
+    call("POST", "api/resume", {}, QJsonDocument(body).toJson(QJsonDocument::Compact), "resume-note",
+         [this, id](const QJsonValue &v) {
+             // Only what changes the list is worth reading it again for.
+             const QString noted = v.toObject().value("noted").toString();
+             bool listed = false;
+             for (const QVariant &kept : std::as_const(m_resume))
+                 listed = listed || kept.toMap().value("id").toString() == id;
+             if (noted == "kept" || listed)
+                 loadResume();
+         },
+         true);
+}
+
+void Backend::forgetResume(const QString &id) {
+    QUrlQuery q;
+    q.addQueryItem("v", id);
+    call("POST", "api/resume/rm", q, {}, "resume-note", [this](const QJsonValue &) { loadResume(); }, true);
+}
+
+void Backend::clearResume() {
+    call("POST", "api/resume/clear", {}, {}, "resume-note", [this](const QJsonValue &) { loadResume(); }, true);
+}
+
+void Backend::loadComments(const QString &video, const QString &sort, int n, bool replies) {
+    QUrlQuery q;
+    q.addQueryItem("v", video);
+    q.addQueryItem("sort", sort);
+    q.addQueryItem("n", QString::number(n));
+    q.addQueryItem("replies", replies ? "1" : "0");
+    call("GET", "api/comments", q, {}, "comments", [this, video, n, replies](const QJsonValue &v) {
+        const QVariantMap answer = v.toObject().toVariantMap();
+        m_comments = {{"video", video},
+                      {"sort", answer.value("sort")},
+                      {"n", n},
+                      {"replies", replies},
+                      {"count", answer.value("count")},
+                      {"items", answer.value("comments")}};
+        emit commentsChanged();
+    });
+}
+
+void Backend::closeComments() {
+    // The engine sees the hang-up and stops looking.
+    supersede("comments");
+    if (m_comments.isEmpty())
+        return;
+    m_comments.clear();
+    emit commentsChanged();
+}
+
+void Backend::loadLenses() {
+    call("GET", "api/lenses", {}, {}, "lenses", [this](const QJsonValue &v) {
+        m_lenses = v.toArray().toVariantList();
+        emit lensesChanged();
+    });
+}
+
+void Backend::addLens(const QString &text) {
+    const QByteArray body = QJsonDocument(QJsonObject{{"text", text}}).toJson(QJsonDocument::Compact);
+    call("POST", "api/lenses", {}, body, "lens-write", [this](const QJsonValue &v) {
+        loadLenses();
+        emit lensAdded(v.toObject().value("id").toString());
+    }, true);
+}
+
+void Backend::editLens(const QString &id, const QString &text) {
+    const QByteArray body = QJsonDocument(QJsonObject{{"text", text}}).toJson(QJsonDocument::Compact);
+    call("POST", "api/lenses/" + id, {}, body, "lens-write", [this, id](const QJsonValue &) {
+        loadLenses();
+        // Its results were for the old words; saving new ones asks for them again.
+        if (m_lensInfo.value("id").toString() == id)
+            openLens(id, 1);
+    }, true);
+}
+
+void Backend::removeLens(const QString &id) {
+    call("POST", "api/lenses/" + id + "/rm", {}, {}, "lens-write", [this, id](const QJsonValue &) {
+        if (m_lensInfo.value("id").toString() == id)
+            closeLens();
+        loadLenses();
+    }, true);
+}
+
+void Backend::closeLens() {
+    supersede("lens");
+    m_lensVideos->clear();
+    setLensProgress(0, 0);
+    if (m_lensInfo.isEmpty())
+        return;
+    m_lensInfo.clear();
+    emit lensChanged();
+}
+
+void Backend::setLensProgress(int done, int total) {
+    total = qMax(0, total);
+    done = qBound(0, done, total);
+    if (done == m_lensDone && total == m_lensTotal)
+        return;
+    m_lensDone = done;
+    m_lensTotal = total;
+    emit lensProgressChanged();
+}
+
+void Backend::openLens(const QString &id, int refresh) {
+    // Another lens's videos are not this one's: they go at once, and this
+    // one's come when the engine has them.
+    if (m_lensInfo.value("id").toString() != id) {
+        m_lensVideos->clear();
+        for (const QVariant &listed : std::as_const(m_lenses)) {
+            const QVariantMap lens = listed.toMap();
+            if (lens.value("id").toString() == id)
+                m_lensInfo = {{"id", id}, {"text", lens.value("text")}, {"tags", lens.value("tags")},
+                              {"searches", lens.value("searches")}};
+        }
+        if (m_lensInfo.value("id").toString() != id)
+            m_lensInfo = {{"id", id}};
+        emit lensChanged();
+    }
+    QUrlQuery q;
+    q.addQueryItem("id", id);
+    q.addQueryItem("stream", "1");
+    q.addQueryItem(refresh >= 2 ? "force" : "refresh", refresh >= 1 ? "1" : "0");
+    stream(
+        "api/lens", q, "lens",
+        [this](const QVariantList &lines) {
+            for (const QVariant &line : lines) {
+                const QVariantMap o = line.toMap();
+                if (o.contains("progress")) {
+                    const QVariantMap progress = o.value("progress").toMap();
+                    setLensProgress(progress.value("done").toInt(), progress.value("total").toInt());
+                } else if (o.contains("result")) {
+                    const QVariantMap result = o.value("result").toMap();
+                    const QVariantMap lens = result.value("lens").toMap();
+                    newPage(m_lensVideos);
+                    m_lensVideos->assign(result.value("videos").toList());
+                    m_lensInfo = {{"id", lens.value("id")},
+                                  {"text", lens.value("text")},
+                                  {"tags", result.value("tags")},
+                                  {"searches", result.value("searches")},
+                                  {"fetchedAt", result.value("fetchedAt")}};
+                    emit lensChanged();
+                    // How many it has, and when they were fetched, is in the list too.
+                    loadLenses();
+                }
+            }
+        },
+        [this] { setLensProgress(0, 0); });
+}
+
+void Backend::read(const QString &text) {
+    const QString typed = text.trimmed();
+    if (typed.isEmpty()) {
+        // Nothing to read; an answer still on its way is for words that are gone.
+        supersede("read");
+        if (!m_reading.isEmpty()) {
+            m_reading.clear();
+            emit readingChanged();
+        }
+        return;
+    }
+    QUrlQuery q;
+    q.addQueryItem("q", typed);
+    call("GET", "api/read", q, {}, "read", [this, typed](const QJsonValue &v) {
+        m_reading = v.toObject().toVariantMap();
+        m_reading.insert("text", typed);
+        emit readingChanged();
+    });
+}
 
 QString Backend::thumbBase() const {
     if (!ready() || m_config.isEmpty() || !m_config.value("thumbnails", true).toBool())

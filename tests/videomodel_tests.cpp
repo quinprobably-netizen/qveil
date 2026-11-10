@@ -93,6 +93,19 @@ class VideoModelTests : public QObject {
     Q_OBJECT
 
 private slots:
+    void whyIsARole()
+    {
+        VideoModel model;
+        QVariantMap with = video("aaaaaaaaaaa");
+        with.insert("why", QVariantList{"talks", "over 30:00"});
+        model.assign({with, video("bbbbbbbbbbb")});
+        const int role = model.roleNames().key("why", -1);
+        QVERIFY(role >= 0);
+        QCOMPARE(model.data(model.index(0), role).toStringList(), QStringList({"talks", "over 30:00"}));
+        QCOMPARE(model.data(model.index(1), role).toStringList(), QStringList());
+        QCOMPARE(model.get(0).value("why").toStringList(), QStringList({"talks", "over 30:00"}));
+    }
+
     void aNewVideoAtTheFrontLeavesTheOthersAlone() {
         VideoModel model;
         model.assign(videos({"a", "b", "c"}));

@@ -6,24 +6,26 @@
 # The tests steer it with files next to the script (the test copies the script
 # into a directory of its own, so every engine has its own steering):
 #   calls            every run is appended: "<kind> <target>", kind being
-#                    resolve, search, info (a channel's name) or channel
+#                    resolve, comments, search, info (a channel's name) or channel
 #   <kind>-delay     seconds to wait before answering that kind
 #   <kind>-delay-once  the same, for the next run only
 #   <kind>-error     a line to fail with on stderr instead of answering
 here=$(dirname "$0")
 config=
 range=
+comments=
 while [ $# -gt 0 ]; do
   case "$1" in
   --config-locations) config="$2" ;;
   -I) range="$2" ;;
+  --write-comments) comments=1 ;;
   esac
   shift
 done
 target=$(tail -n 1 "$config")
 case "$target" in
-*ytsearch*) kind=search ;;
-*watch*) kind=resolve ;;
+*ytsearch* | *results\?*) kind=search ;;
+*watch*) if [ -n "$comments" ]; then kind=comments; else kind=resolve; fi ;;
 *) if [ "$range" = 0 ]; then kind=info; else kind=channel; fi ;;
 esac
 echo "$kind $target" >>"$here/calls"
@@ -72,7 +74,16 @@ channel)
     ;;
   esac
   ;;
+comments)
+  # Three threads, the first pinned by the uploader; the second has a reply,
+  # sent only when replies were asked for (the last number of max_comments).
+  reply=
+  if ! grep -q "max_comments=[0-9]*,[0-9]*,0,0" "$config"; then
+    reply=',{"id":"c2.1","parent":"c2","author":"@gamma","text":"Agreed"}'
+  fi
+  echo "{\"comment_count\":1204,\"comments\":[{\"id\":\"c1\",\"parent\":\"root\",\"author\":\"@alpha\",\"text\":\"Correction at 0:10\",\"like_count\":640,\"_time_text\":\"9 hours ago\",\"is_pinned\":true,\"author_is_uploader\":true},{\"id\":\"c2\",\"parent\":\"root\",\"author\":\"@beta\",\"text\":\"Nice\",\"like_count\":12,\"_time_text\":\"6 hours ago\"}$reply,{\"id\":\"c3\",\"parent\":\"root\",\"author\":\"@delta\",\"text\":\"See https://example.com/x\",\"_time_text\":\"1 hour ago\"}]}"
+  ;;
 resolve)
-  echo '{"title":"Canned video","channel":"Alpha","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","duration":61,"requested_formats":[{"url":"https://upstream.invalid/video","protocol":"https","vcodec":"avc1"},{"url":"https://upstream.invalid/audio","protocol":"https","vcodec":"none"}]}'
+  echo '{"title":"Canned video","channel":"Alpha","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","duration":61,"description":"About this video.\\n0:00 Intro","view_count":59000,"timestamp":1762700000,"chapters":[{"start_time":0,"title":"Intro"},{"start_time":60,"title":"Middle"}],"requested_formats":[{"url":"https://upstream.invalid/video","protocol":"https","vcodec":"avc1"},{"url":"https://upstream.invalid/audio","protocol":"https","vcodec":"none"}]}'
   ;;
 esac
