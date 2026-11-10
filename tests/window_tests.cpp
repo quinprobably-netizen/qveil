@@ -111,6 +111,9 @@ struct App {
 
     void click(QQuickItem *target) const
     {
+        // What has only just appeared or moved is laid out with the next
+        // frame; a click sent before that would go where the item was.
+        QTest::qWait(40);
         QTest::mouseClick(window, Qt::LeftButton, {}, target->mapToScene(QPointF(target->width() / 2, target->height() / 2)).toPoint());
     }
     void hover(QQuickItem *target) const
@@ -598,6 +601,120 @@ private slots:
                  app.backend->privacy().value("pages").toMap().value("comments").toString());
         QVERIFY(!app.item("comments-note")->property("text").toString().isEmpty());
         QVERIFY(app.items("comment").isEmpty());
+    }
+
+    void aLensIsWrittenReadSavedAndShown()
+    {
+        App app(true);
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_2);
+        QCOMPARE(app.page(), QString("lenses"));
+        QQuickItem *text = app.item("lens-text");
+        QVERIFY(text);
+        // With no lens yet, the page opens ready to write one.
+        QTRY_VERIFY(text->property("editing").toBool());
+        QVERIFY(app.items("lens-row").isEmpty());
+        QVERIFY(!app.item("lens-save")->isEnabled());
+        app.type("bread, sourdough over 30 min");
+        QTRY_COMPARE(app.item("lens-tags")->property("count").toInt(), 3);
+        // What a refresh will ask YouTube for, word for word.
+        const QString searches = app.item("lens-searches")->property("text").toString();
+        QVERIFY2(searches.contains("\u201cbread\u201d") && searches.contains("\u201csourdough\u201d"), qPrintable(searches));
+        QCOMPARE(app.asked("GET api/lens?"), 0);
+
+        QVERIFY(app.item("lens-save")->isEnabled());
+        app.click(app.item("lens-save"));
+        QTRY_COMPARE(app.items("lens-row").size(), 1);
+        QVERIFY(app.items("lens-row").first()->property("current").toBool());
+        QTRY_COMPARE(app.item("lens-grid")->property("count").toInt(), 6);
+        QVERIFY(!app.items("card-why").isEmpty());
+        QCOMPARE(text->property("text").toString(), QString("bread, sourdough over 30 min"));
+        // Saved, and nothing changed since: there is nothing to save.
+        QVERIFY(!app.item("lens-save")->isEnabled());
+    }
+
+    void aLensWithoutATopicCannotBeSaved()
+    {
+        App app(true);
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_VERIFY(app.item("lens-text")->property("editing").toBool());
+        app.type("no music");
+        QQuickItem *error = app.item("lens-error");
+        QTRY_VERIFY(error->isVisible());
+        QVERIFY(error->property("text").toString().startsWith("Say what it should be about"));
+        QVERIFY(!app.item("lens-save")->isEnabled());
+        // Enter doesn't save it either.
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTest::qWait(300);
+        QCOMPARE(app.asked("POST api/lenses"), 0);
+    }
+
+    void deletingALensAsksOnceInPlace()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.items("lens-row").size(), 2);
+        // The first lens is open, with its words in the editor.
+        QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString("slow woodworking with hand tools, no music"));
+        QQuickItem *del = app.item("lens-delete");
+        QCOMPARE(del->property("text").toString(), QString("Delete"));
+        app.click(del);
+        QCOMPARE(del->property("text").toString(), QString("Delete?"));
+        QCOMPARE(app.items("lens-row").size(), 2);
+        QTRY_VERIFY(app.item("lens-cancel")->isVisible());
+        app.click(app.item("lens-cancel"));
+        QTRY_COMPARE(del->property("text").toString(), QString("Delete"));
+        app.click(del);
+        app.click(del);
+        QTRY_COMPARE(app.items("lens-row").size(), 1);
+        // The one that is left is the one that is open.
+        QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString("systems talks over 30 min, this year"));
+
+        // Another lens is a click away.
+        app.window->setProperty("page", "home");
+    }
+
+    void aSearchCanBeKeptAsALensAndHomeCanStartOne()
+    {
+        App app;
+        READY(app);
+        QMetaObject::invokeMethod(app.item("search"), "edit");
+        app.type("talks over 30 min");
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QCOMPARE(app.page(), QString("search"));
+        QTRY_VERIFY(app.item("reading-tags")->isVisible());
+        QCOMPARE(app.item("reading-tags")->property("count").toInt(), 2);
+        QTRY_VERIFY(!app.items("card-why").isEmpty());
+        QQuickItem *keep = app.item("keep-lens");
+        QVERIFY(keep && keep->isVisible());
+        app.click(keep);
+        QTRY_COMPARE(app.page(), QString("lenses"));
+        QTRY_COMPARE(app.items("lens-row").size(), 3);
+        QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString("talks over 30 min"));
+        QVERIFY(app.items("lens-row").last()->property("current").toBool());
+
+        // Home's "New lens" opens the page with nothing written yet.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTest::keyClick(app.window, Qt::Key_1);
+        app.click(app.item("feed-tab-new"));
+        QCOMPARE(app.page(), QString("lenses"));
+        QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString());
+        QTRY_VERIFY(app.item("lens-text")->property("editing").toBool());
+        for (QQuickItem *row : app.items("lens-row"))
+            QVERIFY(!row->property("current").toBool());
+    }
+
+    void theLensNoteIsTheEnginesOwnSentence()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_2);
+        QQuickItem *note = app.item("lens-note");
+        QVERIFY(note);
+        QTRY_COMPARE(note->property("text").toString(), app.backend->privacy().value("pages").toMap().value("lenses").toString());
+        QVERIFY(!note->property("text").toString().isEmpty());
     }
 };
 

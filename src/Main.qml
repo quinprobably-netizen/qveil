@@ -127,6 +127,8 @@ ApplicationWindow {
             backend.openChannel(backend.channel.id)
         else if (page === "search")
             backend.search(backend.query)
+        else if (page === "lenses")
+            lensesPage.refresh()
         else if (page === "home" && feedPage.onLens)
             backend.openLens(feedPage.feed, 2)
         else if (page === "home")
@@ -223,6 +225,11 @@ ApplicationWindow {
                 watch.close()
         }
         function onPlayReady(info) { watch.open(info) }
+        // A lens that was just added is shown, wherever it was added from.
+        function onLensAdded(id) {
+            if (win.page !== "lenses")
+                win.go("lenses")
+        }
         function onNotice(text) { toast.show(text) }
     }
 
@@ -367,7 +374,10 @@ ApplicationWindow {
                         backend.refreshFeed(false, shown)
                     }
                     onRefreshRequested: win.refresh()
-                    onNewLensRequested: win.go("lenses")
+                    onNewLensRequested: {
+                        win.go("lenses")
+                        lensesPage.startNew()
+                    }
                     onAddChannelRequested: win.addChannel()
                 }
 
@@ -386,6 +396,16 @@ ApplicationWindow {
                     emptyText: backend.query ? qsTr("No results.") : ""
                     onActivated: (video, index) => win.play(video, backend.results, index)
                     onChannelRequested: id => win.openChannel(id)
+
+                    // A search worth repeating becomes a feed.
+                    Act {
+                        objectName: "keep-lens"
+                        visible: backend.query !== ""
+                        text: qsTr("Keep as a lens")
+                        glyph: "qrc:/icons/lens.svg"
+                        tip: qsTr("Saves this search as a feed you can come back to")
+                        onClicked: backend.addLens(backend.query)
+                    }
                 }
 
                 VideoPage {
@@ -456,13 +476,17 @@ ApplicationWindow {
                     }
                 }
 
-                // Lenses and settings are drawn by the tasks that add them.
-                Item {
+                LensesPage {
                     id: lensesPage
-                    objectName: "page-lenses"
                     anchors.fill: parent
                     visible: win.page === "lenses" && !win.watching
+                    thumbs: win.thumbs
+                    progress: win.watched
+                    onActivated: (video, index) => win.play(video, backend.lensVideos, index)
+                    onChannelRequested: id => win.openChannel(id)
                 }
+
+                // Settings are drawn by the task that adds them.
                 Item {
                     id: settingsPage
                     objectName: "page-settings"

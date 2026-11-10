@@ -18,34 +18,50 @@ Item {
 
     implicitHeight: Style.control
 
+    // Latest, then the lenses (which scroll sideways when there are more
+    // than fit), then the way to a new one, which is never pushed out of reach.
     Row {
         id: row
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
         spacing: 2
-        // The tabs give way to the actions, never the other way round.
-        width: Math.max(0, parent.width - tail.width - note.width - Style.u * 6)
-        clip: true
 
         TabWord {
+            id: latest
             objectName: "feed-tab-latest"
             text: qsTr("Latest")
             current: tabs.current === "latest"
             onClicked: tabs.picked("latest")
         }
-        Repeater {
-            model: tabs.lenses
-            delegate: TabWord {
-                required property var modelData
-                objectName: "feed-tab-" + modelData.id
-                // A lens can be a long sentence; its tab is the start of it.
-                text: modelData.text.length > 30 ? modelData.text.slice(0, 29) + "…" : modelData.text
-                glyph: "qrc:/icons/lens.svg"
-                current: tabs.current === modelData.id
-                onClicked: tabs.picked(modelData.id)
+        Flickable {
+            id: strip
+            width: Math.max(0, Math.min(lensRow.width,
+                                        tabs.width - latest.width - fresh.width - tail.width - note.width - Style.u * 8))
+            height: Style.control
+            contentWidth: lensRow.width
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            flickableDirection: Flickable.HorizontalFlick
+
+            Row {
+                id: lensRow
+                spacing: 2
+                Repeater {
+                    model: tabs.lenses
+                    delegate: TabWord {
+                        required property var modelData
+                        objectName: "feed-tab-" + modelData.id
+                        // A lens can be a long sentence; its tab is the start of it.
+                        text: modelData.text.length > 26 ? modelData.text.slice(0, 25) + "\u2026" : modelData.text
+                        glyph: "qrc:/icons/lens.svg"
+                        current: tabs.current === modelData.id
+                        onClicked: tabs.picked(modelData.id)
+                    }
+                }
             }
         }
         Act {
+            id: fresh
             objectName: "feed-tab-new"
             text: qsTr("New lens")
             glyph: "qrc:/icons/plus.svg"
