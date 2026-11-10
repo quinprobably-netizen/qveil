@@ -1067,7 +1067,12 @@ private slots:
 
     void themeFollowsAChangeOfColours()
     {
-        QTemporaryDir dir;
+        // The theme watches its directory's parent too, so that is a private
+        // one and not /tmp, which other programs (and other tests) change at
+        // any moment: every such change re-arms the watch, and a write that
+        // lands while it is being re-armed goes unseen.
+        QTemporaryDir root;
+        const QDir dir(root.filePath("current"));
         QVERIFY(QDir().mkpath(dir.filePath("theme")));
         write(dir.filePath("theme/colors.toml"), "background = \"#101010\"\n");
         Theme theme(dir.path());
