@@ -10,6 +10,7 @@
 #include <QQmlEngine>
 #include <QQuickWindow>
 #include <QSettings>
+#include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QtTest>
@@ -1039,6 +1040,43 @@ private slots:
         Theme theme(dir.path());
         QCOMPARE(theme.accent(), QString("#112233"));
         QCOMPARE(theme.accentForeground(), QString("white"));
+    }
+
+    void themeReadsTheRoomAndTheFont()
+    {
+        QTemporaryDir dir, tools;
+        QVERIFY(QDir().mkpath(dir.filePath("theme")));
+        write(dir.filePath("theme/colors.toml"),
+              "accent = \"#a08dff\"\nbackground = \"#151326\"\ndark_background = \"#100e1d\"\nforeground = \"#dad6ec\"\n");
+        const QString fc = tools.filePath("fc-match");
+        write(fc, "#!/bin/sh\nprintf 'Test Mono'\n");
+        QVERIFY(QFile::setPermissions(fc, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+        Theme theme(dir.path(), nullptr, {}, {}, fc);
+        QTRY_COMPARE(theme.fontFamily(), QString("Test Mono"));
+        QCOMPARE(theme.background(), QString("#151326"));
+        QCOMPARE(theme.foreground(), QString("#dad6ec"));
+        QCOMPARE(theme.accent(), QString("#a08dff"));
+
+        // Without a theme, or without fontconfig, there is still a room and a typeface.
+        QTemporaryDir empty;
+        Theme bare(empty.path(), nullptr, {}, {}, "/nonexistent/fc-match");
+        QCOMPARE(bare.background(), QString("#111115"));
+        QCOMPARE(bare.foreground(), QString("#e9e4f0"));
+        QCOMPARE(bare.fontFamily(), QString("monospace"));
+    }
+
+    void themeFollowsAChangeOfColours()
+    {
+        QTemporaryDir dir;
+        QVERIFY(QDir().mkpath(dir.filePath("theme")));
+        write(dir.filePath("theme/colors.toml"), "background = \"#101010\"\n");
+        Theme theme(dir.path());
+        QCOMPARE(theme.background(), QString("#101010"));
+        QSignalSpy changed(&theme, &Theme::changed);
+        write(dir.filePath("theme/colors.toml"), "background = \"#202020\"\nforeground = \"#fafafa\"\n");
+        QTRY_COMPARE(theme.background(), QString("#202020"));
+        QCOMPARE(theme.foreground(), QString("#fafafa"));
+        QVERIFY(changed.count() >= 1);
     }
 
     void themeFollowsHyprlandRounding()

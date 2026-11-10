@@ -81,6 +81,8 @@ int main(int argc, char *argv[]) {
 
     QQuickStyle::setStyle("Material");
     qmlRegisterType<MpvItem>("Qveil", 1, 0, "MpvItem");
+    // What the window looks like: the tokens every part is drawn with.
+    qmlRegisterSingletonType(QUrl("qrc:/Style.qml"), "Qveil", 1, 0, "Style");
 
     // Installed before anything is translated, and every qsTr() binding is
     // re-evaluated when the Omarchy language changes.

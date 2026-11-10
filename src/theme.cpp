@@ -12,9 +12,25 @@
 #include <cmath>
 #include <utility>
 
-Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl, const QString &hyprEvents)
+Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl, const QString &hyprEvents,
+             const QString &fcMatch)
     : QObject(parent),
       m_directory(directory.isEmpty() ? QDir::homePath() + "/.local/state/omarchy/current" : directory) {
+    // The typeface is whatever `monospace` means on this system right now.
+    // Qt resolves the alias once and never again, so the name is asked for
+    // (as the Omarchy shell does) and asked again when fontconfig's settings
+    // change, which is what `omarchy font set` does.
+    m_fcMatch = !fcMatch.isEmpty() ? fcMatch : directory.isEmpty() ? QStandardPaths::findExecutable("fc-match") : QString();
+    m_fontconfig = directory.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + "/fontconfig"
+                                       : QString();
+    connect(&m_fontProcess, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        const QString family = QString::fromUtf8(m_fontProcess.readAllStandardOutput()).trimmed();
+        if (code == 0 && status == QProcess::NormalExit && !family.isEmpty() && family != m_fontFamily) {
+            m_fontFamily = family;
+            emit changed();
+        }
+    });
+
     m_debounce.setSingleShot(true);
     m_debounce.setInterval(80);
     connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, [this] { m_debounce.start(); });
@@ -67,6 +83,10 @@ Theme::~Theme() {
         m_roundingProcess.kill();
         m_roundingProcess.waitForFinished(1000);
     }
+    if (m_fontProcess.state() != QProcess::NotRunning) {
+        m_fontProcess.kill();
+        m_fontProcess.waitForFinished(1000);
+    }
 }
 
 void Theme::refreshRounding() {
@@ -94,16 +114,24 @@ void Theme::readEvents() {
         m_eventBuffer.clear();
 }
 
-QString Theme::readAccent(const QString &path) {
+QString Theme::readAccent(const QString &path) { return readColour(path, "accent", "#FFD60A"); }
+
+QString Theme::readColour(const QString &path, const QString &key, const QString &fallback) {
     QFile file(path);
     if (file.open(QIODevice::ReadOnly)) {
-        const QRegularExpression expression(R"re(^\s*accent\s*=\s*["'](#[0-9a-fA-F]{6})["'])re",
+        const QRegularExpression expression("^\\s*" + QRegularExpression::escape(key) + R"re(\s*=\s*["'](#[0-9a-fA-F]{6})["'])re",
                                             QRegularExpression::MultilineOption);
         const auto match = expression.match(QString::fromUtf8(file.readAll()));
         if (match.hasMatch())
             return match.captured(1);
     }
-    return "#FFD60A";
+    return fallback;
+}
+
+void Theme::refreshFont() {
+    if (m_fcMatch.isEmpty() || m_fontProcess.state() != QProcess::NotRunning)
+        return;
+    m_fontProcess.start(m_fcMatch, {"-f", "%{family[0]}", "monospace"});
 }
 
 // Black or white, whichever reads on the accent (WCAG relative luminance).
@@ -128,14 +156,23 @@ void Theme::reload() {
         ancestor = QFileInfo(ancestor).absolutePath();
     QStringList candidates{ancestor, QFileInfo(ancestor).absolutePath(), m_directory,
                            m_directory + "/theme", m_directory + "/theme/colors.toml"};
+    // Where `omarchy font set` writes which font `monospace` is.
+    if (!m_fontconfig.isEmpty())
+        candidates << m_fontconfig << m_fontconfig + "/fonts.conf";
     candidates.removeDuplicates();
     for (const auto &path : candidates)
         if (QFileInfo::exists(path))
             m_watcher.addPath(path);
 
-    const auto accent = readAccent(m_directory + "/theme/colors.toml");
-    if (accent != m_accent) {
+    const QString colours = m_directory + "/theme/colors.toml";
+    const auto accent = readAccent(colours);
+    const auto background = readColour(colours, "background", "#111115");
+    const auto foreground = readColour(colours, "foreground", "#e9e4f0");
+    if (accent != m_accent || background != m_background || foreground != m_foreground) {
         m_accent = accent;
+        m_background = background;
+        m_foreground = foreground;
         emit changed();
     }
+    refreshFont();
 }
