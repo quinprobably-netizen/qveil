@@ -6,4 +6,5 @@
 //! search per topic, and everything else (the filtering, the ordering, the
 //! reasons shown with each result) happens on this machine.
 
+pub mod rank;
 pub mod read;
