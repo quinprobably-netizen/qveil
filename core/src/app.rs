@@ -180,7 +180,13 @@ pub fn lens(
             fetched_at: at,
             videos,
         };
-        lens::save_cache(paths, id, &fresh)?;
+        // Asked once more, as late as it can be: the searches took a while.
+        if !wanted() {
+            bail!(crate::ytdlp::CANCELLED);
+        }
+        if !lens::save_results(paths, &lens, &fresh)? {
+            bail!("That lens was changed while it was being refreshed; open it again.");
+        }
         Some(fresh)
     } else {
         stored

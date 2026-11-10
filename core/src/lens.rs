@@ -141,8 +141,20 @@ pub fn cached(paths: &Paths, id: &str) -> Result<Option<Cached>> {
     store::load_cache(&path).map(Some)
 }
 
-pub fn save_cache(paths: &Paths, id: &str, results: &Cached) -> Result<()> {
-    store::save_compact(&paths.lens_cache(id), results)
+/// Keeps what `lens`'s searches found, if it is still the lens they ran
+/// for. They take a while, and meanwhile its words may have been changed or
+/// the lens removed: results for other words would be shown as its own for
+/// hours, and results for no lens would stay behind in the cache. Returns
+/// whether they were kept.
+pub fn save_results(paths: &Paths, lens: &Lens, results: &Cached) -> Result<bool> {
+    let _lock = store::lock(paths)?;
+    let unchanged = load(paths)?
+        .iter()
+        .any(|l| l.id == lens.id && l.text == lens.text);
+    if unchanged {
+        store::save_compact(&paths.lens_cache(&lens.id), results)?;
+    }
+    Ok(unchanged)
 }
 
 fn forget_cache(paths: &Paths, id: &str) -> Result<()> {
@@ -176,7 +188,7 @@ mod tests {
             fetched_at: 9,
             videos: vec![],
         };
-        save_cache(&p, &lens.id, &results).unwrap();
+        assert!(save_results(&p, &lens, &results).unwrap());
         assert_eq!(cached(&p, &lens.id).unwrap().unwrap().fetched_at, 9);
         let edited = edit(&p, &lens.id, "bread", 6).unwrap();
         assert_eq!(
@@ -184,7 +196,7 @@ mod tests {
             (lens.id.as_str(), "bread")
         );
         assert!(cached(&p, &lens.id).unwrap().is_none());
-        save_cache(&p, &lens.id, &results).unwrap();
+        assert!(save_results(&p, &edited, &results).unwrap());
         remove(&p, &lens.id).unwrap();
         assert!(load(&p).unwrap().is_empty());
         assert!(!p.lens_cache(&lens.id).exists());
@@ -222,6 +234,28 @@ mod tests {
         assert!(e.contains("lenses.json"), "{e}");
         assert!(add(&p, "bread", 0).is_err());
         assert_eq!(std::fs::read(p.lenses()).unwrap(), b"{ nope");
+    }
+
+    #[test]
+    fn results_are_only_saved_for_the_words_they_were_fetched_for() {
+        let d = TempDir::new();
+        let p = d.paths();
+        let lens = add(&p, "bread", 0).unwrap();
+        let results = Cached {
+            fetched_at: 9,
+            videos: vec![],
+        };
+        assert!(save_results(&p, &lens, &results).unwrap());
+        assert!(p.lens_cache(&lens.id).exists());
+        // Its words changed while its searches ran: what they found is for
+        // the old words, and is not kept as the new ones' results.
+        let edited = edit(&p, &lens.id, "jazz", 1).unwrap();
+        assert!(!save_results(&p, &lens, &results).unwrap());
+        assert!(!p.lens_cache(&lens.id).exists());
+        // It was removed meanwhile: nothing is left behind for it.
+        remove(&p, &lens.id).unwrap();
+        assert!(!save_results(&p, &edited, &results).unwrap());
+        assert!(!p.lens_cache(&lens.id).exists());
     }
 
     #[test]

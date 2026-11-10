@@ -76,6 +76,18 @@ impl Reading {
         self.topics.len() != 1 || *self != plain
     }
 
+    /// Whether anything is set besides what to search for. A search without
+    /// a filter is one search, however many topics it could be split into,
+    /// and goes to YouTube as it was typed ("rick and morty").
+    pub fn has_filters(&self) -> bool {
+        let plain = Reading {
+            topics: self.topics.clone(),
+            dropped: self.dropped,
+            ..Reading::default()
+        };
+        *self != plain
+    }
+
     /// A lens has to be about something: rules alone have nothing to search for.
     pub fn check(&self) -> Result<()> {
         if self.topics.is_empty() {
@@ -141,11 +153,12 @@ impl Reading {
             }
             why.push(format!("since {}", fmt_date(since)));
         }
-        let title = v.title.to_lowercase();
-        let channel = v.channel.as_deref().unwrap_or_default().to_lowercase();
+        // By whole words: "no ai" must not turn away "Explained".
+        let title = words(&v.title);
+        let channel = words(v.channel.as_deref().unwrap_or_default());
         if self.exclude.iter().any(|x| {
-            let x = x.to_lowercase();
-            title.contains(&x) || channel.contains(&x)
+            let x = words(x);
+            has_run(&title, &x) || has_run(&channel, &x)
         }) {
             return None;
         }
@@ -157,6 +170,20 @@ impl Reading {
         }
         Some(why)
     }
+}
+
+/// The words of `text`, in lower case: runs of letters and digits.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Whether the words of `phrase` occur in `text`, next to each other and in order.
+fn has_run(text: &[String], phrase: &[String]) -> bool {
+    !phrase.is_empty() && text.windows(phrase.len()).any(|run| run == phrase)
 }
 
 /// "1 Jan 2026", in UTC.
@@ -191,9 +218,30 @@ fn start_of_year(year: i16) -> Option<i64> {
     Some(first.to_zoned(TimeZone::UTC).ok()?.timestamp().as_second())
 }
 
-/// Reads `text` at the time `now` (Unix seconds), which the date rules are
-/// measured from.
+/// Who the text is for, which decides how freely it is read.
+#[derive(Clone, Copy, PartialEq)]
+enum For {
+    /// A lens: its reading is shown as tags and saved by choice, so it can
+    /// say what it leaves out in words ("no music").
+    Lens,
+    /// The search box: most of what is typed there is a title or a name, so
+    /// "no …" is only words ("no man's sky"), and a minus sign is how
+    /// something is left out.
+    Search,
+}
+
+/// Reads `text` as a lens, at the time `now` (Unix seconds), which the date
+/// rules are measured from.
 pub fn read(text: &str, now: i64) -> Reading {
+    read_for(text, now, For::Lens)
+}
+
+/// Reads `text` as a search.
+pub fn read_search(text: &str, now: i64) -> Reading {
+    read_for(text, now, For::Search)
+}
+
+fn read_for(text: &str, now: i64, whom: For) -> Reading {
     let mut r = Reading::default();
     let mut topics: Vec<String> = Vec::new();
     for part in parts(text) {
@@ -207,7 +255,7 @@ pub fn read(text: &str, now: i64) -> Reading {
             }
             Part::Plain(p) => {
                 for clause in clauses(p) {
-                    topics.extend(read_clause(clause, now, &mut r));
+                    topics.extend(read_clause(clause, now, whom, &mut r));
                 }
             }
         }
@@ -311,7 +359,7 @@ impl Words {
 }
 
 /// Reads one clause into `r`, and returns the topic it leaves, if any.
-fn read_clause(clause: Vec<&str>, now: i64, r: &mut Reading) -> Option<String> {
+fn read_clause(clause: Vec<&str>, now: i64, whom: For, r: &mut Reading) -> Option<String> {
     let mut w = Words::new(&clause);
 
     // "-word" anywhere: without that word.
@@ -338,7 +386,7 @@ fn read_clause(clause: Vec<&str>, now: i64, r: &mut Reading) -> Option<String> {
     }
 
     // "no …": the whole clause is what isn't wanted.
-    if w.len() > 1 && matches!(w.at(0), "no" | "not" | "without" | "except") {
+    if whom == For::Lens && w.len() > 1 && matches!(w.at(0), "no" | "not" | "without" | "except") {
         if w.len() == 2 && w.at(1) == "shorts" {
             r.shorts = false;
         } else if w.has(1, &["from", "my", "subscriptions"]) {
@@ -370,6 +418,19 @@ fn read_clause(clause: Vec<&str>, now: i64, r: &mut Reading) -> Option<String> {
     }
     if w.is(&["newest first"]) {
         r.newest_first = true;
+        return None;
+    }
+
+    // One word that is a rule, and only as a clause of its own: "jazz, new"
+    // is jazz from the last month, "new york" is a city.
+    if w.len() == 1 {
+        match w.at(0) {
+            "long" | "long-form" | "longform" => r.min_len = Some(LONG),
+            "short" | "quick" => r.max_len = Some(SHORT),
+            "today" => r.since = Some(now - DAY),
+            "new" | "recent" => r.since = Some(now - RECENT),
+            _ => return Some(w.as_typed.join(" ")),
+        }
         return None;
     }
 
@@ -469,17 +530,6 @@ fn lift_lengths(w: &mut Words, r: &mut Reading) {
         }
         i += 1;
     }
-    // One word, and only at either end of the clause: "long talks" is a
-    // rule, "how long to boil an egg" is a question.
-    for end in [0, w.len().saturating_sub(1)] {
-        match w.at(end) {
-            "long" | "long-form" | "longform" => r.min_len = Some(LONG),
-            "short" | "quick" => r.max_len = Some(SHORT),
-            _ => continue,
-        }
-        w.remove(end, 1);
-        break;
-    }
 }
 
 /// The number a length starts with ("20" of "20min").
@@ -525,21 +575,14 @@ fn lift_dates(w: &mut Words, now: i64, r: &mut Reading) {
             None
         };
         match found {
-            Some((since, used)) => {
+            // Only where it ends the clause: "talks this year" is a date,
+            // "this week in tech" is a programme.
+            Some((since, used)) if i + used == w.len() => {
                 r.since = Some(since);
                 w.lift(i, used);
             }
-            None => i += 1,
+            _ => i += 1,
         }
-    }
-    for end in [0, w.len().saturating_sub(1)] {
-        match w.at(end) {
-            "today" => r.since = Some(now - DAY),
-            "new" | "recent" => r.since = Some(now - RECENT),
-            _ => continue,
-        }
-        w.lift(end, 1);
-        break;
     }
 }
 
@@ -610,12 +653,12 @@ mod tests {
         assert_eq!(read("lectures at least 1.5 h", NOW).min_len, Some(5400));
         assert_eq!(read("lectures over 90min", NOW).min_len, Some(5400));
         assert_eq!(read("clips shorter than 45 seconds", NOW).max_len, Some(45));
-        let r = read("long-form interviews", NOW);
+        let r = read("interviews, long-form", NOW);
         assert_eq!(
             (r.topics.as_slice(), r.min_len),
             (&["interviews".to_string()][..], Some(1200))
         );
-        let r = read("quick recipes", NOW);
+        let r = read("recipes, quick", NOW);
         assert_eq!(
             (r.topics.as_slice(), r.max_len),
             (&["recipes".to_string()][..], Some(300))
@@ -627,12 +670,12 @@ mod tests {
         );
         assert_eq!(topics("cats from the last 3 months"), ["cats"]);
         assert_eq!(read("cats since 2024", NOW).since, Some(1_704_067_200));
-        assert_eq!(read("cats today", NOW).since, Some(NOW - DAY));
+        assert_eq!(read("cats, today", NOW).since, Some(NOW - DAY));
         assert_eq!(read("cats this week", NOW).since, Some(NOW - 7 * DAY));
         // 2026-11-01 00:00:00 UTC.
         assert_eq!(read("cats this month", NOW).since, Some(1_793_491_200));
-        assert_eq!(read("new jazz", NOW).since, Some(NOW - 30 * DAY));
-        assert_eq!(topics("new jazz"), ["jazz"]);
+        assert_eq!(read("jazz, new", NOW).since, Some(NOW - 30 * DAY));
+        assert_eq!(topics("jazz, new"), ["jazz"]);
         assert_eq!(read("jazz, from my subscriptions", NOW).subs, Subs::Only);
         assert_eq!(
             read("jazz, not from my subscriptions", NOW).subs,
@@ -662,6 +705,86 @@ mod tests {
         // "over" and "under" need a length after them.
         assert!(!read("under the bridge", NOW).has_rules());
         assert!(!read("over 9000", NOW).has_rules());
+    }
+
+    #[test]
+    fn names_and_titles_that_hold_a_rule_word_are_left_whole() {
+        // One-word rules only count as a clause of their own, and a date
+        // only where it ends its clause.
+        for q in [
+            "new york",
+            "long island iced tea",
+            "the big short",
+            "short film",
+            "quick sort",
+            "usa today",
+            "this week in tech",
+            "today show highlights",
+            "recent discoveries in physics",
+        ] {
+            let r = read(q, NOW);
+            assert_eq!(r.topics, [q], "{q}");
+            assert!(!r.has_filters(), "{q}");
+        }
+    }
+
+    #[test]
+    fn a_search_is_only_handled_here_when_it_has_a_filter() {
+        // Several topics are still one search when that is all there is:
+        // the search box sends such a query on as it was typed.
+        for q in [
+            "rick and morty",
+            "Paris, Texas",
+            r#"rust "borrow checker" explained"#,
+        ] {
+            assert!(!read_search(q, NOW).has_filters(), "{q}");
+        }
+        // In a search, "no …" is words like any other: it is how titles
+        // begin. Only a minus sign excludes.
+        let r = read_search("no man's sky, base building", NOW);
+        assert!(!r.has_filters());
+        assert!(r.exclude.is_empty());
+        assert_eq!(read_search("jazz -fusion", NOW).exclude, ["fusion"]);
+        assert!(read_search("talks over 30 min", NOW).has_filters());
+        // A lens says what it leaves out in words.
+        assert_eq!(read("jazz, no fusion", NOW).exclude, ["fusion"]);
+    }
+
+    #[test]
+    fn what_is_left_out_is_matched_by_whole_words() {
+        let v = |title: &str| Video {
+            id: "aaaaaaaaaaa".into(),
+            title: title.into(),
+            channel: Some("Oliver Cooks".into()),
+            channel_id: None,
+            published: None,
+            duration: None,
+            views: None,
+            short: false,
+            live: false,
+        };
+        let r = read("cooking, no ai", NOW);
+        assert!(
+            r.keeps(&v("Sourdough Explained, Again: Training a Starter"), false)
+                .is_some()
+        );
+        assert!(r.keeps(&v("AI cooking"), false).is_none());
+        assert!(r.keeps(&v("Cooking (ai)"), false).is_none());
+        // The channel is called Oliver: "-live" doesn't mean it.
+        assert!(
+            read("cooking -live", NOW)
+                .keeps(&v("Dinner"), false)
+                .is_some()
+        );
+        assert!(
+            read("cooking -live", NOW)
+                .keeps(&v("Dinner, LIVE!"), false)
+                .is_none()
+        );
+        // A phrase is matched as that run of words.
+        let r = read("cooking, no pressure cooker", NOW);
+        assert!(r.keeps(&v("Pressure and a cooker"), false).is_some());
+        assert!(r.keeps(&v("My Pressure Cooker stew"), false).is_none());
     }
 
     #[test]

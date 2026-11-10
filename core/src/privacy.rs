@@ -105,7 +105,7 @@ const EVERYWHERE: &[&str] = &[
     "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
     "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
     "Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.",
-    "A lens is refreshed as one search per topic: on one address their timing links them, and even over Tor a set of related searches can be linked by content.",
+    "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing): on one address their timing links them, and even over Tor a set of related searches can be linked by content.",
     "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.",
 ];
 
@@ -141,7 +141,7 @@ const DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Player state",
-        "mpv keeps no resume files or history. qveil itself remembers where you stopped in an unfinished video for a set number of days (7 unless you change it; 0 turns it off) in a file only you can read, then deletes it; a finished video is forgotten at once.",
+        "mpv keeps no resume files or history. qveil itself remembers where you stopped in an unfinished video for a set number of days (7 unless you change it; 0 turns it off) in a file only you can read; a finished video is forgotten at once. A position that has expired is no longer offered, and is deleted the next time qveil starts or saves a position.",
     ),
     (
         "Local data",
@@ -191,20 +191,20 @@ const ROUTES: Routes = Routes {
     proxy: "A proxy you trust, such as a VPN's: YouTube sees its address, not yours. A SOCKS proxy gets fresh credentials per request (a separate circuit if it is Tor); a proxy URL with credentials of its own is not isolated.",
 };
 
-const SEARCH: &str = "Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches.";
+const SEARCH: &str = "Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches. A search with a filter in it (\"over 30 min\", \"-word\") is sent as one search per topic, like a lens, and filtered and ordered on this computer.";
 const SUBSCRIPTIONS: &str = "Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels.";
-const HISTORY_OFF: &str = "Off: qveil keeps no list of what you watch.";
+const HISTORY_OFF: &str = "Off: qveil keeps no history. Where you stopped in unfinished videos is remembered separately, while resume is on.";
 const HISTORY_ON: &str =
     "On: kept only on this computer, in a file only you can read, until you clear it.";
 const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.";
-const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches; your wording, the filters and the ranking stay on this computer.";
+const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
 
 /// What is said about resume when positions are kept for `days` (0: not at all).
 fn resume(days: u32) -> String {
     match days {
         0 => "Off: qveil doesn't remember where you stopped.".into(),
         _ => format!(
-            "On: qveil remembers where you stopped in an unfinished video for {}, in a file only you can read, then deletes it. A finished video is forgotten at once.",
+            "On: qveil remembers where you stopped in an unfinished video for {}, in a file only you can read. After that it is no longer offered, and it is deleted the next time qveil starts or saves a position. A finished video is forgotten at once.",
             if days == 1 {
                 "1 day".to_string()
             } else {
@@ -394,6 +394,11 @@ mod tests {
                 "unlinkable",
                 // With resume on, qveil does remember some of it.
                 "doesn't remember what you watch",
+                "keeps no list of what you watch",
+                // Some rules go to YouTube as its own filters.
+                "the filters and the ranking stay",
+                // Nothing deletes a position at the moment it expires.
+                "then deletes it",
             ] {
                 assert!(!text.contains(wrong), "{wrong:?} in: {text}");
             }
@@ -407,6 +412,10 @@ mod tests {
             "links the two circuits",
             "fingerprint",
             "one more lookup of that video",
+            "sent with the search as YouTube's own filter",
+            "searched a second time",
+            "the next time qveil starts or saves a position",
+            "keeps no history",
             "one search per topic",
             "a finished video is forgotten at once",
         ] {

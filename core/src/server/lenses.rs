@@ -8,7 +8,7 @@ use super::http::{NDJSON_HEAD, Request, Watch, respond};
 use super::{MAX_SEARCH, Server};
 use crate::app::{self, LensRefresh, Runtime};
 use crate::errors;
-use crate::lens::read::{Reading, read};
+use crate::lens::read::{Reading, read, read_search};
 use crate::lens::{self, Lens};
 use crate::store::Paths;
 use anyhow::{Context, Result};
@@ -26,11 +26,12 @@ struct Written {
     text: String,
 }
 
-/// Whether a search query is to be handled here: it has rules, and something
-/// to search for. Anything else goes to YouTube exactly as it was typed. A
-/// query is never refused for looking like rules ("no country for old men").
+/// Whether a search query is to be handled here: it has a filter to apply,
+/// and something to search for. Anything else goes to YouTube exactly as it
+/// was typed, whether it could be split into topics ("rick and morty") or
+/// only looks like a rule ("no country for old men").
 pub(super) fn has_rules(reading: &Reading) -> bool {
-    reading.has_rules() && !reading.topics.is_empty()
+    reading.has_filters() && !reading.topics.is_empty()
 }
 
 /// A lens as the list shows it: how it reads, and what is stored for it.
@@ -56,18 +57,30 @@ fn write_line(out: &mut TcpStream, line: &Value) -> std::io::Result<()> {
 }
 
 impl Server {
-    /// `GET api/read?q=…`: how a text would be read, as a lens or in the
-    /// search box. Nothing is asked of anyone, so the window can call it as
-    /// the user types.
+    /// `GET api/read?q=…`: how a text would be read in the search box, or
+    /// with `&for=lens` as a lens. Nothing is asked of anyone, so the window
+    /// can call it as the user types. `rules` says whether there is anything
+    /// to show for it: for a search, a filter that will be applied here.
     pub(super) fn read_json(&self, req: &Request) -> Value {
         let text = req.query.get("q").map(String::as_str).unwrap_or_default();
-        let reading = read(text, app::now());
+        let lens = req.query.get("for").is_some_and(|f| f == "lens");
+        let reading = if lens {
+            read(text, app::now())
+        } else {
+            read_search(text, app::now())
+        };
+        let rules = if lens {
+            reading.has_rules()
+        } else {
+            has_rules(&reading)
+        };
         let mut v = json!({
             "tags": reading.tags(),
             "searches": reading.topics,
-            "rules": has_rules(&reading),
+            "rules": rules,
         });
-        if let Err(e) = reading.check() {
+        // Only a lens has to be about something: a search is sent as typed.
+        if lens && let Err(e) = reading.check() {
             v["error"] = json!(e.to_string());
         }
         v
@@ -399,7 +412,23 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         assert!(v.get("error").is_none());
         let (_, v) = json(&base, "GET", "api/read?q=rust", "");
         assert_eq!(v["rules"], false);
-        let (status, v) = json(&base, "GET", "api/read?q=no%20music", "");
+        // The search box and a lens read "no …" differently, and say so.
+        let (_, v) = json(&base, "GET", "api/read?q=no%20man%27s%20sky%2C%20bases", "");
+        assert_eq!(v["rules"], false);
+        let (_, v) = json(
+            &base,
+            "GET",
+            "api/read?q=bases%2C%20no%20music&for=lens",
+            "",
+        );
+        assert_eq!(
+            v["tags"][1],
+            serde_json::json!({ "label": "not", "value": "music" })
+        );
+        // Two topics and no filter: nothing for the search box to apply.
+        let (_, v) = json(&base, "GET", "api/read?q=rick%20and%20morty", "");
+        assert_eq!(v["rules"], false);
+        let (status, v) = json(&base, "GET", "api/read?q=no%20music&for=lens", "");
         assert_eq!(status, 200);
         assert!(
             v["error"]
@@ -425,6 +454,23 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         // Quotes are searched as typed, quotes and all.
         search("%22over%209000%22");
         assert_eq!(asked(&bin).last().unwrap(), r#"'ytsearch40:"over 9000"'"#);
+        // More than one thing to search for, and nothing else: one search, as typed.
+        for q in [
+            "rick and morty",
+            "Paris, Texas",
+            "no man's sky, base building",
+        ] {
+            let encoded: String = url::form_urlencoded::byte_serialize(q.as_bytes()).collect();
+            let v = search(&encoded);
+            let sent = format!("'ytsearch40:{}'", q.replace('\'', r"'\''"));
+            assert_eq!(asked(&bin).last().unwrap(), &sent);
+            assert!(v[0].get("why").is_none(), "{q}");
+        }
+        search("rust%20%22borrow%20checker%22%20explained");
+        assert_eq!(
+            asked(&bin).last().unwrap(),
+            r#"'ytsearch40:rust "borrow checker" explained'"#
+        );
         // What only looks like rules, with nothing left to search for, is a search too.
         let v = search("no%20country%20for%20old%20men");
         assert_eq!(

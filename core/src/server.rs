@@ -336,7 +336,7 @@ impl Server {
 
     /// The reading of a search's query, when it has rules to apply.
     fn reads_rules(&self, req: &http::Request) -> Option<lens::read::Reading> {
-        let reading = lens::read::read(req.query.get("q")?, app::now());
+        let reading = lens::read::read_search(req.query.get("q")?, app::now());
         lenses::has_rules(&reading).then_some(reading)
     }
 

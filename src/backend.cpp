@@ -846,7 +846,7 @@ void Backend::openLens(const QString &id, int refresh) {
         [this] { setLensProgress(0, 0); });
 }
 
-void Backend::read(const QString &text) {
+void Backend::read(const QString &text, bool lens) {
     const QString typed = text.trimmed();
     if (typed.isEmpty()) {
         // Nothing to read; an answer still on its way is for words that are gone.
@@ -859,6 +859,8 @@ void Backend::read(const QString &text) {
     }
     QUrlQuery q;
     q.addQueryItem("q", typed);
+    if (lens)
+        q.addQueryItem("for", "lens");
     call("GET", "api/read", q, {}, "read", [this, typed](const QJsonValue &v) {
         m_reading = v.toObject().toVariantMap();
         m_reading.insert("text", typed);

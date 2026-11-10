@@ -646,8 +646,12 @@ private slots:
         QCOMPARE(shown, QStringList({"abc"}));
         QVERIFY(!window.reading().value("rules").toBool());
 
-        window.read("no music");
+        // A lens has to be about something; in the search box the same words are only words.
+        window.read("no music", true);
         WAIT_FOR(window.reading().value("error").toString().startsWith("Say what it should be about"), 5000);
+        window.read("no music");
+        WAIT_FOR(!window.reading().contains("error"), 5000);
+        QVERIFY(!window.reading().value("rules").toBool());
         // Nothing to read: nothing shown, and nothing asked.
         window.read("   ");
         QVERIFY(window.reading().isEmpty());

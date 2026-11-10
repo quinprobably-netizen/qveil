@@ -96,10 +96,10 @@ mod tests {
         // This month, videos: a week fits in a month with room to spare.
         assert_eq!(of("talks this week").as_deref(), Some("EgQIBBAB"));
         // This week, videos.
-        assert_eq!(of("talks today").as_deref(), Some("EgQIAxAB"));
+        assert_eq!(of("talks, today").as_deref(), Some("EgQIAxAB"));
         // Both.
         assert_eq!(
-            of("talks today over 1 hour").as_deref(),
+            of("talks over 1 hour, today").as_deref(),
             Some("EgYIAxABGAI=")
         );
     }

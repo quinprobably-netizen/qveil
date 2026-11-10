@@ -394,8 +394,8 @@ fn run() -> Result<()> {
             let query = query.join(" ");
             // A query with rules in it ("talks over 30 min") is read the way
             // the window's search box reads it; any other is sent as typed.
-            let reading = lens::read::read(&query, app::now());
-            if reading.has_rules() && !reading.topics.is_empty() {
+            let reading = lens::read::read_search(&query, app::now());
+            if reading.has_filters() && !reading.topics.is_empty() {
                 let found = app::smart_search(&rt, paths, &reading, limit, &|| true)?;
                 if out.json {
                     return print_json(&found);

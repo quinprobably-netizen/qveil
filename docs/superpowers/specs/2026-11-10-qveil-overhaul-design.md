@@ -151,9 +151,14 @@ understood is always visible. English only in this release.
   "about", "show me") is a topic. Rules inside a topic clause are lifted out:
   "systems talks over 30 min this year" is one topic and two rules.
 - At most 6 topics. Quoted text is always literal. Single-word rules
-  ("long", "new", "today") only count at the start or end of a clause. A
-  lens with no topic is an error that says so; in the search box a query
-  with no topic is searched as typed.
+  ("long", "new", "today") only count as a clause of their own ("jazz, new"),
+  and a date only where it ends its clause, so "new york" and "this week in
+  tech" stay whole. Exclusions match whole words. A lens with no topic is an
+  error that says so.
+- The search box is stricter than a lens: a query is only handled here when
+  it carries a filter (a length, a date, `-word`, an order). Several topics
+  alone ("rick and morty") or a leading "no" ("no man's sky") are sent to
+  YouTube as typed.
 
 **Fetching.** One YouTube search per topic through the existing yt-dlp search
 path, 30 results each. Where YouTube has a matching filter of its own (its
@@ -173,8 +178,8 @@ Every result carries a `why`: its topic and the rules it met.
 opened with results older than 6 hours.
 
 **API.**
-- `GET api/read?q=`: the reading of a text, offline. The window calls it while
-  the user types.
+- `GET api/read?q=` (the search box) and `&for=lens` (a lens): the reading of
+  a text, offline. The window calls it while the user types.
 - `GET api/lenses`, `POST api/lenses` (create), `POST api/lenses/<id>`
   (edit), `POST api/lenses/<id>/rm`.
 - `GET api/lens?id=&refresh=0|1`: progress lines, then the ranked videos, in

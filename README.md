@@ -75,7 +75,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.
 - You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.
 - Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.
-- A lens is refreshed as one search per topic: on one address their timing links them, and even over Tor a set of related searches can be linked by content.
+- A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing): on one address their timing links them, and even over Tor a set of related searches can be linked by content.
 - Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.
 
 **The details**
@@ -89,7 +89,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 | **Command lines** | Anything on a command line can be read by every local user through `/proc`. So the app's own calls give yt-dlp its proxy (and password), your searches and the video you open through a private file (mode `0600`, in a fresh `0700` directory that is removed afterwards, also when the engine is stopped: the window closing, Ctrl+C or `kill` end any yt-dlp first, and a run that was killed hard has its directory swept up by the next one), and `qveil play` hands mpv its loopback URLs the same way. **qveil's own command line is not covered:** `qveil search …`, `qveil play <url>` and `qveil sub add …` carry what you type in their arguments, which other local users can read through `/proc` while the command runs, unlike a search typed into the window. |
 | **Process tree** | yt-dlp and mpv are started in process groups of their own, and are killed together with whatever they started (a deno for yt-dlp's JavaScript challenge, say) when the engine stops, and also when it is killed outright: a small guard process, which is qveil itself, outlives it for a moment and does that. |
 | **Tracking parameters** | Links are reduced to the video ID; `si=`, `pp=`, `feature=` and similar are dropped. A start time (`t=`) is kept, for the player only. |
-| **Player state** | mpv keeps no resume files or history. qveil itself remembers where you stopped in an unfinished video for a set number of days (7 unless you change it; 0 turns it off) in a file only you can read, then deletes it; a finished video is forgotten at once. |
+| **Player state** | mpv keeps no resume files or history. qveil itself remembers where you stopped in an unfinished video for a set number of days (7 unless you change it; 0 turns it off) in a file only you can read; a finished video is forgotten at once. A position that has expired is no longer offered, and is deleted the next time qveil starts or saves a position. |
 | **Local data** | Subscriptions, lenses, resume positions and the history live in `~/.local/share/qveil`, the feed cache and each lens's results in `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those). |
 | **Telemetry** | None. |
 
@@ -97,13 +97,13 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 
 **On the pages**
 
-- **Search.** Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches.
+- **Search.** Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches. A search with a filter in it ("over 30 min", "-word") is sent as one search per topic, like a lens, and filtered and ordered on this computer.
 - **Subscriptions.** Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels.
-- **Lenses.** A refresh sends one search per topic, each a request of its own. YouTube sees those searches; your wording, the filters and the ranking stay on this computer.
+- **Lenses.** A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.
 - **Comments.** Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.
-- **History, off.** Off: qveil keeps no list of what you watch.
+- **History, off.** Off: qveil keeps no history. Where you stopped in unfinished videos is remembered separately, while resume is on.
 - **History, on.** On: kept only on this computer, in a file only you can read, until you clear it.
-- **Resume, on.** On: qveil remembers where you stopped in an unfinished video for 7 days, in a file only you can read, then deletes it. A finished video is forgotten at once.
+- **Resume, on.** On: qveil remembers where you stopped in an unfinished video for 7 days, in a file only you can read. After that it is no longer offered, and it is deleted the next time qveil starts or saves a position. A finished video is forgotten at once.
 - **Resume, off.** Off: qveil doesn't remember where you stopped.
 <!-- privacy:end -->
 

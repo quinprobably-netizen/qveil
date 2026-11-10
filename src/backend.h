@@ -156,8 +156,9 @@ public:
     Q_INVOKABLE void removeLens(const QString &id);
     // `refresh`: 0 shows what is stored, 1 fetches when that is stale, 2 always fetches.
     Q_INVOKABLE void openLens(const QString &id, int refresh);
-    // Asks how `text` reads. Nothing leaves the machine for it.
-    Q_INVOKABLE void read(const QString &text);
+    // Asks how `text` reads: in the search box, or (`lens`) as a lens, which
+    // may say in words what it leaves out. Nothing leaves the machine for it.
+    Q_INVOKABLE void read(const QString &text, bool lens = false);
     Q_INVOKABLE void reportError(const QString &message);
     Q_INVOKABLE void clearError();
 
