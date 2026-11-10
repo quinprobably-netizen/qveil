@@ -21,6 +21,18 @@ ListView {
         return out
     }
     signal picked(var video, int row)
+    // Whether the keyboard is in the sheet: the row it is on is marked.
+    property bool keyed: false
+    function step(by) {
+        currentIndex = Math.max(0, Math.min(count - 1, currentIndex + by))
+        positionViewAtIndex(currentIndex, ListView.Contain)
+    }
+    function activate() {
+        if (currentIndex >= 0 && currentIndex < entries.length)
+            picked(entries[currentIndex].video, entries[currentIndex].row)
+    }
+    onEntriesChanged: currentIndex = 0
+    keyNavigationEnabled: false
 
     model: entries
     clip: true
@@ -30,6 +42,9 @@ ListView {
         id: entry
         required property var modelData
         readonly property string title: modelData.video.title || ""
+        required property int index
+        // The keyboard's cursor: a frame on the picture, as on a card.
+        readonly property bool marked: tab.keyed && ListView.isCurrentItem
         objectName: "next-entry"
         width: tab.width
         height: 92
@@ -53,6 +68,13 @@ ListView {
                 source: Format.thumb(backend.thumbBase, entry.modelData.video.id, entry.modelData.video.batch || 0)
                 clear: area.containsMouse
                 mode: tab.thumbs
+            }
+            Rectangle {
+                anchors.fill: parent
+                visible: entry.marked
+                color: "transparent"
+                border.width: 2
+                border.color: Style.accent
             }
             Rectangle {
                 anchors.right: parent.right

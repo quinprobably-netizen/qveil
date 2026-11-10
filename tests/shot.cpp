@@ -52,7 +52,7 @@ int main(int argc, char *argv[]) {
         // The video, moved to its small window once it plays there.
         {"pip", "play(backend.feed.get(0), backend.feed, 0); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: win.togglePip() }', win)"},
-        {"watch-comments", "play(backend.feed.get(0)); watch.sheet.current = 'comments'"},
+        {"watch-comments", "play(backend.feed.get(0)); watch.enterSheet('comments')"},
     };
     if (!views.contains(view)) {
         std::fprintf(stderr, "no view %s; there are: %s\n", argv[1], qPrintable(QStringList(views.keys()).join(", ")));

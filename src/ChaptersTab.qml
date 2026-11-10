@@ -3,7 +3,7 @@ import Qveil
 import "Format.js" as Format
 import "Linkify.js" as Linkify
 
-// The whole description, and the video's chapters as a list.
+// The video's chapters as a list. (Its description is under the video, once.)
 Flickable {
     id: tab
 
@@ -14,6 +14,23 @@ Flickable {
     property int current: -1
     signal linkActivated(string link)
     signal chapterPicked(real seconds)
+    // Whether the keyboard is in the sheet, and which chapter it is on.
+    property bool keyed: false
+    property int at: 0
+    onChaptersChanged: at = Math.max(0, current)
+    function step(by) {
+        at = Math.max(0, Math.min(chapters.length - 1, at + by))
+        // Keeps the row in view.
+        const y = Style.u * 3 + Style.u * 6 + at * Style.control
+        if (y < contentY)
+            contentY = Math.max(0, y - Style.control)
+        else if (y + Style.control > contentY + height)
+            contentY = y + Style.control - height + Style.u * 2
+    }
+    function activate() {
+        if (at >= 0 && at < chapters.length)
+            chapterPicked(chapters[at].start)
+    }
 
     contentHeight: column.height + Style.u * 6
     clip: true
@@ -26,30 +43,6 @@ Flickable {
         width: tab.width - Style.u * 6
         spacing: Style.u * 4
 
-        Text {
-            width: parent.width
-            visible: tab.description !== ""
-            text: Linkify.html(tab.description, Style.accent)
-            textFormat: Text.StyledText
-            wrapMode: Text.Wrap
-            lineHeight: 1.25
-            color: Style.fg
-            linkColor: Style.accent
-            font.family: Style.font
-            font.pixelSize: Style.small
-            onLinkActivated: link => tab.linkActivated(link)
-            HoverHandler { cursorShape: parent.hoveredLink ? Qt.PointingHandCursor : Qt.ArrowCursor }
-        }
-        Text {
-            width: parent.width
-            visible: tab.description === "" && tab.chapters.length === 0
-            text: qsTr("This video has no description.")
-            textFormat: Text.PlainText
-            wrapMode: Text.Wrap
-            color: Style.faint
-            font.family: Style.font
-            font.pixelSize: Style.small
-        }
         Column {
             width: parent.width
             visible: tab.chapters.length > 0
@@ -67,8 +60,11 @@ Flickable {
                     width: column.width
                     height: Style.control
                     color: area.containsMouse ? Style.hover : "transparent"
+                    // The keyboard's cursor.
+                    border.width: tab.keyed && index === tab.at ? 2 : 0
+                    border.color: Style.accent
                     Text {
-                        id: at
+                        id: stamp
                         anchors.left: parent.left
                         anchors.leftMargin: Style.u
                         anchors.verticalCenter: parent.verticalCenter
@@ -80,7 +76,7 @@ Flickable {
                         font.pixelSize: Style.small
                     }
                     Text {
-                        anchors.left: at.right
+                        anchors.left: stamp.right
                         anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
                         text: modelData.title

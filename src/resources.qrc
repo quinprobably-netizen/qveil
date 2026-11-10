@@ -37,7 +37,7 @@
         <file alias="PlayerSurface.qml">PlayerSurface.qml</file>
         <file alias="SeekBar.qml">SeekBar.qml</file>
         <file alias="SideSheet.qml">SideSheet.qml</file>
-        <file alias="AboutTab.qml">AboutTab.qml</file>
+        <file alias="ChaptersTab.qml">ChaptersTab.qml</file>
         <file alias="UpNextTab.qml">UpNextTab.qml</file>
         <file alias="WatchPage.qml">WatchPage.qml</file>
         <file alias="CommentsTab.qml">CommentsTab.qml</file>

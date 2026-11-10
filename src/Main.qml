@@ -51,7 +51,7 @@ ApplicationWindow {
     // browsed, they move through what is browsed, as they always do.
     // (A window counts as active while its parent window is, so that is
     // not the question; whether something in it has the keyboard is.)
-    readonly property bool steering: watching || (pip && pipWindow.activeFocusItem !== null)
+    readonly property bool steering: (watching && !watch.inSheet) || (pip && pipWindow.activeFocusItem !== null)
     // Where a channel's page was opened from.
     property string channelFrom: "home"
     readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
@@ -301,6 +301,8 @@ ApplicationWindow {
             route.close()
         else if (fullscreen)
             showNormal()
+        else if (watch.active && watch.inSheet)
+            watch.leaveSheet()
         else if (watch.active && watch.theatre)
             watch.theatre = false
         else if (watch.active)
@@ -389,7 +391,8 @@ ApplicationWindow {
     Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
     Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: win.togglePip() }
     Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.theatre = !watch.theatre }
-    Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { watch.theatre = false; watch.sheet.current = "comments" } }
+    Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.enterSheet("comments") }
+    Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.playNext() }
     Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(false) }
     Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(true) }
     Shortcut { sequence: "<"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.speedStep(false) }

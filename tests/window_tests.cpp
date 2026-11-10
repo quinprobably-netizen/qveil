@@ -558,7 +558,8 @@ private slots:
         QCOMPARE(App::count(app.item("seek"), "segment"), 1);
         QVERIFY(!app.item("seek-chapter")->isVisible());
         QVERIFY(!app.item("watch-stats")->isVisible());
-        app.click(app.item("tab-about"));
+        // No chapters, so no tab for them.
+        QVERIFY(!app.item("tab-chapters")->isVisible());
         QVERIFY(app.items("chapter").isEmpty());
         QStringList said;
         App::texts(watch, said);
@@ -599,7 +600,7 @@ private slots:
         app.click(app.items("card").at(1));
         QQuickItem *surface = app.item("surface");
         QTRY_VERIFY(!surface->property("pending").toBool());
-        app.click(app.item("tab-about"));
+        app.click(app.item("tab-chapters"));
         QTRY_COMPARE(app.items("chapter").size(), 7);
         app.click(app.items("chapter").at(2));
         QCOMPARE(surface->property("lastSeek").toInt(), 760);
@@ -628,14 +629,15 @@ private slots:
             QTRY_VERIFY(!sheet->isVisible());
             QVERIFY(surface->width() > 1000);
         }
-        App app(false, QSize(950, 600));
+        // A narrow column has no room beside the video: there the sheet is under it.
+        App app(false, QSize(630, 1030));
         READY(app);
         app.play({{"id", "vid00000002"}});
         QQuickItem *sheet = app.item("sheet"), *about = app.item("watch-about"), *surface = app.item("surface");
         QVERIFY(sheet && about && surface);
         QTRY_VERIFY(sheet->mapToScene(QPointF(0, 0)).y() >= about->mapToScene(QPointF(0, about->height())).y());
-        QVERIFY(surface->mapToScene(QPointF(surface->width(), 0)).x() <= 950);
-        QVERIFY(sheet->mapToScene(QPointF(sheet->width(), 0)).x() <= 950);
+        QVERIFY(surface->mapToScene(QPointF(surface->width(), 0)).x() <= 630);
+        QVERIFY(sheet->mapToScene(QPointF(sheet->width(), 0)).x() <= 630);
     }
 
     void aLinkInADescriptionLeadsBackIntoTheAppOrIsOnlyCopied()
@@ -681,7 +683,7 @@ private slots:
         QVERIFY(app.items("reply").isEmpty());
 
         // Coming back to the tab asks for nothing.
-        app.click(app.item("tab-about"));
+        app.click(app.item("tab-next"));
         app.click(app.item("tab-comments"));
         QTest::qWait(300);
         QCOMPARE(app.asked("GET api/comments"), 1);
@@ -1407,7 +1409,7 @@ private slots:
         // Without a list there is nothing to come next, and the sheet opens on what the video is.
         app.play({{"id", "vid00000004"}});
         QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
-        QCOMPARE(app.item("sheet")->property("current").toString(), QString("about"));
+        QCOMPARE(app.item("sheet")->property("current").toString(), QString("next"));
     }
 
     // --- Fluid: it follows its tile, moves briefly, loads without jumps, and its shelves glide. ---
@@ -1831,6 +1833,87 @@ private slots:
         QTRY_VERIFY(app.item("shelves-home")->property("leadSelected").toBool());
         QTest::keyClick(app.window, Qt::Key_Return);
         QTRY_COMPARE(app.item("surface")->property("startedAt").toInt(), 845);
+    }
+
+    void inTheQuarterTileTheSheetStandsBesideTheVideo()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QQuickItem *sheet = app.item("sheet"), *surface = app.item("surface");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        // Beside the video, in view, and the picture is no smaller for it.
+        QTRY_VERIFY2(box(sheet).left() >= box(surface).right(), qPrintable(QString::number(box(sheet).left())));
+        QVERIFY2(box(sheet).right() <= 941 && box(sheet).top() < 120 && box(sheet).bottom() <= 508,
+                 qPrintable(QString("%1..%2").arg(box(sheet).top()).arg(box(sheet).bottom())));
+        QVERIFY2(box(surface).height() >= 250, qPrintable(QString::number(box(surface).height())));
+        // What comes next is what it opens on, with rows in view.
+        QCOMPARE(sheet->property("current").toString(), QString("next"));
+        QTRY_VERIFY(app.items("next-entry").size() >= 3);
+        QVERIFY(box(app.items("next-entry").at(2)).bottom() <= 508);
+        // The description is under the video and nowhere else; the sheet has the chapters.
+        QVERIFY(app.item("watch-about")->isVisible());
+        QVERIFY(!app.item("tab-about"));
+        QVERIFY(app.item("tab-chapters")->isVisible());
+    }
+
+    void theSheetCanBeUsedFromTheKeyboard()
+    {
+        App app;
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QQuickItem *sheet = app.item("sheet"), *surface = app.item("surface"), *watch = app.item("watch");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        QVERIFY(!watch->property("inSheet").toBool());
+        QVERIFY(app.window->property("steering").toBool());
+
+        // C gives the keyboard to the sheet, on the comments (which are fetched now).
+        QTest::keyClick(app.window, Qt::Key_C);
+        QTRY_VERIFY(watch->property("inSheet").toBool());
+        QCOMPARE(sheet->property("current").toString(), QString("comments"));
+        QTRY_COMPARE(app.items("comment").size(), 5);
+        // The keys are the sheet's now, not the video's.
+        QVERIFY(!app.window->property("steering").toBool());
+        // Left and right (and h and l) change the tab.
+        QTest::keyClick(app.window, Qt::Key_H);
+        QCOMPARE(sheet->property("current").toString(), QString("next"));
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTest::keyClick(app.window, Qt::Key_L);
+        QCOMPARE(sheet->property("current").toString(), QString("chapters"));
+        // Down and Enter on a chapter go to it.
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QCOMPARE(surface->property("lastSeek").toInt(), 760);
+        // In what comes next, the row the keyboard is on is marked, and Enter plays it.
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTest::keyClick(app.window, Qt::Key_H);
+        QCOMPARE(sheet->property("current").toString(), QString("next"));
+        QTRY_VERIFY(!app.items("next-entry").isEmpty());
+        QVERIFY(app.items("next-entry").first()->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_VERIFY(app.items("next-entry").at(1)->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000003"));
+
+        // Escape gives the keys back to the video first, and only then leaves it.
+        QTest::keyClick(app.window, Qt::Key_C);
+        QTRY_VERIFY(watch->property("inSheet").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!watch->property("inSheet").toBool());
+        QVERIFY(app.window->property("watching").toBool());
+        QVERIFY(app.window->property("steering").toBool());
+        // N is the next video in the list.
+        QTest::keyClick(app.window, Qt::Key_N);
+        QTRY_COMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000004"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.window->property("watching").toBool());
     }
 
     // --- What the council found in the code. ---

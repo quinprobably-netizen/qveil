@@ -36,7 +36,8 @@ Popup {
                 [["I"], qsTr("Picture in picture, and back")],
                 [["T"], qsTr("Theatre")],
                 [["F"], qsTr("Fullscreen")],
-                [["C"], qsTr("Comments")],
+                [["C"], qsTr("Comments, with the keyboard in the sheet (Esc gives it back)")],
+                [["N"], qsTr("Next video")],
             ]
         },
     ]

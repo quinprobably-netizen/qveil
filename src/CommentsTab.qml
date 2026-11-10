@@ -32,6 +32,12 @@ Item {
             backend.loadComments(video, sort, n, replies)
         }
     }
+    // The keyboard scrolls them.
+    property bool keyed: false
+    function step(by) {
+        flick.contentY = Math.max(0, Math.min(Math.max(0, flick.contentHeight - flick.height), flick.contentY + by * 96))
+    }
+    function activate() {}
     function more() {
         n = Math.min(200, n + 40)
         load()

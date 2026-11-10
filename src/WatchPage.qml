@@ -25,8 +25,15 @@ FocusScope {
     readonly property alias sheet: sheet
     readonly property bool active: surface.active
     readonly property var info: surface.info
-    // Too narrow for the sheet to stand beside the video.
-    readonly property bool narrow: width < 1000
+    // The sheet stands beside the video when the window is wide, and also
+    // when the video is held down by the window's height anyway and the
+    // width it leaves is enough: then the sheet costs the picture nothing (a
+    // quarter tile). Only where neither holds (a narrow column) is it under.
+    readonly property real stackedHeight: Math.min(Math.round((width - 2 * Style.gutter) * 9 / 16), Math.max(200, height - 190))
+    readonly property bool narrow: !(width >= 1000
+        || width - 2 * Style.gutter - Math.round(stackedHeight * 16 / 9) >= sheetWidth + Style.gutter)
+    // Whether the keyboard is in the sheet, and not the video's.
+    readonly property bool inSheet: sheet.keyed
     readonly property bool beside: !narrow && !theatre && !full
     // How wide the sheet is when it stands beside the video.
     readonly property int sheetWidth: width >= 1180 ? 384 : 320
@@ -43,11 +50,32 @@ FocusScope {
         // A lookup of the last video's comments is for nobody now.
         backend.closeComments()
         expanded = false
-        sheet.current = list && index >= 0 && index + 1 < list.count ? "next" : "about"
+        sheet.current = "next"
         surface.prepare(video)
         flick.contentY = 0
     }
     function open(i) { surface.open(i) }
+    // Gives the keyboard to the sheet, on one of its tabs; and back to the video.
+    function enterSheet(tab) {
+        theatre = false
+        if (full)
+            return
+        sheet.current = tab === "chapters" && !sheet.hasChapters ? "next" : tab
+        sheet.forceActiveFocus()
+        // Under the video, it is brought into view.
+        if (narrow)
+            flick.contentY = Math.max(0, Math.min(flick.contentHeight - flick.height, below.y + column.y - Style.u * 2))
+    }
+    function leaveSheet() {
+        surface.forceActiveFocus()
+        if (narrow)
+            flick.contentY = 0
+    }
+    // The video after this one in the list it was opened from.
+    function playNext() {
+        if (list && index >= 0 && index + 1 < list.count)
+            page.videoRequested(list.get(index + 1), list, index + 1)
+    }
     function close() {
         // A lookup of comments that is still running is for nobody now.
         backend.closeComments()
@@ -200,24 +228,26 @@ FocusScope {
         width: page.beside ? page.sheetWidth : below.width
         height: page.beside ? page.height - Style.u * 5 - Style.gutter : below.height
         commentCount: comments.count
+        hasChapters: surface.chapters.length > 0
 
-        about: AboutTab {
+        chapters: ChaptersTab {
             anchors.fill: parent
-            description: page.info.description || ""
             chapters: surface.chapters
             current: bar.chapter
-            onLinkActivated: link => page.follow(link)
+            keyed: sheet.keyed
             onChapterPicked: seconds => surface.seekTo(seconds)
         }
         comments: CommentsTab {
             id: comments
             anchors.fill: parent
+            keyed: sheet.keyed
             video: page.info.id || ""
             active: sheet.visible && sheet.current === "comments" && page.active
             onLinkActivated: link => page.follow(link)
         }
         next: UpNextTab {
             anchors.fill: parent
+            keyed: sheet.keyed
             thumbs: page.thumbs
             list: page.list
             index: page.index
