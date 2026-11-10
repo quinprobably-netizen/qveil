@@ -46,6 +46,7 @@ mod server;
 mod signals;
 mod store;
 mod subs;
+mod topics;
 mod util;
 mod video;
 mod ytdlp;

@@ -21,6 +21,9 @@ pub struct Config {
     /// For how many days qveil remembers where an unfinished video was
     /// stopped. 0 turns that off, and deletes what was remembered.
     pub resume_days: u32,
+    /// Topic feeds: search by itself for what the channels you follow are
+    /// about (see `topics`). Off unless it is turned on.
+    pub topic_feeds: bool,
     /// Show thumbnails (fetched through the same route as everything else).
     pub thumbnails: bool,
     /// How many channel feeds to fetch at once.
@@ -39,6 +42,7 @@ impl Default for Config {
             max_height: 1080,
             history: false,
             resume_days: 7,
+            topic_feeds: false,
             thumbnails: true,
             feed_workers: 4,
             ytdlp: "yt-dlp".into(),

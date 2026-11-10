@@ -30,6 +30,7 @@ struct ConfigPatch {
     thumbnails: Option<bool>,
     max_height: Option<u32>,
     resume_days: Option<u32>,
+    topic_feeds: Option<bool>,
 }
 
 /// What the window reports while a video plays: `POST api/resume`.
@@ -147,6 +148,12 @@ impl Server {
             ("GET", ["api", "lenses"]) => self.lenses_json()?,
             ("POST", ["api", "lenses"]) => self.write_lens(None, &req.body)?,
             ("POST", ["api", "lenses", id]) => self.write_lens(Some(id), &req.body)?,
+            // What is on this machine: no search is made for it.
+            ("GET", ["api", "topics"]) => json!(app::topics(&rt, paths, false, &|| true)?),
+            ("POST", ["api", "topics", "hide"]) => {
+                app::hide_topic(paths, req.param("id")?)?;
+                json!({})
+            }
             ("POST", ["api", "lenses", id, "rm"]) => {
                 crate::lens::remove(paths, id)?;
                 json!({})
@@ -214,6 +221,7 @@ impl Server {
             "thumbnails": rt.cfg.thumbnails,
             "maxHeight": rt.cfg.max_height,
             "resumeDays": rt.cfg.resume_days,
+            "topicFeeds": rt.cfg.topic_feeds,
             "configPath": self.paths.config,
             // What the window says about privacy, from the one place that
             // words it (see `privacy`).
@@ -260,6 +268,9 @@ impl Server {
         }
         if let Some(days) = p.resume_days {
             cfg.resume_days = days.min(365);
+        }
+        if let Some(on) = p.topic_feeds {
+            cfg.topic_feeds = on;
         }
         // Validates the proxy before anything is saved.
         let mut next = Runtime::new(cfg, &self.paths, None, false)?;

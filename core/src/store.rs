@@ -68,6 +68,14 @@ impl Paths {
     pub fn lens_cache(&self, id: &str) -> PathBuf {
         self.cache.join(format!("lens-{id}.json"))
     }
+    /// The topic feeds that were hidden (see `topics`).
+    pub fn topics(&self) -> PathBuf {
+        self.data.join("topics.json")
+    }
+    /// What the topic feeds' searches last found.
+    pub fn topics_cache(&self) -> PathBuf {
+        self.cache.join("topics.json")
+    }
     pub fn feed_cache(&self) -> PathBuf {
         self.cache.join("feed.json")
     }

@@ -183,6 +183,8 @@ pub struct Pages {
     pub resume: String,
     pub comments: &'static str,
     pub lenses: &'static str,
+    /// For whether topic feeds are on.
+    pub topics: &'static str,
 }
 
 const ROUTES: Routes = Routes {
@@ -197,6 +199,9 @@ const HISTORY_OFF: &str = "Off: qveil keeps no history. Where you stopped in unf
 const HISTORY_ON: &str =
     "On: kept only on this computer, in a file only you can read, until you clear it.";
 const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.";
+const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.";
+const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three phrases for each of up to four groups, again once a group's results are a day old. YouTube sees those searches, which say what the channels you follow are about. Videos from channels you already follow are left out of what is shown.";
+const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
 const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
 
 /// What is said about resume when positions are kept for `days` (0: not at all).
@@ -222,6 +227,8 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
         .route_points()
         .into_iter()
         .chain(EVERYWHERE.iter().copied())
+        // What is only true while a setting is on.
+        .chain(cfg.topic_feeds.then_some(TOPICS_POINT))
         .map(String::from)
         .collect();
     Privacy {
@@ -236,6 +243,11 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
             resume: resume(cfg.resume_days),
             comments: COMMENTS,
             lenses: LENSES,
+            topics: if cfg.topic_feeds {
+                TOPICS_ON
+            } else {
+                TOPICS_OFF
+            },
         },
     }
 }
@@ -297,6 +309,8 @@ pub fn markdown() -> String {
         ("History, on", HISTORY_ON),
         ("Resume, on", resume_on.as_str()),
         ("Resume, off", resume_off.as_str()),
+        ("Topic feeds, off", TOPICS_OFF),
+        ("Topic feeds, on", TOPICS_ON),
     ] {
         md.push_str(&format!("- **{name}.** {line}\n"));
     }
@@ -496,7 +510,8 @@ mod tests {
                 "lenses",
                 "resume",
                 "search",
-                "subscriptions"
+                "subscriptions",
+                "topics"
             ]
         );
         assert!(v["summary"].is_string());

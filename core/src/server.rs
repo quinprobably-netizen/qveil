@@ -389,6 +389,7 @@ impl Server {
                 self.search_stream(&mut stream, &req)
             }
             ("GET", ["api", "lens"]) => self.lens(&mut stream, &req),
+            ("POST", ["api", "topics", "refresh"]) => self.refresh_topics(&mut stream),
             ("GET", ["api", "feed"]) => self.feed(&mut stream, &req),
             ("POST", ["api", "play"]) => self.play(&mut stream, &req),
             ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),

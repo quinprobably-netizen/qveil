@@ -10,6 +10,7 @@ use crate::lens::{self, Cached, Lens};
 use crate::net::{self, Net};
 use crate::store::{self, Paths};
 use crate::subs::{self, Sub, Subs};
+use crate::topics;
 use crate::util::lock;
 use crate::video::Video;
 use crate::ytdlp::Ytdlp;
@@ -280,6 +281,141 @@ fn search_topics(
             now: now(),
         },
     ))
+}
+
+/// A topic feed: a group of the channels you follow, and what its searches
+/// last found on channels you don't.
+#[derive(Serialize)]
+pub struct TopicFeed {
+    #[serde(flatten)]
+    pub group: topics::Group,
+    #[serde(rename = "fetchedAt", skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<i64>,
+    pub videos: Vec<Ranked>,
+}
+
+#[derive(Serialize)]
+pub struct Topics {
+    /// Whether topic feeds are on. Off, there are no groups.
+    pub enabled: bool,
+    pub groups: Vec<TopicFeed>,
+}
+
+/// The topic feeds. While the setting is off this reads nothing and asks
+/// nobody. On, the groups are worked out from what is on this machine (the
+/// subscriptions and the titles in the feed cache); with `refresh`, a group
+/// whose results are missing or a day old is searched for again, one search
+/// per phrase, and videos from channels that are already followed are left
+/// out. `wanted` is asked between searches, as for a lens.
+pub fn topics(
+    rt: &Runtime,
+    paths: &Paths,
+    refresh: bool,
+    wanted: &dyn Fn() -> bool,
+) -> Result<Topics> {
+    if !rt.cfg.topic_feeds {
+        return Ok(Topics {
+            enabled: false,
+            groups: Vec::new(),
+        });
+    }
+    let subs = load_subs(paths)?;
+    let cache: FeedCache = store::load_cache(&paths.feed_cache())?;
+    // Each channel's titles, newest first.
+    let mut latest: Vec<&feed::Seen> = cache.seen.values().collect();
+    latest.sort_by_key(|s| {
+        (
+            std::cmp::Reverse(s.video.published.unwrap_or(s.first_seen)),
+            s.video.id.clone(),
+        )
+    });
+    let channels: Vec<topics::Channel> = subs
+        .channels
+        .iter()
+        .map(|sub| topics::Channel {
+            id: &sub.id,
+            name: &sub.name,
+            titles: latest
+                .iter()
+                .filter(|s| s.video.channel_id.as_deref() == Some(sub.id.as_str()))
+                .map(|s| s.video.title.as_str())
+                .collect(),
+        })
+        .collect();
+    let hidden: topics::Hidden = store::load(&paths.topics())?;
+    let groups: Vec<topics::Group> = topics::groups(&channels)
+        .into_iter()
+        .filter(|g| !hidden.ids.contains(&g.id))
+        .take(topics::MAX_GROUPS)
+        .collect();
+    let mut results: topics::Results = store::load_cache(&paths.topics_cache())?;
+    if refresh {
+        for group in &groups {
+            let at = now();
+            let due = results
+                .groups
+                .get(&group.id)
+                .is_none_or(|c| at - c.fetched_at >= topics::STALE);
+            if !due {
+                continue;
+            }
+            let reading = Reading {
+                topics: group.searches.clone(),
+                subs: crate::lens::read::Subs::Exclude,
+                ..Reading::default()
+            };
+            let videos =
+                search_topics(rt, paths, &reading, topics::PER_SEARCH, &|_, _| {}, wanted)?;
+            if !wanted() {
+                bail!(crate::ytdlp::CANCELLED);
+            }
+            let _lock = store::lock(paths)?;
+            let mut kept: topics::Results = store::load_cache(&paths.topics_cache())?;
+            kept.groups.insert(
+                group.id.clone(),
+                Cached {
+                    fetched_at: at,
+                    videos,
+                },
+            );
+            // Only what there is still a group for is kept.
+            kept.groups
+                .retain(|id, _| groups.iter().any(|g| g.id == *id));
+            store::save_compact(&paths.topics_cache(), &kept)?;
+            results = kept;
+        }
+    }
+    Ok(Topics {
+        enabled: true,
+        groups: groups
+            .into_iter()
+            .map(|group| {
+                let found = results.groups.remove(&group.id);
+                TopicFeed {
+                    fetched_at: found.as_ref().map(|c| c.fetched_at),
+                    videos: found.map(|c| c.videos).unwrap_or_default(),
+                    group,
+                }
+            })
+            .collect(),
+    })
+}
+
+/// Hides the topic feed `id`: it is not shown or searched for again.
+pub fn hide_topic(paths: &Paths, id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 32 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("{id:?} is not a topic feed");
+    }
+    let _lock = store::lock(paths)?;
+    let mut hidden: topics::Hidden = store::load(&paths.topics())?;
+    if !hidden.ids.iter().any(|h| h == id) {
+        hidden.ids.push(id.to_string());
+        // Old ones go first: a group that no longer exists needs no entry.
+        let over = hidden.ids.len().saturating_sub(200);
+        hidden.ids.drain(..over);
+        store::save(&paths.topics(), &hidden)?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]

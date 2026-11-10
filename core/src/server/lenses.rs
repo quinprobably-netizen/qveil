@@ -108,6 +108,32 @@ impl Server {
         entry(&self.paths, &lens, now)
     }
 
+    /// `POST api/topics/refresh`: the topic feeds, after searching again for
+    /// those whose results are missing or a day old. Like a lens's refresh it
+    /// stops when the client hangs up or the route is left, and what was
+    /// found on another route is not kept.
+    pub(super) fn refresh_topics(self: &Arc<Self>, out: &mut TcpStream) -> Result<()> {
+        let rt = self.runtime();
+        let watch = Watch::new(out);
+        let wanted = || !watch.gone() && self.still_on(&rt);
+        let result = self.guarded(&rt, app::topics(&rt, &self.paths, true, &wanted));
+        if watch.gone() {
+            return Ok(());
+        }
+        match result {
+            Ok(found) => respond(
+                out,
+                200,
+                "application/json",
+                json!(found).to_string().as_bytes(),
+            ),
+            Err(e) => {
+                let body = errors::body(&format!("{e:#}")).to_string();
+                respond(out, 500, "application/json", body.as_bytes())
+            }
+        }
+    }
+
     /// `GET api/lens?id=…&refresh=0|1&force=0|1`: the lens and its results.
     /// With `&stream=1` the reply is lines, in the feed's format:
     /// `{"progress":{"done":N,"total":M}}` as its searches finish, and last
@@ -556,5 +582,164 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
             "{v}"
         );
         assert!(!s.paths.lens_cache(&id).exists());
+    }
+
+    /// Three channels: two about hand-tool woodworking and one about systems
+    /// programming, with what they uploaded lately; and one more that is
+    /// followed, whose videos a search is going to find.
+    fn follow_some_channels(d: &TempDir) {
+        use crate::feed::{FeedCache, Seen};
+        use crate::subs::{Sub, Subs};
+        use crate::video::Video;
+        let paths = d.paths();
+        let channels = [
+            (
+                "UCwood000000000000000000a",
+                "Northlight Woodworks",
+                vec![
+                    "A dovetail box with four hand tools",
+                    "Sharpening a hand plane properly",
+                    "Dovetail joints without a jig",
+                    "Restoring an old hand plane",
+                ],
+            ),
+            (
+                "UCwood000000000000000000b",
+                "Quiet Bench",
+                vec![
+                    "Hand plane basics",
+                    "My first dovetail",
+                    "Tuning a hand plane",
+                    "Dovetail saw comparison",
+                ],
+            ),
+            (
+                "UCsys0000000000000000000a",
+                "Low Level Hours",
+                vec![
+                    "Why the borrow checker says no",
+                    "Allocators, from scratch",
+                    "A bump allocator in 50 lines",
+                    "The borrow checker and lifetimes",
+                ],
+            ),
+            // The channel the first search's first result is from.
+            ("UCaaaaaaaaaaaaaaaaaaaaa1", "One", vec![]),
+        ];
+        let mut subs = Subs::default();
+        let mut cache = FeedCache::default();
+        for (id, name, titles) in channels {
+            subs.add(Sub {
+                id: id.into(),
+                name: name.into(),
+            });
+            for (n, title) in titles.iter().enumerate() {
+                let video = Video {
+                    // (The last letter tells the two woodworking channels apart.)
+                    id: format!("{}{}{n:02}", &id[2..10], &id[id.len() - 1..]),
+                    title: (*title).into(),
+                    channel: Some(name.into()),
+                    channel_id: Some(id.into()),
+                    published: Some(1_700_000_000 - n as i64),
+                    duration: None,
+                    views: None,
+                    short: false,
+                    live: false,
+                };
+                cache.seen.insert(
+                    video.id.clone(),
+                    Seen {
+                        video,
+                        first_seen: 0,
+                        last_seen: 0,
+                    },
+                );
+            }
+        }
+        crate::store::save(&paths.subscriptions(), &subs).unwrap();
+        crate::store::save_compact(&paths.feed_cache(), &cache).unwrap();
+    }
+
+    #[test]
+    fn topic_feeds_ask_nobody_until_they_are_turned_on_and_then_once_a_day() {
+        let (bin, base, d) = rig();
+        follow_some_channels(&d);
+        // Off, as it is unless it is turned on: nothing is worked out, nothing searched.
+        let (_, v) = json(&base, "GET", "api/topics", "");
+        assert_eq!(v, serde_json::json!({ "enabled": false, "groups": [] }));
+        let (status, v) = json(&base, "POST", "api/topics/refresh", "");
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["groups"], serde_json::json!([]));
+        assert!(asked(&bin).is_empty());
+
+        let (status, cfg) = json(&base, "POST", "api/config", r#"{"topicFeeds":true}"#);
+        assert_eq!(status, 200, "{cfg}");
+        assert_eq!(cfg["topicFeeds"], true);
+        // Listing them is reading what is on this machine.
+        let (_, v) = json(&base, "GET", "api/topics", "");
+        assert_eq!(v["enabled"], true);
+        let groups = v["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "{v}");
+        assert_eq!(
+            groups[0]["channels"],
+            serde_json::json!(["Northlight Woodworks", "Quiet Bench"])
+        );
+        assert_eq!(groups[0]["searches"][0], "hand plane");
+        assert_eq!(groups[0]["videos"], serde_json::json!([]));
+        assert!(groups[0].get("fetchedAt").is_none());
+        assert_eq!(
+            groups[1]["channels"],
+            serde_json::json!(["Low Level Hours"])
+        );
+        assert!(asked(&bin).is_empty());
+
+        // A refresh sends each group's searches, and nothing else.
+        let (status, v) = json(&base, "POST", "api/topics/refresh", "");
+        assert_eq!(status, 200, "{v}");
+        let wanted: Vec<String> = v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["searches"].as_array().unwrap().clone())
+            .map(|s| format!("'ytsearch20:{}'", s.as_str().unwrap()))
+            .collect();
+        assert_eq!(asked(&bin), wanted);
+        let first = &v["groups"][0];
+        assert!(first["fetchedAt"].as_i64().unwrap() > 0);
+        // What was found, with the phrase that found it; and nothing from a
+        // channel that is already followed (the first search's first result).
+        let videos = first["videos"].as_array().unwrap();
+        assert!(!videos.is_empty(), "{first}");
+        assert_eq!(videos[0]["why"][0], "hand plane");
+        for video in videos {
+            assert_ne!(video["channel_id"], "UCaaaaaaaaaaaaaaaaaaaaa1", "{video}");
+        }
+        let all = v["groups"].to_string();
+        assert!(
+            !all.contains("aaaaaaaaa11"),
+            "a followed channel's video is on a topic shelf"
+        );
+
+        // Within the day, a refresh has nothing to do.
+        let (_, again) = json(&base, "POST", "api/topics/refresh", "");
+        assert_eq!(asked(&bin), wanted);
+        assert_eq!(again["groups"][0]["videos"], first["videos"]);
+
+        // A group that is hidden is gone, and stays gone.
+        let id = first["id"].as_str().unwrap();
+        let (status, _) = json(&base, "POST", &format!("api/topics/hide?id={id}"), "");
+        assert_eq!(status, 200);
+        let (_, v) = json(&base, "GET", "api/topics", "");
+        assert_eq!(v["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["groups"][0]["channels"],
+            serde_json::json!(["Low Level Hours"])
+        );
+
+        // Turned off again, there is nothing, and nothing is asked.
+        json(&base, "POST", "api/config", r#"{"topicFeeds":false}"#);
+        let (_, v) = json(&base, "POST", "api/topics/refresh", "");
+        assert_eq!(v, serde_json::json!({ "enabled": false, "groups": [] }));
+        assert_eq!(asked(&bin), wanted);
     }
 }
