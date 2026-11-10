@@ -145,6 +145,7 @@ mod tests {
             channel_id: None,
             duration: None,
             start: Some(90),
+            resume: None,
             video: "http://127.0.0.1:4000/SECRETTOKEN/s/sid/v".into(),
             audio: Some("http://127.0.0.1:4000/SECRETTOKEN/s/sid/a".into()),
             description: None,

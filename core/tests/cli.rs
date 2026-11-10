@@ -540,3 +540,49 @@ fn the_privacy_text_prints_without_a_home_and_wipe_needs_no_confirmation_with_ye
     assert!(text(&out.stdout).contains("wiped"));
     assert!(!home.data().join("qveil").exists());
 }
+
+#[test]
+fn resume_lists_and_clears() {
+    let home = Home::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let file = home.data().join("qveil/resume.json");
+    write(
+        &file,
+        &format!(
+            r#"{{"positions":[
+                {{"id":"dQw4w9WgXcQ","pos":845,"dur":2463,"at":{now},"title":"A talk","channel":"Chan"}},
+                {{"id":"aaaaaaaaaaa","pos":100,"dur":400,"at":5,"title":"Long ago"}}]}}"#
+        ),
+    );
+    let out = home.run(&["resume"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let listed = text(&out.stdout);
+    assert!(
+        listed.contains("dQw4w9WgXcQ")
+            && listed.contains("A talk")
+            && listed.contains("Chan")
+            && listed.contains("14:05 of 41:03")
+            && listed.contains("7 days left"),
+        "{listed}"
+    );
+    // What has expired is neither shown nor left on disk.
+    assert!(!listed.contains("Long ago"), "{listed}");
+    assert!(!fs::read_to_string(&file).unwrap().contains("aaaaaaaaaaa"));
+    let out = home.run(&["resume", "--json"], "");
+    assert!(text(&out.stdout).contains(r#""pos": 845"#));
+    // `qveil config` says where it is and for how long.
+    let out = home.run(&["config"], "");
+    let shown = text(&out.stdout);
+    assert!(
+        shown.contains("resume.json") && shown.contains("7 days"),
+        "{shown}"
+    );
+    let out = home.run(&["resume", "--clear"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!file.exists());
+    let out = home.run(&["resume"], "");
+    assert!(text(&out.stdout).contains("nothing kept"));
+}

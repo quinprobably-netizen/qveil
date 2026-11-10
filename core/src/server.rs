@@ -27,6 +27,7 @@ mod thumbs;
 use crate::app::{self, Runtime, Watched};
 use crate::ids::VideoRef;
 use crate::inflight::{ROUTE_CHANGED, Why};
+use crate::resume;
 use crate::store::Paths;
 use crate::util::{lock, random_hex};
 use crate::video::Chapter;
@@ -76,6 +77,10 @@ pub struct PlayInfo {
     pub duration: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start: Option<u64>,
+    /// Where this video was stopped last time, when that is remembered and
+    /// the link asked for no start of its own (see `resume`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<u64>,
     /// Absolute loopback URLs.
     pub video: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,6 +108,11 @@ pub struct Opened {
 
 impl Server {
     pub fn new(rt: Runtime, paths: Paths) -> Arc<Self> {
+        // What has expired is deleted now, and not only when the next video
+        // is watched: it is a record of what was watched.
+        if let Err(e) = resume::purge(&paths, rt.cfg.resume_days, app::now()) {
+            note!("qveil: couldn't tidy the remembered positions: {e:#}");
+        }
         Arc::new(Self {
             runtime: RwLock::new(Arc::new(rt)),
             paths,
@@ -225,6 +235,7 @@ impl Server {
                 channel_id: s.channel_id,
                 duration: s.duration,
                 start: v.start,
+                resume: self.kept_position(&rt, v),
                 video: format!("{base}/s/{sid}/v"),
                 audio: has_audio.then(|| format!("{base}/s/{sid}/a")),
                 description: s.description,
@@ -235,6 +246,23 @@ impl Server {
             },
             watched,
         })
+    }
+
+    /// Where `v` was stopped, if that is still remembered. A link that names
+    /// its own start is taken at its word. Reading the file can fail, and a
+    /// video that then starts from the beginning is better than one that
+    /// doesn't start.
+    fn kept_position(&self, rt: &Runtime, v: &VideoRef) -> Option<u64> {
+        if v.start.is_some() {
+            return None;
+        }
+        match resume::get(&self.paths, rt.cfg.resume_days, &v.id, app::now()) {
+            Ok(kept) => kept.map(|p| p.pos),
+            Err(e) => {
+                note!("qveil: couldn't read where this video was stopped: {e:#}");
+                None
+            }
+        }
     }
 
     /// Adds an opened video to the history, if that is on.

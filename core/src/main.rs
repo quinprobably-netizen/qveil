@@ -147,6 +147,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show or forget where unfinished videos were stopped
+    Resume {
+        /// Forget every position instead of showing them
+        #[arg(long)]
+        clear: bool,
+        /// Print the positions as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show file locations, effective settings and what is exposed
     Config,
     /// What qveil does, and doesn't, about your privacy on the configured route
@@ -378,6 +387,7 @@ fn run() -> Result<()> {
         }
         Cmd::Sub(cmd) => sub(&rt, paths, cmd),
         Cmd::History { clear, json } => history(&rt.cfg, paths, clear, json),
+        Cmd::Resume { clear, json } => resumed(&rt.cfg, paths, clear, json),
         Cmd::Config => show_config(&rt, paths),
         Cmd::Privacy { .. } => {
             outln!("{}", privacy::text(&rt.net));
@@ -473,6 +483,49 @@ fn sub(rt: &Runtime, paths: &Paths, cmd: SubCmd) -> Result<()> {
     Ok(())
 }
 
+/// `qveil resume`: where unfinished videos were stopped.
+fn resumed(cfg: &Config, paths: &Paths, clear: bool, json: bool) -> Result<()> {
+    if clear {
+        resume::clear(paths)?;
+        outln!("positions forgotten");
+        return Ok(());
+    }
+    let now = app::now();
+    let kept = resume::list(paths, cfg.resume_days, now)?;
+    if json {
+        return print_json(&kept);
+    }
+    if cfg.resume_days == 0 {
+        outln!(
+            "resume is off (set `resume_days` in {})",
+            paths.config.display()
+        );
+        return Ok(());
+    }
+    if kept.is_empty() {
+        outln!("nothing kept");
+        return Ok(());
+    }
+    for p in &kept {
+        let mut parts = vec![p.title.replace(['\t', '\n'], " ")];
+        parts.extend(p.channel.clone());
+        parts.push(format!(
+            "{} of {}",
+            video::fmt_duration(p.pos),
+            video::fmt_duration(p.dur)
+        ));
+        // Rounded up: a position with an hour to go still has "1 day left".
+        let days = (resume::expires(p, cfg.resume_days) - now + 86_399) / 86_400;
+        parts.push(if days == 1 {
+            "1 day left".into()
+        } else {
+            format!("{days} days left")
+        });
+        outln!("{}  {}", p.id, parts.join("  \u{b7}  "));
+    }
+    Ok(())
+}
+
 fn history(cfg: &Config, paths: &Paths, clear: bool, json: bool) -> Result<()> {
     if clear {
         app::clear_history(paths)?;
@@ -511,6 +564,11 @@ fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
         p.history().display(),
         exists(&p.history())
     );
+    outln!(
+        "resume         {}{}",
+        p.resume().display(),
+        exists(&p.resume())
+    );
     outln!("cache          {}{}", p.cache.display(), exists(&p.cache));
     // Migration couldn't merge these (both names had the same file), so they
     // are still there, and still hold subscriptions or settings.
@@ -530,6 +588,14 @@ fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
             "on (local only)"
         } else {
             "off"
+        }
+    );
+    outln!(
+        "resume         {}",
+        match rt.cfg.resume_days {
+            0 => "off".to_string(),
+            1 => "1 day, then deleted (local only)".to_string(),
+            n => format!("{n} days, then deleted (local only)"),
         }
     );
     outln!("max height     {}p", rt.cfg.max_height);

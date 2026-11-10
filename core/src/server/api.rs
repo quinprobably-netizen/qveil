@@ -10,6 +10,7 @@ use crate::ids;
 use crate::inflight::Why;
 use crate::net::{self, TOR_PROXY};
 use crate::privacy;
+use crate::resume;
 use crate::util::lock;
 use crate::video::Video;
 use anyhow::{Context, Result, bail};
@@ -28,6 +29,20 @@ struct ConfigPatch {
     history: Option<bool>,
     thumbnails: Option<bool>,
     max_height: Option<u32>,
+    resume_days: Option<u32>,
+}
+
+/// What the window reports while a video plays: `POST api/resume`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stopped {
+    /// The video: its ID or a link to it.
+    v: String,
+    pos: u64,
+    dur: u64,
+    title: String,
+    #[serde(default)]
+    channel: Option<String>,
 }
 
 impl Server {
@@ -128,6 +143,44 @@ impl Server {
                 app::clear_history(paths)?;
                 json!({})
             }
+            ("GET", ["api", "resume"]) => {
+                let days = rt.cfg.resume_days;
+                let kept: Vec<Value> = resume::list(paths, days, app::now())?
+                    .iter()
+                    .map(|p| {
+                        let mut v = json!(p);
+                        v["expires"] = json!(resume::expires(p, days));
+                        v
+                    })
+                    .collect();
+                json!(kept)
+            }
+            ("POST", ["api", "resume"]) => {
+                let s: Stopped = serde_json::from_slice(&req.body).context("bad position")?;
+                let video = ids::parse_video(&s.v)
+                    .with_context(|| format!("{:?} isn't a YouTube video", s.v))?;
+                let now = app::now();
+                let position = resume::Position {
+                    id: video.id,
+                    pos: s.pos,
+                    dur: s.dur,
+                    at: now,
+                    title: s.title,
+                    channel: s.channel.filter(|c| !c.is_empty()),
+                };
+                json!({ "noted": resume::note(paths, rt.cfg.resume_days, position, now)? })
+            }
+            ("POST", ["api", "resume", "rm"]) => {
+                let target = req.param("v")?;
+                let video = ids::parse_video(target)
+                    .with_context(|| format!("{target:?} isn't a YouTube video"))?;
+                resume::forget(paths, &video.id)?;
+                json!({})
+            }
+            ("POST", ["api", "resume", "clear"]) => {
+                resume::clear(paths)?;
+                json!({})
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))
@@ -152,6 +205,7 @@ impl Server {
             "history": rt.cfg.history,
             "thumbnails": rt.cfg.thumbnails,
             "maxHeight": rt.cfg.max_height,
+            "resumeDays": rt.cfg.resume_days,
             "configPath": self.paths.config,
             // What the window says about privacy, from the one place that
             // words it (see `privacy`).
@@ -196,9 +250,17 @@ impl Server {
         if let Some(m) = p.max_height {
             cfg.max_height = m.clamp(144, 4320);
         }
+        if let Some(days) = p.resume_days {
+            cfg.resume_days = days.min(365);
+        }
         // Validates the proxy before anything is saved.
         let mut next = Runtime::new(cfg, &self.paths, None, false)?;
         next.cfg.save(&self.paths.config)?;
+        // Off means forgotten, not just no longer offered. A shorter time
+        // takes what is now too old with it.
+        if next.cfg.resume_days != rt.cfg.resume_days {
+            resume::purge(&self.paths, next.cfg.resume_days, app::now())?;
+        }
         let route_changed = !next.net.same_route(&rt.net);
         if !route_changed {
             // The same route keeps its running calls (and the registry that
@@ -362,6 +424,119 @@ mod tests {
                 .unwrap()
                 .contains("fresh credentials per request")
         );
+    }
+
+    #[test]
+    fn positions_are_noted_listed_forgotten_and_offered_when_playing() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: fake_ytdlp(&bin.0, &up.url("/video?gen=")),
+            ..Config::default()
+        });
+        let id = test_video().id;
+        let body = format!(r#"{{"v":"{id}","pos":845,"dur":2463,"title":"T","channel":"C"}}"#);
+        assert_eq!(
+            http(&base, "POST", &path(&base, "api/resume"), &body),
+            (200, r#"{"noted":"kept"}"#.into())
+        );
+        let (_, list) = http(&base, "GET", &path(&base, "api/resume"), "");
+        let v: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            (
+                v[0]["id"].as_str(),
+                v[0]["pos"].as_u64(),
+                v[0]["title"].as_str(),
+                v[0]["channel"].as_str()
+            ),
+            (Some(id.as_str()), Some(845), Some("T"), Some("C"))
+        );
+        assert_eq!(
+            v[0]["expires"].as_i64().unwrap() - v[0]["at"].as_i64().unwrap(),
+            7 * 86_400
+        );
+        let play = |target: &str| -> Value {
+            let (status, body) = http(
+                &base,
+                "POST",
+                &path(&base, &format!("api/play?v={target}")),
+                "",
+            );
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str(&body).unwrap()
+        };
+        assert_eq!(play(&id)["resume"], 845);
+        // A link with a start time of its own wins.
+        assert!(
+            play(&format!("https://youtu.be/{id}?t=60"))
+                .get("resume")
+                .is_none()
+        );
+        assert_eq!(
+            http(
+                &base,
+                "POST",
+                &path(&base, &format!("api/resume/rm?v={id}")),
+                ""
+            )
+            .0,
+            200
+        );
+        assert_eq!(http(&base, "GET", &path(&base, "api/resume"), "").1, "[]");
+        assert!(play(&id).get("resume").is_none());
+        // What isn't a video is refused, not filed.
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/resume"),
+            r#"{"v":"https://evil.example/x","pos":100,"dur":400,"title":"T"}"#,
+        );
+        assert_eq!(status, 500, "{body}");
+    }
+
+    #[test]
+    fn turning_resume_off_deletes_what_was_kept() {
+        let (s, base, _d) = server();
+        let body = r#"{"v":"dQw4w9WgXcQ","pos":100,"dur":400,"title":"T"}"#;
+        http(&base, "POST", &path(&base, "api/resume"), body);
+        assert!(s.paths.resume().exists());
+        let (_, cfg) = http(&base, "GET", &path(&base, "api/config"), "");
+        assert_eq!(
+            serde_json::from_str::<Value>(&cfg).unwrap()["resumeDays"],
+            7
+        );
+        let (status, cfg) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"resumeDays":0}"#,
+        );
+        assert_eq!(status, 200, "{cfg}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&cfg).unwrap()["resumeDays"],
+            0
+        );
+        assert!(!s.paths.resume().exists());
+        assert_eq!(
+            http(&base, "POST", &path(&base, "api/resume"), body).1,
+            r#"{"noted":"off"}"#
+        );
+        let (_, cfg) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"resumeDays":9999}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&cfg).unwrap()["resumeDays"],
+            365
+        );
+        http(&base, "POST", &path(&base, "api/resume"), body);
+        assert_eq!(
+            http(&base, "POST", &path(&base, "api/resume/clear"), "").0,
+            200
+        );
+        assert!(!s.paths.resume().exists());
     }
 
     #[test]
