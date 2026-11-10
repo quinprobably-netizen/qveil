@@ -46,6 +46,10 @@ QtObject {
     readonly property int bar: 56
     readonly property int gutter: 24
     readonly property int control: 28
-    // How long a fill or a veil takes to change.
-    readonly property int quick: 120
+    // Whether things move at all: the desktop's own setting.
+    readonly property bool motion: theme.animations
+    // How long a fill or a veil takes to change, and how long something
+    // takes to arrive or to glide to its place. Brief, or not at all.
+    readonly property int quick: motion ? 120 : 0
+    readonly property int move: motion ? 180 : 0
 }

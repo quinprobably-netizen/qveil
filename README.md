@@ -157,6 +157,11 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
   so instead of playing it.
 - **Moving from YouTube**: drop a Google Takeout `subscriptions.csv`, or a
   NewPipe or FreeTube export, anywhere on the window. It's read offline.
+- It is made for a tiling window manager: its size follows the tile it is in
+  (larger in a wide one, a strip of a lead in a short one, two cards and a
+  folded search field in a narrow column), and everything can be reached from
+  the keyboard. What moves moves briefly, and not at all when the desktop's
+  animations are off.
 - It takes its colours and accent from the Omarchy theme, its type from the
   desktop's interface font, and its corners from Hyprland's window rounding.
 
@@ -164,7 +169,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 |---|---|
 | `/` | Search |
 | `1` `2` `3` `4` `5` | Home, lenses, channels, history, settings |
-| Arrows, `Enter` | Move and play |
+| Arrows or `h` `j` `k` `l`, `Enter` | Move and play |
 | `R` | Refresh what is showing |
 | `P` | Route |
 | `Space` | Play or pause |

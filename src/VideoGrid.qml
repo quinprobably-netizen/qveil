@@ -73,9 +73,23 @@ GridView {
     // The pointer is on a card: the keyboard's mark steps aside.
     function pointed() { navigating = false }
 
+    add: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.move } }
+    populate: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.move } }
+
+    // h j k l move like the arrows.
     Keys.onPressed: event => {
         navigating = true
-        event.accepted = false
+        event.accepted = true
+        if (event.key === Qt.Key_H)
+            moveCurrentIndexLeft()
+        else if (event.key === Qt.Key_L)
+            moveCurrentIndexRight()
+        else if (event.key === Qt.Key_K)
+            moveCurrentIndexUp()
+        else if (event.key === Qt.Key_J)
+            moveCurrentIndexDown()
+        else
+            event.accepted = false
     }
     Keys.onReturnPressed: if (currentIndex >= 0) activated(at(currentIndex), currentIndex)
     Keys.onEnterPressed: if (currentIndex >= 0) activated(at(currentIndex), currentIndex)

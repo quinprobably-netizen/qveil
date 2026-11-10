@@ -19,6 +19,9 @@ Item {
     // and the picture is shown plainly.
     readonly property bool effect: veiled && GraphicsInfo.api !== GraphicsInfo.Software
     // How much of the veil is on: 1 veiled, 0 clear.
+    // It comes in when it is there, not all at once.
+    opacity: ready ? 1 : 0
+    Behavior on opacity { NumberAnimation { duration: Style.move * 1.5 } }
     property real veil: clear ? 0 : 1
     Behavior on veil { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
 

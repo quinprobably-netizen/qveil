@@ -35,6 +35,9 @@ FocusScope {
     property bool navigating: false
     // How many videos a shelf shows; the rest is a step away, in full.
     readonly property int most: 12
+    // In a short tile the lead is a strip, so that a whole shelf fits under it.
+    readonly property bool compact: height < 560
+    readonly property int leadHeight: compact ? 106 : width < 840 ? 200 : 264
     // How many cards fit across, and how tall one is (as in Shelf).
     readonly property int across: Math.max(2, Math.floor((view.width + Style.u * 4) / 280))
     readonly property int cardHeight: Math.round((Math.floor((view.width + Style.u * 4) / across) - Style.u * 4) * 9 / 16) + 104
@@ -43,7 +46,7 @@ FocusScope {
     // empty: one row that scrolls sideways when there is no room for more.
     readonly property int latestRows: {
         const shelf = Style.control + Style.u * 2 + cardHeight + 18 + view.spacing
-        const lead = first !== null ? (view.width < 840 ? 200 : 264) + view.spacing : 0
+        const lead = first !== null ? leadHeight + view.spacing : 0
         const free = view.height - view.topMargin - lead - (keys.length - 1) * shelf
                      - Style.control - Style.u * 2 - (Style.control + 2 * view.spacing)
         return Math.max(1, Math.min(6, Math.ceil(free / cardHeight)))
@@ -174,11 +177,28 @@ FocusScope {
         const top = shelf.y + shelf.rowTop(column)
         const bottom = top + shelf.cellHeight
         if (row === 0 && top - shelf.y < shelf.cellHeight)
-            view.positionViewAtBeginning()
+            scrollTo(view.originY - view.headerItem.height - view.topMargin)
         else if (bottom > view.contentY + view.height)
-            view.contentY = bottom - view.height + Style.u * 2
+            scrollTo(bottom - view.height + Style.u * 2)
         else if (top < view.contentY)
-            view.contentY = shelf.y
+            scrollTo(shelf.y)
+    }
+    // The page glides there.
+    function scrollTo(y) {
+        scroll.stop()
+        if (Style.move === 0) {
+            view.contentY = y
+            return
+        }
+        scroll.to = y
+        scroll.start()
+    }
+    NumberAnimation {
+        id: scroll
+        target: view
+        property: "contentY"
+        duration: Style.move * 1.4
+        easing.type: Easing.OutCubic
     }
     function pickCurrent() {
         const key = keys[row]
@@ -200,9 +220,20 @@ FocusScope {
         function onTopicsChanged() { page.rekey() }
     }
 
+    // h j k l move like the arrows.
     Keys.onPressed: event => {
         navigating = true
-        event.accepted = false
+        event.accepted = true
+        if (event.key === Qt.Key_H)
+            move(-1)
+        else if (event.key === Qt.Key_L)
+            move(1)
+        else if (event.key === Qt.Key_K)
+            step(-1)
+        else if (event.key === Qt.Key_J)
+            step(1)
+        else
+            event.accepted = false
     }
     Keys.onLeftPressed: move(-1)
     Keys.onRightPressed: move(1)
@@ -258,8 +289,11 @@ FocusScope {
                 readonly property color panel: Qt.tint(Style.bg, Style.tint(0.05))
                 readonly property bool mirrored: Qt.application.layoutDirection === Qt.RightToLeft
                 width: parent.width
-                height: view.width < 840 ? 200 : 264
+                height: page.leadHeight
                 visible: page.first !== null
+                // It comes in, when there turns out to be one.
+                opacity: page.first !== null ? 1 : 0
+                Behavior on opacity { NumberAnimation { duration: Style.move } }
                 color: panel
                 clip: true
 
@@ -273,6 +307,8 @@ FocusScope {
                 Item {
                     id: picture
                     objectName: "lead-picture"
+                    // A narrow column has no room for it beside the words.
+                    visible: view.width >= 700
                     anchors.right: parent.right
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
@@ -306,13 +342,15 @@ FocusScope {
                 }
                 Column {
                     anchors.left: parent.left
-                    anchors.leftMargin: Style.u * 8
-                    anchors.right: picture.left
-                    anchors.rightMargin: -Style.u * 8
+                    anchors.leftMargin: page.compact ? Style.u * 5 : Style.u * 8
+                    anchors.right: picture.visible ? picture.left : parent.right
+                    anchors.rightMargin: picture.visible ? -Style.u * 8 : Style.u * 5
                     anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.u * 3
+                    spacing: page.compact ? Style.u : Style.u * 3
 
                     Text {
+                        // (A strip has no room for it; the title and what is left say it.)
+                        visible: !page.compact
                         text: qsTr("Continue watching")
                         textFormat: Text.PlainText
                         color: Style.accent
@@ -333,13 +371,13 @@ FocusScope {
                         lineHeight: 1.05
                         color: Style.fg
                         font.family: Style.font
-                        font.pixelSize: lead.height < 240 ? Style.head + 2 : Style.lead
+                        font.pixelSize: page.compact ? Style.title : lead.height < 240 ? Style.head + 2 : Style.lead
                         font.weight: Style.strong
                     }
                     Text {
                         objectName: "lead-meta"
                         width: parent.width
-                        text: [lead.kept.channel || "",
+                        text: [page.compact ? qsTr("Continue watching") : "", lead.kept.channel || "",
                                qsTr("%1 left").arg(Format.clock(Math.max(0, (lead.kept.dur || 0) - (lead.kept.pos || 0))))]
                                   .filter(s => s !== "").join("  ·  ")
                         textFormat: Text.PlainText
@@ -349,6 +387,8 @@ FocusScope {
                         font.pixelSize: Style.body
                     }
                     Row {
+                        // In a strip, pressing the lead is the way to resume.
+                        visible: !page.compact
                         topPadding: Style.u
                         spacing: Style.u * 2
                         Act {
@@ -446,6 +486,10 @@ FocusScope {
             sourceLabel: modelData === "latest" ? qsTr("Newest") : modelData === "resume" ? qsTr("Last watched") : qsTr("Best match")
             onArranged: setting => page.arranged(modelData, setting)
             rows: modelData === "latest" ? page.latestRows : 1
+            // What is still coming has its places shown meanwhile.
+            loading: modelData === "latest" ? page.loading
+                   : isTopic ? !topic.fetchedAt
+                   : isLens ? !!lens.fetchedAt && backend.shelves[modelData] === undefined : false
             entries: page.entriesOf(modelData)
             empty: modelData === "latest"
                    ? (page.loading ? "" : page.noChannels

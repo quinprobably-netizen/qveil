@@ -50,6 +50,12 @@ Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl, 
         }
     });
 
+    connect(&m_motionProcess, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        // Only a plain "false" turns them off: no answer leaves them on.
+        if (code == 0 && status == QProcess::NormalExit)
+            setAnimations(QString::fromUtf8(m_motionProcess.readAllStandardOutput()).trimmed() != "false");
+    });
+
     m_debounce.setSingleShot(true);
     m_debounce.setInterval(80);
     connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, [this] { m_debounce.start(); });
@@ -110,6 +116,10 @@ Theme::~Theme() {
         m_uiProcess.kill();
         m_uiProcess.waitForFinished(1000);
     }
+    if (m_motionProcess.state() != QProcess::NotRunning) {
+        m_motionProcess.kill();
+        m_motionProcess.waitForFinished(1000);
+    }
 }
 
 void Theme::refreshRounding() {
@@ -154,9 +164,18 @@ QString Theme::readColour(const QString &path, const QString &key, const QString
 void Theme::refreshFont() {
     if (!m_gsettings.isEmpty() && m_uiProcess.state() == QProcess::NotRunning)
         m_uiProcess.start(m_gsettings, {"get", "org.gnome.desktop.interface", "font-name"});
+    if (!m_gsettings.isEmpty() && m_motionProcess.state() == QProcess::NotRunning)
+        m_motionProcess.start(m_gsettings, {"get", "org.gnome.desktop.interface", "enable-animations"});
     if (m_fcMatch.isEmpty() || m_fontProcess.state() != QProcess::NotRunning)
         return;
     m_fontProcess.start(m_fcMatch, {"-f", "%{family[0]}", "monospace"});
+}
+
+void Theme::setAnimations(bool on) {
+    if (on == m_animations)
+        return;
+    m_animations = on;
+    emit changed();
 }
 
 QString Theme::familyOf(const QString &description) {

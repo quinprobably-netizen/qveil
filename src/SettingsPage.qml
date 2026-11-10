@@ -53,6 +53,11 @@ FocusScope {
         focus: true
         Keys.onUpPressed: page.step(-1)
         Keys.onDownPressed: page.step(1)
+        Keys.onPressed: event => {
+            event.accepted = event.key === Qt.Key_J || event.key === Qt.Key_K
+            if (event.accepted)
+                page.step(event.key === Qt.Key_J ? 1 : -1)
+        }
 
         Text {
             leftPadding: Style.u * 3

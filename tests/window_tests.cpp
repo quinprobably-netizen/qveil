@@ -1,5 +1,6 @@
 #include <QClipboard>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QQuickStyle>
 #include <QGuiApplication>
@@ -482,7 +483,7 @@ private slots:
     void theLeadAndTheShelvesFitANarrowWindow()
     {
         for (const int width : {950, 760}) {
-            App app(false, QSize(width, 600));
+            App app(false, QSize(width, 760));
             READY(app);
             QTRY_VERIFY(app.item("lead")->isVisible());
             QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 2);
@@ -495,8 +496,8 @@ private slots:
             QVERIFY2(app.item("lead-title")->width() >= 220, qPrintable(QString::number(app.item("lead-title")->width())));
             QQuickItem *picture = app.item("lead-picture");
             QVERIFY(picture);
-            QVERIFY2(right("lead-forget") <= picture->mapToScene(QPointF(0, 0)).x() + 100,
-                     qPrintable(QString("%1 past %2").arg(right("lead-forget")).arg(picture->mapToScene(QPointF(0, 0)).x())));
+            const qreal edge = picture->isVisible() ? picture->mapToScene(QPointF(0, 0)).x() + 100 : right("lead");
+            QVERIFY2(right("lead-forget") <= edge, qPrintable(QString("%1 past %2").arg(right("lead-forget")).arg(edge)));
             QQuickItem *all = App::under(app.item("shelf-latest"), "shelf-all");
             QVERIFY(all->mapToScene(QPointF(all->width(), 0)).x() <= width);
         }
@@ -1395,6 +1396,216 @@ private slots:
         app.play({{"id", "vid00000004"}});
         QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
         QCOMPARE(app.item("sheet")->property("current").toString(), QString("about"));
+    }
+
+    // --- Fluid: it follows its tile, moves briefly, loads without jumps, and its shelves glide. ---
+
+    void theSizeFollowsTheTileWithoutAJump()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        for (const auto &[width, zoom] : {std::pair{1280, 1.0}, std::pair{1440, 1.125}, std::pair{1600, 1.25}, std::pair{1920, 1.5}, std::pair{2560, 1.5}}) {
+            App app(false, QSize(width, 900));
+            READY(app);
+            QCOMPARE(app.window->property("zoom").toReal(), zoom);
+            QCOMPARE(box(app.item("bar")).height(), 56 * zoom);
+            QCOMPARE(box(app.item("bar")).width(), qreal(width));
+        }
+    }
+
+    void aShortTileHasTheLeadAsAStripAndAWholeShelfUnderIt()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QQuickItem *lead = app.item("lead");
+        QTRY_VERIFY(lead->isVisible());
+        QTRY_VERIFY2(box(lead).height() <= 120, qPrintable(QString::number(box(lead).height())));
+        // It still says what it is and how much is left, and pressing it resumes.
+        QCOMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
+        QVERIFY(app.item("lead-title")->isVisible() && app.item("lead-meta")->isVisible());
+        QVERIFY(!app.item("lead-over")->isVisible());
+        // A whole row of the latest fits under it.
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")));
+        QTRY_VERIFY(App::count(shelf, "card") >= 3);
+        QQuickItem *card = App::under(shelf, "card");
+        QTRY_VERIFY2(box(card).bottom() <= 508, qPrintable(QString::number(box(card).bottom())));
+        app.click(lead);
+        QTRY_COMPARE(app.item("surface")->property("startedAt").toInt(), 845);
+
+        // In a tile with room, the lead is the lead.
+        App tall(false, QSize(941, 1030));
+        READY(tall);
+        QTRY_VERIFY(tall.item("lead")->isVisible());
+        QTRY_VERIFY(box(tall.item("lead")).height() >= 200);
+        QVERIFY(tall.item("lead-over")->isVisible());
+    }
+
+    void aNarrowColumnFoldsTheSearchFieldIntoItsKey()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(630, 1030));
+        READY(app);
+        QQuickItem *search = app.item("search");
+        QVERIFY2(box(search).width() <= 60, qPrintable(QString::number(box(search).width())));
+        // Nothing lies over anything else, and nothing is past the edge.
+        QVERIFY(box(app.item("nav-history")).right() <= box(search).left());
+        QVERIFY(box(search).right() <= box(app.item("nav-route")).left());
+        QVERIFY(box(app.item("nav-settings")).right() <= 630);
+        // Its key, or a press, opens it over the bar; Escape folds it again.
+        QTest::keyClick(app.window, '/');
+        QTRY_VERIFY(app.window->property("typing").toBool());
+        QTRY_VERIFY2(box(search).width() >= 300, qPrintable(QString::number(box(search).width())));
+        QVERIFY(box(search).left() >= 0 && box(search).right() <= 630);
+        app.type("rust");
+        QCOMPARE(search->property("text").toString(), QString("rust"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.window->property("typing").toBool());
+        QTRY_VERIFY(box(search).width() <= 60);
+        // The lead is its words: there is no room for its picture beside them.
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QVERIFY(!app.item("lead-picture")->isVisible());
+        QVERIFY(box(app.item("lead-forget")).right() <= box(app.item("lead")).right());
+        QVERIFY(app.item("lead-title")->width() >= 400);
+        // Two whole cards across.
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")));
+        QCOMPARE(shelf->property("across").toInt(), 2);
+    }
+
+    void hjklMoveLikeTheArrows()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_COMPARE(home->property("column").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(home->property("row").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTRY_COMPARE(home->property("row").toInt(), 0);
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_COMPARE(home->property("column").toInt(), 0);
+        // In a grid.
+        app.seeAll();
+        QQuickItem *grid = app.item("home-grid");
+        QTRY_VERIFY(grid->hasActiveFocus());
+        grid->setProperty("currentIndex", 0);
+        const int columns = grid->property("columns").toInt();
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_COMPARE(grid->property("currentIndex").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(grid->property("currentIndex").toInt(), 1 + columns);
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_COMPARE(grid->property("currentIndex").toInt(), 0);
+        // In a list.
+        QTest::keyClick(app.window, Qt::Key_3);
+        QQuickItem *channels = nullptr;
+        QTRY_VERIFY((channels = app.item("channel-list")) && channels->hasActiveFocus());
+        QTRY_COMPARE(app.items("channel-row").size(), 5);
+        channels->setProperty("currentIndex", 0);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(channels->property("currentIndex").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTRY_COMPARE(channels->property("currentIndex").toInt(), 0);
+        // While a video has the page, J and L are still ten seconds back and on.
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(app.window->property("watching").toBool());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QCOMPARE(app.page(), QString("channels"));
+    }
+
+    void aShelfGlidesByARowWithItsArrows()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")));
+        QTRY_VERIFY(App::count(shelf, "card") >= 5);
+        QQuickItem *row = App::under(shelf, "shelf-row"), *next = App::under(shelf, "shelf-next"), *prev = App::under(shelf, "shelf-prev");
+        QVERIFY(row && next && prev);
+        // The arrows are there when the shelf is pointed at, and only where there is more.
+        QVERIFY(!next->isVisible() && !prev->isVisible());
+        app.hover(row);
+        QTRY_VERIFY(next->isVisible());
+        QVERIFY(!prev->isVisible());
+        const qreal cell = row->property("cellWidth").toReal();
+        app.click(next);
+        // It moves there, not jumps: part-way first, then a whole row on.
+        QTRY_VERIFY(row->property("contentX").toReal() > 0);
+        QVERIFY(row->property("contentX").toReal() < 4 * cell);
+        QTRY_COMPARE(row->property("contentX").toReal(), 4 * cell);
+        QTRY_VERIFY(prev->isVisible());
+        // Whole cards still: the first one showing starts where the row starts.
+        QList<QQuickItem *> cards;
+        App::collect(shelf, "card", cards);
+        qreal first = 1e9;
+        for (QQuickItem *card : cards)
+            if (box(card).right() > box(row).left() + 1)
+                first = qMin(first, box(card).left());
+        QVERIFY2(qAbs(first - box(row).left()) <= 1, qPrintable(QString::number(first - box(row).left())));
+        app.click(next);
+        QTRY_COMPARE(row->property("contentX").toReal(), 8 * cell);
+        // At the end there is no more that way.
+        QTRY_VERIFY(!next->isVisible());
+        app.click(prev);
+        QTRY_COMPARE(row->property("contentX").toReal(), 4 * cell);
+        // A shelf whose videos all fit has no arrows.
+        QQuickItem *few = app.item("shelf-resume");
+        app.hover(App::under(few, "shelf-row"));
+        QTest::qWait(250);
+        QVERIFY(!App::under(few, "shelf-next")->isVisible());
+    }
+
+    void aShelfHoldsItsPlaceWhileItLoads()
+    {
+        App app(true, QSize(1280, 720), {{"QVEIL_STANDIN_SLOW_FEED", "1.5"}});
+        READY(app);
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")));
+        // The places of what is coming are there, as many as fit across, and no words about nothing.
+        QTRY_COMPARE(App::count(shelf, "card-placeholder"), shelf->property("across").toInt() * shelf->property("rows").toInt());
+        QCOMPARE(App::count(shelf, "card"), 0);
+        // (Once the page has arrived: it settles into place over a moment.)
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        const qreal height = shelf->height();
+        QQuickItem *more = app.item("home-new-lens");
+        const qreal below = more ? more->mapToScene(QPointF(0, 0)).y() : -1;
+        // When they come, they take those places: nothing under them moves.
+        QTRY_VERIFY_WITH_TIMEOUT(App::count(shelf, "card") >= 4, 6000);
+        QTRY_COMPARE(App::count(shelf, "card-placeholder"), 0);
+        QCOMPARE(shelf->height(), height);
+        if (more)
+            QCOMPARE(more->mapToScene(QPointF(0, 0)).y(), below);
+    }
+
+    void movingBetweenPagesIsBriefAndCanBeTurnedOff()
+    {
+        App app;
+        READY(app);
+        QQuickItem *stage = app.item("stage");
+        QVERIFY(stage);
+        QTRY_COMPARE(stage->opacity(), 1.0);
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("channels")));
+        // The page that comes in fades in; the one that left is gone at once.
+        QVERIFY(stage->opacity() < 1.0);
+        QVERIFY(!app.item("shelves")->isVisible());
+        QElapsedTimer timer;
+        timer.start();
+        QTRY_COMPARE(stage->opacity(), 1.0);
+        QVERIFY2(timer.elapsed() < 400, qPrintable(QString::number(timer.elapsed())));
+
+        // With the desktop's animations off, nothing moves.
+        app.theme->setProperty("animations", false);
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("history")));
+        QCOMPARE(stage->opacity(), 1.0);
     }
 
     // --- Sorting and filtering; topic feeds. ---

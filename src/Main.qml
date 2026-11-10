@@ -35,9 +35,10 @@ ApplicationWindow {
     // Whether keys are going into a text field. Every Qt Quick text input
     // has a cursor position and nothing else that takes focus does. While
     // this is true, no letter, digit or bracket is a shortcut.
-    // A wide window (a full screen, a television) is drawn half again as
-    // large: everything in it, by the one factor.
-    readonly property real zoom: width >= 1600 ? 1.5 : 1
+    // A window wider than 1280 is drawn larger, everything in it by the one
+    // factor, up to half again as large at 1920: the size follows the tile it
+    // is in, with no step anywhere.
+    readonly property real zoom: Math.max(1, Math.min(1.5, 1 + (width - 1280) / 1280))
     // What opens over the window is drawn as large as what is in it.
     function scaleOverlay() {
         Overlay.overlay.transformOrigin = Item.TopLeft
@@ -273,6 +274,15 @@ ApplicationWindow {
             showFullScreen()
     }
 
+    // What the stage shows: a page, or the video. Whatever comes in arrives briefly.
+    readonly property string showing: watching ? "watch" : page
+    onShowingChanged: if (Style.move > 0) arrive.restart()
+    ParallelAnimation {
+        id: arrive
+        NumberAnimation { target: stage; property: "opacity"; from: 0; to: 1; duration: Style.move; easing.type: Easing.OutCubic }
+        NumberAnimation { target: settle; property: "y"; from: 8; to: 0; duration: Style.move; easing.type: Easing.OutCubic }
+    }
+
     // A menu that is open (see SortMenu): Escape closes it first.
     property var openMenu: null
 
@@ -417,8 +427,29 @@ ApplicationWindow {
                 FindField {
                     id: search
                     objectName: "search"
-                    anchors.centerIn: parent
-                    width: Math.min(460, parent.width)
+                    // In a narrow tile it is folded into its key, and opens
+                    // over the places while it is used.
+                    readonly property bool open: !bar.folded || editing || text !== ""
+                    anchors.horizontalCenter: bar.folded ? undefined : parent.horizontalCenter
+                    anchors.right: bar.folded ? parent.right : undefined
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: !bar.folded ? Math.min(460, parent.width) : open ? bar.openWidth : 40
+                    Behavior on width { enabled: bar.folded; NumberAnimation { duration: Style.move; easing.type: Easing.OutCubic } }
+                    z: 3
+                    clip: true
+                    // (So that the places don't show through it while it is over them.)
+                    Rectangle {
+                        z: -1
+                        anchors.fill: parent
+                        visible: bar.folded
+                        color: Style.bg
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        visible: bar.folded && !search.open
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: search.edit()
+                    }
                     onEscaped: win.focusPage(win.page)
                     onSubmitted: query => {
                         win.go("search")
@@ -486,6 +517,9 @@ ApplicationWindow {
 
             Item {
                 id: stage
+                objectName: "stage"
+                // What comes in fades and settles into place; what left is gone at once.
+                transform: Translate { id: settle }
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.top: top.bottom

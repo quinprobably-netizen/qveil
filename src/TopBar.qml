@@ -19,6 +19,11 @@ Rectangle {
     readonly property alias routeAnchor: routePlace
     // Too narrow for the route to be spelled out beside its dot.
     readonly property bool tight: width < 900
+    // Too narrow for the search field to stand open: it folds into its key,
+    // and opens over the places while it is used.
+    readonly property bool folded: width - start.width - end.width - Style.gutter * 2 < 240
+    // How wide the field is when it opens over the places.
+    readonly property real openWidth: slot.x + slot.width - Style.gutter
     signal picked(string place)
     signal routeClicked()
 

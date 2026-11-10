@@ -93,6 +93,17 @@ FocusScope {
 
     ListView {
         id: list
+        objectName: "history-list"
+        // j and k move like the arrows.
+        Keys.onPressed: event => {
+            event.accepted = true
+            if (event.key === Qt.Key_J)
+                incrementCurrentIndex()
+            else if (event.key === Qt.Key_K)
+                decrementCurrentIndex()
+            else
+                event.accepted = false
+        }
         anchors.left: top.left
         anchors.right: top.right
         anchors.top: top.bottom

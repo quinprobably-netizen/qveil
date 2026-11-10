@@ -384,6 +384,33 @@ length is not known has no place under a length filter. "Watched" is what
 has a kept position and, while the history is kept, what is in it. What
 comes next after a video follows the order that was showing.
 
+### Fluid, and at home in a tile (added 2026-11-10, at the owner's request)
+
+The owner, using a tiling window manager: "wishing the ui felt more fluid",
+"the ui doesnt feel native to it"; all four parts of a live mockup chosen.
+Where this differs from "The window adapts to its size" above, this stands.
+
+- **It follows the tile.** The size is continuous: 1 up to 1280 px of width,
+  then growing in a straight line to 1.5 at 1920 and staying there (no step
+  at 1600). In a short tile (under 560 units of page height) the lead is a
+  strip: its title, what is left, its picture; pressing it resumes; a whole
+  row of the latest fits under it. In a narrow column the lead drops its
+  picture (under 700 units of width), cards go two across, and the search
+  field folds into its key and opens over the places while it is used.
+  h j k l move like the arrows on the shelves, in grids, in lists and in the
+  settings; while a video has the page, J and L are still ten seconds.
+- **Things move, briefly.** What the stage shows (a page, the video) fades in
+  and settles over 180 ms; what left is gone at once. Menus and popups fade.
+  A card's picture comes a little closer under the pointer and the keyboard's
+  outline fades. All of it is off when the desktop's animations are
+  (`enable-animations`).
+- **Loading without pops.** A shelf whose videos are still coming shows their
+  places, at their size, breathing; a picture fades into its place when it is
+  there; the lead fades in. A shelf is as tall empty as full.
+- **Shelves glide.** A row rests on a whole card. Pointed at, a shelf shows an
+  arrow at each edge where there is more, which glides it by a row; the
+  keyboard glides it too, and the page glides to what the keyboard is on.
+
 ## Verification
 
 - `bin/test`: Rust and Qt suites. The Qt suite is tied to today's object

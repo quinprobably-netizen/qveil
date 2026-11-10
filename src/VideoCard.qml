@@ -71,6 +71,9 @@ Item {
                 source: card.thumb
                 clear: card.lit
                 mode: card.view.thumbs
+                // A little closer when it is pointed at (the frame clips it).
+                scale: hover.hovered ? 1.045 : 1
+                Behavior on scale { NumberAnimation { duration: Style.move * 1.5; easing.type: Easing.OutCubic } }
             }
             Rectangle {
                 anchors.right: parent.right
@@ -104,7 +107,9 @@ Item {
         Rectangle {
             anchors.fill: frame
             anchors.margins: -3
-            visible: card.lit
+            opacity: card.lit ? 1 : 0
+            visible: opacity > 0
+            Behavior on opacity { NumberAnimation { duration: Style.quick } }
             color: "transparent"
             border.width: 1
             border.color: Style.fg

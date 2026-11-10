@@ -283,6 +283,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "api/config":
             self.send(200, state["config"])
         elif path == "api/feed":
+            # For the tests of what shows while the feed is still coming.
+            time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_FEED", "0")))
             feed = {"channels": len(state["subs"]), "entries": FEED, "fallbacks": 0, "errors": [], "fresh": 0}
             if "stream" in q:
                 self.lines([{"progress": {"done": 5, "total": 5}}, {"result": feed}])

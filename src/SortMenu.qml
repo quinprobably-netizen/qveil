@@ -88,6 +88,9 @@ Act {
         margins: Style.u * 2
         focus: true
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
+        // It arrives and goes briefly.
+        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.quick } }
+        exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: Style.quick } }
         // Escape is the window's key: it is told which menu is open, and closes it.
         onOpened: if (control.Window.window) control.Window.window.openMenu = menu
         onClosed: if (control.Window.window && control.Window.window.openMenu === menu) control.Window.window.openMenu = null

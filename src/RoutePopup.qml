@@ -22,6 +22,9 @@ Popup {
     // Never over the window's edge, wherever it is opened from.
     margins: Style.u * 2
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    // It arrives and goes briefly.
+    enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.quick } }
+    exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: Style.quick } }
     onAboutToShow: chooser.refresh()
 
     background: Rectangle {

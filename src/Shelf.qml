@@ -20,6 +20,8 @@ Item {
     property string thumbs: "clear"
     property var progress: ({})
     property string estimateNote
+    // Whether its videos are still coming: their places are shown meanwhile.
+    property bool loading: false
     // Whether the keyboard is on this shelf, and on which of its videos.
     property bool current: false
     property int column: 0
@@ -54,7 +56,39 @@ Item {
     // that the page doesn't jump as the shelves fill.
     implicitHeight: head.height + Style.u * 2 + row.cellHeight * shownRows
 
-    onColumnChanged: if (current && !wrapped) row.positionViewAtIndex(column, GridView.Contain)
+    onColumnChanged: if (current && !wrapped) reveal(column)
+
+    // Glides the row so that the video at `index` is in view.
+    function reveal(index) {
+        const x = index * row.cellWidth
+        if (x < row.contentX)
+            glideTo(x)
+        else if (x + row.cellWidth > row.contentX + row.width)
+            glideTo(x + row.cellWidth - row.width)
+    }
+    // A row's width on, or back; always to where a card starts.
+    function turn(by) {
+        const from = glide.running ? glide.to : row.contentX
+        glideTo(Math.round((from + by * across * row.cellWidth) / row.cellWidth) * row.cellWidth)
+    }
+    function glideTo(x) {
+        const to = Math.max(0, Math.min(row.contentWidth - row.width, x))
+        glide.stop()
+        if (Style.move === 0) {
+            row.contentX = to
+            return
+        }
+        glide.to = to
+        glide.start()
+    }
+    NumberAnimation {
+        id: glide
+        target: row
+        property: "contentX"
+        duration: Style.move * 1.6
+        easing.type: Easing.OutCubic
+    }
+    HoverHandler { id: over }
 
     Item {
         id: head
@@ -121,6 +155,7 @@ Item {
     // rows that fill the width and don't scroll.
     GridView {
         id: row
+        objectName: "shelf-row"
         // What a card asks of what it is in.
         readonly property string thumbs: shelf.thumbs
         readonly property var progress: shelf.progress
@@ -137,9 +172,12 @@ Item {
         // The cards have a margin of their own: the first picture starts
         // under the heading, and the last one ends at the page's edge.
         x: -Style.u * 2
-        width: parent.width + Style.u * 4
+        // (Exactly as wide as its cards, so that it always rests on a whole one.)
+        width: cellWidth * shelf.across
         height: cellHeight * shelf.shownRows
-        cellWidth: Math.floor(width / shelf.across)
+        cellWidth: Math.floor((parent.width + Style.u * 4) / shelf.across)
+        // Let go of, it settles on a whole card.
+        snapMode: GridView.SnapToRow
         cellHeight: Math.round((cellWidth - Style.u * 4) * 9 / 16) + 104 + (reasons ? 18 : 0)
         flow: shelf.wrapped ? GridView.FlowLeftToRight : GridView.FlowTopToBottom
         interactive: !shelf.wrapped
@@ -155,12 +193,90 @@ Item {
             selected: shelf.current && shelf.column === index
         }
     }
+    // The places of what is coming, breathing while they are empty.
+    Grid {
+        anchors.top: head.bottom
+        anchors.topMargin: Style.u * 2
+        x: row.x
+        columns: shelf.across
+        visible: shelf.loading && shelf.entries.length === 0
+        Repeater {
+            model: parent.visible ? shelf.across * (shelf.wrapped ? shelf.rows : 1) : 0
+            delegate: Item {
+                objectName: "card-placeholder"
+                width: row.cellWidth
+                height: row.cellHeight
+                Rectangle {
+                    id: place
+                    x: Style.u * 2
+                    y: Style.u * 2
+                    width: parent.width - Style.u * 4
+                    height: Math.round(width * 9 / 16)
+                    color: Style.rest
+                    SequentialAnimation on opacity {
+                        running: place.visible && Style.motion
+                        loops: Animation.Infinite
+                        NumberAnimation { from: 1; to: 0.45; duration: 550; easing.type: Easing.InOutSine }
+                        NumberAnimation { from: 0.45; to: 1; duration: 550; easing.type: Easing.InOutSine }
+                    }
+                }
+                Rectangle {
+                    x: Style.u * 2
+                    anchors.top: place.bottom
+                    anchors.topMargin: Style.u * 3
+                    width: place.width * 0.7
+                    height: Style.card
+                    color: Style.rest
+                }
+            }
+        }
+    }
+    // More of the row, a row at a time: at its edges while it is pointed at.
+    component Turn: Rectangle {
+        id: turnButton
+        property int by: 1
+        property bool can: false
+        y: row.y + Style.u * 2
+        width: 44
+        height: Math.round((row.cellWidth - Style.u * 4) * 9 / 16)
+        opacity: over.hovered && !shelf.wrapped && can ? 1 : 0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: Style.quick } }
+        gradient: Gradient {
+            orientation: Gradient.Horizontal
+            GradientStop { position: turnButton.by > 0 ? 1 : 0; color: Qt.rgba(Style.bg.r, Style.bg.g, Style.bg.b, 0.92) }
+            GradientStop { position: turnButton.by > 0 ? 0 : 1; color: Qt.rgba(Style.bg.r, Style.bg.g, Style.bg.b, 0) }
+        }
+        Glyph {
+            anchors.centerIn: parent
+            source: "qrc:/icons/back.svg"
+            rotation: turnButton.by > 0 ? 180 : 0
+            size: 20
+            color: Style.fg
+        }
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: shelf.turn(turnButton.by)
+        }
+    }
+    Turn {
+        objectName: "shelf-prev"
+        by: -1
+        can: row.contentX > 1
+        anchors.left: parent.left
+    }
+    Turn {
+        objectName: "shelf-next"
+        can: row.contentX + row.width < row.contentWidth - 1
+        anchors.right: parent.right
+    }
     Text {
         id: none
         anchors.top: head.bottom
         anchors.topMargin: Style.u * 3
         width: parent.width
-        visible: shelf.entries.length === 0 && text !== ""
+        visible: shelf.entries.length === 0 && text !== "" && !shelf.loading
         text: shelf.empty
         textFormat: Text.PlainText
         wrapMode: Text.Wrap

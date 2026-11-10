@@ -15,6 +15,7 @@ Popup {
             keys: [
                 [["/", "Ctrl+L"], qsTr("Search")],
                 [["1", "2", "3", "4", "5"], qsTr("Home, lenses, channels, history, settings")],
+                [["H", "J", "K", "L"], qsTr("Move, like the arrows (while browsing)")],
                 [["R"], qsTr("Refresh what is showing")],
                 [["P"], qsTr("Route")],
                 [["Esc"], qsTr("Back")],
@@ -60,6 +61,9 @@ Popup {
     padding: Style.u * 5
     modal: true
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    // It arrives and goes briefly.
+    enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.quick } }
+    exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: Style.quick } }
     Overlay.modal: Rectangle { color: Style.scrim }
 
     background: Rectangle {

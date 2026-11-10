@@ -20,6 +20,8 @@ class Theme : public QObject {
     Q_PROPERTY(QString fontFamily READ fontFamily NOTIFY changed)
     // The desktop's interface typeface: what the window is set in.
     Q_PROPERTY(QString uiFamily READ uiFamily NOTIFY changed)
+    // Whether the desktop has animations on (its settings' enable-animations).
+    Q_PROPERTY(bool animations READ animations WRITE setAnimations NOTIFY changed)
     // The colour of a protected route (Tor, proxy): a muted green that is the
     // same on every theme, so "protected" never reads as the decorative accent.
     Q_PROPERTY(QString protectedColor READ protectedColor CONSTANT)
@@ -39,6 +41,8 @@ public:
     QString foreground() const { return m_foreground; }
     QString fontFamily() const { return m_fontFamily; }
     QString uiFamily() const { return m_uiFamily; }
+    bool animations() const { return m_animations; }
+    void setAnimations(bool on);
     // The family in a font as the desktop's settings write it ("Adwaita Sans
     // 11", "Inter Bold 10"), if it is installed; otherwise nothing.
     static QString familyOf(const QString &description);
@@ -67,6 +71,8 @@ private:
     QString m_uiFamily, m_uiDefault;
     QString m_gsettings;
     QProcess m_uiProcess;
+    bool m_animations = true;
+    QProcess m_motionProcess;
     QString m_fontconfig;
     QFileSystemWatcher m_watcher;
     QTimer m_debounce;
