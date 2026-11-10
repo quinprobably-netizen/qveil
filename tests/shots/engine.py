@@ -98,6 +98,7 @@ PRIVACY = {
               "subscriptions": "Kept only on this computer.",
               "history_off": "Off: qveil keeps no history.",
               "history_on": "On: kept only on this computer, until you clear it.",
+              "topics": "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.",
               "resume": "On: qveil remembers where you stopped in an unfinished video for 7 days.",
               "comments": "Fetched only when you open them, as one more lookup of that video.",
               "lenses": "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer."},
@@ -106,6 +107,7 @@ PRIVACY = {
 state = {
     "config": {"route": "direct", "proxy": None, "describe": "direct", "isolated": False, "torRunning": True,
                "history": False, "thumbnails": True, "maxHeight": 1080, "resumeDays": 7,
+               "topicFeeds": bool(os.environ.get("QVEIL_STANDIN_TOPICS")),
                "configPath": "/dev/null", "privacy": PRIVACY},
     "subs": [{"id": c, "name": n} for c, n in CHANNELS],
     "resume": [
@@ -123,6 +125,42 @@ state = {
     "log": [],
     "next": 3,
 }
+# Topic feeds: two groups of the channels above, and what a search found
+# for each on other channels. `fetched` says whether they were searched for.
+TOPICS_OFF = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself."
+TOPICS_ON = ("On: qveil groups the channels you follow by the words that keep coming back in their titles, on this "
+             "computer, and searches YouTube by itself for up to three phrases for each of up to four groups.")
+state["topics"] = {"fetched": False, "hidden": []}
+
+
+def topic_groups():
+    def found(prefix, phrase, names):
+        return [{"id": "%s%07d" % (prefix, i), "title": "%s, number %d" % (phrase, i + 1), "channel": names[i % len(names)],
+                 "channel_id": "UCzzzzzzzzzzzzzzzzzzzzz%d" % (i % len(names)), "published": NOW - (i + 1) * DAY,
+                 "duration": 900 + 300 * i, "views": 1000 * (i + 1), "why": [phrase]} for i in range(8)]
+    groups = [
+        {"id": "aa11bb22cc33", "label": "hand plane, dovetail", "channels": ["Northlight Woodworks", "Kiln Notes"],
+         "searches": ["hand plane", "dovetail"], "videos": found("tpw", "hand plane", ["Quiet Bench", "Old Iron", "Shavings"])},
+        {"id": "dd44ee55ff66", "label": "borrow checker, allocators", "channels": ["Low Level Hours"],
+         "searches": ["borrow checker", "allocators"], "videos": found("tps", "borrow checker", ["Tiny Systems", "Ferrous Notes"])},
+    ]
+    out = []
+    for g in groups:
+        if g["id"] in state["topics"]["hidden"]:
+            continue
+        if state["topics"]["fetched"]:
+            g["fetchedAt"] = NOW
+        else:
+            g["videos"] = []
+        out.append(g)
+    return out
+
+
+def topics():
+    on = state["config"]["topicFeeds"]
+    return {"enabled": on, "groups": topic_groups() if on else []}
+
+
 if os.environ.get("QVEIL_STANDIN_EMPTY"):
     state["resume"], state["lenses"] = [], []
 # As many lenses as there can be.
@@ -284,6 +322,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             for i, v in enumerate(FEED[:4])] if state["config"]["history"] else [])
         elif path == "api/resume":
             self.send(200, state["resume"] if state["config"]["resumeDays"] else [])
+        elif path == "api/topics":
+            if "refresh" in q and state["config"]["topicFeeds"]:
+                state["topics"]["fetched"] = True
+            if "stream" in q:
+                self.lines([{"progress": {"done": 0, "total": 4}}, {"result": topics()}], 0.05)
+            else:
+                self.send(200, topics())
         elif path == "api/lenses":
             self.send(200, [lens_entry(l) for l in state["lenses"]])
         elif path == "api/lens":
@@ -364,7 +409,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os._exit(3)
         if path == "api/config":
             cfg = state["config"]
-            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays"):
+            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds"):
                 if key in body:
                     cfg[key] = body[key]
             cfg["resumeDays"] = max(0, min(365, int(cfg["resumeDays"])))
@@ -374,6 +419,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cfg["privacy"]["pages"]["resume"] = (
                 "Off: qveil doesn't remember where you stopped." if days == 0 else
                 "On: qveil remembers where you stopped in an unfinished video for %d day%s." % (days, "" if days == 1 else "s"))
+            cfg["privacy"]["pages"]["topics"] = TOPICS_ON if cfg["topicFeeds"] else TOPICS_OFF
             cfg["privacy"]["summary"] = {"direct": "Direct: YouTube sees your IP address.",
                                          "tor": "Through Tor: YouTube sees an exit node's address, not your IP.",
                                          "proxy": "Through your proxy: YouTube sees its address, not your IP."}[cfg["route"]]
@@ -410,6 +456,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                            "title": body.get("title", ""), "channel": body.get("channel"),
                                            "expires": NOW + 7 * DAY})
             self.send(200, {"noted": noted})
+        elif path == "api/topics/hide":
+            state["topics"]["hidden"].append(q.get("id", ""))
+            self.send(200, {})
         elif path == "api/resume/rm":
             state["resume"] = [r for r in state["resume"] if r["id"] != q.get("v")]
             self.send(200, {})

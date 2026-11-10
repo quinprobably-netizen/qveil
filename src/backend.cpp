@@ -127,7 +127,7 @@ QVariantMap Backend::privacyOf(const QVariantMap &config) {
     const QVariantMap sentRoutes = sent.value("routes").toMap(), sentPages = sent.value("pages").toMap();
     for (const char *key : {"direct", "tor", "proxy"})
         routes.insert(key, text(sentRoutes, key));
-    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses"})
+    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses", "topics"})
         pages.insert(key, text(sentPages, key));
     QStringList points;
     for (const QVariant &point : sent.value("points").toList())
@@ -796,6 +796,37 @@ void Backend::removeLens(const QString &id) {
             closeLens();
         loadLenses();
     }, true);
+}
+
+void Backend::loadTopics() {
+    call("GET", "api/topics", {}, {}, "topics-list", [this](const QJsonValue &v) {
+        m_topics = v.toObject().toVariantMap();
+        emit topicsChanged();
+    });
+}
+
+void Backend::refreshTopics() {
+    QUrlQuery q;
+    q.addQueryItem("refresh", "1");
+    q.addQueryItem("stream", "1");
+    stream(
+        "api/topics", q, "topics",
+        [this](const QVariantList &lines) {
+            for (const QVariant &line : lines) {
+                const QVariantMap o = line.toMap();
+                if (o.contains("result")) {
+                    m_topics = o.value("result").toMap();
+                    emit topicsChanged();
+                }
+            }
+        },
+        {});
+}
+
+void Backend::hideTopic(const QString &id) {
+    QUrlQuery q;
+    q.addQueryItem("id", id);
+    call("POST", "api/topics/hide", q, {}, "topics-hide", [this](const QJsonValue &) { loadTopics(); }, true);
 }
 
 void Backend::closeLens() {

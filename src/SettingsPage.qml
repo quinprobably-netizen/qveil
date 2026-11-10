@@ -253,6 +253,18 @@ FocusScope {
                     }
                 }
                 SettingRow {
+                    objectName: "set-topics"
+                    width: parent.width
+                    name: qsTr("Topic feeds")
+                    // What turning it on sends, in the engine's words.
+                    note: page.pages.topics || ""
+                    noteName: "set-topics-note"
+                    Choices {
+                        Choice { objectName: "topics-off"; text: qsTr("Off"); current: !page.config.topicFeeds; patch: ({ topicFeeds: false }) }
+                        Choice { objectName: "topics-on"; text: qsTr("On"); current: !!page.config.topicFeeds; patch: ({ topicFeeds: true }) }
+                    }
+                }
+                SettingRow {
                     objectName: "set-shorts"
                     width: parent.width
                     name: qsTr("Shorts")

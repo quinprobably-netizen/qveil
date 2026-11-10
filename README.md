@@ -124,6 +124,19 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
   will make, and every result says why it is there. The search box reads the
   same rules ("talks over 30 min", "jazz -fusion"); a query without one goes
   to YouTube exactly as typed.
+- **Topic feeds** (off unless you turn them on in Settings, Home): qveil works
+  out what the channels you follow are about, from the words that keep coming
+  back in their titles, groups them (a channel unlike the rest gets a group of
+  its own), and searches for more of the same on channels you don't follow.
+  Each group is a shelf on the home page that you can keep as a lens or hide.
+  The grouping happens on your machine by fixed rules; the searches are what
+  YouTube sees, by themselves once a day per group, which is why it is a
+  setting.
+- **Sort and filter**: every shelf and every list has one control for the
+  order (newest, most viewed, longest, shortest), a length filter, and hiding
+  what you have watched. It only rearranges what qveil already has, and each
+  shelf remembers its own setting. "Watched" is what has a kept position and,
+  if you keep a history, what is in it.
 - **Watching**: the video in a page of its own, with its description, its
   chapters cut into the seek bar, what comes next in the list you opened it
   from, and its **comments**, which are only fetched when you open that tab.

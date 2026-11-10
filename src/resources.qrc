@@ -57,6 +57,8 @@
         <file alias="TopBar.qml">TopBar.qml</file>
         <file alias="Choices.qml">Choices.qml</file>
         <file alias="SettingRow.qml">SettingRow.qml</file>
+        <file alias="Arrange.js">Arrange.js</file>
+        <file alias="SortMenu.qml">SortMenu.qml</file>
         <file alias="Format.js">Format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="icons/play.svg">icons/play.svg</file>

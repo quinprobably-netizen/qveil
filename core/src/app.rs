@@ -311,6 +311,7 @@ pub fn topics(
     rt: &Runtime,
     paths: &Paths,
     refresh: bool,
+    progress: &dyn Fn(usize, usize),
     wanted: &dyn Fn() -> bool,
 ) -> Result<Topics> {
     if !rt.cfg.topic_feeds {
@@ -350,22 +351,35 @@ pub fn topics(
         .collect();
     let mut results: topics::Results = store::load_cache(&paths.topics_cache())?;
     if refresh {
-        for group in &groups {
-            let at = now();
-            let due = results
-                .groups
-                .get(&group.id)
-                .is_none_or(|c| at - c.fetched_at >= topics::STALE);
-            if !due {
-                continue;
-            }
+        let at = now();
+        let due: Vec<&topics::Group> = groups
+            .iter()
+            .filter(|group| {
+                results
+                    .groups
+                    .get(&group.id)
+                    .is_none_or(|c| at - c.fetched_at >= topics::STALE)
+            })
+            .collect();
+        // How far it is, counted in searches, over all the groups that are due.
+        let total: usize = due.iter().map(|g| g.searches.len()).sum();
+        let mut before = 0;
+        for group in due {
+            let so_far = before;
+            before += group.searches.len();
             let reading = Reading {
                 topics: group.searches.clone(),
                 subs: crate::lens::read::Subs::Exclude,
                 ..Reading::default()
             };
-            let videos =
-                search_topics(rt, paths, &reading, topics::PER_SEARCH, &|_, _| {}, wanted)?;
+            let videos = search_topics(
+                rt,
+                paths,
+                &reading,
+                topics::PER_SEARCH,
+                &|done, _| progress(so_far + done, total),
+                wanted,
+            )?;
             if !wanted() {
                 bail!(crate::ytdlp::CANCELLED);
             }

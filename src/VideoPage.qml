@@ -14,6 +14,12 @@ FocusScope {
     property bool loading: false
     default property alias actions: actionRow.data
     readonly property alias grid: grid
+    // How the list is sorted and filtered, what the order it came in is
+    // called, and what is known to have been watched.
+    property var arrange: ({})
+    property string sourceLabel: qsTr("Newest")
+    property var watched: ({})
+    signal arranged(var setting)
     // Where focus belongs when the page is shown.
     readonly property Item content: grid
     property alias thumbs: grid.thumbs
@@ -72,6 +78,12 @@ FocusScope {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.u
+                SortMenu {
+                    objectName: "page-sort"
+                    setting: page.arrange
+                    sourceLabel: page.sourceLabel
+                    onChanged: setting => page.arranged(setting)
+                }
             }
         }
         Column {
@@ -90,7 +102,9 @@ FocusScope {
         anchors.bottom: parent.bottom
         anchors.topMargin: Style.u * 2
         focus: true
-        model: page.model
+        source: page.model
+        arrange: page.arrange
+        watched: page.watched
         onActivated: (video, index) => page.activated(video, index)
         onChannelRequested: id => page.channelRequested(id)
     }

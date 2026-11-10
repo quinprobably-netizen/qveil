@@ -68,6 +68,8 @@ ApplicationWindow {
         property real volume: 80
         // Whether it has been said that positions are kept.
         property bool resumeTold: false
+        // How each feed and shelf is sorted and filtered: { key: setting }, as JSON.
+        property string arrangements: "{}"
         // Before 0.4 this was a switch, called the veil.
         Component.onCompleted: {
             const old = value("veilThumbnails")
@@ -86,6 +88,38 @@ ApplicationWindow {
             map[kept.id] = kept.dur > 0 ? kept.pos / kept.dur : 0
         return map
     }
+    // How each feed and shelf is sorted and filtered, by its key (see Arrange.js).
+    readonly property var arrangements: {
+        try {
+            return JSON.parse(prefs.arrangements) || {}
+        } catch (e) {
+            return {}
+        }
+    }
+    function arrange(key, setting) {
+        const next = Object.assign({}, arrangements)
+        next[key] = setting
+        prefs.arrangements = JSON.stringify(next)
+    }
+    // What qveil knows to have been watched: what has a kept position and,
+    // while the history is kept, what is in it. { id: true }
+    readonly property var watchedIds: {
+        const ids = {}
+        for (const kept of backend.resume)
+            ids[kept.id] = true
+        if (backend.config.history)
+            for (const seen of backend.history)
+                ids[seen.id] = true
+        return ids
+    }
+    // Topic feeds are searched for when they are turned on and once when the
+    // window starts; the engine decides which are due (once a day each).
+    readonly property bool topicsOn: backend.ready && !!backend.config.topicFeeds
+    onTopicsOnChanged: topicsOn ? backend.refreshTopics() : backend.loadTopics()
+    // Hiding what was watched needs the history, where it is kept.
+    readonly property bool historyKept: backend.ready && !!backend.config.history
+    onHistoryKeptChanged: if (historyKept) backend.loadHistory()
+
     // The list the video that is playing was opened from, and where in it:
     // what comes next is the rest of that list.
     property var playList: null
@@ -170,8 +204,9 @@ ApplicationWindow {
             return
         }
         const p = pages[page]
-        if (p && p.grid && p.grid.currentIndex >= 0 && p.model.count > 0)
-            win.play(p.model.get(p.grid.currentIndex), p.model, p.grid.currentIndex)
+        const list = p && p.grid ? p.grid.list : null
+        if (list && p.grid.currentIndex >= 0 && list.count > 0)
+            win.play(list.get(p.grid.currentIndex), list, p.grid.currentIndex)
     }
 
     // The player opens at once, with what the card knows, while the engine
@@ -238,7 +273,14 @@ ApplicationWindow {
             showFullScreen()
     }
 
+    // A menu that is open (see SortMenu): Escape closes it first.
+    property var openMenu: null
+
     function goBack() {
+        if (openMenu) {
+            openMenu.close()
+            return
+        }
         // In the small window, Escape brings the video back.
         if (pip && pipWindow.active)
             togglePip()
@@ -458,6 +500,9 @@ ApplicationWindow {
                     thumbs: win.thumbs
                     shorts: prefs.showShorts
                     progress: win.watched
+                    arrangements: win.arrangements
+                    watched: win.watchedIds
+                    onArranged: (key, setting) => win.arrange(key, setting)
                     onActivated: (video, index) => win.play(video, feedPage.model, index)
                     onShelfActivated: (video, list, index) => win.play(video, list, index)
                     onChannelRequested: id => win.openChannel(id)
@@ -484,10 +529,14 @@ ApplicationWindow {
                     heading: backend.query ? qsTr("\u201c%1\u201d").arg(backend.query) : qsTr("Search")
                     subheading: backend.privacy.pages.search
                     model: backend.results
+                    arrange: win.arrangements.search || ({})
+                    sourceLabel: qsTr("Best match")
+                    watched: win.watchedIds
+                    onArranged: setting => win.arrange("search", setting)
                     estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
                     loading: backend.busy.indexOf("search") >= 0
                     emptyText: backend.query ? qsTr("No results.") : ""
-                    onActivated: (video, index) => win.play(video, backend.results, index)
+                    onActivated: (video, index) => win.play(video, searchPage.grid.list, index)
                     onChannelRequested: id => win.openChannel(id)
 
                     // A search worth repeating becomes a feed.
@@ -511,10 +560,13 @@ ApplicationWindow {
                     subheading: backend.channelVideos.count
                                 ? qsTr("%n recent videos", "", backend.channelVideos.count) : ""
                     model: backend.channelVideos
+                    arrange: win.arrangements.channel || ({})
+                    watched: win.watchedIds
+                    onArranged: setting => win.arrange("channel", setting)
                     estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
                     loading: backend.busy.indexOf("channel") >= 0
                     emptyText: qsTr("No videos.")
-                    onActivated: (video, index) => win.play(video, backend.channelVideos, index)
+                    onActivated: (video, index) => win.play(video, channelPage.grid.list, index)
 
                     // Subscribe is the call to action; Subscribed is the same
                     // word switched on, with a check.
@@ -599,7 +651,7 @@ ApplicationWindow {
                 // time makes it as long as that is.
                 BusyLine {
                     objectName: "progress"
-                    readonly property var tasks: backend.busy.filter(t => ["play", "config", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0)
+                    readonly property var tasks: backend.busy.filter(t => ["play", "config", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0 && t !== "topics-list" && t !== "history")
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top

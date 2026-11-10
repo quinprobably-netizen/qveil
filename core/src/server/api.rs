@@ -149,7 +149,9 @@ impl Server {
             ("POST", ["api", "lenses"]) => self.write_lens(None, &req.body)?,
             ("POST", ["api", "lenses", id]) => self.write_lens(Some(id), &req.body)?,
             // What is on this machine: no search is made for it.
-            ("GET", ["api", "topics"]) => json!(app::topics(&rt, paths, false, &|| true)?),
+            ("GET", ["api", "topics"]) => {
+                json!(app::topics(&rt, paths, false, &|_, _| {}, &|| true)?)
+            }
             ("POST", ["api", "topics", "hide"]) => {
                 app::hide_topic(paths, req.param("id")?)?;
                 json!({})

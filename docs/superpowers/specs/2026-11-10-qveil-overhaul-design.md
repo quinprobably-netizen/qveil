@@ -347,6 +347,43 @@ privacy rules and every behaviour above stand.
   video was opened from a list with something after it; otherwise the sheet
   opens on About.
 
+### Topic feeds and sorting (added 2026-11-10, at the owner's request)
+
+The owner asked for "a feed to the home page based off the topics of
+subscribed channels (multiple if outliers)" and "ways to sort by different
+filters", and chose from questions and mockups: topic feeds that search by
+themselves, off by default; one sort menu on every shelf and list.
+
+**Topic feeds.** Engine: `topics.rs` groups the followed channels by the
+words and word pairs that come back in at least two of a channel's latest 30
+titles (stop words and the channel's own name left out). Two channels share a
+group when they have at least two such words in common and their terms are
+alike enough; a channel unlike the rest is a group of its own; a channel with
+nothing recurring has none. A group's searches are up to three terms, pairs
+first. Fixed rules, no model, nothing leaves the machine for it. With the
+setting `topic_feeds` on (off by default), `GET api/topics?refresh=1`
+searches for the groups whose results are missing or a day old (up to four
+groups, 20 results a search), ranks them like a lens, and leaves out channels
+that are already followed; `GET api/topics` lists what is kept; `POST
+api/topics/hide` hides a group for good. Off, none of it reads or asks
+anything. The privacy text has a sentence for on and for off, and a point in
+the list while it is on. Window: a row in Settings, Home, with the engine's
+sentence; while on, each group is a shelf after the lenses, named by its
+terms and saying which channels it comes from, with "Keep as lens" (its
+searches become a lens) and "Hide". The window asks for a refresh when the
+setting is turned on and once when it starts; the engine decides what is due.
+
+**Sorting and filtering.** One control in every shelf's heading, in the tab
+row of a feed in full, and on search results and a channel's page. It says
+what it is set to and opens a menu: the order (as it came, newest where that
+is not the same, most viewed, longest, shortest), the length (any, under 10
+minutes, 10 to 30, over 30) and whether what was watched is shown. It
+rearranges what is already here and never asks the engine for anything. Each
+shelf and list keeps its own setting, in the window's settings. A video whose
+length is not known has no place under a length filter. "Watched" is what
+has a kept position and, while the history is kept, what is in it. What
+comes next after a video follows the order that was showing.
+
 ## Verification
 
 - `bin/test`: Rust and Qt suites. The Qt suite is tied to today's object

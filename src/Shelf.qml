@@ -23,6 +23,11 @@ Item {
     // Whether the keyboard is on this shelf, and on which of its videos.
     property bool current: false
     property int column: 0
+    // How it is sorted and filtered (see Arrange.js), and what the order it
+    // came in is called.
+    property var arrange: ({})
+    property string sourceLabel: qsTr("Newest")
+    signal arranged(var setting)
     // Actions, after the note.
     default property alias actions: tail.data
     // How many cards fit across: whole ones, sized to the width.
@@ -95,6 +100,12 @@ Item {
                 color: Style.faint
                 font.family: Style.font
                 font.pixelSize: Style.small
+            }
+            SortMenu {
+                objectName: "shelf-sort"
+                setting: shelf.arrange
+                sourceLabel: shelf.sourceLabel
+                onChanged: setting => shelf.arranged(setting)
             }
             Act {
                 objectName: "shelf-all"

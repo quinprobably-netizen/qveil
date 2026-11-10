@@ -1397,6 +1397,147 @@ private slots:
         QCOMPARE(app.item("sheet")->property("current").toString(), QString("about"));
     }
 
+    // --- Sorting and filtering; topic feeds. ---
+
+    void aShelfIsSortedAndFilteredWithoutAskingAnybody()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")));
+        QTRY_VERIFY(App::count(shelf, "card") >= 4);
+        const auto first = [&](QQuickItem *in) {
+            // The card furthest towards the start of the first row.
+            QQuickItem *best = nullptr;
+            QList<QQuickItem *> cards;
+            App::collect(in, "card", cards);
+            for (QQuickItem *card : cards) {
+                const QPointF at = card->mapToScene(QPointF(0, 0));
+                if (!best || at.y() < best->mapToScene(QPointF(0, 0)).y() - 1
+                    || (qAbs(at.y() - best->mapToScene(QPointF(0, 0)).y()) <= 1 && at.x() < best->mapToScene(QPointF(0, 0)).x()))
+                    best = card;
+            }
+            return best ? best->property("video").toMap().value("id").toString() : QString();
+        };
+        QCOMPARE(first(shelf), QString("vid00000001"));
+        QQuickItem *sort = App::under(shelf, "shelf-sort");
+        QVERIFY(sort);
+        QCOMPARE(sort->property("text").toString(), QString("Newest"));
+        // (Once what the page asks for as it comes up has been asked.)
+        QTest::qWait(400);
+        const QStringList before = app.asked();
+
+        // The most viewed first.
+        app.click(sort);
+        QTRY_VERIFY(app.item("sort-views") && app.item("sort-views")->isVisible());
+        app.click(app.item("sort-views"));
+        QTRY_COMPARE(first(shelf), QString("vid00000002"));
+        QVERIFY(sort->property("text").toString().contains("Most viewed"));
+        // Only the long ones (over half an hour), still by views.
+        app.click(app.item("length-long"));
+        QTRY_COMPARE(first(shelf), QString("vid00000005"));
+        QVERIFY(sort->property("text").toString().contains("30"));
+        // Without what has a kept position (three of them have).
+        app.click(app.item("watched-hide"));
+        QTRY_COMPARE(first(shelf), QString("vid00000006"));
+        QList<QQuickItem *> cards;
+        App::collect(shelf, "card", cards);
+        for (QQuickItem *card : cards) {
+            QVERIFY(card->property("video").toMap().value("duration").toInt() > 1800);
+            QVERIFY(!QStringList({"vid00000001", "vid00000005", "vid00000004"})
+                         .contains(card->property("video").toMap().value("id").toString()));
+        }
+        // The longest, and the shortest of the long.
+        app.click(app.item("sort-longest"));
+        QTRY_COMPARE(first(shelf), QString("vid00000006"));
+        app.click(app.item("sort-shortest"));
+        QTRY_COMPARE(first(shelf), QString("vid00000010"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.item("sort-views") || !app.item("sort-views")->isVisible());
+        // None of that asked the engine for anything.
+        QCOMPARE(app.asked(), before);
+
+        // The feed in full is the same feed, in the same order, and what
+        // comes next after a video is what comes next in that order.
+        app.seeAll();
+        QQuickItem *grid = app.item("home-grid");
+        QTRY_VERIFY(grid->isVisible());
+        QTRY_COMPARE(grid->property("count").toInt(), 3);
+        QCOMPARE(app.item("feed-sort")->property("text").toString(), sort->property("text").toString());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000010"));
+        QTRY_COMPARE(app.items("next-entry").size(), 2);
+        QCOMPARE(app.items("next-entry").first()->property("title").toString(), QString("The cheapest bench that works"));
+
+        // Another shelf has a setting of its own.
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        QTRY_VERIFY(app.item("shelf-resume"));
+        QCOMPARE(App::under(app.item("shelf-resume"), "shelf-sort")->property("text").toString(), QString("Last watched"));
+    }
+
+    void topicFeedsAreOffUntilTurnedOnAndThenAreShelves()
+    {
+        App app(false, QSize(1280, 2400));
+        READY(app);
+        QTRY_VERIFY(app.item("shelf-aaaa0002"));
+        QTest::qWait(300);
+        // Off: no shelves, and nothing is asked for them.
+        QVERIFY(!app.item("shelf-topic-aa11bb22cc33"));
+        QCOMPARE(app.asked("GET api/topics?refresh"), 0);
+
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-home"));
+        QQuickItem *row = app.item("set-topics");
+        QVERIFY(row && row->isVisible());
+        const auto said = [&] { return app.backend->privacy().value("pages").toMap().value("topics").toString(); };
+        QVERIFY(said().startsWith("Off"));
+        QCOMPARE(app.item("set-topics-note")->property("text").toString(), said());
+        QVERIFY(app.item("topics-off")->property("current").toBool());
+        app.click(app.item("topics-on"));
+        QTRY_VERIFY(app.backend->config().value("topicFeeds").toBool());
+        QTRY_VERIFY(said().startsWith("On"));
+        QCOMPARE(app.item("set-topics-note")->property("text").toString(), said());
+        // Turned on, they are searched for, once.
+        QTRY_COMPARE(app.asked("GET api/topics?refresh"), 1);
+
+        QTest::keyClick(app.window, Qt::Key_1);
+        QQuickItem *wood = nullptr;
+        QTRY_VERIFY((wood = app.item("shelf-topic-aa11bb22cc33")));
+        QVERIFY(app.item("shelf-topic-dd44ee55ff66"));
+        QCOMPARE(App::under(wood, "shelf-title")->property("text").toString(), QString("Hand plane, dovetail"));
+        // Which of your channels it comes from.
+        QStringList words;
+        App::texts(wood, words);
+        QVERIFY2(words.join("|").contains("Northlight Woodworks"), qPrintable(words.join("|")));
+        QTRY_VERIFY(App::count(wood, "card") >= 4);
+        QVERIFY(App::under(wood, "card-why"));
+        // Going home again doesn't search again.
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTest::qWait(200);
+        QCOMPARE(app.asked("GET api/topics?refresh"), 1);
+
+        // Hidden, a topic is gone.
+        app.click(App::under(app.item("shelf-topic-dd44ee55ff66"), "topic-hide"));
+        QTRY_COMPARE(app.asked("POST api/topics/hide?id=dd44ee55ff66"), 1);
+        QTRY_VERIFY(!app.item("shelf-topic-dd44ee55ff66"));
+        // Kept as a lens, it is one: its searches are the lens's words.
+        // (The shelves were made again when one went: the other is looked for anew.)
+        QTRY_VERIFY((wood = app.item("shelf-topic-aa11bb22cc33")));
+        app.click(App::under(wood, "topic-keep"));
+        QTRY_COMPARE(app.page(), QString("lenses"));
+        QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString("hand plane, dovetail"));
+
+        // Off again: the shelves go.
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-home"));
+        app.click(app.item("topics-off"));
+        QTRY_VERIFY(!app.backend->config().value("topicFeeds").toBool());
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTRY_VERIFY(!app.item("shelf-topic-aa11bb22cc33"));
+    }
+
     // --- The window adapts to its size. ---
 
     void aShelfShowsWholeCardsAndTheLatestFillTheWindow()

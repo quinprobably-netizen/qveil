@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import Qveil
 import "Format.js" as Format
+import "Arrange.js" as Arrange
 
 // Home, as it opens: the video you were in the middle of leads the page, and
 // under it every feed is a shelf: the other unfinished videos, the latest
@@ -48,6 +49,19 @@ FocusScope {
         return Math.max(1, Math.min(6, Math.ceil(free / cardHeight)))
     }
 
+    // How each shelf is sorted and filtered, by its key (see Arrange.js).
+    property var arrangements: ({})
+    // What is known to have been watched: { id: true }.
+    property var watched: ({})
+    signal arranged(string key, var setting)
+    // The topic feeds, while they are on: api/topics' groups.
+    readonly property var topics: backend.topics.enabled ? (backend.topics.groups || []) : []
+    function topicOf(key) {
+        for (const group of topics)
+            if ("topic-" + group.id === key)
+                return group
+        return ({})
+    }
     signal activated(var video, var list, int index)
     signal resumed(var video)
     signal allRequested(string feed)
@@ -72,6 +86,8 @@ FocusScope {
             next.push("resume")
         for (const lens of backend.lenses)
             next.push(lens.id)
+        for (const group of topics)
+            next.push("topic-" + group.id)
         if (next.join("|") !== keys.join("|")) {
             keys = next
             row = Math.max(0, Math.min(row, keys.length - 1))
@@ -83,31 +99,45 @@ FocusScope {
                 return lens
         return ({})
     }
-    // A shelf's videos.
-    function entriesOf(key) {
-        const out = []
+    // All of a shelf's videos, as it is sorted and filtered.
+    function sourceOf(key) {
+        let all
         if (key === "resume") {
-            for (const kept of backend.resume.slice(1, most + 1))
-                out.push({ id: kept.id, title: kept.title || "", channel: kept.channel || "", duration: kept.dur,
+            all = []
+            for (const kept of backend.resume.slice(1))
+                all.push({ id: kept.id, title: kept.title || "", channel: kept.channel || "", duration: kept.dur,
                            why: [qsTr("%1 left").arg(Format.clock(Math.max(0, kept.dur - kept.pos)))] })
         } else if (key === "latest") {
-            const n = latestRows > 1 ? latestRows * across : most
-            for (let i = 0; i < backend.feed.count && i < n; i++)
-                out.push(backend.feed.get(i))
+            // As it came, only as much of it as is shown is read.
+            if (Arrange.plain(arrangements[key])) {
+                all = []
+                const n = latestRows > 1 ? latestRows * across : most
+                for (let i = 0; i < backend.feed.count && i < n; i++)
+                    all.push(backend.feed.get(i))
+                return all
+            }
+            all = Arrange.rows(backend.feed)
+        } else if (key.indexOf("topic-") === 0) {
+            all = topicOf(key).videos || []
         } else {
-            return (backend.shelves[key] || []).slice(0, most)
+            all = backend.shelves[key] || []
         }
-        return out
+        // (What is left unfinished is not "watched" on its own shelf.)
+        return Arrange.apply(all, arrangements[key], key === "resume" ? ({}) : watched)
+    }
+    // What a shelf shows of them.
+    function entriesOf(key) {
+        const n = key === "latest" && latestRows > 1 ? latestRows * across : most
+        return sourceOf(key).slice(0, n)
     }
     function pick(key, video, index) {
         if (key === "resume") {
             page.resumed(video)
-        } else if (key === "latest") {
+        } else if (key === "latest" && Arrange.plain(arrangements[key])) {
             // The shelf is the start of the feed: what comes next is the rest of it.
             page.activated(video, backend.feed, index)
         } else {
-            const all = backend.shelves[key] || []
-            page.activated(video, { count: all.length, get: i => all[i] }, index)
+            page.activated(video, Arrange.listed(sourceOf(key)), index)
         }
     }
     function move(by) {
@@ -167,6 +197,7 @@ FocusScope {
         target: backend
         function onResumeChanged() { page.rekey() }
         function onLensesChanged() { page.rekey() }
+        function onTopicsChanged() { page.rekey() }
     }
 
     Keys.onPressed: event => {
@@ -388,7 +419,9 @@ FocusScope {
             id: shelf
             required property string modelData
             required property int index
-            readonly property bool isLens: modelData !== "resume" && modelData !== "latest"
+            readonly property bool isTopic: modelData.indexOf("topic-") === 0
+            readonly property var topic: isTopic ? page.topicOf(modelData) : ({})
+            readonly property bool isLens: !isTopic && modelData !== "resume" && modelData !== "latest"
             readonly property var lens: isLens ? page.lensOf(modelData) : ({})
             // A lens's shelf is read from what the engine keeps for it, when
             // the shelf comes into being and again when the lens was fetched anew.
@@ -400,15 +433,25 @@ FocusScope {
             height: implicitHeight
             key: modelData
             title: modelData === "resume" ? qsTr("Also unfinished")
-                 : modelData === "latest" ? qsTr("Latest from your channels") : (lens.text || "")
-            note: modelData === "latest" ? page.status : isLens ? qsTr("Lens") : ""
-            all: modelData !== "resume"
+                 : modelData === "latest" ? qsTr("Latest from your channels")
+                 : isTopic ? (topic.label || "").charAt(0).toUpperCase() + (topic.label || "").slice(1)
+                 : (lens.text || "")
+            // A topic says which of your channels it comes from.
+            readonly property var from: topic.channels || []
+            note: modelData === "latest" ? page.status : isLens ? qsTr("Lens")
+                : isTopic ? (from.length > 1 ? qsTr("Topic  ·  from %1 and %n more", "", from.length - 1).arg(from[0])
+                                             : qsTr("Topic  ·  from %1").arg(from[0] || "")) : ""
+            all: modelData !== "resume" && !isTopic
+            arrange: page.arrangements[modelData] || ({})
+            sourceLabel: modelData === "latest" ? qsTr("Newest") : modelData === "resume" ? qsTr("Last watched") : qsTr("Best match")
+            onArranged: setting => page.arranged(modelData, setting)
             rows: modelData === "latest" ? page.latestRows : 1
             entries: page.entriesOf(modelData)
             empty: modelData === "latest"
                    ? (page.loading ? "" : page.noChannels
                       ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
                       : qsTr("Nothing here yet. Press R to refresh."))
+                   : isTopic ? (topic.fetchedAt ? qsTr("Nothing here for this topic, as it is filtered.") : qsTr("Searching for this topic…"))
                    : isLens && !lens.fetchedAt ? qsTr("Nothing fetched for this lens yet. Open it to run its searches.")
                    : isLens ? qsTr("Nothing fits this lens right now.") : ""
             thumbs: page.thumbs
@@ -422,6 +465,22 @@ FocusScope {
             onAllRequested: page.allRequested(modelData)
             onPointed: page.navigating = false
 
+            Act {
+                objectName: "topic-keep"
+                visible: shelf.isTopic
+                text: qsTr("Keep as lens")
+                quiet: true
+                tip: qsTr("Make a lens of this topic's searches")
+                onClicked: backend.addLens((shelf.topic.searches || []).join(", "))
+            }
+            Act {
+                objectName: "topic-hide"
+                visible: shelf.isTopic
+                text: qsTr("Hide")
+                quiet: true
+                tip: qsTr("Don't show or search for this topic again")
+                onClicked: backend.hideTopic(shelf.topic.id)
+            }
             Act {
                 visible: shelf.modelData === "latest" && page.noChannels
                 text: qsTr("Add a channel")

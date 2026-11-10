@@ -60,6 +60,9 @@ class Backend : public QObject {
     // What each lens last found, by its id, for the shelves of the home
     // page: { id: [video, …] }, filled by loadShelf.
     Q_PROPERTY(QVariantMap shelves READ shelves NOTIFY shelvesChanged)
+    // The topic feeds: { enabled, groups: [{ id, label, channels, searches,
+    // fetchedAt, videos }] }. Empty while the setting is off.
+    Q_PROPERTY(QVariantMap topics READ topics NOTIFY topicsChanged)
     // The lens that is open: {id, text, tags, searches, fetchedAt}; its videos are `lensVideos`.
     Q_PROPERTY(QVariantMap lensInfo READ lensInfo NOTIFY lensChanged)
     Q_PROPERTY(VideoModel *lensVideos READ lensVideos CONSTANT)
@@ -119,6 +122,7 @@ public:
     QVariantMap comments() const { return m_comments; }
     QVariantList lenses() const { return m_lenses; }
     QVariantMap shelves() const { return m_shelves; }
+    QVariantMap topics() const { return m_topics; }
     QVariantMap lensInfo() const { return m_lensInfo; }
     VideoModel *lensVideos() const { return m_lensVideos; }
     int lensDone() const { return m_lensDone; }
@@ -161,6 +165,12 @@ public:
     Q_INVOKABLE void addLens(const QString &text);
     Q_INVOKABLE void editLens(const QString &id, const QString &text);
     Q_INVOKABLE void removeLens(const QString &id);
+    // The topic feeds as the engine has them: this asks YouTube for nothing.
+    Q_INVOKABLE void loadTopics();
+    // The same after searching for those that are due (the engine decides:
+    // at most once a day each, and only while the setting is on).
+    Q_INVOKABLE void refreshTopics();
+    Q_INVOKABLE void hideTopic(const QString &id);
     // `refresh`: 0 shows what is stored, 1 fetches when that is stale, 2 always fetches.
     Q_INVOKABLE void openLens(const QString &id, int refresh);
     // Asks how `text` reads: in the search box, or (`lens`) as a lens, which
@@ -196,6 +206,7 @@ signals:
     void commentsChanged();
     void lensesChanged();
     void shelvesChanged();
+    void topicsChanged();
     void lensChanged();
     void lensProgressChanged();
     void readingChanged();
@@ -314,6 +325,7 @@ private:
     QVariantMap m_comments;
     QVariantList m_lenses;
     QVariantMap m_shelves;
+    QVariantMap m_topics;
     QVariantMap m_lensInfo;
     VideoModel *m_lensVideos = new VideoModel(this);
     int m_lensDone = 0;

@@ -18,7 +18,13 @@ FocusScope {
     // Where focus belongs when the page is shown.
     readonly property Item content: overview ? shelves : grid
     readonly property alias grid: grid
-    readonly property var model: grid.model
+    // What the grid shows, as something with count and get.
+    readonly property var model: grid.list
+    // How each feed and shelf is sorted and filtered, by its key, and what
+    // is known to have been watched.
+    property var arrangements: ({})
+    property var watched: ({})
+    signal arranged(string key, var setting)
     readonly property bool onLens: feed !== "latest"
     readonly property bool noChannels: backend.feedInfo.channels === 0 && backend.subs.length === 0
     readonly property bool loading: onLens ? backend.busy.indexOf("lens") >= 0
@@ -103,6 +109,9 @@ FocusScope {
         thumbs: page.thumbs
         progress: page.progress
         status: page.brief
+        arrangements: page.arrangements
+        watched: page.watched
+        onArranged: (key, setting) => page.arranged(key, setting)
         loading: page.loading
         noChannels: page.noChannels
         onActivated: (video, list, index) => page.shelfActivated(video, list, index)
@@ -139,6 +148,12 @@ FocusScope {
                 onPicked: which => page.feed = which
                 onNewLens: page.newLensRequested()
 
+                SortMenu {
+                    objectName: "feed-sort"
+                    setting: page.arrangements[page.feed] || ({})
+                    sourceLabel: page.onLens ? qsTr("Best match") : qsTr("Newest")
+                    onChanged: setting => page.arranged(page.feed, setting)
+                }
                 Act {
                     visible: !page.onLens && !page.noChannels
                     text: page.shorts ? qsTr("Shorts on") : qsTr("Shorts off")
@@ -168,7 +183,9 @@ FocusScope {
         anchors.topMargin: Style.u * 2
         visible: !page.overview
         focus: !page.overview
-        model: page.onLens ? backend.lensVideos : backend.feed
+        source: page.onLens ? backend.lensVideos : backend.feed
+        arrange: page.arrangements[page.feed] || ({})
+        watched: page.watched
         thumbs: page.thumbs
         progress: page.progress
         estimateNote: page.onLens ? qsTr("Approximate: YouTube's search only says how long ago")

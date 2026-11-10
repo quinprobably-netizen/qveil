@@ -108,30 +108,60 @@ impl Server {
         entry(&self.paths, &lens, now)
     }
 
-    /// `POST api/topics/refresh`: the topic feeds, after searching again for
-    /// those whose results are missing or a day old. Like a lens's refresh it
-    /// stops when the client hangs up or the route is left, and what was
-    /// found on another route is not kept.
-    pub(super) fn refresh_topics(self: &Arc<Self>, out: &mut TcpStream) -> Result<()> {
+    /// `GET api/topics?refresh=1`: the topic feeds, after searching again
+    /// for those whose results are missing or a day old. Like a lens's
+    /// refresh it stops when the client hangs up or the route is left, and
+    /// what was found on another route is not kept. With `&stream=1` the
+    /// reply is lines, as for a lens: progress, then the result or an error.
+    pub(super) fn refresh_topics(
+        self: &Arc<Self>,
+        out: &mut TcpStream,
+        req: &Request,
+    ) -> Result<()> {
         let rt = self.runtime();
         let watch = Watch::new(out);
+        let stream = req.flag("stream");
+        let out = RefCell::new(out);
+        let started = Cell::new(false);
+        let say = |line: Value| {
+            let mut out = out.borrow_mut();
+            if !started.replace(true) && out.write_all(NDJSON_HEAD.as_bytes()).is_err() {
+                return;
+            }
+            let _ = write_line(&mut out, &line);
+        };
+        let progress = |done: usize, total: usize| {
+            if stream {
+                say(json!({ "progress": { "done": done, "total": total } }));
+            }
+        };
         let wanted = || !watch.gone() && self.still_on(&rt);
-        let result = self.guarded(&rt, app::topics(&rt, &self.paths, true, &wanted));
+        let result = self.guarded(&rt, app::topics(&rt, &self.paths, true, &progress, &wanted));
         if watch.gone() {
             return Ok(());
         }
-        match result {
-            Ok(found) => respond(
-                out,
-                200,
-                "application/json",
-                json!(found).to_string().as_bytes(),
-            ),
-            Err(e) => {
+        match (stream, result) {
+            (true, Ok(found)) => say(json!({ "result": found })),
+            (true, Err(e)) => say(errors::body(&format!("{e:#}"))),
+            (false, Ok(found)) => {
+                return respond(
+                    &mut out.borrow_mut(),
+                    200,
+                    "application/json",
+                    json!(found).to_string().as_bytes(),
+                );
+            }
+            (false, Err(e)) => {
                 let body = errors::body(&format!("{e:#}")).to_string();
-                respond(out, 500, "application/json", body.as_bytes())
+                return respond(
+                    &mut out.borrow_mut(),
+                    500,
+                    "application/json",
+                    body.as_bytes(),
+                );
             }
         }
+        Ok(())
     }
 
     /// `GET api/lens?id=…&refresh=0|1&force=0|1`: the lens and its results.
@@ -667,7 +697,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         // Off, as it is unless it is turned on: nothing is worked out, nothing searched.
         let (_, v) = json(&base, "GET", "api/topics", "");
         assert_eq!(v, serde_json::json!({ "enabled": false, "groups": [] }));
-        let (status, v) = json(&base, "POST", "api/topics/refresh", "");
+        let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(status, 200, "{v}");
         assert_eq!(v["groups"], serde_json::json!([]));
         assert!(asked(&bin).is_empty());
@@ -694,7 +724,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         assert!(asked(&bin).is_empty());
 
         // A refresh sends each group's searches, and nothing else.
-        let (status, v) = json(&base, "POST", "api/topics/refresh", "");
+        let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(status, 200, "{v}");
         let wanted: Vec<String> = v["groups"]
             .as_array()
@@ -721,7 +751,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         );
 
         // Within the day, a refresh has nothing to do.
-        let (_, again) = json(&base, "POST", "api/topics/refresh", "");
+        let (_, again) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(asked(&bin), wanted);
         assert_eq!(again["groups"][0]["videos"], first["videos"]);
 
@@ -738,7 +768,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
 
         // Turned off again, there is nothing, and nothing is asked.
         json(&base, "POST", "api/config", r#"{"topicFeeds":false}"#);
-        let (_, v) = json(&base, "POST", "api/topics/refresh", "");
+        let (_, v) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(v, serde_json::json!({ "enabled": false, "groups": [] }));
         assert_eq!(asked(&bin), wanted);
     }
