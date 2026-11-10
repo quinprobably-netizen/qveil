@@ -58,7 +58,12 @@ FocusScope {
     property var watched: ({})
     signal arranged(string key, var setting)
     // The topic feeds, while they are on: api/topics' groups.
-    readonly property var topics: backend.topics.enabled ? (backend.topics.groups || []) : []
+    // A group that was never searched for is only a shelf while it is being
+    // searched for: otherwise there is nothing to show for it, and nothing coming.
+    readonly property bool searching: backend.busy.indexOf("topics") >= 0
+    readonly property var topics: backend.topics.enabled
+        ? (backend.topics.groups || []).filter(g => g.fetchedAt || searching) : []
+    onTopicsChanged: rekey()
     function topicOf(key) {
         for (const group of topics)
             if ("topic-" + group.id === key)
@@ -125,6 +130,8 @@ FocusScope {
         } else {
             all = backend.shelves[key] || []
         }
+        // A live stream can't be played here, so it isn't offered.
+        all = all.filter(v => !v.live)
         // (What is left unfinished is not "watched" on its own shelf.)
         return Arrange.apply(all, arrangements[key], key === "resume" ? ({}) : watched)
     }
@@ -177,7 +184,7 @@ FocusScope {
         const top = shelf.y + shelf.rowTop(column)
         const bottom = top + shelf.cellHeight
         if (row === 0 && top - shelf.y < shelf.cellHeight)
-            scrollTo(view.originY - view.headerItem.height - view.topMargin)
+            scrollTo(view.originY - view.topMargin)
         else if (bottom > view.contentY + view.height)
             scrollTo(bottom - view.height + Style.u * 2)
         else if (top < view.contentY)
@@ -217,7 +224,11 @@ FocusScope {
         target: backend
         function onResumeChanged() { page.rekey() }
         function onLensesChanged() { page.rekey() }
-        function onTopicsChanged() { page.rekey() }
+        // A shelf whose read failed is asked for again when it is next wanted.
+        function onTaskFailed(task) {
+            if (task.indexOf("shelf-") === 0)
+                delete page.read[task.slice(6)]
+        }
     }
 
     // h j k l move like the arrows.
@@ -488,14 +499,14 @@ FocusScope {
             rows: modelData === "latest" ? page.latestRows : 1
             // What is still coming has its places shown meanwhile.
             loading: modelData === "latest" ? page.loading
-                   : isTopic ? !topic.fetchedAt
+                   : isTopic ? !topic.fetchedAt && page.searching
                    : isLens ? !!lens.fetchedAt && backend.shelves[modelData] === undefined : false
             entries: page.entriesOf(modelData)
             empty: modelData === "latest"
                    ? (page.loading ? "" : page.noChannels
                       ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
                       : qsTr("Nothing here yet. Press R to refresh."))
-                   : isTopic ? (topic.fetchedAt ? qsTr("Nothing here for this topic, as it is filtered.") : qsTr("Searching for this topic…"))
+                   : isTopic ? qsTr("Nothing found for this topic.")
                    : isLens && !lens.fetchedAt ? qsTr("Nothing fetched for this lens yet. Open it to run its searches.")
                    : isLens ? qsTr("Nothing fits this lens right now.") : ""
             thumbs: page.thumbs
@@ -522,7 +533,7 @@ FocusScope {
                 visible: shelf.isTopic
                 text: qsTr("Hide")
                 quiet: true
-                tip: qsTr("Don't show or search for this topic again")
+                tip: qsTr("Hide this topic")
                 onClicked: backend.hideTopic(shelf.topic.id)
             }
             Act {

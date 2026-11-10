@@ -116,7 +116,7 @@ ApplicationWindow {
     // Topic feeds are searched for when they are turned on and once when the
     // window starts; the engine decides which are due (once a day each).
     readonly property bool topicsOn: backend.ready && !!backend.config.topicFeeds
-    onTopicsOnChanged: topicsOn ? backend.refreshTopics() : backend.loadTopics()
+    onTopicsOnChanged: topicsOn ? backend.refreshTopics() : backend.dropTopics()
     // Hiding what was watched needs the history, where it is kept.
     readonly property bool historyKept: backend.ready && !!backend.config.history
     onHistoryKeptChanged: if (historyKept) backend.loadHistory()
@@ -291,8 +291,9 @@ ApplicationWindow {
             openMenu.close()
             return
         }
-        // In the small window, Escape brings the video back.
-        if (pip && pipWindow.active)
+        // In the small window (when the keyboard is in it), Escape brings the
+        // video back; in this one it goes back, as it always does.
+        if (pip && pipWindow.activeFocusItem !== null)
             togglePip()
         else if (help.opened)
             help.close()
@@ -383,8 +384,8 @@ ApplicationWindow {
     Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.mpv.muted = !player.mpv.muted }
     Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(-5) }
     Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(5) }
-    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.nudge(-10) }
-    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.nudge(10) }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(-10) }
+    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(10) }
     Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
     Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: win.togglePip() }
     Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.theatre = !watch.theatre }

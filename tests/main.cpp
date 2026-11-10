@@ -1,3 +1,4 @@
+#include "videomodel.h"
 #include <QGuiApplication>
 #include <QQmlEngine>
 #include <QQuickStyle>
@@ -19,6 +20,7 @@ int main(int argc, char *argv[]) {
     QGuiApplication app(argc, argv);
     // As the app registers it: the parts and pages import it from Qveil.
     qmlRegisterSingletonType(QUrl("qrc:/Style.qml"), "Qveil", 1, 0, "Style");
+    qmlRegisterType<VideoModel>("Qveil", 1, 0, "VideoModel");
     // libmpv refuses to start unless numbers are parsed with the C locale.
     std::setlocale(LC_NUMERIC, "C");
 

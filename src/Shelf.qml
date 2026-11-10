@@ -89,6 +89,15 @@ Item {
         easing.type: Easing.OutCubic
     }
     HoverHandler { id: over }
+    VideoModel { id: held }
+    onEntriesChanged: held.assign(entries)
+    // Sorted or filtered anew, the row starts from its start.
+    readonly property string arrangedAs: JSON.stringify(arrange)
+    onArrangedAsChanged: {
+        glide.stop()
+        row.contentX = 0
+    }
+    Component.onCompleted: held.assign(entries)
 
     Item {
         id: head
@@ -185,10 +194,12 @@ Item {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         keyNavigationEnabled: false
-        model: shelf.entries
+        // Held in a list that is changed where it differs, so that the row
+        // keeps its place when its videos change.
+        model: held
         delegate: VideoCard {
-            required property var modelData
-            video: modelData
+            required property var model
+            video: model
             view: row
             selected: shelf.current && shelf.column === index
         }

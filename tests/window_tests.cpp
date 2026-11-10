@@ -21,6 +21,7 @@
 
 #include "backend.h"
 #include "mpvitem.h"
+#include "videomodel.h"
 #include "suite.h"
 #include "theme.h"
 #include "translator.h"
@@ -225,7 +226,11 @@ class WindowTests : public QObject {
     Q_OBJECT
 
 private slots:
-    void initTestCase() { qmlRegisterType<MpvItem>("Qveil", 1, 0, "MpvItem"); }
+    void initTestCase()
+    {
+        qmlRegisterType<MpvItem>("Qveil", 1, 0, "MpvItem");
+        qmlRegisterType<VideoModel>("Qveil", 1, 0, "VideoModel");
+    }
 
     void init()
     {
@@ -1252,7 +1257,7 @@ private slots:
             if (card->property("selected").toBool())
                 selected = card;
         QVERIFY(selected);
-        QCOMPARE(selected->property("video").toMap().value("id").toString(), QString("vid00000003"));
+        QCOMPARE(selected->property("videoId").toString(), QString("vid00000003"));
         QTest::keyClick(app.window, Qt::Key_Return);
         QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000003"));
         QTRY_VERIFY(!app.items("next-entry").isEmpty());
@@ -1629,7 +1634,7 @@ private slots:
                     || (qAbs(at.y() - best->mapToScene(QPointF(0, 0)).y()) <= 1 && at.x() < best->mapToScene(QPointF(0, 0)).x()))
                     best = card;
             }
-            return best ? best->property("video").toMap().value("id").toString() : QString();
+            return best ? best->property("videoId").toString() : QString();
         };
         QCOMPARE(first(shelf), QString("vid00000001"));
         QQuickItem *sort = App::under(shelf, "shelf-sort");
@@ -1655,9 +1660,8 @@ private slots:
         QList<QQuickItem *> cards;
         App::collect(shelf, "card", cards);
         for (QQuickItem *card : cards) {
-            QVERIFY(card->property("video").toMap().value("duration").toInt() > 1800);
-            QVERIFY(!QStringList({"vid00000001", "vid00000005", "vid00000004"})
-                         .contains(card->property("video").toMap().value("id").toString()));
+            QVERIFY(card->property("seconds").toInt() > 1800);
+            QVERIFY(!QStringList({"vid00000001", "vid00000005", "vid00000004"}).contains(card->property("videoId").toString()));
         }
         // The longest, and the shortest of the long.
         app.click(app.item("sort-longest"));
@@ -1747,6 +1751,193 @@ private slots:
         QTRY_VERIFY(!app.backend->config().value("topicFeeds").toBool());
         QTest::keyClick(app.window, Qt::Key_1);
         QTRY_VERIFY(!app.item("shelf-topic-aa11bb22cc33"));
+    }
+
+    // --- What the council found in the code. ---
+
+    void turningTopicFeedsOffDuringARefreshKeepsThemOff()
+    {
+        App app(false, QSize(1280, 2400), {{"QVEIL_STANDIN_SLOW_TOPICS", "1.2"}});
+        READY(app);
+        app.backend->setConfig({{"topicFeeds", true}});
+        QTRY_VERIFY(app.backend->busy().contains("topics"));
+        app.backend->setConfig({{"topicFeeds", false}});
+        QTRY_VERIFY(!app.backend->config().value("topicFeeds").toBool());
+        // The search that was running is let go of, and what it finds is not shown.
+        QTRY_VERIFY(!app.backend->busy().contains("topics"));
+        QTest::qWait(1800);
+        QVERIFY(!app.backend->property("topics").toMap().value("enabled").toBool());
+        QVERIFY(!app.item("shelf-topic-aa11bb22cc33"));
+    }
+
+    void topicShelvesShowWhatIsKeptWhileARefreshRunsAndWhenItFails()
+    {
+        App app(false, QSize(1280, 2400),
+                {{"QVEIL_STANDIN_TOPICS", "fetched"}, {"QVEIL_STANDIN_SLOW_TOPICS", "1.5"}, {"QVEIL_STANDIN_TOPICS_FAIL", "1"}});
+        READY(app);
+        // What was found before is there at once, while the refresh is still running...
+        QQuickItem *wood = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((wood = app.item("shelf-topic-aa11bb22cc33")), 1200);
+        QTRY_VERIFY_WITH_TIMEOUT(App::count(wood, "card") >= 4, 1000);
+        QVERIFY(app.backend->busy().contains("topics"));
+        // ...and still there when it has failed, with the failure said.
+        QTRY_VERIFY_WITH_TIMEOUT(!app.backend->busy().contains("topics"), 4000);
+        QTRY_VERIFY(!app.backend->error().isEmpty());
+        QVERIFY((wood = app.item("shelf-topic-aa11bb22cc33")));
+        QVERIFY(App::count(wood, "card") >= 4);
+    }
+
+    void hidingATopicNeverLeavesAShelfWaitingForNothing()
+    {
+        App app(false, QSize(1280, 3200), {{"QVEIL_STANDIN_TOPICS", "fetched"}, {"QVEIL_STANDIN_TOPIC_GROUPS", "5"}});
+        READY(app);
+        QQuickItem *first = nullptr;
+        QTRY_VERIFY((first = app.item("shelf-topic-aa11bb22cc33")));
+        QTRY_VERIFY(App::count(first, "card") >= 4);
+        const int searches = app.asked("GET api/topics?refresh");
+        app.click(App::under(first, "topic-hide"));
+        QTRY_VERIFY(!app.item("shelf-topic-aa11bb22cc33"));
+        // The one that comes in in its place is searched for, and then has its videos:
+        // nothing sits there breathing with no search behind it.
+        QTRY_VERIFY(app.asked("GET api/topics?refresh") > searches);
+        QTRY_VERIFY(!app.backend->busy().contains("topics"));
+        QQuickItem *fifth = nullptr;
+        QTRY_VERIFY((fifth = app.item("shelf-topic-000000000005")));
+        QTRY_VERIFY(App::count(fifth, "card") >= 1);
+        QCOMPARE(App::count(app.item("shelves"), "card-placeholder"), 0);
+    }
+
+    void upOnTheFirstShelfKeepsThePageAtItsTop()
+    {
+        App app;
+        READY(app);
+        QQuickItem *lead = app.item("lead");
+        QTRY_VERIFY(lead->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        const qreal top = lead->mapToScene(QPointF(0, 0)).y();
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        for (const int key : {Qt::Key_Right, Qt::Key_K, Qt::Key_Down, Qt::Key_Up, Qt::Key_Up}) {
+            QTest::keyClick(app.window, Qt::Key(key));
+            QTest::qWait(350);
+        }
+        QCOMPARE(app.item("shelves-home")->property("row").toInt(), 0);
+        QCOMPARE(lead->mapToScene(QPointF(0, 0)).y(), top);
+    }
+
+    void liveStreamsAreNotOnShelves()
+    {
+        App app(false, QSize(1280, 2400), {{"QVEIL_STANDIN_LIVE", "1"}, {"QVEIL_STANDIN_TOPICS", "fetched"}});
+        READY(app);
+        app.backend->setConfig({{"topicFeeds", true}});
+        QQuickItem *lens = nullptr, *topic = nullptr;
+        // (The topics first: the shelves are made again when they arrive.)
+        QTRY_VERIFY((topic = app.item("shelf-topic-aa11bb22cc33")));
+        QTRY_VERIFY(App::count(topic, "card") >= 4);
+        QTRY_VERIFY((lens = app.item("shelf-aaaa0002")));
+        QTRY_VERIFY(App::count(lens, "card") >= 4);
+        // One of each shelf's videos is a live stream, which qveil can't play: it isn't offered.
+        for (QQuickItem *shelf : {lens, topic}) {
+            QList<QQuickItem *> cards;
+            App::collect(shelf, "card", cards);
+            for (QQuickItem *card : cards) {
+                QVERIFY2(card->property("videoId").toString() != "len0000200" && card->property("videoId").toString() != "tpw0000000",
+                         qPrintable(card->property("videoId").toString()));
+            }
+        }
+    }
+
+    void aSortedGridKeepsItsPlaceWhenItsListChanges()
+    {
+        App app;
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QMetaObject::invokeMethod(app.window, "arrange", Q_ARG(QVariant, QString("latest")),
+                                  Q_ARG(QVariant, QVariantMap({{"sort", "views"}, {"length", "any"}, {"watched", "hide"}})));
+        app.seeAll();
+        QQuickItem *grid = app.item("home-grid");
+        // Twelve, less the three that have a kept position.
+        QTRY_COMPARE(grid->property("count").toInt(), 9);
+        grid->setProperty("currentIndex", 6);
+        QObject *list = grid->property("list").value<QObject *>();
+        QVERIFY(list);
+        QVariantMap at;
+        QMetaObject::invokeMethod(list, "get", Q_RETURN_ARG(QVariantMap, at), Q_ARG(int, 6));
+        const QString id = at.value("id").toString();
+        QVERIFY(!id.isEmpty());
+        // A position is forgotten, so one more video belongs in the list.
+        app.backend->forgetResume("vid00000004");
+        QTRY_COMPARE(grid->property("count").toInt(), 10);
+        // The keyboard is still on the video it was on, not thrown back to the first.
+        const int now = grid->property("currentIndex").toInt();
+        QVERIFY2(now > 0, "the grid was reset to its start");
+        QMetaObject::invokeMethod(list, "get", Q_RETURN_ARG(QVariantMap, at), Q_ARG(int, now));
+        QCOMPARE(at.value("id").toString(), id);
+    }
+
+    void theSortMenuStaysInsideAWideWindow()
+    {
+        App app(false, QSize(1920, 1080));
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")));
+        app.click(App::under(shelf, "shelf-sort"));
+        QQuickItem *last = nullptr;
+        QTRY_VERIFY((last = app.item("watched-hide")) && last->isVisible());
+        QTest::qWait(250);
+        const QRectF at = last->mapRectToScene(QRectF(0, 0, last->width(), last->height()));
+        QVERIFY2(QRectF(0, 0, 1920, 1080).contains(at),
+                 qPrintable(QString("%1,%2 %3x%4").arg(at.x()).arg(at.y()).arg(at.width()).arg(at.height())));
+        app.click(last);
+        QTRY_VERIFY(App::under(shelf, "shelf-sort")->property("text").toString().contains("unwatched"));
+    }
+
+    void whileAVideoIsInTheSmallWindowTheMainWindowsKeysAreItsOwn()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        app.window->requestActivate();
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QTRY_VERIFY(!app.window->property("steering").toBool());
+        // J and L move, as H and K do.
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_COMPARE(home->property("column").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(home->property("row").toInt(), 1);
+        // Escape goes back in this window; it doesn't pull the video out of the small one.
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+        QCOMPARE(app.page(), QString("channel"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QCOMPARE(app.page(), QString("home"));
+        QVERIFY(app.window->property("pip").toBool());
+        QVERIFY(app.pip()->isVisible());
+    }
+
+    void whatTurningTopicFeedsOnDoesIsSaidBeforeItIsDone()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-home"));
+        const QVariantMap pages = app.backend->privacy().value("pages").toMap();
+        QVERIFY(pages.value("topics_on").toString().startsWith("On"));
+        // While it is off, the row says what off is, and what on would do, in the engine's words.
+        QCOMPARE(app.item("set-topics-note")->property("text").toString(), pages.value("topics_off").toString());
+        QQuickItem *would = app.item("set-topics-would");
+        QVERIFY(would && would->isVisible());
+        QCOMPARE(would->property("text").toString(), pages.value("topics_on").toString());
+        QCOMPARE(app.asked("GET api/topics?refresh"), 0);
+        app.click(app.item("topics-on"));
+        QTRY_VERIFY(app.backend->config().value("topicFeeds").toBool());
+        QTRY_VERIFY(!would->isVisible());
     }
 
     // --- The window adapts to its size. ---

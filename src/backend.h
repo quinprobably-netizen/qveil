@@ -171,6 +171,9 @@ public:
     // at most once a day each, and only while the setting is on).
     Q_INVOKABLE void refreshTopics();
     Q_INVOKABLE void hideTopic(const QString &id);
+    // Lets go of a refresh that is running and shows no topic feeds (the
+    // setting was turned off).
+    Q_INVOKABLE void dropTopics();
     // `refresh`: 0 shows what is stored, 1 fetches when that is stale, 2 always fetches.
     Q_INVOKABLE void openLens(const QString &id, int refresh);
     // Asks how `text` reads: in the search box, or (`lens`) as a lens, which

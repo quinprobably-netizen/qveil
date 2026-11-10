@@ -30,6 +30,9 @@ Item {
     // How far it was watched, 0 to 1, when that is remembered.
     readonly property real progress: (view.progress && view.progress[video.id]) || 0
     readonly property var why: video.why || []
+    // The video's id and length, for whoever asks the card (its `video` may be a row of a list).
+    readonly property string videoId: video.id || ""
+    readonly property int seconds: video.duration || 0
 
     width: view.cellWidth
     height: view.cellHeight

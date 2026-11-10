@@ -45,7 +45,7 @@ public:
     // Makes the rows exactly `entries`. An entry without an ID is skipped,
     // and so is a repeat of an ID already seen (the first one counts) and a
     // live stream.
-    void assign(const QVariantList &entries);
+    Q_INVOKABLE void assign(const QVariantList &entries);
     // Adds the entries whose IDs aren't there yet, after the last row.
     void append(const QVariantList &entries);
     void clear();

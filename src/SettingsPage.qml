@@ -261,9 +261,12 @@ FocusScope {
                     objectName: "set-topics"
                     width: parent.width
                     name: qsTr("Topic feeds")
-                    // What turning it on sends, in the engine's words.
-                    note: page.pages.topics || ""
+                    // What it is now, and (before it is turned on) what
+                    // turning it on would send, both in the engine's words.
+                    note: (page.config.topicFeeds ? page.pages.topics_on : page.pages.topics_off) || ""
                     noteName: "set-topics-note"
+                    would: page.config.topicFeeds ? "" : (page.pages.topics_on || "")
+                    wouldName: "set-topics-would"
                     Choices {
                         Choice { objectName: "topics-off"; text: qsTr("Off"); current: !page.config.topicFeeds; patch: ({ topicFeeds: false }) }
                         Choice { objectName: "topics-on"; text: qsTr("On"); current: !!page.config.topicFeeds; patch: ({ topicFeeds: true }) }

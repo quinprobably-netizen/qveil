@@ -25,6 +25,7 @@
 
 #include "backend.h"
 #include "mpvitem.h"
+#include "videomodel.h"
 #include "theme.h"
 #include "translator.h"
 
@@ -66,6 +67,7 @@ int main(int argc, char *argv[]) {
     QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, settings.path());
     app.setOrganizationName("qveil-shots");
     qmlRegisterType<MpvItem>("Qveil", 1, 0, "MpvItem");
+    qmlRegisterType<VideoModel>("Qveil", 1, 0, "VideoModel");
     qmlRegisterSingletonType(QUrl("qrc:/Style.qml"), "Qveil", 1, 0, "Style");
 
     // Installed as the app installs it, so that counted strings read as they will.

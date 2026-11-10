@@ -99,6 +99,9 @@ PRIVACY = {
               "history_off": "Off: qveil keeps no history.",
               "history_on": "On: kept only on this computer, until you clear it.",
               "topics": "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.",
+              "topics_off": "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.",
+              "topics_on": ("On: qveil groups the channels you follow by the words that keep coming back in their titles, on this "
+                            "computer, and searches YouTube by itself for up to three phrases for each of up to four groups."),
               "resume": "On: qveil remembers where you stopped in an unfinished video for 7 days.",
               "comments": "Fetched only when you open them, as one more lookup of that video.",
               "lenses": "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer."},
@@ -130,7 +133,8 @@ state = {
 TOPICS_OFF = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself."
 TOPICS_ON = ("On: qveil groups the channels you follow by the words that keep coming back in their titles, on this "
              "computer, and searches YouTube by itself for up to three phrases for each of up to four groups.")
-state["topics"] = {"fetched": False, "hidden": []}
+# QVEIL_STANDIN_TOPICS=fetched: they were searched for on an earlier day.
+state["topics"] = {"fetched": os.environ.get("QVEIL_STANDIN_TOPICS") == "fetched", "hidden": [], "new": set()}
 
 
 def topic_groups():
@@ -144,11 +148,20 @@ def topic_groups():
         {"id": "dd44ee55ff66", "label": "borrow checker, allocators", "channels": ["Low Level Hours"],
          "searches": ["borrow checker", "allocators"], "videos": found("tps", "borrow checker", ["Tiny Systems", "Ferrous Notes"])},
     ]
+    # More groups than are shown at once, when asked for: hiding one lets the next in.
+    for i in range(2, int(os.environ.get("QVEIL_STANDIN_TOPIC_GROUPS", "2"))):
+        groups.append({"id": "%012x" % (i + 1), "label": "topic %d" % (i + 1), "channels": ["Channel %d" % i],
+                       "searches": ["topic %d" % (i + 1)], "videos": found("tp%d" % i, "topic %d" % (i + 1), ["Someone"])})
+    if os.environ.get("QVEIL_STANDIN_LIVE"):
+        groups[0]["videos"][0]["live"] = True
     out = []
     for g in groups:
         if g["id"] in state["topics"]["hidden"]:
             continue
-        if state["topics"]["fetched"]:
+        if len(out) == 4:
+            break
+        # A group that was not among those searched for has nothing yet.
+        if state["topics"]["fetched"] and g["id"] not in state["topics"]["new"]:
             g["fetchedAt"] = NOW
         else:
             g["videos"] = []
@@ -214,6 +227,8 @@ def lens_videos(lens):
     out = []
     for i, v in enumerate(FEED[:6]):
         v = dict(v)
+        if i == 0 and os.environ.get("QVEIL_STANDIN_LIVE"):
+            v["live"] = True
         v["id"] = "len%s%02d" % (lens["id"][-6:], i)
         v["why"] = [topics[i % len(topics)]] + ["over " + x for x in rule]
         out.append(v)
@@ -325,10 +340,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "api/resume":
             self.send(200, state["resume"] if state["config"]["resumeDays"] else [])
         elif path == "api/topics":
-            if "refresh" in q and state["config"]["topicFeeds"]:
+            refresh = "refresh" in q and state["config"]["topicFeeds"]
+            if refresh:
+                was_on = True
+                time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_TOPICS", "0")))
+                if os.environ.get("QVEIL_STANDIN_TOPICS_FAIL"):
+                    self.lines([{"error": "The engine's words for a search that failed", "code": "other"}])
+                    return
                 state["topics"]["fetched"] = True
+                state["topics"]["new"] = set()
             if "stream" in q:
-                self.lines([{"progress": {"done": 0, "total": 4}}, {"result": topics()}], 0.05)
+                # (A refresh that was running when the setting was turned off
+                # still says what it found: the window must not show it.)
+                result = topics() if not refresh else {"enabled": True, "groups": topic_groups()}
+                self.lines([{"progress": {"done": 0, "total": 4}}, {"result": result}], 0.05)
             else:
                 self.send(200, topics())
         elif path == "api/lenses":
@@ -460,6 +485,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(200, {"noted": noted})
         elif path == "api/topics/hide":
             state["topics"]["hidden"].append(q.get("id", ""))
+            # Whatever comes in in its place has not been searched for.
+            shown = [g["id"] for g in topic_groups()]
+            state["topics"]["new"] = set(shown[3:]) if os.environ.get("QVEIL_STANDIN_TOPIC_GROUPS") else set()
             self.send(200, {})
         elif path == "api/resume/rm":
             state["resume"] = [r for r in state["resume"] if r["id"] != q.get("v")]

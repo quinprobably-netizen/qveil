@@ -60,9 +60,16 @@ public:
     // the item can be read safely.
     void synchronize(QQuickFramebufferObject *item) override {
         m_window = item->window();
+        // The scene graph is told not to follow the item's size itself: it
+        // would compare the framebuffer with the item's own size and make a
+        // new one on every frame while the two differ, which they do whenever
+        // the window is drawn larger. It is made again here, when the size it
+        // is for changes.
         const double scale = static_cast<MpvItem *>(item)->renderScale();
-        if (scale != m_scale) {
-            m_scale = scale;
+        const double ratio = m_window ? m_window->effectiveDevicePixelRatio() : 1;
+        const QSize size = (item->size() * ratio * scale).toSize();
+        if (size != m_size) {
+            m_size = size;
             invalidateFramebufferObject();
         }
     }
@@ -92,7 +99,7 @@ public:
                 post(m_shared.get(), "renderReady");
             }
         }
-        return QQuickFramebufferObject::Renderer::createFramebufferObject(size * m_scale);
+        return QQuickFramebufferObject::Renderer::createFramebufferObject(m_size.isEmpty() ? size : m_size);
     }
 
     void render() override {
@@ -115,7 +122,7 @@ public:
 private:
     std::shared_ptr<MpvShared> m_shared;
     QQuickWindow *m_window = nullptr;
-    double m_scale = 1;
+    QSize m_size;
 };
 
 } // namespace
@@ -129,6 +136,8 @@ MpvShared::~MpvShared() {
 }
 
 MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mpv_create()) {
+    // The renderer sizes the framebuffer (see MpvRenderer::synchronize).
+    setTextureFollowsItemSize(false);
     if (!m_mpv)
         qFatal("libmpv: couldn't create a player");
     m_shared = std::make_shared<MpvShared>(m_mpv);

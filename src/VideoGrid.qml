@@ -26,7 +26,7 @@ GridView {
     readonly property var shown: arranged && source.count >= 0 ? Arrange.apply(Arrange.rows(source), arrange, watched) : []
     // What is showing, as something with count and get: what comes next
     // after a video is what comes next here.
-    readonly property var list: arranged ? Arrange.listed(shown) : (source !== null ? source : model)
+    readonly property var list: arranged ? held : (source !== null ? source : model)
     function at(i) { return list.get(i) }
     signal activated(var video, int index)
     signal channelRequested(string id)
@@ -56,12 +56,31 @@ GridView {
         background: Item {}
     }
 
-    model: arranged ? shown : source
+    // What is arranged is held in a list of its own, which is changed where
+    // it differs when it is arranged anew: the view keeps its place and the
+    // keyboard stays on its video, as with the list as it came.
+    VideoModel { id: held }
+    // How the list was last arranged, to tell the user's own change from a change in the list.
+    property string appliedAs
+    onShownChanged: {
+        held.assign(arranged ? shown : [])
+        // Sorted or filtered anew by the user, it starts from its start;
+        // changed under them (a video watched, more results arriving), it
+        // stays where it is.
+        const as = JSON.stringify(Arrange.of(arrange))
+        if (as !== appliedAs) {
+            appliedAs = as
+            if (arranged) {
+                currentIndex = count > 0 ? 0 : -1
+                positionViewAtBeginning()
+            }
+        }
+    }
+    model: arranged ? held : source
 
     delegate: VideoCard {
         required property var model
-        // (A row of a list model has the roles itself; an array's has the object.)
-        video: model.modelData !== undefined ? model.modelData : model
+        video: model
         view: grid
         selected: GridView.isCurrentItem && grid.activeFocus && grid.navigating
     }

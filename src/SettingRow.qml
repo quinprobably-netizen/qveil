@@ -10,6 +10,9 @@ Rectangle {
     property string note
     // The note's name, for whoever looks for it.
     property string noteName
+    // A second line, fainter: what another choice would mean.
+    property string would
+    property string wouldName
     default property alias control: slot.data
 
     implicitHeight: Math.max(words.height, slot.height) + Style.u * 7
@@ -40,6 +43,12 @@ Rectangle {
             objectName: row.noteName
             width: parent.width
             text: row.note
+        }
+        Notice {
+            objectName: row.wouldName
+            width: parent.width
+            text: row.would
+            color: Style.faint
         }
     }
     Row {

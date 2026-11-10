@@ -86,6 +86,12 @@ Act {
         width: 208
         padding: Style.u * 2
         margins: Style.u * 2
+        // In a window that is drawn larger, what is over it is drawn larger
+        // too, and the bounds a popup keeps to are then larger than what is
+        // seen: the far edges are brought in by the difference.
+        readonly property real zoom: control.Window.window && control.Window.window.zoom ? control.Window.window.zoom : 1
+        bottomMargin: Style.u * 2 + (Overlay.overlay ? Overlay.overlay.height * (1 - 1 / zoom) : 0)
+        rightMargin: Style.u * 2 + (Overlay.overlay ? Overlay.overlay.width * (1 - 1 / zoom) : 0)
         focus: true
         closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
         // It arrives and goes briefly.

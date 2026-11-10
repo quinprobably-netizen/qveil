@@ -127,7 +127,7 @@ QVariantMap Backend::privacyOf(const QVariantMap &config) {
     const QVariantMap sentRoutes = sent.value("routes").toMap(), sentPages = sent.value("pages").toMap();
     for (const char *key : {"direct", "tor", "proxy"})
         routes.insert(key, text(sentRoutes, key));
-    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses", "topics"})
+    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses", "topics", "topics_on", "topics_off"})
         pages.insert(key, text(sentPages, key));
     QStringList points;
     for (const QVariant &point : sent.value("points").toList())
@@ -784,6 +784,9 @@ void Backend::editLens(const QString &id, const QString &text) {
     const QByteArray body = QJsonDocument(QJsonObject{{"text", text}}).toJson(QJsonDocument::Compact);
     call("POST", "api/lenses/" + id, {}, body, "lens-write", [this, id](const QJsonValue &) {
         loadLenses();
+        // What its shelf showed was for the old words.
+        if (m_shelves.remove(id) > 0)
+            emit shelvesChanged();
         // Its results were for the old words; saving new ones asks for them again.
         if (m_lensInfo.value("id").toString() == id)
             openLens(id, 1);
@@ -792,6 +795,8 @@ void Backend::editLens(const QString &id, const QString &text) {
 
 void Backend::removeLens(const QString &id) {
     call("POST", "api/lenses/" + id + "/rm", {}, {}, "lens-write", [this, id](const QJsonValue &) {
+        if (m_shelves.remove(id) > 0)
+            emit shelvesChanged();
         if (m_lensInfo.value("id").toString() == id)
             closeLens();
         loadLenses();
@@ -806,27 +811,49 @@ void Backend::loadTopics() {
 }
 
 void Backend::refreshTopics() {
+    // What is kept is shown at once; the searches, if any are due, take a while.
+    loadTopics();
     QUrlQuery q;
     q.addQueryItem("refresh", "1");
     q.addQueryItem("stream", "1");
+    auto answered = std::make_shared<bool>(false);
     stream(
         "api/topics", q, "topics",
-        [this](const QVariantList &lines) {
+        [this, answered](const QVariantList &lines) {
             for (const QVariant &line : lines) {
                 const QVariantMap o = line.toMap();
-                if (o.contains("result")) {
+                // Turned off meanwhile, what it found is not shown.
+                if (o.contains("result") && m_config.value("topicFeeds").toBool()) {
+                    *answered = true;
                     m_topics = o.value("result").toMap();
                     emit topicsChanged();
                 }
             }
         },
-        {});
+        [this, answered] {
+            // It failed or was let go of: what is kept is what there is.
+            if (!*answered && m_config.value("topicFeeds").toBool())
+                loadTopics();
+        });
 }
 
 void Backend::hideTopic(const QString &id) {
+    // A refresh that is running would bring it back.
+    supersede("topics");
     QUrlQuery q;
     q.addQueryItem("id", id);
-    call("POST", "api/topics/hide", q, {}, "topics-hide", [this](const QJsonValue &) { loadTopics(); }, true);
+    call("POST", "api/topics/hide", q, {}, "topics-hide", [this](const QJsonValue &) {
+        // Whatever takes its place has not been searched for yet.
+        if (m_config.value("topicFeeds").toBool())
+            refreshTopics();
+    }, true);
+}
+
+void Backend::dropTopics() {
+    supersede("topics");
+    supersede("topics-list");
+    m_topics = {{"enabled", false}, {"groups", QVariantList()}};
+    emit topicsChanged();
 }
 
 void Backend::closeLens() {
