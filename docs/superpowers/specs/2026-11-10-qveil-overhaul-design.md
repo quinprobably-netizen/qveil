@@ -83,7 +83,10 @@ No new request is made for any of it.
 - Answers are kept in memory for the engine's life (the 16 most recent
   video-and-sort pairs), never on disk.
 - Commenters' pictures are never fetched. The window draws an initial.
-- New error code for "comments are turned off for this video".
+- yt-dlp cannot tell "no comments" from "comments turned off", so an empty
+  answer is not an error; the window says "No comments here, or they are
+  turned off."
+- Command line: `qveil comments <video> [--new] [-n N] [--replies] [--json]`.
 
 Privacy sentence (every route): *Comments are fetched only when you open them,
 as one more lookup of that video; commenters' pictures are never fetched.*
@@ -147,8 +150,10 @@ understood is always visible. English only in this release.
 - What is left of a clause after removing those and filler ("videos",
   "about", "show me") is a topic. Rules inside a topic clause are lifted out:
   "systems talks over 30 min this year" is one topic and two rules.
-- At most 6 topics. Quoted text is always literal. No topic at all is an
-  error that says so.
+- At most 6 topics. Quoted text is always literal. Single-word rules
+  ("long", "new", "today") only count at the start or end of a clause. A
+  lens with no topic is an error that says so; in the search box a query
+  with no topic is searched as typed.
 
 **Fetching.** One YouTube search per topic through the existing yt-dlp search
 path, 30 results each. Where YouTube has a matching filter of its own (its
@@ -247,8 +252,10 @@ the new shell.
 - Controls: seek bar cut into chapters with the chapter named beside the
   time, play, volume, speed, picture in picture, theatre, fullscreen. A
   "Resumed at 14:05 · Start over" note when a position was restored.
-- Keys: existing ones stay (`P` still switches route). New: `I` picture in
-  picture, `T` theatre, `C` comments, `[` `]` chapter, `<` `>` speed.
+- Keys: existing ones stay (`P` still switches route), except the digits,
+  which follow the rail: `1` home, `2` lenses, `3` channels, `4` history,
+  `5` settings. New: `I` picture in picture, `T` theatre, `C` comments,
+  `[` `]` chapter, `<` `>` speed.
 
 **Picture in picture.** A second window titled "Picture-in-Picture". Omarchy's
 stock rule already floats, pins and places windows with that title; the README
