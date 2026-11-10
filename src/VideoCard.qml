@@ -40,7 +40,8 @@ Item {
     HoverHandler {
         id: hover
         cursorShape: Qt.PointingHandCursor
-        onHoveredChanged: if (hovered) card.view.pointed()
+        // (Reported as it moves: the view decides whether it really did.)
+        onPointChanged: if (hovered) card.view.pointed(point.scenePosition)
     }
     TapHandler {
         onTapped: card.view.pick(card.index)
@@ -106,16 +107,14 @@ Item {
                 color: Style.accent
             }
         }
-        // What is looked at is outlined, a little way out.
+        // The keyboard's cursor: a frame on the picture.
         Rectangle {
+            objectName: "cursor"
             anchors.fill: frame
-            anchors.margins: -3
-            opacity: card.lit ? 1 : 0
-            visible: opacity > 0
-            Behavior on opacity { NumberAnimation { duration: Style.quick } }
+            visible: card.selected
             color: "transparent"
-            border.width: 1
-            border.color: Style.fg
+            border.width: 2
+            border.color: Style.accent
         }
 
         Text {

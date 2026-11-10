@@ -14,6 +14,8 @@ Rectangle {
     property bool quiet: false
     // The one thing to do here: in the accent.
     property bool primary: false
+    // Whether the keyboard's cursor is on it.
+    property bool marked: false
     property string tip
     readonly property bool hot: enabled && (area.containsMouse || activeFocus)
     signal clicked()
@@ -23,6 +25,8 @@ Rectangle {
     radius: Style.radius
     color: primary ? (hot ? Qt.lighter(Style.accent, 1.12) : Style.accent) : hot ? Style.hover : filled ? Style.rest : "transparent"
     opacity: enabled ? 1 : 0.4
+    border.width: marked ? 2 : 0
+    border.color: primary ? Style.fg : Style.accent
     scale: area.pressed ? 0.97 : 1
     activeFocusOnTab: true
     Behavior on color { ColorAnimation { duration: Style.quick } }

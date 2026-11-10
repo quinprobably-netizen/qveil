@@ -446,25 +446,31 @@ private slots:
         app.seeAll();
         QTRY_VERIFY(app.items("card").size() >= 4);
         const QList<QQuickItem *> cards = app.items("card");
-        QQuickItem *frost = App::under(cards.at(0), "frost"), *next = App::under(cards.at(1), "frost");
-        QVERIFY(frost && next);
-        QVERIFY(frost->property("veiled").toBool());
-        QVERIFY(!frost->property("clear").toBool());
-        app.hover(cards.at(0));
-        QTRY_VERIFY(frost->property("clear").toBool());
+        QQuickItem *first = App::under(cards.at(0), "frost"), *second = App::under(cards.at(1), "frost"),
+                   *third = App::under(cards.at(2), "frost");
+        QVERIFY(first && second && third);
+        QVERIFY(third->property("veiled").toBool());
+        // The keyboard's cursor is on the first card from the start, and lifts its veil.
+        QTRY_VERIFY(app.item("home-grid")->hasActiveFocus());
+        QTRY_VERIFY(first->property("clear").toBool());
+        QVERIFY(!third->property("clear").toBool());
+        // So does the pointer, for the card it is on (and the cursor steps aside).
+        app.hover(cards.at(1));
+        app.hover(cards.at(2));
+        QTRY_VERIFY(third->property("clear").toBool());
+        QTRY_VERIFY(!first->property("clear").toBool());
         app.hover(app.item("search"));
-        QTRY_VERIFY(!frost->property("clear").toBool());
+        QTRY_VERIFY(!third->property("clear").toBool());
 
-        // The keyboard lifts the veil of the card it is on.
-        app.item("home-grid")->forceActiveFocus();
+        // The keyboard again: the card it moves to.
         QTest::keyClick(app.window, Qt::Key_Right);
-        QTRY_VERIFY(next->property("clear").toBool());
-        QVERIFY(!frost->property("clear").toBool());
+        QTRY_VERIFY(second->property("clear").toBool());
+        QVERIFY(!third->property("clear").toBool());
 
         // Thumbnails shown as they are have nothing laid over them.
         app.window->setProperty("thumbs", "clear");
-        QTRY_VERIFY(!frost->property("veiled").toBool());
-        QVERIFY(!frost->property("effect").toBool());
+        QTRY_VERIFY(!third->property("veiled").toBool());
+        QVERIFY(!third->property("effect").toBool());
     }
 
     void theGridDropsColumnsInANarrowWindow()
@@ -1238,6 +1244,9 @@ private slots:
         QTRY_VERIFY(app.item("lead")->isVisible());
         QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
         QTRY_VERIFY(home->hasActiveFocus() || app.item("shelves")->hasActiveFocus());
+        // (Off the lead, onto the first shelf.)
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_VERIFY(!app.item("shelves-home")->property("onLead").toBool());
         QCOMPARE(home->property("row").toInt(), 0);
         // The first shelf is the latest; the next is the other unfinished videos.
         QTest::keyClick(app.window, Qt::Key_Down);
@@ -1264,9 +1273,7 @@ private slots:
         // Up has an end, and so has Left.
         QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
         QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
-        QTest::keyClick(app.window, Qt::Key_Up);
-        QTest::keyClick(app.window, Qt::Key_Up);
-        QTRY_COMPARE(home->property("row").toInt(), 0);
+        QCOMPARE(home->property("row").toInt(), 0);
         for (int i = 0; i < 4; ++i)
             QTest::keyClick(app.window, Qt::Key_Left);
         QCOMPARE(home->property("column").toInt(), 0);
@@ -1487,6 +1494,9 @@ private slots:
         QTRY_VERIFY(app.item("lead")->isVisible());
         QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
         QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        // (Off the lead, onto the first shelf.)
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_VERIFY(!app.item("shelves-home")->property("onLead").toBool());
         QTest::keyClick(app.window, Qt::Key_L);
         QTRY_COMPARE(home->property("column").toInt(), 1);
         QTest::keyClick(app.window, Qt::Key_J);
@@ -1753,6 +1763,76 @@ private slots:
         QTRY_VERIFY(!app.item("shelf-topic-aa11bb22cc33"));
     }
 
+    // --- The owner's picks from the council's mockups. ---
+
+    void theKeyboardsCursorIsThereFromTheStartOnTheLead()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QQuickItem *home = app.item("shelves-home"), *lead = app.item("lead");
+        QTRY_VERIFY(lead->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        const auto marked = [&] {
+            QStringList ids;
+            for (QQuickItem *card : app.items("card"))
+                if (card->property("selected").toBool())
+                    ids << card->property("videoId").toString();
+            return ids;
+        };
+        // No key has been pressed: the cursor is on the lead, and on nothing else.
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+        QQuickItem *frame = app.item("lead-cursor");
+        QVERIFY(frame && frame->isVisible());
+        QCOMPARE(frame->property("border").value<QObject *>()->property("width").toInt(), 2);
+        QVERIFY(marked().isEmpty());
+        // Down is the first shelf's first card, framed on its picture; Up is the lead again.
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_COMPARE(marked(), QStringList{"vid00000001"});
+        QVERIFY(!home->property("leadSelected").toBool());
+        QQuickItem *cursor = nullptr;
+        for (QQuickItem *card : app.items("card"))
+            if (card->property("selected").toBool())
+                cursor = App::under(card, "cursor");
+        QVERIFY(cursor && cursor->isVisible());
+        QCOMPARE(cursor->property("border").value<QObject *>()->property("width").toInt(), 2);
+        QCOMPARE(cursor->size(), App::under(cursor->parentItem(), "frost")->size());
+        // Under the pointer the cursor steps aside; a key brings it back where it was.
+        app.hover(app.items("card").at(1));
+        app.hover(app.items("card").at(2));
+        QTRY_VERIFY(marked().isEmpty());
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+
+        // On the lead, left and right choose what Enter does.
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(home->property("leadAction").toInt(), 1);
+        QVERIFY(app.item("lead-over")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_Left);
+        QTest::keyClick(app.window, Qt::Key_Left);
+        QCOMPARE(home->property("leadAction").toInt(), 0);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("startedAt").toInt(), 845);
+        QCOMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000001"));
+
+        // A grid's cursor is there from the start too.
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        app.seeAll();
+        QTRY_VERIFY(app.item("home-grid")->hasActiveFocus());
+        QTRY_COMPARE(marked(), QStringList{"vid00000001"});
+    }
+
+    void inAShortTileEnterOnTheLeadResumes()
+    {
+        App app(false, QSize(941, 508));
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QTRY_VERIFY(app.item("shelves-home")->property("leadSelected").toBool());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("startedAt").toInt(), 845);
+    }
+
     // --- What the council found in the code. ---
 
     void turningTopicFeedsOffDuringARefreshKeepsThemOff()
@@ -1907,6 +1987,9 @@ private slots:
         app.window->requestActivate();
         QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
         QTRY_VERIFY(!app.window->property("steering").toBool());
+        // (Off the lead, onto the first shelf.)
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_VERIFY(!app.item("shelves-home")->property("onLead").toBool());
         // J and L move, as H and K do.
         QTest::keyClick(app.window, Qt::Key_L);
         QTRY_COMPARE(home->property("column").toInt(), 1);
@@ -2096,6 +2179,9 @@ private slots:
         QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
         QTRY_VERIFY2(!app.window->property("steering").toBool(),
                      qPrintable(QString("main active %1, small active %2").arg(app.window->isActive()).arg(app.pip()->isActive())));
+        // (Off the lead, onto the first shelf.)
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_VERIFY(!app.item("shelves-home")->property("onLead").toBool());
         // On the shelves...
         QTest::keyClick(app.window, Qt::Key_Right);
         QTRY_COMPARE(home->property("column").toInt(), 1);
@@ -2259,6 +2345,10 @@ private slots:
         READY(app);
         QQuickItem *home = app.item("shelves-home");
         QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        // (Off the lead, onto the first shelf.)
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_VERIFY(!app.item("shelves-home")->property("onLead").toBool());
         QTest::keyClick(app.window, '/');
         QTRY_VERIFY(app.window->property("typing").toBool());
         QTest::keyClick(app.window, Qt::Key_Escape);

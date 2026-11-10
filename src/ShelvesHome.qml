@@ -32,7 +32,21 @@ FocusScope {
     property var columns: ({})
     readonly property int column: columns[keys[row]] || 0
     // The keyboard's mark shows once the keyboard is used, and hides under the pointer.
-    property bool navigating: false
+    // (It is there from the start: the keyboard needs no first key to show where it is.)
+    property bool navigating: true
+    // Whether the keyboard is on the lead, above the first shelf, and on
+    // which of its actions (0 resume, 1 start over, 2 forget). It starts
+    // there when there is a lead: Enter picks up where you were.
+    property bool onLead: false
+    property int leadAction: 0
+    property bool moved: false
+    readonly property bool leadSelected: navigating && activeFocus && onLead && first !== null
+    onFirstChanged: {
+        if (first === null)
+            onLead = false
+        else if (!moved)
+            onLead = true
+    }
     // How many videos a shelf shows; the rest is a step away, in full.
     readonly property int most: 12
     // In a short tile the lead is a strip, so that a whole shelf fits under it.
@@ -150,8 +164,21 @@ FocusScope {
             page.activated(video, Arrange.listed(sourceOf(key)), index)
         }
     }
+    // The cursor steps aside when the pointer moves over the page (not when
+    // it only rests there as the page opens).
+    property point pointerAt: Qt.point(-1, -1)
+    function pointed(at) {
+        if (pointerAt.x >= 0 && (at.x !== pointerAt.x || at.y !== pointerAt.y))
+            navigating = false
+        pointerAt = at
+    }
     function move(by) {
         navigating = true
+        if (onLead) {
+            // Along the lead's actions; a strip has only the one.
+            leadAction = compact ? 0 : Math.max(0, Math.min(2, leadAction + by))
+            return
+        }
         const key = keys[row]
         const last = entriesOf(key).length - 1
         const next = Object.assign({}, columns)
@@ -160,6 +187,21 @@ FocusScope {
     }
     function step(by) {
         navigating = true
+        moved = true
+        if (onLead) {
+            if (by > 0) {
+                onLead = false
+                Qt.callLater(ensure)
+            }
+            return
+        }
+        // Up from the top of the first shelf is the lead.
+        if (by < 0 && row === 0 && first !== null && !(keys[0] === "latest" && latestRows > 1 && column >= across)) {
+            onLead = true
+            leadAction = 0
+            scrollTo(view.originY - view.topMargin)
+            return
+        }
         // Within the rows of the latest first; then to the shelf before or after.
         if (keys[row] === "latest" && latestRows > 1) {
             const to = column + by * across
@@ -208,6 +250,16 @@ FocusScope {
         easing.type: Easing.OutCubic
     }
     function pickCurrent() {
+        if (onLead && first !== null) {
+            const kept = first
+            if (leadAction === 1)
+                startOver(kept)
+            else if (leadAction === 2)
+                backend.forgetResume(kept.id)
+            else
+                page.resumed({ id: kept.id, title: kept.title || "", channel: kept.channel || "" })
+            return
+        }
         const key = keys[row]
         const entries = entriesOf(key)
         if (column < entries.length)
@@ -308,12 +360,23 @@ FocusScope {
                 color: panel
                 clip: true
 
+                // The keyboard's cursor, when it is on the lead.
+                Rectangle {
+                    objectName: "lead-cursor"
+                    anchors.fill: parent
+                    z: 2
+                    visible: page.leadSelected
+                    color: "transparent"
+                    border.width: 2
+                    border.color: Style.accent
+                }
                 MouseArea {
                     id: leadArea
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: page.resumed({ id: lead.kept.id, title: lead.kept.title || "", channel: lead.kept.channel || "" })
+                    onPositionChanged: mouse => page.pointed(mapToItem(null, mouse.x, mouse.y))
                 }
                 Item {
                     id: picture
@@ -407,6 +470,7 @@ FocusScope {
                             implicitHeight: 36
                             text: qsTr("Resume")
                             primary: true
+                            marked: page.leadSelected && page.leadAction === 0
                             onClicked: page.resumed({ id: lead.kept.id, title: lead.kept.title || "", channel: lead.kept.channel || "" })
                         }
                         Act {
@@ -414,6 +478,7 @@ FocusScope {
                             implicitHeight: 36
                             text: qsTr("Start over")
                             filled: true
+                            marked: page.leadSelected && page.leadAction === 1
                             onClicked: page.startOver(lead.kept)
                         }
                         Act {
@@ -421,6 +486,7 @@ FocusScope {
                             implicitHeight: 36
                             text: qsTr("Forget")
                             quiet: true
+                            marked: page.leadSelected && page.leadAction === 2
                             tip: qsTr("Forget where you stopped in this video")
                             onClicked: backend.forgetResume(lead.kept.id)
                         }
@@ -513,12 +579,12 @@ FocusScope {
             progress: page.progress
             estimateNote: isLens ? qsTr("Approximate: YouTube's search only says how long ago")
                                  : qsTr("Approximate: YouTube's feed for this channel was unavailable")
-            current: page.navigating && page.activeFocus && page.row === index
+            current: page.navigating && page.activeFocus && !page.onLead && page.row === index
             column: page.columns[modelData] || 0
             onActivated: (video, at) => page.pick(modelData, video, at)
             onChannelRequested: id => page.channelRequested(id)
             onAllRequested: page.allRequested(modelData)
-            onPointed: page.navigating = false
+            onPointed: at => page.pointed(at)
 
             Act {
                 objectName: "topic-keep"

@@ -14,7 +14,8 @@ GridView {
     // How far each video was watched: { id: fraction }.
     property var progress: ({})
     // The selection shows once the keyboard is used, and hides on hover.
-    property bool navigating: false
+    // (It is there from the start: the keyboard needs no first key to show where it is.)
+    property bool navigating: true
     // The list to show, when the grid is to sort and filter it itself (see
     // Arrange.js): a list model, and how it is set. Otherwise `model` is set.
     property var source: null
@@ -90,7 +91,14 @@ GridView {
         activated(at(i), i)
     }
     // The pointer is on a card: the keyboard's mark steps aside.
-    function pointed() { navigating = false }
+    // (When it has moved, that is: a pointer that only rests over the window
+    // when a page opens is not using it.)
+    property point pointerAt: Qt.point(-1, -1)
+    function pointed(at) {
+        if (pointerAt.x >= 0 && (at.x !== pointerAt.x || at.y !== pointerAt.y))
+            navigating = false
+        pointerAt = at
+    }
 
     add: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.move } }
     populate: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.move } }

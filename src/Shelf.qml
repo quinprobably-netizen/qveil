@@ -49,7 +49,7 @@ Item {
     signal channelRequested(string id)
     signal allRequested()
     // The pointer is on one of its cards.
-    signal pointed()
+    signal pointed(point at)
 
     objectName: "shelf-" + key
     // As tall while it is still empty as it will be with its videos, so
@@ -173,7 +173,7 @@ Item {
         readonly property bool reasons: shelf.entries.length > 0 && (shelf.entries[0].why || []).length > 0
         signal channelRequested(string id)
         function pick(i) { shelf.activated(shelf.entries[i], i) }
-        function pointed() { shelf.pointed() }
+        function pointed(at) { shelf.pointed(at) }
         onChannelRequested: id => shelf.channelRequested(id)
 
         anchors.top: head.bottom
