@@ -48,6 +48,9 @@ int main(int argc, char *argv[]) {
         {"search", "go('search'); backend.search('talks over 30 min')"},
         {"watch", "play(backend.feed.get(0), backend.feed, 0)"},
         {"feed", "feedPage.showAll('latest')"},
+        // The video, moved to its small window once it plays there.
+        {"pip", "play(backend.feed.get(0), backend.feed, 0); "
+                "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: win.togglePip() }', win)"},
         {"watch-comments", "play(backend.feed.get(0)); watch.sheet.current = 'comments'"},
     };
     if (!views.contains(view)) {
@@ -93,8 +96,10 @@ int main(int argc, char *argv[]) {
             if (go.hasError())
                 std::fprintf(stderr, "%s\n", qPrintable(go.error().toString()));
         }
-        QTimer::singleShot(view.startsWith("watch") || view == "pip" ? 5000 : 2500, &app, [&] {
-            const bool saved = window->grabWindow().save(out);
+        QTimer::singleShot(view == "pip" ? 8000 : view.startsWith("watch") ? 5000 : 2500, &app, [&] {
+            // The small window is a window of its own.
+            QQuickWindow *shown = view == "pip" ? window->property("pipWindow").value<QQuickWindow *>() : window;
+            const bool saved = shown && shown->grabWindow().save(out);
             std::fprintf(stderr, saved ? "saved %s\n" : "couldn't save %s\n", qPrintable(out));
             QCoreApplication::exit(saved ? 0 : 1);
         });

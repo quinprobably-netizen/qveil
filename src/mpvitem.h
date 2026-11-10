@@ -4,6 +4,7 @@
 #include <QMutex>
 #include <QQuickFramebufferObject>
 
+#include <atomic>
 #include <memory>
 
 #include <mpv/client.h>
@@ -23,6 +24,8 @@ struct MpvShared {
     // Created, used and freed by the renderer alone, on the render thread with
     // its GL context current: render.h allows one mpv_render_* call at a time.
     mpv_render_context *render = nullptr;
+    // Whether there is one, for the item to ask from its own thread.
+    std::atomic<bool> ready{false};
     // mpv's threads post to the item through this; it is cleared (under the
     // mutex) before the item goes away.
     QMutex mutex;
@@ -103,6 +106,8 @@ signals:
 
 private slots:
     void handleEvents();
+    // The renderer has made mpv's render context (see MpvRenderer).
+    void renderReady();
 
 private:
     void command(const QList<QByteArray> &args);
@@ -111,6 +116,13 @@ private:
 
     mpv_handle *m_mpv = nullptr;
     std::shared_ptr<MpvShared> m_shared;
+    // A video that was asked for before there was anything to draw it with
+    // (see load()).
+    void startLoad();
+    bool m_waiting = false;
+    quint64 m_asked = 0;
+    QString m_video, m_audio;
+    double m_start = 0;
     double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100, m_speed = 1, m_renderScale = 1;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false, m_started = false;

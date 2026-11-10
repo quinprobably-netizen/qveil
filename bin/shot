@@ -7,7 +7,7 @@
 # (tests/shots/engine.py), inside a headless compositor of its own, so it
 # renders on the GPU without opening anything on the desktop. Views: home,
 # feed, narrow, lenses, channels, history, settings, settings-about, search,
-# watch, watch-comments.
+# watch, watch-comments, pip (the small window itself, with the video in it).
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"

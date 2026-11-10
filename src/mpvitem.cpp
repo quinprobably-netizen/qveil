@@ -5,6 +5,8 @@
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
 #include <QQuickWindow>
+#include <QSGRendererInterface>
+#include <QTimer>
 #include <QtGui/qguiapplication_platform.h>
 
 namespace {
@@ -47,6 +49,7 @@ public:
             return;
         }
         m_shared->render = nullptr;
+        m_shared->ready = false;
         // Every mpv_render_* call happens on this thread, so none can overlap
         // these two. After the first, mpv's threads no longer reach the item.
         mpv_render_context_set_update_callback(context, nullptr, nullptr);
@@ -83,7 +86,10 @@ public:
                 qWarning("libmpv: couldn't create the OpenGL render context");
             } else {
                 m_shared->render = context;
+                m_shared->ready = true;
                 mpv_render_context_set_update_callback(context, onRenderUpdate, m_shared.get());
+                // A video may be waiting for this (see MpvItem::load).
+                post(m_shared.get(), "renderReady");
             }
         }
         return QQuickFramebufferObject::Renderer::createFramebufferObject(size * m_scale);
@@ -218,19 +224,10 @@ void MpvItem::command(const QList<QByteArray> &args) {
 }
 
 void MpvItem::load(const QString &video, const QString &audio, double start) {
-    // Set as a node list: an audio URL contains ':', which the plain string
-    // form would split as a path list.
-    QByteArray audioUtf8 = audio.toUtf8();
-    mpv_node item{};
-    item.format = MPV_FORMAT_STRING;
-    item.u.string = audioUtf8.data();
-    mpv_node_list list{audio.isEmpty() ? 0 : 1, &item, nullptr};
-    mpv_node files{};
-    files.format = MPV_FORMAT_NODE_ARRAY;
-    files.u.list = &list;
-    mpv_set_property(m_mpv, "audio-files", MPV_FORMAT_NODE, &files);
-    mpv_set_property_string(m_mpv, "start", start > 0 ? QByteArray::number(start).constData() : "none");
-    mpv_set_property_string(m_mpv, "pause", "no");
+    m_video = video;
+    m_audio = audio;
+    m_start = start;
+    ++m_asked;
 
     m_loading = true;
     m_loaded = false;
@@ -243,10 +240,52 @@ void MpvItem::load(const QString &video, const QString &audio, double start) {
     emit positionChanged();
     emit durationChanged();
     emit cachedChanged();
-    command({"loadfile", video.toUtf8(), "replace"});
+
+    // mpv sets its video output up when a file is loaded, and gives the
+    // picture up for that file if there is nothing to draw it with yet: the
+    // sound plays over a black frame. The render context is made by the
+    // scene graph the first time the item is drawn, which for a window that
+    // is only now being shown (the small window) is after this call. So the
+    // file waits for it. Where nothing will ever draw (the software scene
+    // graph of the tests), or if it doesn't come, the file is loaded anyway.
+    if (m_shared->ready || QQuickWindow::graphicsApi() == QSGRendererInterface::Software) {
+        startLoad();
+        return;
+    }
+    m_waiting = true;
+    update();
+    QTimer::singleShot(3000, this, [this, asked = m_asked] {
+        if (m_waiting && asked == m_asked)
+            startLoad();
+    });
+}
+
+void MpvItem::renderReady() {
+    if (m_waiting)
+        startLoad();
+}
+
+void MpvItem::startLoad() {
+    m_waiting = false;
+    // Set as a node list: an audio URL contains ':', which the plain string
+    // form would split as a path list.
+    QByteArray audioUtf8 = m_audio.toUtf8();
+    mpv_node item{};
+    item.format = MPV_FORMAT_STRING;
+    item.u.string = audioUtf8.data();
+    mpv_node_list list{m_audio.isEmpty() ? 0 : 1, &item, nullptr};
+    mpv_node files{};
+    files.format = MPV_FORMAT_NODE_ARRAY;
+    files.u.list = &list;
+    mpv_set_property(m_mpv, "audio-files", MPV_FORMAT_NODE, &files);
+    mpv_set_property_string(m_mpv, "start", m_start > 0 ? QByteArray::number(m_start).constData() : "none");
+    mpv_set_property_string(m_mpv, "pause", "no");
+    command({"loadfile", m_video.toUtf8(), "replace"});
 }
 
 void MpvItem::stop() {
+    // What was waiting to be loaded is no longer wanted.
+    m_waiting = false;
     m_loading = false;
     setStarted(false);
     emit bufferingChanged();
