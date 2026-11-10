@@ -29,6 +29,7 @@ use crate::ids::VideoRef;
 use crate::inflight::{ROUTE_CHANGED, Why};
 use crate::store::Paths;
 use crate::util::{lock, random_hex};
+use crate::video::Chapter;
 use anyhow::{Context, Result, bail};
 use http::{
     ACCEPT_BACKOFF, Deadline, Pending, REQUEST_LINE_TIMEOUT, REQUEST_TIMEOUT, Reject, Slot,
@@ -79,6 +80,17 @@ pub struct PlayInfo {
     pub video: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub views: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub likes: Option<u64>,
+    /// Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub chapters: Vec<Chapter>,
 }
 
 /// A video that is resolved and registered for relaying, and what is left to
@@ -215,6 +227,11 @@ impl Server {
                 start: v.start,
                 video: format!("{base}/s/{sid}/v"),
                 audio: has_audio.then(|| format!("{base}/s/{sid}/a")),
+                description: s.description,
+                views: s.views,
+                likes: s.likes,
+                published: s.published,
+                chapters: s.chapters,
             },
             watched,
         })
@@ -378,6 +395,49 @@ mod tests {
         );
         assert_eq!(status, 500);
         assert!(body.contains("isn't a YouTube video"));
+    }
+
+    #[test]
+    fn the_play_answer_carries_the_details() {
+        let bin = TempDir::new();
+        let ytdlp = crate::store::testing::script(
+            &bin.0.join("yt-dlp"),
+            r#"cat <<'EOF'
+{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1",
+ "description":"D","view_count":7,"like_count":2,"timestamp":9,
+ "chapters":[{"start_time":5,"title":"One"}]}
+EOF"#,
+        );
+        let (s, _base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let v = serde_json::to_value(s.open(&test_video()).unwrap()).unwrap();
+        assert_eq!(v["description"], "D");
+        assert_eq!(
+            (v["views"].as_u64(), v["likes"].as_u64()),
+            (Some(7), Some(2))
+        );
+        assert_eq!(v["published"], 9);
+        assert_eq!(
+            v["chapters"],
+            serde_json::json!([{ "start": 5, "title": "One" }])
+        );
+
+        // A video that says none of it has none of the keys.
+        let bare = TempDir::new();
+        let ytdlp = crate::store::testing::script(
+            &bare.0.join("yt-dlp"),
+            r#"echo '{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"}'"#,
+        );
+        let (s, _base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let v = serde_json::to_value(s.open(&test_video()).unwrap()).unwrap();
+        for key in ["description", "views", "likes", "published", "chapters"] {
+            assert!(v.get(key).is_none(), "{key} in {v}");
+        }
     }
 
     #[test]

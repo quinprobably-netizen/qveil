@@ -25,6 +25,13 @@ pub struct Video {
     pub live: bool,
 }
 
+/// A chapter of a video: where it starts, in seconds, and what it is called.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Chapter {
+    pub start: u64,
+    pub title: String,
+}
+
 pub fn fmt_duration(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
     if h > 0 {

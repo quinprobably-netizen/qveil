@@ -11,7 +11,7 @@ use crate::ids;
 use crate::inflight::{Inflight, Run, StartError};
 use crate::net::{Net, USER_AGENT};
 use crate::private::PrivateDir;
-use crate::video::Video;
+use crate::video::{Chapter, Video};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 use std::fmt;
@@ -78,7 +78,21 @@ pub struct Streams {
     pub video: String,
     pub audio: Option<String>,
     pub headers: Vec<(String, String)>,
+    /// What the page says about the video. All of it comes with the lookup
+    /// that finds the streams, so showing it costs no request.
+    pub description: Option<String>,
+    pub views: Option<u64>,
+    pub likes: Option<u64>,
+    /// Unix seconds.
+    pub published: Option<i64>,
+    pub chapters: Vec<Chapter>,
 }
+
+/// How much of a description is kept, in characters. YouTube allows 5000;
+/// this only bounds what a page that isn't YouTube's could hand over.
+const DESCRIPTION_MAX: usize = 20_000;
+/// How many chapters are kept.
+const CHAPTERS_MAX: usize = 200;
 
 impl Ytdlp {
     /// The options every call shares. None of them is private, and none is
@@ -520,7 +534,32 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
             .into(),
         audio,
         headers,
+        description: str_field(v, &["description"])
+            .map(|d| d.chars().take(DESCRIPTION_MAX).collect()),
+        views: v["view_count"].as_u64(),
+        likes: v["like_count"].as_u64(),
+        published: v["timestamp"].as_i64().or(v["release_timestamp"].as_i64()),
+        chapters: chapters(v),
     })
+}
+
+/// The video's chapters, in the order yt-dlp lists them. One without a title
+/// names nothing, so it is left out.
+fn chapters(v: &Value) -> Vec<Chapter> {
+    v["chapters"]
+        .as_array()
+        .map(|cs| {
+            cs.iter()
+                .filter_map(|c| {
+                    Some(Chapter {
+                        start: c["start_time"].as_f64()?.max(0.0) as u64,
+                        title: str_field(c, &["title"])?,
+                    })
+                })
+                .take(CHAPTERS_MAX)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn str_field(v: &Value, keys: &[&str]) -> Option<String> {
@@ -593,6 +632,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!((s.video.as_str(), s.audio), ("https://gv.test/c", None));
+    }
+
+    #[test]
+    fn details_come_with_the_streams() {
+        let s = resolved(
+            r#"{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1",
+                "description":"Line one\nLine two","view_count":59000,"like_count":640,"timestamp":1762700000,
+                "chapters":[{"start_time":0.0,"title":"Intro"},{"start_time":252.4,"title":"Ownership"},{"start_time":300,"title":""}]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.description.as_deref(), Some("Line one\nLine two"));
+        assert_eq!(
+            (s.views, s.likes, s.published),
+            (Some(59000), Some(640), Some(1762700000))
+        );
+        assert_eq!(
+            s.chapters,
+            [
+                Chapter {
+                    start: 0,
+                    title: "Intro".into()
+                },
+                Chapter {
+                    start: 252,
+                    title: "Ownership".into()
+                }
+            ]
+        );
+        // A release date stands in for a missing upload date, and a video
+        // that says nothing has nothing.
+        let s = resolved(
+            r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","release_timestamp":5}"#,
+        )
+        .unwrap();
+        assert_eq!(s.published, Some(5));
+        assert!(s.description.is_none() && s.views.is_none() && s.chapters.is_empty());
+    }
+
+    #[test]
+    fn a_long_description_is_cut_and_chapters_are_capped() {
+        let text = "é".repeat(30_000);
+        let chapters: Vec<String> = (0..300)
+            .map(|i| format!(r#"{{"start_time":{i},"title":"c{i}"}}"#))
+            .collect();
+        let s = resolved(&format!(
+            r#"{{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","description":"{text}","chapters":[{}]}}"#,
+            chapters.join(",")
+        ))
+        .unwrap();
+        assert_eq!(s.description.unwrap().chars().count(), 20_000);
+        assert_eq!(s.chapters.len(), 200);
     }
 
     #[test]
