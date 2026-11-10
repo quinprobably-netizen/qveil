@@ -621,3 +621,34 @@ JSON
     let out = home.run(&["comments", "https://evil.example/x"], "");
     assert!(!out.status.success());
 }
+
+#[test]
+fn read_and_lens_commands() {
+    let home = Home::new();
+    let out = home.run(&["read", "talks", "over", "30", "min"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let shown = text(&out.stdout);
+    assert!(
+        shown.contains("about  talks") && shown.contains("longer than  30:00"),
+        "{shown}"
+    );
+    assert!(shown.contains("searches:\n  talks"), "{shown}");
+    let out = home.run(&["lens", "add", "bread,", "no", "music"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = home.run(&["lens", "add", "no", "music"], "");
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("Say what it should be about"));
+    let out = home.run(&["lens", "ls"], "");
+    assert!(
+        text(&out.stdout).contains("1  bread, no music"),
+        "{}",
+        text(&out.stdout)
+    );
+    // Shown from what is stored, without asking YouTube.
+    let out = home.run(&["lens", "show", "1", "--list"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = home.run(&["lens", "rm", "1"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = home.run(&["lens", "ls"], "");
+    assert!(text(&out.stdout).contains("no lenses"));
+}

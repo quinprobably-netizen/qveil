@@ -4,6 +4,9 @@
 use crate::config::Config;
 use crate::feed::{self, Entry, FeedCache};
 use crate::ids;
+use crate::lens::rank::{self, Found, Ranked};
+use crate::lens::read::{Reading, Tag, read};
+use crate::lens::{self, Cached, Lens};
 use crate::net::{self, Net};
 use crate::store::{self, Paths};
 use crate::subs::{self, Sub, Subs};
@@ -13,6 +16,7 @@ use crate::ytdlp::Ytdlp;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -123,6 +127,139 @@ pub fn search_each(
         bail!("empty search");
     }
     rt.yt.search_each(query, limit, each)
+}
+
+/// Whether a lens's searches are run before it is answered.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LensRefresh {
+    /// Only what is stored.
+    Off,
+    /// When there are no results yet, or they are older than `lens::STALE`.
+    Stale,
+    Force,
+}
+
+/// A lens with how it was read and what its searches found.
+#[derive(Serialize)]
+pub struct LensResult {
+    pub lens: Lens,
+    pub tags: Vec<Tag>,
+    /// What a refresh asks YouTube for, word for word.
+    pub searches: Vec<String>,
+    #[serde(rename = "fetchedAt", skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<i64>,
+    pub videos: Vec<Ranked>,
+}
+
+/// The lens `id`, fetched again if `refresh` says so. `progress` hears how
+/// many of its searches are done, and `wanted` is asked between them (and
+/// while one runs): once nobody wants the answer, or the route it runs on has
+/// been left, it stops and nothing is saved.
+pub fn lens(
+    rt: &Runtime,
+    paths: &Paths,
+    id: &str,
+    refresh: LensRefresh,
+    progress: &dyn Fn(usize, usize),
+    wanted: &dyn Fn() -> bool,
+) -> Result<LensResult> {
+    let lens = lens::get(paths, id)?;
+    let at = now();
+    let reading = read(&lens.text, at);
+    let stored = lens::cached(paths, id)?;
+    let due = match refresh {
+        LensRefresh::Off => false,
+        LensRefresh::Stale => stored
+            .as_ref()
+            .is_none_or(|c| at - c.fetched_at >= lens::STALE),
+        LensRefresh::Force => true,
+    };
+    let stored = if due {
+        let videos = search_topics(rt, paths, &reading, lens::PER_TOPIC, progress, wanted)?;
+        let fresh = Cached {
+            fetched_at: at,
+            videos,
+        };
+        lens::save_cache(paths, id, &fresh)?;
+        Some(fresh)
+    } else {
+        stored
+    };
+    let (fetched_at, videos) = match stored {
+        Some(c) => (Some(c.fetched_at), c.videos),
+        None => (None, Vec::new()),
+    };
+    Ok(LensResult {
+        tags: reading.tags(),
+        searches: reading.topics,
+        lens,
+        fetched_at,
+        videos,
+    })
+}
+
+/// A search whose query had rules in it: its topics are searched, and what
+/// comes back is filtered and ordered here, like a lens that isn't kept.
+pub fn smart_search(
+    rt: &Runtime,
+    paths: &Paths,
+    reading: &Reading,
+    limit: usize,
+    wanted: &dyn Fn() -> bool,
+) -> Result<Vec<Ranked>> {
+    search_topics(rt, paths, reading, limit, &|_, _| {}, wanted)
+}
+
+/// One search per topic, one after the other, then the ranking. The searches
+/// are all that leaves the machine: the rules and the order are applied here.
+fn search_topics(
+    rt: &Runtime,
+    paths: &Paths,
+    reading: &Reading,
+    per_topic: usize,
+    progress: &dyn Fn(usize, usize),
+    wanted: &dyn Fn() -> bool,
+) -> Result<Vec<Ranked>> {
+    reading.check()?;
+    let total = reading.topics.len();
+    progress(0, total);
+    let mut found = Vec::new();
+    for (topic, query) in reading.topics.iter().enumerate() {
+        let mut rank = 0;
+        rt.yt.search_each(query, per_topic, &mut |video| {
+            found.push(Found { video, topic, rank });
+            rank += 1;
+            wanted()
+        })?;
+        if !wanted() {
+            bail!(crate::ytdlp::CANCELLED);
+        }
+        progress(topic + 1, total);
+    }
+    let subscribed: HashSet<String> = load_subs(paths)?
+        .channels
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    // What was watched is only known when the history is kept.
+    let watched: HashSet<String> = if rt.cfg.history {
+        load_history(paths)?
+            .watched
+            .into_iter()
+            .map(|w| w.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    Ok(rank::rank(
+        reading,
+        found,
+        &rank::Context {
+            subscribed: &subscribed,
+            watched: &watched,
+            now: now(),
+        },
+    ))
 }
 
 #[derive(Serialize)]

@@ -143,6 +143,14 @@ impl Server {
                 app::clear_history(paths)?;
                 json!({})
             }
+            ("GET", ["api", "read"]) => self.read_json(req),
+            ("GET", ["api", "lenses"]) => self.lenses_json()?,
+            ("POST", ["api", "lenses"]) => self.write_lens(None, &req.body)?,
+            ("POST", ["api", "lenses", id]) => self.write_lens(Some(id), &req.body)?,
+            ("POST", ["api", "lenses", id, "rm"]) => {
+                crate::lens::remove(paths, id)?;
+                json!({})
+            }
             ("GET", ["api", "resume"]) => {
                 let days = rt.cfg.resume_days;
                 let kept: Vec<Value> = resume::list(paths, days, app::now())?

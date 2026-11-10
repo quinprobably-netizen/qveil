@@ -20,6 +20,7 @@ mod api;
 mod comments;
 mod http;
 mod jobs;
+mod lenses;
 mod relay;
 #[cfg(test)]
 mod testkit;
@@ -28,6 +29,7 @@ mod thumbs;
 use crate::app::{self, Runtime, Watched};
 use crate::ids::VideoRef;
 use crate::inflight::{ROUTE_CHANGED, Why};
+use crate::lens;
 use crate::resume;
 use crate::store::Paths;
 use crate::util::{lock, random_hex};
@@ -332,6 +334,12 @@ impl Server {
         });
     }
 
+    /// The reading of a search's query, when it has rules to apply.
+    fn reads_rules(&self, req: &http::Request) -> Option<lens::read::Reading> {
+        let reading = lens::read::read(req.query.get("q")?, app::now());
+        lenses::has_rules(&reading).then_some(reading)
+    }
+
     /// The path after `/<token>/`, if the token is right.
     fn token_rest<'a>(&self, path: &'a str) -> Option<&'a str> {
         http::token_rest(&self.token, path)
@@ -371,9 +379,16 @@ impl Server {
                 self.relay(&mut stream, &req, sid, kind)
             }
             ("GET", ["thumb", id]) => self.thumb(&mut stream, &req, id),
+            // A query with rules in it is searched by topic and filtered
+            // here; any other goes to YouTube as it was typed.
+            ("GET", ["api", "search"]) if self.reads_rules(&req).is_some() => {
+                let reading = self.reads_rules(&req).unwrap_or_default();
+                self.smart_search(&mut stream, &req, &self.runtime(), &reading)
+            }
             ("GET", ["api", "search"]) if req.flag("stream") => {
                 self.search_stream(&mut stream, &req)
             }
+            ("GET", ["api", "lens"]) => self.lens(&mut stream, &req),
             ("GET", ["api", "feed"]) => self.feed(&mut stream, &req),
             ("POST", ["api", "play"]) => self.play(&mut stream, &req),
             ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),

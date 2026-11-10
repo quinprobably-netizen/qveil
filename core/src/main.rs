@@ -160,6 +160,16 @@ enum Cmd {
     /// Manage subscriptions (stored only on this machine)
     #[command(subcommand)]
     Sub(SubCmd),
+    /// Feeds you describe in words (stored only on this machine)
+    #[command(subcommand)]
+    Lens(LensCmd),
+    /// Show how a search or a lens would be read, without asking YouTube
+    #[command(after_help = IN_PROC)]
+    Read {
+        /// The words to read (several are joined)
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
     /// Show or clear the local watch history (off unless `history = true`)
     History {
         /// Delete the watch history instead of showing it
@@ -212,6 +222,41 @@ struct Output {
     /// Print results as text instead of opening the picker
     #[arg(long)]
     list: bool,
+}
+
+#[derive(Subcommand)]
+enum LensCmd {
+    /// Add a lens: what it should be about, and any rules ("over 20 min", "no music")
+    #[command(after_help = IN_PROC)]
+    Add {
+        /// The lens, in words (several are joined)
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// List the lenses
+    #[command(visible_alias = "ls")]
+    List {
+        /// Print the lenses as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a lens's videos, as last fetched
+    Show {
+        /// The lens: its number in `qveil lens ls`, or its ID
+        which: String,
+        /// Run its searches again first (one YouTube search per topic)
+        #[arg(long)]
+        refresh: bool,
+        #[command(flatten)]
+        out: Output,
+        #[command(flatten)]
+        route: Route,
+    },
+    /// Remove a lens
+    Rm {
+        /// The lens: its number in `qveil lens ls`, or its ID
+        which: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -323,6 +368,7 @@ fn run() -> Result<()> {
         | Cmd::Play { route, .. }
         | Cmd::Feed { route, .. }
         | Cmd::Comments { route, .. }
+        | Cmd::Lens(LensCmd::Show { route, .. })
         | Cmd::Sub(SubCmd::Add { route, .. }) => route.clone(),
         _ => Route::default(),
     };
@@ -444,6 +490,21 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Sub(cmd) => sub(&rt, paths, cmd),
+        Cmd::Lens(cmd) => lenses(&server, cmd),
+        Cmd::Read { text } => {
+            let reading = lens::read::read(&text.join(" "), app::now());
+            for tag in reading.tags() {
+                outln!("{}  {}", tag.label, tag.value);
+            }
+            outln!("searches:");
+            for topic in &reading.topics {
+                outln!("  {topic}");
+            }
+            if let Err(e) = reading.check() {
+                note!("qveil: {e}");
+            }
+            Ok(())
+        }
         Cmd::History { clear, json } => history(&rt.cfg, paths, clear, json),
         Cmd::Resume { clear, json } => resumed(&rt.cfg, paths, clear, json),
         Cmd::Config => show_config(&rt, paths),
@@ -516,6 +577,58 @@ fn browse(
         };
         if let Err(e) = server.open(&r).and_then(|info| player::play(cfg, &info)) {
             note!("qveil: {}", friendly(&format!("{e:#}")));
+        }
+    }
+    Ok(())
+}
+
+fn lenses(server: &Arc<Server>, cmd: LensCmd) -> Result<()> {
+    let rt = server.runtime();
+    let paths = &server.paths;
+    match cmd {
+        LensCmd::Add { text } => {
+            let lens = lens::add(paths, &text.join(" "), app::now())?;
+            outln!("added: {}", lens.text);
+        }
+        LensCmd::List { json } => {
+            let all = lens::load(paths)?;
+            if json {
+                return print_json(&all);
+            }
+            if all.is_empty() {
+                outln!("no lenses (add one with `qveil lens add <words>`)");
+            }
+            for (i, l) in all.iter().enumerate() {
+                outln!("{}  {}", i + 1, l.text);
+            }
+        }
+        LensCmd::Show {
+            which,
+            refresh,
+            out,
+            ..
+        } => {
+            let lens = lens::find(paths, &which)?;
+            let refresh = if refresh {
+                app::LensRefresh::Force
+            } else {
+                app::LensRefresh::Off
+            };
+            let found = app::lens(&rt, paths, &lens.id, refresh, &|_, _| {}, &|| true)?;
+            if out.json {
+                return print_json(&found);
+            }
+            if found.fetched_at.is_none() {
+                note!("not fetched yet: `qveil lens show {which} --refresh` runs its searches");
+                return Ok(());
+            }
+            let rows = found.videos.into_iter().map(|r| (r.video, None)).collect();
+            return browse(server, rows, out.list);
+        }
+        LensCmd::Rm { which } => {
+            let lens = lens::find(paths, &which)?;
+            lens::remove(paths, &lens.id)?;
+            outln!("removed: {}", lens.text);
         }
     }
     Ok(())
@@ -775,8 +888,8 @@ mod tests {
                 assert!(!takes(&cmd), "`qveil {path}` shows a route it doesn't use");
                 continue;
             }
-            let uses_network =
-                ["search", "play", "feed", "comments", "sub add"].contains(&path.as_str());
+            let uses_network = ["search", "play", "feed", "comments", "sub add", "lens show"]
+                .contains(&path.as_str());
             assert_eq!(takes(&cmd), uses_network, "`qveil {path}`");
         }
         // They can't be given both, and the others don't take either.
@@ -792,7 +905,8 @@ mod tests {
             let says = cmd
                 .get_after_help()
                 .is_some_and(|h| h.to_string().contains("/proc"));
-            let takes_input = ["search", "play", "comments", "sub add"].contains(&path.as_str());
+            let takes_input = ["search", "play", "comments", "sub add", "lens add", "read"]
+                .contains(&path.as_str());
             assert_eq!(says, takes_input, "`qveil {path}`");
         }
     }

@@ -60,6 +60,14 @@ impl Paths {
     pub fn resume(&self) -> PathBuf {
         self.data.join("resume.json")
     }
+    /// The feeds described in words (see `lens`).
+    pub fn lenses(&self) -> PathBuf {
+        self.data.join("lenses.json")
+    }
+    /// What the searches of the lens `id` last found.
+    pub fn lens_cache(&self, id: &str) -> PathBuf {
+        self.cache.join(format!("lens-{id}.json"))
+    }
     pub fn feed_cache(&self) -> PathBuf {
         self.cache.join("feed.json")
     }
