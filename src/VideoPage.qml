@@ -1,9 +1,8 @@
 import QtQuick
-import QtQuick.Controls
-import QtQuick.Controls.Material
-import QtQuick.Layouts
+import Qveil
 
-// A heading, optional actions on the right, and a grid of videos.
+// A heading, optional actions at its end, and a grid of videos: a search's
+// results, a channel's uploads.
 FocusScope {
     id: page
 
@@ -13,78 +12,92 @@ FocusScope {
     property var model
     property string emptyText
     property bool loading: false
-    property alias actions: actionRow.data
-    // What to offer instead of an empty grid, under `emptyText`.
-    property alias emptyActions: emptyState.actions
-    property alias grid: grid
+    default property alias actions: actionRow.data
+    readonly property alias grid: grid
     // Where focus belongs when the page is shown.
     readonly property Item content: grid
-    // Whether the empty state sits on a cloud of the veil's dye.
-    property bool washEmpty: false
-    property alias veil: grid.veil
+    property alias thumbs: grid.thumbs
+    property alias progress: grid.progress
     // Explains in a tooltip over a card's date why it is approximate: each
     // page knows why.
     property alias estimateNote: grid.estimateNote
+    // What goes between the heading and the grid.
+    property alias extras: extra.data
 
-    signal activated(var video)
+    signal activated(var video, int index)
     signal channelRequested(string id)
 
-    ColumnLayout {
-        anchors.fill: parent
-        spacing: 0
+    Column {
+        id: top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.leftMargin: Style.gutter
+        anchors.rightMargin: Style.gutter
+        anchors.topMargin: Style.u * 3
+        spacing: Style.u * 2
 
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.leftMargin: 28
-            Layout.rightMargin: 28
-            Layout.topMargin: 22
-            Layout.bottomMargin: 8
-            spacing: 12
-
-            ColumnLayout {
-                Layout.fillWidth: true
+        Item {
+            width: parent.width
+            height: Math.max(words.height, actionRow.height)
+            Column {
+                id: words
+                anchors.left: parent.left
+                anchors.right: actionRow.left
+                anchors.rightMargin: Style.u * 3
                 spacing: 3
-
-                Label {
-                    Layout.fillWidth: true
+                Text {
+                    width: parent.width
                     text: page.heading
+                    textFormat: Text.PlainText
                     elide: Text.ElideRight
-                    font.pixelSize: 26
-                    font.weight: Font.DemiBold
+                    color: Style.fg
+                    font.family: Style.font
+                    font.pixelSize: Style.head
+                    font.bold: true
                 }
-                Label {
-                    Layout.fillWidth: true
+                Text {
+                    width: parent.width
                     visible: text !== ""
                     text: page.subheading
+                    textFormat: Text.PlainText
                     wrapMode: Text.Wrap
-                    font.pixelSize: 13
-                    color: "#8d8d98"
+                    color: Style.dim
+                    font.family: Style.font
+                    font.pixelSize: Style.small
                 }
             }
-
-            RowLayout {
+            Row {
                 id: actionRow
-                spacing: 8
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.u
             }
         }
-
-        VideoGrid {
-            id: grid
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            focus: true
-            model: page.model
-            onActivated: video => page.activated(video)
-            onChannelRequested: id => page.channelRequested(id)
+        Column {
+            id: extra
+            width: parent.width
+            spacing: Style.u * 2
         }
+        Rule { width: parent.width }
+    }
+
+    VideoGrid {
+        id: grid
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: top.bottom
+        anchors.bottom: parent.bottom
+        anchors.topMargin: Style.u * 2
+        focus: true
+        model: page.model
+        onActivated: (video, index) => page.activated(video, index)
+        onChannelRequested: id => page.channelRequested(id)
     }
 
     EmptyState {
-        id: emptyState
-        anchors.fill: parent
+        anchors.fill: grid
         visible: !page.loading && page.model.count === 0 && page.emptyText !== ""
-        // The first-run welcome sits on a cloud of the veil's dye.
-        wash: page.washEmpty
         text: page.emptyText
     }
 }

@@ -45,10 +45,32 @@ ApplicationWindow {
 
     Settings {
         id: prefs
-        property bool veilThumbnails: true
+        // "frosted" (veiled until looked at) or "clear".
+        property string thumbnails: "frosted"
         property bool showShorts: false
         property real volume: 80
+        // Before 0.4 this was a switch, called the veil.
+        Component.onCompleted: {
+            const old = value("veilThumbnails")
+            if (old === false || old === "false") {
+                thumbnails = "clear"
+                setValue("veilThumbnails", true)
+            }
+        }
     }
+    // How thumbnails are shown: "frosted" or "clear".
+    property alias thumbs: prefs.thumbnails
+    // How far each unfinished video was watched: { id: fraction }.
+    readonly property var watched: {
+        const map = {}
+        for (const kept of backend.resume)
+            map[kept.id] = kept.dur > 0 ? kept.pos / kept.dur : 0
+        return map
+    }
+    // The list the video that is playing was opened from, and where in it:
+    // what comes next is the rest of that list.
+    property var playList: null
+    property int playIndex: -1
 
     function go(p) {
         if (!pages[p])
@@ -103,6 +125,8 @@ ApplicationWindow {
             backend.openChannel(backend.channel.id)
         else if (page === "search")
             backend.search(backend.query)
+        else if (page === "home" && feedPage.onLens)
+            backend.openLens(feedPage.feed, 2)
         else if (page === "home")
             backend.refreshFeed(true, prefs.showShorts)
     }
@@ -117,12 +141,14 @@ ApplicationWindow {
     function playCurrent() {
         const p = pages[page]
         if (p && p.grid && p.grid.currentIndex >= 0 && p.model.count > 0)
-            win.play(p.model.get(p.grid.currentIndex))
+            win.play(p.model.get(p.grid.currentIndex), p.model, p.grid.currentIndex)
     }
 
     // The player opens at once, with what the card knows, while the engine
-    // looks the video up.
-    function play(video) {
+    // looks the video up. `list` and `index` say where it was opened from.
+    function play(video, list, index) {
+        playList = list || null
+        playIndex = list ? index : -1
         player.prepare(video)
         backend.play(video.id)
     }
@@ -327,137 +353,85 @@ ApplicationWindow {
                 anchors.bottom: parent.bottom
                 anchors.topMargin: top.visible ? Style.u * 2 : 0
 
-            VideoPage {
-                id: feedPage
-                objectName: "feedPage"
-                anchors.fill: parent
-                visible: win.page === "home" && !player.active
-                focus: visible
-                veil: prefs.veilThumbnails
-                // The first-run welcome sits on a cloud of the veil's dye.
-                washEmpty: win.noSubs
-                heading: qsTr("Feed")
-                subheading: {
-                    // While it runs, how far the refresh is; it says more than the
-                    // channel count, which it would only repeat.
-                    if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
-                        return qsTr("Refreshing %1 of %2").arg(backend.refreshDone).arg(backend.refreshTotal)
-                    const info = backend.feedInfo
-                    if (!info.channels)
-                        return ""
-                    let s = qsTr("Latest from %n channels", "", info.channels)
-                    if (info.errors && info.errors.length > 0)
-                        s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
-                    return s
+                HomePage {
+                    id: feedPage
+                    objectName: "feedPage"
+                    anchors.fill: parent
+                    visible: win.page === "home" && !player.active
+                    focus: visible
+                    thumbs: win.thumbs
+                    shorts: prefs.showShorts
+                    progress: win.watched
+                    onActivated: (video, index) => win.play(video, feedPage.model, index)
+                    onChannelRequested: id => win.openChannel(id)
+                    onResumed: video => win.play(video)
+                    onShortsToggled: shown => {
+                        prefs.showShorts = shown
+                        backend.refreshFeed(false, shown)
+                    }
+                    onRefreshRequested: win.refresh()
+                    onNewLensRequested: win.go("lenses")
+                    onAddChannelRequested: win.addChannel()
                 }
-                model: backend.feed
-                estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
-                loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
-                emptyText: backend.feedInfo.channels === 0
-                           ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
-                           : qsTr("Nothing here yet. Press R to refresh.")
-                emptyActions: [
-                    Button {
-                        visible: backend.feedInfo.channels === 0
-                        text: qsTr("Add a channel")
-                        highlighted: true
-                        onClicked: win.addChannel()
-                    }
-                ]
-                onActivated: video => win.play(video)
-                onChannelRequested: id => win.openChannel(id)
-                actions: [
-                    CheckBox {
-                        visible: !win.noSubs
-                        text: qsTr("Shorts")
-                        checked: prefs.showShorts
-                        onToggled: {
-                            prefs.showShorts = checked
-                            backend.refreshFeed(false, checked)
-                        }
-                    },
-                    Button {
-                        visible: !win.noSubs
-                        text: qsTr("Refresh")
-                        flat: true
-                        icon.source: "qrc:/icons/refresh.svg"
-                        enabled: backend.busy.indexOf("feed") < 0
-                        onClicked: win.refresh()
-                    }
-                ]
-            }
 
-            VideoPage {
-                id: searchPage
-                objectName: "searchPage"
-                anchors.fill: parent
-                visible: win.page === "search" && !player.active
-                veil: prefs.veilThumbnails
-                heading: backend.query ? qsTr("“%1”").arg(backend.query) : qsTr("Search")
-                subheading: backend.privacy.pages.search
-                model: backend.results
-                estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
-                loading: backend.busy.indexOf("search") >= 0
-                emptyText: backend.query ? qsTr("No results.") : ""
-                onActivated: video => win.play(video)
-                onChannelRequested: id => win.openChannel(id)
-            }
+                VideoPage {
+                    id: searchPage
+                    objectName: "searchPage"
+                    anchors.fill: parent
+                    visible: win.page === "search" && !player.active
+                    thumbs: win.thumbs
+                    progress: win.watched
+                    heading: backend.query ? qsTr("\u201c%1\u201d").arg(backend.query) : qsTr("Search")
+                    subheading: backend.privacy.pages.search
+                    model: backend.results
+                    estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
+                    loading: backend.busy.indexOf("search") >= 0
+                    emptyText: backend.query ? qsTr("No results.") : ""
+                    onActivated: (video, index) => win.play(video, backend.results, index)
+                    onChannelRequested: id => win.openChannel(id)
+                }
 
-            VideoPage {
-                id: channelPage
-                anchors.fill: parent
-                visible: win.page === "channel" && !player.active
-                veil: prefs.veilThumbnails
-                heading: backend.channel.name || ""
-                subheading: backend.channelVideos.count
-                            ? qsTr("%n recent videos", "", backend.channelVideos.count) : ""
-                model: backend.channelVideos
-                estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
-                loading: backend.busy.indexOf("channel") >= 0
-                emptyText: qsTr("No videos.")
-                onActivated: video => win.play(video)
-                actions: [
-                    Button {
-                        id: subscribe
+                VideoPage {
+                    id: channelPage
+                    anchors.fill: parent
+                    visible: win.page === "channel" && !player.active
+                    thumbs: win.thumbs
+                    progress: win.watched
+                    heading: backend.channel.name || ""
+                    subheading: backend.channelVideos.count
+                                ? qsTr("%n recent videos", "", backend.channelVideos.count) : ""
+                    model: backend.channelVideos
+                    estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
+                    loading: backend.busy.indexOf("channel") >= 0
+                    emptyText: qsTr("No videos.")
+                    onActivated: (video, index) => win.play(video, backend.channelVideos, index)
+
+                    // Subscribe is the call to action; Subscribed is the same
+                    // word switched on, with a check.
+                    Act {
                         readonly property bool isOn: !!backend.channel.subscribed
                         visible: !!backend.channel.name
                         text: isOn ? qsTr("Subscribed") : qsTr("Subscribe")
-                        // Subscribe is the filled call to action. Subscribed is the same
-                        // control switched on: a check and an accent outline, not flat text.
-                        highlighted: !isOn
-                        flat: isOn
-                        checked: isOn
-                        icon.source: isOn ? "qrc:/icons/check.svg" : ""
-                        icon.width: 18
-                        icon.height: 18
+                        glyph: isOn ? "qrc:/icons/check.svg" : ""
+                        filled: true
                         onClicked: isOn ? backend.unsubscribe(backend.channel.id)
                                         : backend.subscribe(backend.channel.id)
-
-                        Rectangle {
-                            anchors.fill: subscribe.background
-                            visible: subscribe.isOn
-                            radius: subscribe.background.radius
-                            color: "transparent"
-                            border.width: 1
-                            border.color: theme.accent
-                        }
                     }
-                ]
-            }
+                }
 
-            SubsPage {
-                id: subsPage
-                anchors.fill: parent
-                visible: win.page === "channels" && !player.active
-                onChannelRequested: id => win.openChannel(id)
-            }
+                SubsPage {
+                    id: subsPage
+                    anchors.fill: parent
+                    visible: win.page === "channels" && !player.active
+                    onChannelRequested: id => win.openChannel(id)
+                }
 
-            HistoryPage {
-                id: historyPage
-                anchors.fill: parent
-                visible: win.page === "history" && !player.active
-                onPlayRequested: video => win.play(video)
-            }
+                HistoryPage {
+                    id: historyPage
+                    anchors.fill: parent
+                    visible: win.page === "history" && !player.active
+                    onPlayRequested: video => win.play(video)
+                }
 
                 // Lenses and settings are drawn by the tasks that add them.
                 Item {

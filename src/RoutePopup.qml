@@ -156,8 +156,8 @@ Popup {
         Switch {
             Layout.leftMargin: -8
             text: qsTr("Veil thumbnails until hovered")
-            checked: popup.prefs.veilThumbnails
-            onToggled: popup.prefs.veilThumbnails = checked
+            checked: popup.prefs.thumbnails === "frosted"
+            onToggled: popup.prefs.thumbnails = checked ? "frosted" : "clear"
         }
         Switch {
             Layout.leftMargin: -8

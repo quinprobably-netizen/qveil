@@ -105,7 +105,6 @@ FocusScope {
     EmptyState {
         anchors.fill: parent
         visible: !page.enabled_
-        wash: true
         text: backend.privacy.pages.history_off
         actions: [
             Button {

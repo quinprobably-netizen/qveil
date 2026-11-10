@@ -1,9 +1,7 @@
 <RCC>
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
-        <file alias="DyeWash.qml">DyeWash.qml</file>
         <file alias="EmptyState.qml">EmptyState.qml</file>
-        <file alias="Wordmark.qml">Wordmark.qml</file>
         <file alias="SearchBox.qml">SearchBox.qml</file>
         <file alias="VideoCard.qml">VideoCard.qml</file>
         <file alias="VideoGrid.qml">VideoGrid.qml</file>
@@ -38,6 +36,10 @@
         <file alias="ErrorBar.qml">ErrorBar.qml</file>
         <file alias="Toast.qml">Toast.qml</file>
         <file alias="BusyLine.qml">BusyLine.qml</file>
+        <file alias="Frost.qml">Frost.qml</file>
+        <file alias="HomePage.qml">HomePage.qml</file>
+        <file alias="ResumeRow.qml">ResumeRow.qml</file>
+        <file alias="FeedTabs.qml">FeedTabs.qml</file>
         <file alias="Format.js">Format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="icons/play.svg">icons/play.svg</file>

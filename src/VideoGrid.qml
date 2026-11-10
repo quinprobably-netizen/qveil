@@ -1,30 +1,46 @@
 import QtQuick
 import QtQuick.Controls
+import Qveil
 
+// A grid of videos that fits as many columns as the width allows.
 GridView {
     id: grid
 
-    property bool veil: true
+    // "frosted" or "clear": how thumbnails are shown (see Frost).
+    property string thumbs: "frosted"
+    // Said when a card's date is pointed at and is only approximate.
     property string estimateNote
-    // The selection ring shows once the keyboard is used, and hides on hover.
+    // How far each video was watched: { id: fraction }.
+    property var progress: ({})
+    // The selection shows once the keyboard is used, and hides on hover.
     property bool navigating: false
-    signal activated(var video)
+    signal activated(var video, int index)
     signal channelRequested(string id)
 
-    readonly property int columns: Math.max(1, Math.floor((width - 40) / 290))
+    readonly property int gutter: Style.gutter - Style.u * 2
+    readonly property int columns: Math.max(1, Math.floor((width - 2 * gutter) / 280))
+    // Whether the cards have a line saying why they are there.
+    readonly property bool reasons: count > 0 && ((model.get(0).why || []).length > 0)
 
-    leftMargin: 20
-    rightMargin: 20
-    bottomMargin: 28
-    cellWidth: Math.floor((width - 40) / columns)
-    cellHeight: Math.round((cellWidth - 16) * 9 / 16) + 102
+    leftMargin: gutter
+    rightMargin: gutter
+    bottomMargin: Style.gutter
+    cellWidth: Math.floor((width - 2 * gutter) / columns)
+    cellHeight: Math.round((cellWidth - Style.u * 4) * 9 / 16) + 96 + (reasons ? 18 : 0)
     clip: true
     boundsBehavior: Flickable.StopAtBounds
     keyNavigationEnabled: true
     highlightFollowsCurrentItem: false
     cacheBuffer: 600
 
-    ScrollBar.vertical: ScrollBar {}
+    ScrollBar.vertical: ScrollBar {
+        id: bar
+        contentItem: Rectangle {
+            implicitWidth: 4
+            color: bar.pressed || bar.hovered ? Style.faint : Style.line
+        }
+        background: Item {}
+    }
 
     delegate: VideoCard {}
 
@@ -32,6 +48,6 @@ GridView {
         navigating = true
         event.accepted = false
     }
-    Keys.onReturnPressed: if (currentIndex >= 0) activated(model.get(currentIndex))
-    Keys.onEnterPressed: if (currentIndex >= 0) activated(model.get(currentIndex))
+    Keys.onReturnPressed: if (currentIndex >= 0) activated(model.get(currentIndex), currentIndex)
+    Keys.onEnterPressed: if (currentIndex >= 0) activated(model.get(currentIndex), currentIndex)
 }

@@ -90,6 +90,21 @@ struct App {
         return nullptr;
     }
     QQuickItem *item(const char *name) const { return window ? under(window->contentItem(), name) : nullptr; }
+    // Every item called `name` that is showing, in the order the scene has them.
+    static void collect(QQuickItem *root, const QString &name, QList<QQuickItem *> &found)
+    {
+        if (root->objectName() == name && root->isVisible())
+            found << root;
+        for (QQuickItem *child : root->childItems())
+            collect(child, name, found);
+    }
+    QList<QQuickItem *> items(const char *name) const
+    {
+        QList<QQuickItem *> found;
+        if (window)
+            collect(window->contentItem(), name, found);
+        return found;
+    }
     QObject *object(const char *name) const { return window ? window->findChild<QObject *>(name) : nullptr; }
 
     void click(QQuickItem *target) const
@@ -230,6 +245,108 @@ private slots:
         QCOMPARE(app.page(), QString("search"));
         QTRY_COMPARE(app.asked("GET api/search"), 1);
         QCOMPARE(app.backend->query(), QString("rust"));
+    }
+
+    void unfinishedVideosSitOnTopAndVanishWhenThereAreNone()
+    {
+        App app;
+        READY(app);
+        QQuickItem *row = app.item("resume-row");
+        QVERIFY(row);
+        QTRY_VERIFY(row->isVisible());
+        QTRY_COMPARE(app.items("resume-entry").size(), 3);
+        QQuickItem *first = app.items("resume-entry").first();
+        QCOMPARE(first->property("title").toString(), QString("Why the borrow checker says no"));
+        QCOMPARE(first->property("remaining").toString(), QString("26:58 left"));
+        // How long they are kept is the setting's number.
+        QVERIFY(row->property("note").toString().contains("7 days"));
+
+        app.backend->forgetResume("vid00000001");
+        QTRY_COMPARE(app.items("resume-entry").size(), 2);
+        app.backend->clearResume();
+        QTRY_VERIFY(!row->isVisible());
+
+        App none(true);
+        READY(none);
+        QTest::qWait(300);
+        QVERIFY(!none.item("resume-row")->isVisible());
+    }
+
+    void aLensTabShowsThatLensInTheGrid()
+    {
+        App app;
+        READY(app);
+        QQuickItem *tabs = app.item("feed-tabs");
+        QQuickItem *grid = app.item("home-grid");
+        QVERIFY(tabs && grid);
+        QTRY_VERIFY(app.item("feed-tab-aaaa0002"));
+        QVERIFY(app.item("feed-tab-latest") && app.item("feed-tab-aaaa0001") && app.item("feed-tab-new"));
+        QVERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QTRY_COMPARE(grid->property("count").toInt(), 12);
+        QVERIFY(app.items("card-why").isEmpty());
+
+        app.click(app.item("feed-tab-aaaa0002"));
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
+        QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
+        QTRY_COMPARE(grid->property("count").toInt(), 6);
+        // Each of a lens's videos says why it is there.
+        QTRY_VERIFY(!app.items("card-why").isEmpty());
+        QVERIFY(app.items("card-why").first()->property("text").toString().contains("over 30:00"));
+        // It was fetched two hours ago: opening it asks for nothing new.
+        QCOMPARE(app.asked("GET api/lens?id=aaaa0002&stream=1&refresh=1"), 1);
+
+        app.click(app.item("feed-tab-latest"));
+        QTRY_COMPARE(grid->property("count").toInt(), 12);
+    }
+
+    void aCardClearsUnderThePointerAndUnderTheKeyboard()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.items("card").size() >= 4);
+        const QList<QQuickItem *> cards = app.items("card");
+        QQuickItem *frost = App::under(cards.at(0), "frost"), *next = App::under(cards.at(1), "frost");
+        QVERIFY(frost && next);
+        QVERIFY(frost->property("veiled").toBool());
+        QVERIFY(!frost->property("clear").toBool());
+        app.hover(cards.at(0));
+        QTRY_VERIFY(frost->property("clear").toBool());
+        app.hover(app.item("search"));
+        QTRY_VERIFY(!frost->property("clear").toBool());
+
+        // The keyboard lifts the veil of the card it is on.
+        app.item("home-grid")->forceActiveFocus();
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_VERIFY(next->property("clear").toBool());
+        QVERIFY(!frost->property("clear").toBool());
+
+        // Thumbnails shown as they are have nothing laid over them.
+        app.window->setProperty("thumbs", "clear");
+        QTRY_VERIFY(!frost->property("veiled").toBool());
+        QVERIFY(!frost->property("effect").toBool());
+    }
+
+    void theGridDropsColumnsInANarrowWindow()
+    {
+        for (const auto &[width, columns] : {std::pair{1280, 4}, std::pair{950, 3}, std::pair{760, 2}}) {
+            App app(false, QSize(width, 600));
+            READY(app);
+            QQuickItem *grid = app.item("home-grid");
+            QVERIFY(grid);
+            QTRY_VERIFY(app.items("card").size() >= columns);
+            QTRY_COMPARE(grid->property("columns").toInt(), columns);
+            // Nothing reaches past the window's edge.
+            for (QQuickItem *card : app.items("card"))
+                QVERIFY(card->mapToScene(QPointF(card->width(), 0)).x() <= width);
+            for (const char *name : {"resume-row", "feed-tabs", "search"})
+                QVERIFY2(app.item(name)->mapToScene(QPointF(app.item(name)->width(), 0)).x() <= width, name);
+        }
+    }
+
+    void nothingOfTheDyeIsLeft()
+    {
+        for (const char *file : {":/DyeWash.qml", ":/Wordmark.qml", ":/shaders/dye.frag.qsb"})
+            QVERIFY2(!QFile::exists(file), file);
     }
 };
 
