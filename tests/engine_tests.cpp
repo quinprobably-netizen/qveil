@@ -233,6 +233,30 @@ private slots:
             QVERIFY2(call.contains(Gamma), qPrintable(call));
     }
 
+    void aShelfIsWhatALensAlreadyFoundAndAsksNobody() {
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+        QSignalSpy added(&window, &Backend::lensAdded);
+        window.addLens("bread, sourdough");
+        WAIT_FOR(added.count() == 1, 10000);
+        const QString id = added.first().first().toString();
+        window.openLens(id, 2);
+        WAIT_FOR(window.lensVideos()->count() > 0 && !window.busy().contains("lens"), 20000);
+        const int before = rig.calls().size();
+
+        QMetaObject::invokeMethod(&window, "loadShelf", Q_ARG(QString, id));
+        WAIT_FOR(window.property("shelves").toMap().contains(id), 10000);
+        const QVariantList videos = window.property("shelves").toMap().value(id).toList();
+        QCOMPARE(videos.size(), window.lensVideos()->count());
+        QVERIFY(!videos.first().toMap().value("id").toString().isEmpty());
+        QVERIFY(!videos.first().toMap().value("why").toList().isEmpty());
+        // It is read from what was kept: yt-dlp is not run for it.
+        QCOMPARE(rig.calls().size(), before);
+    }
+
     void aHandleOpensTheChannelItNames() {
         // Links to a channel are mostly written with its handle.
         Rig rig;

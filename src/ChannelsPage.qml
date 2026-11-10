@@ -30,7 +30,7 @@ FocusScope {
             color: Style.fg
             font.family: Style.font
             font.pixelSize: Style.head
-            font.bold: true
+            font.weight: Style.strong
         }
         // What following a channel means, in the engine's words.
         Notice {

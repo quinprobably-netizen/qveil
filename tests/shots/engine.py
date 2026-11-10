@@ -325,6 +325,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(200, {"sort": q.get("sort", "top"), "count": 1204 if found else 0, "comments": found + extra})
         elif path.startswith("thumb/"):
             data = png(path[6:])
+            # Pictures made for stills, when there are some (bin/shot says where).
+            pictures = os.environ.get("QVEIL_STANDIN_THUMBS", "")
+            if pictures:
+                name = path[6:].split("?")[0]
+                n = int(name[-2:]) + 1 if name.startswith("len") else int("".join(c for c in name if c.isdigit()) or 1)
+                try:
+                    with open(os.path.join(pictures, "%d.png" % ((n - 1) % 12 + 1)), "rb") as f:
+                        data = f.read()
+                except OSError:
+                    pass
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
             self.send_header("Content-Length", str(len(data)))

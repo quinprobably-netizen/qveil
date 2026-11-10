@@ -75,7 +75,7 @@ FocusScope {
             color: Style.fg
             font.family: Style.font
             font.pixelSize: Style.head
-            font.bold: true
+            font.weight: Style.strong
         }
         Text {
             width: parent.width
@@ -135,7 +135,7 @@ FocusScope {
                         color: Style.fg
                         font.family: Style.font
                         font.pixelSize: Style.body
-                        font.bold: true
+                        font.weight: Style.strong
                     }
                     Text {
                         width: parent.width

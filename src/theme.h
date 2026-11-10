@@ -18,15 +18,18 @@ class Theme : public QObject {
     // The system's typeface: what fontconfig's `monospace` alias resolves to,
     // which is what `omarchy font set` changes and the bar draws with.
     Q_PROPERTY(QString fontFamily READ fontFamily NOTIFY changed)
+    // The desktop's interface typeface: what the window is set in.
+    Q_PROPERTY(QString uiFamily READ uiFamily NOTIFY changed)
     // The colour of a protected route (Tor, proxy): a muted green that is the
     // same on every theme, so "protected" never reads as the decorative accent.
     Q_PROPERTY(QString protectedColor READ protectedColor CONSTANT)
 
 public:
-    // `hyprctl`, `hyprEvents` (Hyprland's event socket) and `fcMatch` are only
-    // given by tests; otherwise they are found from the environment.
+    // `hyprctl`, `hyprEvents` (Hyprland's event socket), `fcMatch` and
+    // `gsettings` are only given by tests; otherwise they are found from the
+    // environment.
     explicit Theme(const QString &currentDirectory = {}, QObject *parent = nullptr, const QString &hyprctl = {},
-                   const QString &hyprEvents = {}, const QString &fcMatch = {});
+                   const QString &hyprEvents = {}, const QString &fcMatch = {}, const QString &gsettings = {});
     ~Theme() override;
 
     QString accent() const { return m_accent; }
@@ -35,6 +38,10 @@ public:
     QString background() const { return m_background; }
     QString foreground() const { return m_foreground; }
     QString fontFamily() const { return m_fontFamily; }
+    QString uiFamily() const { return m_uiFamily; }
+    // The family in a font as the desktop's settings write it ("Adwaita Sans
+    // 11", "Inter Bold 10"), if it is installed; otherwise nothing.
+    static QString familyOf(const QString &description);
     QString protectedColor() const { return "#5fae83"; }
 
     static QString readAccent(const QString &path);
@@ -57,6 +64,9 @@ private:
     QString m_fontFamily = "monospace";
     QString m_fcMatch;
     QProcess m_fontProcess;
+    QString m_uiFamily, m_uiDefault;
+    QString m_gsettings;
+    QProcess m_uiProcess;
     QString m_fontconfig;
     QFileSystemWatcher m_watcher;
     QTimer m_debounce;

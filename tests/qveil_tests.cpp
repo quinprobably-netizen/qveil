@@ -1,3 +1,4 @@
+#include <QFontDatabase>
 #include <QDir>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -1063,6 +1064,32 @@ private slots:
         QCOMPARE(bare.background(), QString("#111115"));
         QCOMPARE(bare.foreground(), QString("#e9e4f0"));
         QCOMPARE(bare.fontFamily(), QString("monospace"));
+    }
+
+    void themeReadsTheSystemsInterfaceFont()
+    {
+        // The desktop's interface font, as its settings give it: a family,
+        // sometimes a style, and a size.
+        QTemporaryDir dir, tools;
+        const QString known = QFontDatabase::families().value(0);
+        QVERIFY(!known.isEmpty());
+        const auto themed = [&](const QString &answer) {
+            const QString tool = tools.filePath("gsettings");
+            write(tool, ("#!/bin/sh\nprintf \"%s\\n\" \"" + answer + "\"\n").toUtf8());
+            QFile::setPermissions(tool, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+            return std::make_unique<Theme>(dir.path(), nullptr, QString(), QString(), QString(), tool);
+        };
+        const QString fallback = QFontDatabase::systemFont(QFontDatabase::GeneralFont).family();
+        auto plain = themed("'" + known + " 11'");
+        QTRY_COMPARE(plain->property("uiFamily").toString(), known);
+        auto styled = themed("'" + known + " Bold 10'");
+        QTRY_COMPARE(styled->property("uiFamily").toString(), known);
+        // A face that isn't installed, or no answer at all, leaves the toolkit's own.
+        auto missing = themed("'No Such Face Anywhere 11'");
+        QTest::qWait(300);
+        QCOMPARE(missing->property("uiFamily").toString(), fallback);
+        Theme bare(dir.path(), nullptr, {}, {}, {}, "/nonexistent/gsettings");
+        QCOMPARE(bare.property("uiFamily").toString(), fallback);
     }
 
     void themeFollowsAChangeOfColours()

@@ -77,7 +77,7 @@ Popup {
             color: Style.fg
             font.family: Style.font
             font.pixelSize: Style.title
-            font.bold: true
+            font.weight: Style.strong
         }
         Repeater {
             model: help.groups

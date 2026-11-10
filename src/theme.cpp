@@ -1,6 +1,7 @@
 // Theme watching follows Omacut (MIT, David Heinemeier Hansson).
 #include "theme.h"
 
+#include <QFontDatabase>
 #include <QColor>
 #include <QDir>
 #include <QFile>
@@ -13,7 +14,7 @@
 #include <utility>
 
 Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl, const QString &hyprEvents,
-             const QString &fcMatch)
+             const QString &fcMatch, const QString &gsettings)
     : QObject(parent),
       m_directory(directory.isEmpty() ? QDir::homePath() + "/.local/state/omarchy/current" : directory) {
     // The typeface is whatever `monospace` means on this system right now.
@@ -27,6 +28,24 @@ Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl, 
         const QString family = QString::fromUtf8(m_fontProcess.readAllStandardOutput()).trimmed();
         if (code == 0 && status == QProcess::NormalExit && !family.isEmpty() && family != m_fontFamily) {
             m_fontFamily = family;
+            emit changed();
+        }
+    });
+
+    // The interface typeface is the desktop's: the one its settings name,
+    // which is what its other apps are set in. The toolkit's own general
+    // font stands in until that is known, and when it isn't.
+    m_uiDefault = QFontDatabase::systemFont(QFontDatabase::GeneralFont).family();
+    m_uiFamily = m_uiDefault;
+    m_gsettings = !gsettings.isEmpty() ? gsettings : directory.isEmpty() ? QStandardPaths::findExecutable("gsettings") : QString();
+    connect(&m_uiProcess, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        QString family;
+        if (code == 0 && status == QProcess::NormalExit)
+            family = familyOf(QString::fromUtf8(m_uiProcess.readAllStandardOutput()));
+        if (family.isEmpty())
+            family = m_uiDefault;
+        if (family != m_uiFamily) {
+            m_uiFamily = family;
             emit changed();
         }
     });
@@ -87,6 +106,10 @@ Theme::~Theme() {
         m_fontProcess.kill();
         m_fontProcess.waitForFinished(1000);
     }
+    if (m_uiProcess.state() != QProcess::NotRunning) {
+        m_uiProcess.kill();
+        m_uiProcess.waitForFinished(1000);
+    }
 }
 
 void Theme::refreshRounding() {
@@ -129,9 +152,28 @@ QString Theme::readColour(const QString &path, const QString &key, const QString
 }
 
 void Theme::refreshFont() {
+    if (!m_gsettings.isEmpty() && m_uiProcess.state() == QProcess::NotRunning)
+        m_uiProcess.start(m_gsettings, {"get", "org.gnome.desktop.interface", "font-name"});
     if (m_fcMatch.isEmpty() || m_fontProcess.state() != QProcess::NotRunning)
         return;
     m_fontProcess.start(m_fcMatch, {"-f", "%{family[0]}", "monospace"});
+}
+
+QString Theme::familyOf(const QString &description) {
+    // 'Adwaita Sans 11': quoted, and ending in a size, sometimes after a
+    // style. Words are dropped from the end until what is left is a family
+    // that is installed.
+    QString name = description.trimmed();
+    if (name.size() >= 2 && (name.startsWith('\'') || name.startsWith('"')) && name.endsWith(name.at(0)))
+        name = name.mid(1, name.size() - 2).trimmed();
+    QStringList words = name.split(' ', Qt::SkipEmptyParts);
+    while (!words.isEmpty()) {
+        const QString family = words.join(' ');
+        if (QFontDatabase::hasFamily(family))
+            return family;
+        words.removeLast();
+    }
+    return {};
 }
 
 // Black or white, whichever reads on the accent (WCAG relative luminance).

@@ -1,19 +1,22 @@
 import QtQuick
 import Qveil
 
-// Home: what was left unfinished, then the feed (the latest from the
-// channels you follow, or one of your lenses).
+// Home. It opens on the shelves (see ShelvesHome); a shelf's heading opens
+// its feed in full: the grid, with a tab for the latest from the channels
+// you follow and one for each of your lenses.
 FocusScope {
     id: page
 
     // Which feed is showing: "latest", or a lens's id.
     property string feed: "latest"
+    // Whether the shelves are showing, and not one feed in full.
+    property bool overview: true
     property string thumbs: "frosted"
     property bool shorts: false
     // How far each video was watched: { id: fraction }.
     property var progress: ({})
     // Where focus belongs when the page is shown.
-    readonly property Item content: grid
+    readonly property Item content: overview ? shelves : grid
     readonly property alias grid: grid
     readonly property var model: grid.model
     readonly property bool onLens: feed !== "latest"
@@ -40,13 +43,41 @@ FocusScope {
         return s
     }
 
+    // The same in few words, for the shelf, whose heading already says what it is.
+    readonly property string brief: {
+        if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
+            return subheading
+        const info = backend.feedInfo
+        if (!info.channels)
+            return ""
+        let s = qsTr("%n channels", "", info.channels)
+        if (info.errors && info.errors.length > 0)
+            s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
+        return s
+    }
+
     signal activated(var video, int index)
+    // A video on a shelf: `list` is what comes after it.
+    signal shelfActivated(var video, var list, int index)
     signal channelRequested(string id)
     signal resumed(var video)
     signal shortsToggled(bool shown)
     signal refreshRequested()
     signal newLensRequested()
     signal addChannelRequested()
+
+    // One feed in full: "latest", or a lens's id.
+    function showAll(which) {
+        feed = which
+        overview = false
+        grid.forceActiveFocus()
+    }
+    function showShelves() {
+        overview = true
+        shelves.forceActiveFocus()
+    }
+    // Plays what the keyboard is on, on the shelves.
+    function pickCurrent() { shelves.pickCurrent() }
 
     // A lens that was removed is not a feed any more.
     Connections {
@@ -61,7 +92,27 @@ FocusScope {
     // There is one open lens, and the lenses page may have opened another
     // meanwhile: coming back, the one this page's tab names is opened again
     // (from what the engine has; that is no reason to search).
-    onVisibleChanged: if (visible && feed !== "latest" && backend.lensInfo.id !== feed) backend.openLens(feed, 0)
+    readonly property bool showing: visible && !overview
+    onShowingChanged: if (showing && feed !== "latest" && backend.lensInfo.id !== feed) backend.openLens(feed, 0)
+
+    ShelvesHome {
+        id: shelves
+        anchors.fill: parent
+        visible: page.overview
+        focus: page.overview
+        thumbs: page.thumbs
+        progress: page.progress
+        status: page.brief
+        loading: page.loading
+        noChannels: page.noChannels
+        onActivated: (video, list, index) => page.shelfActivated(video, list, index)
+        onResumed: video => page.resumed(video)
+        onAllRequested: which => page.showAll(which)
+        onChannelRequested: id => page.channelRequested(id)
+        onRefreshRequested: page.refreshRequested()
+        onAddChannelRequested: page.addChannelRequested()
+        onNewLensRequested: page.newLensRequested()
+    }
 
     Column {
         id: top
@@ -72,15 +123,8 @@ FocusScope {
         anchors.rightMargin: Style.gutter
         anchors.topMargin: Style.u * 3
         spacing: Style.u * 4
+        visible: !page.overview
 
-        ResumeRow {
-            objectName: "resume-row"
-            width: parent.width
-            entries: backend.resume
-            days: backend.config.resumeDays || 0
-            onPicked: video => page.resumed(video)
-            onForgotten: id => backend.forgetResume(id)
-        }
         Column {
             width: parent.width
             spacing: Style.u
@@ -91,6 +135,7 @@ FocusScope {
                 lenses: backend.lenses
                 current: page.feed
                 status: page.subheading
+                onBack: page.showShelves()
                 onPicked: which => page.feed = which
                 onNewLens: page.newLensRequested()
 
@@ -121,7 +166,8 @@ FocusScope {
         anchors.top: top.bottom
         anchors.bottom: parent.bottom
         anchors.topMargin: Style.u * 2
-        focus: true
+        visible: !page.overview
+        focus: !page.overview
         model: page.onLens ? backend.lensVideos : backend.feed
         thumbs: page.thumbs
         progress: page.progress
@@ -133,7 +179,7 @@ FocusScope {
 
     EmptyState {
         anchors.fill: grid
-        visible: !page.loading && grid.count === 0
+        visible: !page.overview && !page.loading && grid.count === 0
         text: page.onLens ? qsTr("Nothing fetched for this lens yet. Refresh runs its searches.")
             : page.noChannels ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
             : qsTr("Nothing here yet. Press R to refresh.")

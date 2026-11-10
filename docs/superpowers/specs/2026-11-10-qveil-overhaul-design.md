@@ -292,6 +292,42 @@ readings, with a list model for comments.
 movement through grids, the error bar with "Change route", toasts,
 drop-to-import, engine restart handling.
 
+### The look, revised (2026-11-10)
+
+The owner saw the first build, drawn in the language of the Omarchy panels,
+and said: "kinda feels like im looking at a large plugin not a video site."
+Of three directions built into the real window they chose **lead and
+shelves**. Where this section and the description of the look above
+disagree, this section is the authority. The layout of the other pages, the
+privacy rules and every behaviour above stand.
+
+- **Pictures lead.** Thumbnails are shown as they are by default. Frosted
+  (blurred until pointed at) and off remain settings.
+- **Type** is the desktop's interface font (the family its settings name, as
+  its other apps use), not the monospace of the panels, at sizes to be read
+  from a seat: 12/13/14 for text, 15 for a card's title, 18 and 22 for
+  headings, 32 for the lead. Emphasis is a weight the face has (demi-bold);
+  nothing is bold by synthesis.
+- **Still not bubbles.** Corners follow Hyprland, fills are flat, there are no
+  pills and no avatar circles. Sections are headings without hairline rules;
+  tabs are marked by a line under them; a choice among settings keeps the
+  selected fill.
+- **The rail** is slim (56 px): glyphs only, each saying what it is when
+  pointed at, with the route's dot and the settings at its foot.
+- **Home** opens on the video most recently left unfinished, as a lead: its
+  picture, its title large, what is left of it, and Resume, Start over and
+  Forget. With nothing unfinished there is no lead. Under it every feed is a
+  shelf that scrolls sideways: the latest from the channels you follow, what
+  else was left unfinished, then one per lens, and at the end the way to a new
+  lens. A lens's shelf shows what the engine already has for it and never
+  searches; shelves out of view are neither made nor filled. A shelf's heading
+  (or "See all") opens that feed in full: the grid with its tabs, as before.
+  Escape, the back arrow in the tab row, `1` and the rail return to the
+  shelves. Arrows move along a shelf and between shelves; Enter plays.
+- **Watching**: "Up next" shows pictures and is the sheet's first tab when the
+  video was opened from a list with something after it; otherwise the sheet
+  opens on About.
+
 ## Verification
 
 - `bin/test`: Rust and Qt suites. The Qt suite is tied to today's object

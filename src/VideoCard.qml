@@ -2,31 +2,34 @@ import QtQuick
 import Qveil
 import "Format.js" as Format
 
-// One video in a grid: its thumbnail under the veil until the card is
-// pointed at or selected, its title, channel and date, and, where a lens or
-// a search put it there, why.
+// One video, in a grid or on a shelf: its thumbnail (frosted until it is
+// pointed at or selected, when thumbnails are set to be), its title, channel
+// and date, and, where a lens or a search put it there, why.
 Item {
     id: card
     objectName: "card"
 
-    // The row's roles, named like the engine's JSON keys (a role called `id`
-    // can only be reached through `model`).
-    required property var model
+    // The video, with the engine's JSON keys: a row of a list, or an object.
+    property var video: ({})
     required property int index
-
-    readonly property GridView view: GridView.view
-    readonly property bool selected: GridView.isCurrentItem && view.activeFocus && view.navigating
+    // What the card is in: a grid or a shelf. It gives the card its size
+    // (cellWidth, cellHeight), how thumbnails are shown (thumbs), how far
+    // videos were watched (progress), the note for approximate dates
+    // (estimateNote), and takes pick(index), pointed() and channelRequested(id).
+    property Item view
+    // Whether the keyboard is on this card.
+    property bool selected: false
     readonly property bool lit: hover.hovered || selected
     // The batch is the page the card came with: its thumbnails share one circuit on Tor.
-    readonly property string thumb: Format.thumb(backend.thumbBase, model.id, model.batch)
+    readonly property string thumb: Format.thumb(backend.thumbBase, video.id, video.batch)
     // Feed and channel entries say whether their date is approximate. A search
     // result has only YouTube's "3 days ago", so there it always is.
-    readonly property bool approximate: model.estimated !== false
+    readonly property bool approximate: video.estimated !== false
     // Unix seconds, or 0 when the video has no date at all.
-    readonly property real stamp: model.date || model.published || 0
+    readonly property real stamp: video.date || video.published || 0
     // How far it was watched, 0 to 1, when that is remembered.
-    readonly property real progress: (view.progress && view.progress[model.id]) || 0
-    readonly property var why: model.why || []
+    readonly property real progress: (view.progress && view.progress[video.id]) || 0
+    readonly property var why: video.why || []
 
     width: view.cellWidth
     height: view.cellHeight
@@ -34,13 +37,10 @@ Item {
     HoverHandler {
         id: hover
         cursorShape: Qt.PointingHandCursor
-        onHoveredChanged: if (hovered) card.view.navigating = false
+        onHoveredChanged: if (hovered) card.view.pointed()
     }
     TapHandler {
-        onTapped: {
-            card.view.currentIndex = card.index
-            card.view.activated(card.view.model.get(card.index), card.index)
-        }
+        onTapped: card.view.pick(card.index)
     }
 
     Item {
@@ -58,7 +58,7 @@ Item {
             Text {
                 anchors.centerIn: parent
                 visible: !frost.ready
-                text: (card.model.channel || card.model.title || "?").charAt(0).toUpperCase()
+                text: (card.video.channel || card.video.title || "?").charAt(0).toUpperCase()
                 textFormat: Text.PlainText
                 color: Style.line
                 font.family: Style.font
@@ -78,14 +78,14 @@ Item {
                 visible: tag.text !== ""
                 width: tag.implicitWidth + Style.u * 3
                 height: tag.implicitHeight + Style.u
-                color: card.model.short ? Style.accent : Style.scrim
+                color: card.video.short ? Style.accent : Style.scrim
                 Text {
                     id: tag
                     anchors.centerIn: parent
-                    text: card.model.short ? qsTr("Short")
-                        : card.model.duration ? Format.clock(card.model.duration) : ""
+                    text: card.video.short ? qsTr("Short")
+                        : card.video.duration ? Format.clock(card.video.duration) : ""
                     textFormat: Text.PlainText
-                    color: card.model.short ? Style.accentText : Style.fg
+                    color: card.video.short ? Style.accentText : Style.fg
                     font.family: Style.font
                     font.pixelSize: Style.caption
                 }
@@ -115,22 +115,22 @@ Item {
             anchors.top: frame.bottom
             anchors.topMargin: Style.u * 2 + 1
             width: parent.width
-            text: card.model.title
+            text: card.video.title
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             maximumLineCount: 2
             elide: Text.ElideRight
             color: Style.fg
             font.family: Style.font
-            font.pixelSize: Style.body
-            font.bold: true
+            font.pixelSize: Style.card
+            font.weight: Style.strong
         }
         Text {
             id: channel
             anchors.top: title.bottom
             anchors.topMargin: 3
             width: Math.min(implicitWidth, parent.width)
-            text: card.model.channel || ""
+            text: card.video.channel || ""
             textFormat: Text.PlainText
             elide: Text.ElideRight
             color: channelHover.hovered ? Style.accent : Style.dim
@@ -139,12 +139,12 @@ Item {
 
             HoverHandler {
                 id: channelHover
-                enabled: !!card.model.channel_id
+                enabled: !!card.video.channel_id
                 cursorShape: Qt.PointingHandCursor
             }
             TapHandler {
-                enabled: !!card.model.channel_id
-                onTapped: card.view.channelRequested(card.model.channel_id)
+                enabled: !!card.video.channel_id
+                onTapped: card.view.channelRequested(card.video.channel_id)
             }
         }
         Text {
@@ -152,7 +152,9 @@ Item {
             anchors.top: channel.bottom
             anchors.topMargin: 2
             width: Math.min(implicitWidth, parent.width)
-            text: Format.meta(card.model, card.stamp)
+            text: Format.meta(card.video, card.stamp)
+            // A video with neither date nor views has no such line.
+            height: text === "" ? 0 : implicitHeight
             textFormat: Text.PlainText
             elide: Text.ElideRight
             color: Style.faint

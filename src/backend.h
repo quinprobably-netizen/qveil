@@ -57,6 +57,9 @@ class Backend : public QObject {
     Q_PROPERTY(QVariantMap comments READ comments NOTIFY commentsChanged)
     // The lenses, as the engine lists them: {id, text, tags, searches, count, fetchedAt}.
     Q_PROPERTY(QVariantList lenses READ lenses NOTIFY lensesChanged)
+    // What each lens last found, by its id, for the shelves of the home
+    // page: { id: [video, …] }, filled by loadShelf.
+    Q_PROPERTY(QVariantMap shelves READ shelves NOTIFY shelvesChanged)
     // The lens that is open: {id, text, tags, searches, fetchedAt}; its videos are `lensVideos`.
     Q_PROPERTY(QVariantMap lensInfo READ lensInfo NOTIFY lensChanged)
     Q_PROPERTY(VideoModel *lensVideos READ lensVideos CONSTANT)
@@ -115,6 +118,7 @@ public:
     QVariantList resume() const { return m_resume; }
     QVariantMap comments() const { return m_comments; }
     QVariantList lenses() const { return m_lenses; }
+    QVariantMap shelves() const { return m_shelves; }
     QVariantMap lensInfo() const { return m_lensInfo; }
     VideoModel *lensVideos() const { return m_lensVideos; }
     int lensDone() const { return m_lensDone; }
@@ -151,6 +155,9 @@ public:
     // Hangs up on a lookup still running and shows nothing: the tab was left.
     Q_INVOKABLE void closeComments();
     Q_INVOKABLE void loadLenses();
+    // Reads what the lens `id` last found from what the engine keeps. It
+    // never searches: a lens that was never fetched has an empty shelf.
+    Q_INVOKABLE void loadShelf(const QString &id);
     Q_INVOKABLE void addLens(const QString &text);
     Q_INVOKABLE void editLens(const QString &id, const QString &text);
     Q_INVOKABLE void removeLens(const QString &id);
@@ -188,6 +195,7 @@ signals:
     void resumeChanged();
     void commentsChanged();
     void lensesChanged();
+    void shelvesChanged();
     void lensChanged();
     void lensProgressChanged();
     void readingChanged();
@@ -305,6 +313,7 @@ private:
     QVariantList m_resume;
     QVariantMap m_comments;
     QVariantList m_lenses;
+    QVariantMap m_shelves;
     QVariantMap m_lensInfo;
     VideoModel *m_lensVideos = new VideoModel(this);
     int m_lensDone = 0;

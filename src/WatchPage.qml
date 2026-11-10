@@ -29,7 +29,7 @@ FocusScope {
     readonly property bool narrow: width < 1000
     readonly property bool beside: !narrow && !theatre && !full
     // How wide the sheet is when it stands beside the video.
-    readonly property int sheetWidth: 312
+    readonly property int sheetWidth: width >= 1180 ? 384 : 320
     readonly property bool subscribed: !!info.channelId && backend.subs.some(s => s.id === info.channelId)
 
     signal closed()
@@ -43,7 +43,7 @@ FocusScope {
         // A lookup of the last video's comments is for nobody now.
         backend.closeComments()
         expanded = false
-        sheet.current = "about"
+        sheet.current = list && index >= 0 && index + 1 < list.count ? "next" : "about"
         surface.prepare(video)
         flick.contentY = 0
     }
@@ -107,7 +107,7 @@ FocusScope {
                 color: Style.fg
                 font.family: Style.font
                 font.pixelSize: Style.head
-                font.bold: true
+                font.weight: Style.strong
             }
             Item {
                 width: parent.width
@@ -123,7 +123,7 @@ FocusScope {
                         color: channelArea.containsMouse ? Style.accent : Style.fg
                         font.family: Style.font
                         font.pixelSize: Style.body
-                        font.bold: true
+                        font.weight: Style.strong
                         MouseArea {
                             id: channelArea
                             anchors.fill: parent
@@ -218,6 +218,7 @@ FocusScope {
         }
         next: UpNextTab {
             anchors.fill: parent
+            thumbs: page.thumbs
             list: page.list
             index: page.index
             onPicked: (video, row) => page.videoRequested(video, page.list, row)

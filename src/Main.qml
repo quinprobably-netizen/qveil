@@ -53,7 +53,7 @@ ApplicationWindow {
     Settings {
         id: prefs
         // "frosted" (veiled until looked at) or "clear".
-        property string thumbnails: "frosted"
+        property string thumbnails: "clear"
         property bool showShorts: false
         property real volume: 80
         // Whether it has been said that positions are kept.
@@ -93,6 +93,9 @@ ApplicationWindow {
             search.text = ""
             backend.read("")
         }
+        // Home is the shelves; a feed in full is a step into it.
+        if (p === "home")
+            feedPage.overview = true
         page = p
         if (p === "channels")
             backend.loadSubs()
@@ -138,7 +141,7 @@ ApplicationWindow {
             backend.search(backend.query)
         else if (page === "lenses")
             lensesPage.refresh()
-        else if (page === "home" && feedPage.onLens)
+        else if (page === "home" && feedPage.onLens && !feedPage.overview)
             backend.openLens(feedPage.feed, 2)
         else if (page === "home")
             backend.refreshFeed(true, prefs.showShorts)
@@ -152,6 +155,10 @@ ApplicationWindow {
     }
 
     function playCurrent() {
+        if (page === "home" && feedPage.overview) {
+            feedPage.pickCurrent()
+            return
+        }
         const p = pages[page]
         if (p && p.grid && p.grid.currentIndex >= 0 && p.model.count > 0)
             win.play(p.model.get(p.grid.currentIndex), p.model, p.grid.currentIndex)
@@ -237,6 +244,8 @@ ApplicationWindow {
             watch.close()
         else if (typing)
             focusPage(page)
+        else if (page === "home" && !feedPage.overview)
+            feedPage.showShelves()
         else if (page === "channel" && channelFrom === "search") {
             // Back to the results it was opened from, which are still
             // there: nothing is searched for again.
@@ -443,6 +452,7 @@ ApplicationWindow {
                     shorts: prefs.showShorts
                     progress: win.watched
                     onActivated: (video, index) => win.play(video, feedPage.model, index)
+                    onShelfActivated: (video, list, index) => win.play(video, list, index)
                     onChannelRequested: id => win.openChannel(id)
                     onResumed: video => win.play(video)
                     onShortsToggled: shown => {
@@ -582,7 +592,7 @@ ApplicationWindow {
                 // time makes it as long as that is.
                 BusyLine {
                     objectName: "progress"
-                    readonly property var tasks: backend.busy.filter(t => ["play", "config", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0)
+                    readonly property var tasks: backend.busy.filter(t => ["play", "config", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0)
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top

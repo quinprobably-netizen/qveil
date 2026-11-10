@@ -1,9 +1,10 @@
 import QtQuick
 import Qveil
 
-// The way around the window: the places down the left edge, and at the foot
-// the route (always in view: amber while YouTube can see your address, green
-// once it can't) and the settings.
+// The way around the window: the places down the left edge, as glyphs that
+// say what they are when pointed at, and at the foot the route (always in
+// view: amber while YouTube can see your address, green once it can't) and
+// the settings.
 Rectangle {
     id: rail
 
@@ -44,7 +45,7 @@ Rectangle {
         signal clicked()
 
         width: Style.rail - 14
-        height: 54
+        height: Style.rail - 14
         radius: Style.radius
         color: current ? Style.sel : area.containsMouse ? Style.hover : "transparent"
         Behavior on color { ColorAnimation { duration: Style.quick } }
@@ -62,14 +63,6 @@ Rectangle {
                     source: place.glyph
                     color: place.tone
                 }
-            }
-            Text {
-                anchors.horizontalCenter: parent.horizontalCenter
-                text: place.label
-                textFormat: Text.PlainText
-                color: place.tone
-                font.family: Style.font
-                font.pixelSize: 10
             }
         }
         MouseArea {
@@ -103,7 +96,7 @@ Rectangle {
             color: Style.accent
             font.family: Style.font
             font.pixelSize: 15
-            font.bold: true
+            font.weight: Style.strong
         }
         Repeater {
             model: rail.places
@@ -111,6 +104,7 @@ Rectangle {
                 required property var modelData
                 objectName: "rail-" + modelData.key
                 label: modelData.label
+                tip: modelData.label
                 glyph: modelData.glyph
                 current: rail.current === modelData.key
                 onClicked: rail.picked(modelData.key)
@@ -129,7 +123,7 @@ Rectangle {
             objectName: "rail-route"
             label: rail.route === "tor" ? qsTr("Tor") : rail.route === "proxy" ? qsTr("Proxy") : qsTr("Direct")
             tone: rail.route === "direct" ? Style.warn : Style.safe
-            tip: rail.routeSummary
+            tip: rail.routeSummary || label
             onClicked: rail.routeClicked()
             Rectangle {
                 anchors.centerIn: parent
@@ -142,6 +136,7 @@ Rectangle {
         Place {
             objectName: "rail-settings"
             label: qsTr("Settings")
+            tip: label
             glyph: "qrc:/icons/settings.svg"
             current: rail.current === "settings"
             onClicked: rail.picked("settings")

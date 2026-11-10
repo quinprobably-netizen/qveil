@@ -26,7 +26,7 @@ GridView {
     rightMargin: gutter
     bottomMargin: Style.gutter
     cellWidth: Math.floor((width - 2 * gutter) / columns)
-    cellHeight: Math.round((cellWidth - Style.u * 4) * 9 / 16) + 96 + (reasons ? 18 : 0)
+    cellHeight: Math.round((cellWidth - Style.u * 4) * 9 / 16) + 110 + (reasons ? 18 : 0)
     clip: true
     boundsBehavior: Flickable.StopAtBounds
     keyNavigationEnabled: true
@@ -42,7 +42,19 @@ GridView {
         background: Item {}
     }
 
-    delegate: VideoCard {}
+    delegate: VideoCard {
+        required property var model
+        video: model
+        view: grid
+        selected: GridView.isCurrentItem && grid.activeFocus && grid.navigating
+    }
+
+    function pick(i) {
+        currentIndex = i
+        activated(model.get(i), i)
+    }
+    // The pointer is on a card: the keyboard's mark steps aside.
+    function pointed() { navigating = false }
 
     Keys.onPressed: event => {
         navigating = true

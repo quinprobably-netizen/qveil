@@ -42,7 +42,7 @@ Column {
             color: item.comment.byUploader ? Style.accent : Style.dim
             font.family: Style.font
             font.pixelSize: Style.small
-            font.bold: true
+            font.weight: Style.strong
         }
     }
     Text {

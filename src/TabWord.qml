@@ -9,13 +9,16 @@ Rectangle {
     property string text
     property url glyph
     property bool current: false
+    // A tab (which page of something is showing) is marked by a line under
+    // it; a choice among settings keeps the selected fill.
+    property bool underlined: false
     readonly property bool hot: area.containsMouse || activeFocus
     signal clicked()
 
     implicitWidth: row.implicitWidth + Style.u * 6
     implicitHeight: Style.control
     radius: Style.radius
-    color: current ? Style.sel : hot ? Style.hover : "transparent"
+    color: current && !underlined ? Style.sel : hot ? Style.hover : "transparent"
     activeFocusOnTab: true
     Behavior on color { ColorAnimation { duration: Style.quick } }
 
@@ -44,10 +47,18 @@ Rectangle {
             color: tab.current || tab.hot ? Style.fg : Style.dim
             font.family: Style.font
             font.pixelSize: Style.body
-            font.bold: tab.current
+            font.weight: (tab.current) ? Style.strong : Font.Normal
         }
     }
 
+    Rectangle {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        visible: tab.underlined && tab.current
+        height: 2
+        color: Style.accent
+    }
     MouseArea {
         id: area
         anchors.fill: parent

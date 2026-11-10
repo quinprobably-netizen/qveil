@@ -5,7 +5,7 @@ search, describe the feeds you want in words, and watch in a native window with
 no Google account, no stored cookies and no browser, and optionally route every
 byte through Tor.
 
-![qveil's home page: unfinished videos on top, then the feed, thumbnails frosted until pointed at](docs/screenshot.png)
+![qveil's home page: the video you were watching leads, with shelves of videos under it](docs/screenshot.png)
 
 > **Prototype.** It works day to day, but expect rough edges. Not affiliated
 > with YouTube or Google.
@@ -110,8 +110,10 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 
 ## The app
 
-- **Home**: the videos you left part-way, then the latest uploads from the
-  channels you follow.
+- **Home**: the video you were in the middle of leads the page, and under it
+  every feed is a shelf that scrolls sideways: the latest from the channels
+  you follow, what else you left unfinished, and each of your lenses. A
+  shelf's heading opens that feed in full.
 - **Lenses**: feeds you describe in words, such as "slow woodworking with hand
   tools, no music, longer than 15 minutes". Fixed rules read the words (no
   language model): what is left after the rules are lifted out is searched
@@ -131,18 +133,17 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
   On another Hyprland setup, add a window rule that floats and pins windows
   titled `Picture-in-Picture` (Omarchy's own is in `default/hypr/apps/pip.lua`).
   Anywhere else it is an ordinary small window.
-- **Frosted thumbnails**: thumbnails stay blurred and muted until you point at
-  them, so a wall of clickbait doesn't shout at you. You can show them plainly,
-  or not load thumbnails at all.
+- **Thumbnails** are shown as they are. If a wall of clickbait is not what
+  you want to look at, the settings can frost them (blurred and muted until
+  you point at one), or not load thumbnails at all.
 - **Live streams aren't supported yet.** qveil relays one plain download per
   video, and a live stream (or a video offered only as HLS/DASH) is a playlist
   whose segments the player would fetch itself, around your route. qveil says
   so instead of playing it.
 - **Moving from YouTube**: drop a Google Takeout `subscriptions.csv`, or a
   NewPipe or FreeTube export, anywhere on the window. It's read offline.
-- It looks like the rest of an Omarchy desktop: the theme's colours and accent,
-  the system's typeface (`omarchy font set` changes it live) and Hyprland's
-  window rounding.
+- It takes its colours and accent from the Omarchy theme, its type from the
+  desktop's interface font, and its corners from Hyprland's window rounding.
 
 | Key | Action |
 |---|---|
@@ -221,7 +222,7 @@ core/        qveil-core, the engine (Rust)
 src/         the window (C++ / Qt Quick)
   backend.*    starts qveil-core and talks to it over loopback
   mpvitem.*    libmpv rendered into the scene
-  theme.*      the Omarchy theme's colours, the system typeface, Hyprland's rounding
+  theme.*      the Omarchy theme's colours, the desktop's interface font, Hyprland's rounding
   Style.qml    the tokens everything is drawn with
   *.qml        the parts (Act, TabWord, Field, …) and the pages built from them
   Linkify.js   what in a description or a comment can be clicked

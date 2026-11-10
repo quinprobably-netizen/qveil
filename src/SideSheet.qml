@@ -24,12 +24,14 @@ Rectangle {
         anchors.top: parent.top
         TabWord {
             objectName: "tab-about"
+            underlined: true
             text: qsTr("About")
             current: sheet.current === "about"
             onClicked: sheet.current = "about"
         }
         TabWord {
             objectName: "tab-comments"
+            underlined: true
             text: sheet.commentCount > 0 ? qsTr("Comments %1").arg(Number(sheet.commentCount).toLocaleString(Qt.locale(), "f", 0))
                                          : qsTr("Comments")
             current: sheet.current === "comments"
@@ -37,6 +39,7 @@ Rectangle {
         }
         TabWord {
             objectName: "tab-next"
+            underlined: true
             text: qsTr("Up next")
             current: sheet.current === "next"
             onClicked: sheet.current = "next"

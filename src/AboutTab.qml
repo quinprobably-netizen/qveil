@@ -89,7 +89,7 @@ Flickable {
                         color: index === tab.current ? Style.fg : Style.dim
                         font.family: Style.font
                         font.pixelSize: Style.small
-                        font.bold: index === tab.current
+                        font.weight: (index === tab.current) ? Style.strong : Font.Normal
                     }
                     MouseArea {
                         id: area

@@ -759,6 +759,19 @@ void Backend::loadLenses() {
     });
 }
 
+void Backend::loadShelf(const QString &id) {
+    if (id.isEmpty())
+        return;
+    QUrlQuery q;
+    q.addQueryItem("id", id);
+    // Never a refresh: only what is already kept.
+    q.addQueryItem("refresh", "0");
+    call("GET", "api/lens", q, {}, "shelf-" + id, [this, id](const QJsonValue &v) {
+        m_shelves.insert(id, v.toObject().value("videos").toArray().toVariantList());
+        emit shelvesChanged();
+    });
+}
+
 void Backend::addLens(const QString &text) {
     const QByteArray body = QJsonDocument(QJsonObject{{"text", text}}).toJson(QJsonDocument::Compact);
     call("POST", "api/lenses", {}, body, "lens-write", [this](const QJsonValue &v) {

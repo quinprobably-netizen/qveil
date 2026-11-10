@@ -11,6 +11,8 @@ ListView {
     property var list: null
     // Where in the list the video that is playing is.
     property int index: -1
+    // "frosted" or "clear": how thumbnails are shown (see Frost).
+    property string thumbs: "clear"
     readonly property var entries: {
         const out = []
         if (list && index >= 0)
@@ -25,34 +27,84 @@ ListView {
     boundsBehavior: Flickable.StopAtBounds
 
     delegate: Rectangle {
+        id: entry
         required property var modelData
         readonly property string title: modelData.video.title || ""
         objectName: "next-entry"
         width: tab.width
-        height: 52
+        height: 92
         color: area.containsMouse ? Style.hover : "transparent"
 
+        Item {
+            id: picture
+            x: Style.u * 2
+            anchors.verticalCenter: parent.verticalCenter
+            width: 136
+            height: 76
+            clip: true
+            Rectangle {
+                anchors.fill: parent
+                color: Style.rest
+            }
+            // The engine has these from the list the video was opened from.
+            Frost {
+                objectName: "frost"
+                anchors.fill: parent
+                source: Format.thumb(backend.thumbBase, entry.modelData.video.id, entry.modelData.video.batch || 0)
+                clear: area.containsMouse
+                mode: tab.thumbs
+            }
+            Rectangle {
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                visible: clock.text !== ""
+                width: clock.implicitWidth + Style.u * 2
+                height: clock.implicitHeight + 2
+                color: Style.scrim
+                Text {
+                    id: clock
+                    anchors.centerIn: parent
+                    text: entry.modelData.video.duration ? Format.clock(entry.modelData.video.duration) : ""
+                    textFormat: Text.PlainText
+                    color: Style.fg
+                    font.family: Style.font
+                    font.pixelSize: Style.caption
+                }
+            }
+        }
         Column {
-            anchors.left: parent.left
+            anchors.left: picture.right
             anchors.right: parent.right
             anchors.leftMargin: Style.u * 3
             anchors.rightMargin: Style.u * 3
             anchors.verticalCenter: parent.verticalCenter
-            spacing: 2
+            spacing: 3
             Text {
                 width: parent.width
-                text: title
+                text: entry.title
                 textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
                 elide: Text.ElideRight
                 color: Style.fg
                 font.family: Style.font
-                font.pixelSize: Style.small
-                font.bold: true
+                font.pixelSize: Style.body
+                font.weight: Style.strong
             }
             Text {
                 width: parent.width
-                text: [modelData.video.channel || "", modelData.video.duration ? Format.clock(modelData.video.duration) : ""]
-                          .filter(s => s !== "").join("  ·  ")
+                visible: text !== ""
+                text: entry.modelData.video.channel || ""
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                color: Style.dim
+                font.family: Style.font
+                font.pixelSize: Style.small
+            }
+            Text {
+                width: parent.width
+                visible: text !== ""
+                text: Format.meta(entry.modelData.video, entry.modelData.video.date || entry.modelData.video.published || 0)
                 textFormat: Text.PlainText
                 elide: Text.ElideRight
                 color: Style.faint
@@ -60,17 +112,12 @@ ListView {
                 font.pixelSize: Style.small
             }
         }
-        Rule {
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-        }
         MouseArea {
             id: area
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: tab.picked(modelData.video, modelData.row)
+            onClicked: tab.picked(entry.modelData.video, entry.modelData.row)
         }
     }
 

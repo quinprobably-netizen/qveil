@@ -45,7 +45,8 @@ int main(int argc, char *argv[]) {
         {"history", "go('history')"},
         {"settings", "go('settings')"},
         {"search", "go('search'); backend.search('talks over 30 min')"},
-        {"watch", "play(backend.feed.get(0))"},
+        {"watch", "play(backend.feed.get(0), backend.feed, 0)"},
+        {"feed", "feedPage.showAll('latest')"},
         {"watch-comments", "play(backend.feed.get(0)); watch.sheet.current = 'comments'"},
     };
     if (!views.contains(view)) {

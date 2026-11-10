@@ -1,5 +1,6 @@
 #include <QClipboard>
 #include <QDirIterator>
+#include <QFont>
 #include <QQuickStyle>
 #include <QGuiApplication>
 #include <QNetworkAccessManager>
@@ -117,12 +118,23 @@ struct App {
     {
         // What has only just appeared or moved is laid out with the next
         // frame; a click sent before that would go where the item was.
-        QTest::qWait(40);
+        // A page that is still filling moves what is on it; the click waits
+        // until the target has stood still for a moment.
+        QPointF was(-1, -1);
+        for (int i = 0; i < 25; ++i) {
+            QTest::qWait(40);
+            const QPointF now = target->mapToScene(QPointF(0, 0));
+            if (now == was)
+                break;
+            was = now;
+        }
         // What is outside the view of a page that scrolls is scrolled to first.
         const qreal top = target->mapToScene(QPointF(0, 0)).y(), bottom = top + target->height();
         qreal by = 0;
         for (QQuickItem *up = target->parentItem(); up; up = up->parentItem()) {
-            if (!up->property("contentY").isValid() || !up->property("contentHeight").isValid())
+            // (Only what scrolls up and down: a strip that scrolls sideways is not it.)
+            if (!up->property("contentY").isValid() || !up->property("contentHeight").isValid()
+                || up->property("contentHeight").toReal() <= up->height() + 1)
                 continue;
             const qreal viewTop = up->mapToScene(QPointF(0, 0)).y(), viewBottom = qMin(viewTop + up->height(), qreal(window->height()));
             if (bottom > viewBottom - 8)
@@ -130,8 +142,9 @@ struct App {
             else if (top < viewTop + 8)
                 by = top - viewTop - 40;
             if (by != 0) {
-                const qreal most = qMax(0.0, up->property("contentHeight").toReal() - up->height());
-                up->setProperty("contentY", qBound(0.0, up->property("contentY").toReal() + by, most));
+                // (A list's header lies before its start, so the view's own bounds decide.)
+                up->setProperty("contentY", up->property("contentY").toReal() + by);
+                QMetaObject::invokeMethod(up, "returnToBounds");
                 QTest::qWait(40);
             }
             break;
@@ -148,6 +161,11 @@ struct App {
             QTest::keyClick(window, *c);
     }
     QString page() const { return window->property("page").toString(); }
+    // Home's feed in full (the grid with its tabs), as a shelf's "See all" opens it.
+    void seeAll(const char *feed = "latest") const
+    {
+        QMetaObject::invokeMethod(item("feedPage"), "showAll", Q_ARG(QVariant, QString(feed)));
+    }
 
     // The small window of picture in picture, and something in it.
     QQuickWindow *pip() const { return window->property("pipWindow").value<QQuickWindow *>(); }
@@ -315,31 +333,37 @@ private slots:
     {
         App app;
         READY(app);
-        QQuickItem *row = app.item("resume-row");
-        QVERIFY(row);
-        QTRY_VERIFY(row->isVisible());
-        QTRY_COMPARE(app.items("resume-entry").size(), 3);
-        QQuickItem *first = app.items("resume-entry").first();
-        QCOMPARE(first->property("title").toString(), QString("Why the borrow checker says no"));
-        QCOMPARE(first->property("remaining").toString(), QString("26:58 left"));
+        QQuickItem *lead = app.item("lead");
+        QVERIFY(lead);
+        QTRY_VERIFY(lead->isVisible());
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
+        QVERIFY(app.item("lead-meta")->property("text").toString().contains("26:58 left"));
         // How long they are kept is the setting's number.
-        QVERIFY(row->property("note").toString().contains("7 days"));
+        QVERIFY(app.item("lead-kept")->property("text").toString().contains("7 days"));
+        // The others have a shelf, each with what is left of it.
+        QTRY_VERIFY(app.item("shelf-resume"));
+        QTRY_COMPARE(App::count(app.item("shelf-resume"), "card"), 2);
+        QCOMPARE(App::under(app.item("shelf-resume"), "card-why")->property("text").toString(), QString("48:20 left"));
 
         app.backend->forgetResume("vid00000001");
-        QTRY_COMPARE(app.items("resume-entry").size(), 2);
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Crossing the Pamir on a steel bike, part 3"));
+        QTRY_COMPARE(App::count(app.item("shelf-resume"), "card"), 1);
         app.backend->clearResume();
-        QTRY_VERIFY(!row->isVisible());
+        QTRY_VERIFY(!lead->isVisible());
+        QTRY_VERIFY(!app.item("shelf-resume"));
 
+        // With nothing unfinished, and with resume off, there is no lead.
         App none(true);
         READY(none);
-        QTest::qWait(300);
-        QVERIFY(!none.item("resume-row")->isVisible());
+        QTRY_VERIFY(none.item("shelf-latest"));
+        QVERIFY(!none.item("lead")->isVisible());
     }
 
     void aLensTabShowsThatLensInTheGrid()
     {
         App app;
         READY(app);
+        app.seeAll();
         QQuickItem *tabs = app.item("feed-tabs");
         QQuickItem *grid = app.item("home-grid");
         QVERIFY(tabs && grid);
@@ -367,6 +391,9 @@ private slots:
     {
         App app;
         READY(app);
+        // With thumbnails set to frosted, in the feed in full.
+        app.window->setProperty("thumbs", "frosted");
+        app.seeAll();
         QTRY_VERIFY(app.items("card").size() >= 4);
         const QList<QQuickItem *> cards = app.items("card");
         QQuickItem *frost = App::under(cards.at(0), "frost"), *next = App::under(cards.at(1), "frost");
@@ -395,6 +422,7 @@ private slots:
         for (const auto &[width, columns] : {std::pair{1280, 4}, std::pair{950, 3}, std::pair{760, 2}}) {
             App app(false, QSize(width, 600));
             READY(app);
+            app.seeAll();
             QQuickItem *grid = app.item("home-grid");
             QVERIFY(grid);
             QTRY_VERIFY(app.items("card").size() >= columns);
@@ -402,8 +430,31 @@ private slots:
             // Nothing reaches past the window's edge.
             for (QQuickItem *card : app.items("card"))
                 QVERIFY(card->mapToScene(QPointF(card->width(), 0)).x() <= width);
-            for (const char *name : {"resume-row", "feed-tabs", "search"})
+            for (const char *name : {"feed-tabs", "search"})
                 QVERIFY2(app.item(name)->mapToScene(QPointF(app.item(name)->width(), 0)).x() <= width, name);
+        }
+    }
+
+    void theLeadAndTheShelvesFitANarrowWindow()
+    {
+        for (const int width : {950, 760}) {
+            App app(false, QSize(width, 600));
+            READY(app);
+            QTRY_VERIFY(app.item("lead")->isVisible());
+            QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 2);
+            const auto right = [&](const char *name) {
+                QQuickItem *item = app.item(name);
+                return item->mapToScene(QPointF(item->width(), 0)).x();
+            };
+            QVERIFY2(right("lead") <= width, qPrintable(QString::number(right("lead"))));
+            // The title has room to be read, and the buttons stay on the lead's own ground.
+            QVERIFY2(app.item("lead-title")->width() >= 220, qPrintable(QString::number(app.item("lead-title")->width())));
+            QQuickItem *picture = app.item("lead-picture");
+            QVERIFY(picture);
+            QVERIFY2(right("lead-forget") <= picture->mapToScene(QPointF(0, 0)).x() + 100,
+                     qPrintable(QString("%1 past %2").arg(right("lead-forget")).arg(picture->mapToScene(QPointF(0, 0)).x())));
+            QQuickItem *all = App::under(app.item("shelf-latest"), "shelf-all");
+            QVERIFY(all->mapToScene(QPointF(all->width(), 0)).x() <= width);
         }
     }
 
@@ -735,6 +786,14 @@ private slots:
         // Home's "New lens" opens the page with nothing written yet.
         QTest::keyClick(app.window, Qt::Key_Escape);
         QTest::keyClick(app.window, Qt::Key_1);
+        QMetaObject::invokeMethod(app.item("shelves"), "positionViewAtEnd");
+        app.click(app.item("home-new-lens"));
+        QCOMPARE(app.page(), QString("lenses"));
+        QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString());
+        // So does the feed's own tab row.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTest::keyClick(app.window, Qt::Key_1);
+        app.seeAll();
         app.click(app.item("feed-tab-new"));
         QCOMPARE(app.page(), QString("lenses"));
         QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString());
@@ -1024,12 +1083,230 @@ private slots:
         QTRY_VERIFY(!help->property("opened").toBool());
     }
 
+    // --- Home as a lead and shelves. ---
+
+    void homeLeadsWithTheVideoYouWereInAndShelvesFollow()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QQuickItem *lead = app.item("lead");
+        QVERIFY(lead);
+        QTRY_VERIFY(lead->isVisible());
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
+        QVERIFY(app.item("lead-meta")->property("text").toString().contains("Low Level Hours"));
+        QVERIFY(app.item("lead-meta")->property("text").toString().contains("26:58 left"));
+        QVERIFY(app.item("lead-kept")->property("text").toString().contains("7 days"));
+        // The grid and its tabs are a step away, not what the page opens on.
+        QVERIFY(!app.item("home-grid")->isVisible());
+
+        // The other unfinished videos, the channels' latest, and each lens, as shelves.
+        QTRY_VERIFY(app.item("shelf-resume") && app.item("shelf-latest") && app.item("shelf-aaaa0001") && app.item("shelf-aaaa0002"));
+        QTRY_COMPARE(App::count(app.item("shelf-resume"), "card"), 2);
+        QTRY_VERIFY(App::count(app.item("shelf-latest"), "card") >= 4);
+        QCOMPARE(App::under(app.item("shelf-aaaa0002"), "shelf-title")->property("text").toString(),
+                 QString("systems talks over 30 min, this year"));
+        QTRY_VERIFY(App::count(app.item("shelf-aaaa0002"), "card") >= 4);
+        // A lens's shelf is what the engine already has for it: showing it searches for nothing.
+        QCOMPARE(app.asked("GET api/lens?id=aaaa0001&refresh=0"), 1);
+        QCOMPARE(app.asked("GET api/lens?id=aaaa0002&refresh=0"), 1);
+        for (const QString &line : app.asked().filter("api/lens"))
+            QVERIFY2(!line.contains("refresh=1") && !line.contains("force=1"), qPrintable(line));
+        QCOMPARE(app.asked("GET api/search"), 0);
+        // Its cards say why they are there.
+        QVERIFY(App::under(app.item("shelf-aaaa0002"), "card-why"));
+    }
+
+    void theLeadResumesStartsOverAndForgets()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        app.click(app.item("lead-resume"));
+        QQuickItem *surface = app.item("surface");
+        QTRY_COMPARE(surface->property("startedAt").toInt(), 845);
+        QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000001"));
+
+        // Starting over forgets the place first, so the video starts at its start.
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        // Coming back, the page is where it was left: the lead is still in view.
+        QTest::qWait(100);
+        QVERIFY2(app.item("lead")->mapToScene(QPointF(0, 0)).y() > 0, "the lead was scrolled away");
+        app.click(app.item("lead-over"));
+        QTRY_COMPARE(app.asked("POST api/resume/rm"), 1);
+        QTRY_VERIFY(surface->property("active").toBool() && !surface->property("pending").toBool());
+        QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000001"));
+        QCOMPARE(surface->property("startedAt").toInt(), 0);
+
+        // The next unfinished video leads now, and can be forgotten where it stands.
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Crossing the Pamir on a steel bike, part 3"));
+        app.click(app.item("lead-forget"));
+        QTRY_COMPARE(app.asked("POST api/resume/rm"), 2);
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Glaze tests: 36 tiles, one kiln load"));
+    }
+
+    void aShelfOpensItsFeedInFullAndEscapeReturns()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QQuickItem *shelves = app.item("shelves"), *grid = app.item("home-grid");
+        // (Once the lead is there, the shelves are where they will stay.)
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && app.item("shelf-aaaa0002"));
+        app.click(App::under(app.item("shelf-latest"), "shelf-all"));
+        QTRY_VERIFY(grid->isVisible());
+        QVERIFY(!shelves->isVisible());
+        QTRY_COMPARE(grid->property("count").toInt(), 12);
+        QVERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QTRY_VERIFY(grid->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(shelves->isVisible());
+        QVERIFY(!grid->isVisible());
+        QCOMPARE(app.page(), QString("home"));
+
+        // A lens's shelf opens that lens.
+        app.click(App::under(app.item("shelf-aaaa0002"), "shelf-title"));
+        QTRY_VERIFY(grid->isVisible());
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
+        QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
+        QTRY_COMPARE(grid->property("count").toInt(), 6);
+        // Home, by its key or the rail, is the shelves again.
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTRY_VERIFY(shelves->isVisible());
+    }
+
+    void arrowsMoveAlongAShelfAndBetweenShelves()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_VERIFY(home->hasActiveFocus() || app.item("shelves")->hasActiveFocus());
+        QCOMPARE(home->property("row").toInt(), 0);
+        // The first shelf is the latest; the next is the other unfinished videos.
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_COMPARE(home->property("row").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(home->property("column").toInt(), 1);
+        // Each shelf remembers where the keyboard was on it.
+        QTest::keyClick(app.window, Qt::Key_Up);
+        QTRY_COMPARE(home->property("row").toInt(), 0);
+        QCOMPARE(home->property("column").toInt(), 0);
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(home->property("column").toInt(), 2);
+        // What is selected is marked, and Enter plays it, with the shelf as what comes next.
+        QQuickItem *selected = nullptr;
+        for (QQuickItem *card : app.items("card"))
+            if (card->property("selected").toBool())
+                selected = card;
+        QVERIFY(selected);
+        QCOMPARE(selected->property("video").toMap().value("id").toString(), QString("vid00000003"));
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000003"));
+        QTRY_VERIFY(!app.items("next-entry").isEmpty());
+        // Up has an end, and so has Left.
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_Up);
+        QTest::keyClick(app.window, Qt::Key_Up);
+        QTRY_COMPARE(home->property("row").toInt(), 0);
+        for (int i = 0; i < 4; ++i)
+            QTest::keyClick(app.window, Qt::Key_Left);
+        QCOMPARE(home->property("column").toInt(), 0);
+    }
+
+    void withNothingKeptHomeStartsWithTheLatest()
+    {
+        App app(true);
+        READY(app);
+        QTRY_VERIFY(app.item("shelf-latest"));
+        QVERIFY(!app.item("lead")->isVisible());
+        QVERIFY(!app.item("shelf-resume"));
+        QTRY_VERIFY(App::count(app.item("shelf-latest"), "card") >= 4);
+        QCOMPARE(app.item("shelves-home")->property("row").toInt(), 0);
+    }
+
+    void shelvesBelowTheFoldAskForNothing()
+    {
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LENSES", "12"}});
+        READY(app);
+        QTRY_VERIFY(app.item("shelf-resume"));
+        QTest::qWait(400);
+        // Twelve lenses are twelve shelves, but only the ones in view are made and filled.
+        QVERIFY(!app.item("shelf-aaaa0012"));
+        QCOMPARE(app.asked("GET api/lens?id=aaaa0012"), 0);
+        QMetaObject::invokeMethod(app.item("shelves"), "positionViewAtEnd");
+        QTRY_VERIFY(app.item("shelf-aaaa0012"));
+        QTRY_COMPARE(app.asked("GET api/lens?id=aaaa0012&refresh=0"), 1);
+    }
+
+    void theRailIsSlimAndSaysItsPlacesWhenPointedAt()
+    {
+        App app;
+        READY(app);
+        QQuickItem *home = app.item("rail-home");
+        QVERIFY(home);
+        QVERIFY(home->parentItem());
+        QVERIFY2(home->width() <= 48, qPrintable(QString::number(home->width())));
+        QCOMPARE(home->property("tip").toString(), QString("Home"));
+        QStringList said;
+        App::texts(home, said);
+        QVERIFY2(!said.contains("Home"), qPrintable(said.join("|")));
+        // The route still says where you stand, when asked.
+        QVERIFY(app.item("rail-route")->property("tip").toString().startsWith("Direct"));
+        // The page starts right beside it.
+        QVERIFY(app.item("search")->mapToScene(QPointF(0, 0)).x() < 90);
+    }
+
+    void typeIsTheSystemsAndPicturesAreClearUnlessAskedOtherwise()
+    {
+        App app;
+        READY(app);
+        const QString family = app.theme->property("uiFamily").toString();
+        QVERIFY(!family.isEmpty());
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QCOMPARE(app.item("lead-title")->property("font").value<QFont>().family(), family);
+        // Nothing is bold by smearing: titles use a weight the face has.
+        QCOMPARE(app.item("lead-title")->property("font").value<QFont>().weight(), QFont::DemiBold);
+
+        QCOMPARE(app.window->property("thumbs").toString(), QString("clear"));
+        QTRY_VERIFY(app.item("shelf-resume") && App::under(app.item("shelf-resume"), "frost"));
+        QVERIFY(!App::under(app.item("shelf-resume"), "frost")->property("veiled").toBool());
+        // Frosted is still there for whoever wants it.
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("thumbs-frosted"));
+        QCOMPARE(app.window->property("thumbs").toString(), QString("frosted"));
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTRY_VERIFY(App::under(app.item("shelf-resume"), "frost")->property("veiled").toBool());
+    }
+
+    void upNextShowsPicturesAndLeadsTheSheetWhenThereIsAList()
+    {
+        App app;
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QCOMPARE(app.item("sheet")->property("current").toString(), QString("next"));
+        QTRY_VERIFY(!app.items("next-entry").isEmpty());
+        QVERIFY(App::under(app.items("next-entry").first(), "frost"));
+        // Without a list there is nothing to come next, and the sheet opens on what the video is.
+        app.play({{"id", "vid00000004"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QCOMPARE(app.item("sheet")->property("current").toString(), QString("about"));
+    }
+
     // --- What the review of the window found. ---
 
     void homeShowsTheLensItsTabNames()
     {
         App app;
         READY(app);
+        app.seeAll();
         QTRY_VERIFY(app.item("feed-tab-aaaa0002"));
         app.click(app.item("feed-tab-aaaa0002"));
         QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
@@ -1040,6 +1317,7 @@ private slots:
         QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0001"));
         // ...and home still shows the one its tab says.
         QTest::keyClick(app.window, Qt::Key_1);
+        app.seeAll("aaaa0002");
         QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
         QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
         QTRY_VERIFY(!app.items("card-why").isEmpty());
@@ -1052,17 +1330,26 @@ private slots:
     {
         App app;
         READY(app);
-        QQuickItem *grid = app.item("home-grid");
-        QTRY_COMPARE(grid->property("count").toInt(), 12);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
         app.play({{"id", "vid00000002"}});
         QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
         QTest::keyClick(app.window, Qt::Key_I);
         QTRY_VERIFY(app.pip()->isVisible());
         QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
         app.window->requestActivate();
-        QTRY_VERIFY(grid->hasActiveFocus());
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
         QTRY_VERIFY2(!app.window->property("steering").toBool(),
                      qPrintable(QString("main active %1, small active %2").arg(app.window->isActive()).arg(app.pip()->isActive())));
+        // On the shelves...
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(home->property("column").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_COMPARE(home->property("row").toInt(), 1);
+        // ...and in a grid.
+        app.seeAll();
+        QQuickItem *grid = app.item("home-grid");
+        QTRY_VERIFY(grid->hasActiveFocus());
         const int columns = grid->property("columns").toInt();
         QVERIFY(columns > 1);
         grid->setProperty("currentIndex", 0);
@@ -1210,13 +1497,23 @@ private slots:
     {
         App app;
         READY(app);
-        QQuickItem *grid = app.item("home-grid");
-        QTRY_COMPARE(grid->property("count").toInt(), 12);
-        grid->setProperty("currentIndex", 0);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
         QTest::keyClick(app.window, '/');
         QTRY_VERIFY(app.window->property("typing").toBool());
         QTest::keyClick(app.window, Qt::Key_Escape);
         QTRY_VERIFY(!app.window->property("typing").toBool());
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(home->property("column").toInt(), 1);
+        // The same in the feed in full.
+        app.seeAll();
+        QQuickItem *grid = app.item("home-grid");
+        QTRY_VERIFY(grid->hasActiveFocus());
+        grid->setProperty("currentIndex", 0);
+        QTest::keyClick(app.window, '/');
+        QTRY_VERIFY(app.window->property("typing").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
         QTRY_VERIFY(grid->hasActiveFocus());
         QTest::keyClick(app.window, Qt::Key_Right);
         QTRY_COMPARE(grid->property("currentIndex").toInt(), 1);

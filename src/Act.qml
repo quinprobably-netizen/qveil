@@ -12,6 +12,8 @@ Rectangle {
     property bool filled: false
     // A quiet one is dim until it is pointed at.
     property bool quiet: false
+    // The one thing to do here: in the accent.
+    property bool primary: false
     property string tip
     readonly property bool hot: enabled && (area.containsMouse || activeFocus)
     signal clicked()
@@ -19,7 +21,7 @@ Rectangle {
     implicitWidth: row.implicitWidth + Style.u * 5
     implicitHeight: Style.control
     radius: Style.radius
-    color: hot ? Style.hover : filled ? Style.rest : "transparent"
+    color: primary ? (hot ? Qt.lighter(Style.accent, 1.12) : Style.accent) : hot ? Style.hover : filled ? Style.rest : "transparent"
     opacity: enabled ? 1 : 0.4
     scale: area.pressed ? 0.97 : 1
     activeFocusOnTab: true
@@ -48,9 +50,10 @@ Rectangle {
             visible: text !== ""
             text: act.text
             textFormat: Text.PlainText
-            color: act.quiet && !act.hot ? Style.dim : Style.fg
+            color: act.primary ? Style.accentText : act.quiet && !act.hot ? Style.dim : Style.fg
             font.family: Style.font
             font.pixelSize: Style.body
+            font.weight: act.primary ? Style.strong : Font.Normal
         }
     }
 

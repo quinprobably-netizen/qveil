@@ -14,6 +14,8 @@ Item {
     property string status
     default property alias actions: tail.data
     signal picked(string which)
+    // Back to the shelves.
+    signal back()
     signal newLens()
 
     implicitHeight: Style.control
@@ -26,9 +28,18 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         spacing: 2
 
+        Act {
+            id: home
+            objectName: "feed-back"
+            glyph: "qrc:/icons/back.svg"
+            tip: qsTr("Back to home")
+            quiet: true
+            onClicked: tabs.back()
+        }
         TabWord {
             id: latest
             objectName: "feed-tab-latest"
+            underlined: true
             text: qsTr("Latest")
             current: tabs.current === "latest"
             onClicked: tabs.picked("latest")
@@ -36,7 +47,7 @@ Item {
         Flickable {
             id: strip
             width: Math.max(0, Math.min(lensRow.width,
-                                        tabs.width - latest.width - fresh.width - tail.width - note.width - Style.u * 8))
+                                        tabs.width - home.width - latest.width - fresh.width - tail.width - note.width - Style.u * 8))
             height: Style.control
             contentWidth: lensRow.width
             clip: true
@@ -54,6 +65,7 @@ Item {
                         // A lens can be a long sentence; its tab is the start of it.
                         text: modelData.text.length > 26 ? modelData.text.slice(0, 25) + "\u2026" : modelData.text
                         glyph: "qrc:/icons/lens.svg"
+                        underlined: true
                         current: tabs.current === modelData.id
                         onClicked: tabs.picked(modelData.id)
                     }

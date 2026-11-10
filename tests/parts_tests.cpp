@@ -187,7 +187,9 @@ private slots:
                     "  SectionHead { width: 300; text: \"d\"; Act { text: \"e\" } }  Tip { text: \"f\"; shown: true }  Rule { width: 100 } }");
         QVERIFY2(stage.item, qPrintable(stage.error));
         const QString family = stage.style("font").toString();
-        QCOMPARE(family, QString("monospace"));
+        // The desktop's interface typeface, as the theme has it.
+        QVERIFY(!family.isEmpty());
+        QCOMPARE(family, stage.theme->uiFamily());
         int texts = 0;
         for (QQuickItem *child : stage.item->findChildren<QQuickItem *>()) {
             if (!child->property("font").isValid())

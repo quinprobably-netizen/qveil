@@ -33,7 +33,6 @@
         <file alias="BusyLine.qml">BusyLine.qml</file>
         <file alias="Frost.qml">Frost.qml</file>
         <file alias="HomePage.qml">HomePage.qml</file>
-        <file alias="ResumeRow.qml">ResumeRow.qml</file>
         <file alias="FeedTabs.qml">FeedTabs.qml</file>
         <file alias="Linkify.js">Linkify.js</file>
         <file alias="PlayerSurface.qml">PlayerSurface.qml</file>
@@ -54,6 +53,8 @@
         <file alias="SettingsPage.qml">SettingsPage.qml</file>
         <file alias="ChannelsPage.qml">ChannelsPage.qml</file>
         <file alias="ResumeNotice.qml">ResumeNotice.qml</file>
+        <file alias="Shelf.qml">Shelf.qml</file>
+        <file alias="ShelvesHome.qml">ShelvesHome.qml</file>
         <file alias="Format.js">Format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="icons/play.svg">icons/play.svg</file>

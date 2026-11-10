@@ -42,7 +42,7 @@ Flickable {
             color: Style.fg
             font.family: Style.font
             font.pixelSize: Style.head
-            font.bold: true
+            font.weight: Style.strong
         }
 
         SectionHead { width: parent.width; text: qsTr("Route") }
@@ -50,16 +50,6 @@ Flickable {
             id: chooser
             width: parent.width
         }
-        Repeater {
-            model: backend.privacy.points
-            delegate: Notice {
-                required property string modelData
-                width: column.width
-                text: modelData
-                color: Style.faint
-            }
-        }
-
         SectionHead { width: parent.width; text: qsTr("History") }
         Row {
             spacing: 2
@@ -163,6 +153,17 @@ Flickable {
             spacing: 2
             TabWord { objectName: "shorts-hidden"; text: qsTr("Hidden"); current: !page.shorts; onClicked: page.shortsPicked(false) }
             TabWord { objectName: "shorts-shown"; text: qsTr("In the feed"); current: page.shorts; onClicked: page.shortsPicked(true) }
+        }
+
+        // What the engine says about what it does and keeps, sentence by sentence.
+        SectionHead { width: parent.width; text: qsTr("Privacy") }
+        Repeater {
+            model: backend.privacy.points
+            delegate: Notice {
+                required property string modelData
+                width: column.width
+                text: modelData
+            }
         }
 
         SectionHead { width: parent.width; text: qsTr("File") }
