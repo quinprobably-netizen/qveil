@@ -179,11 +179,13 @@ Item {
             anchors.top: meta.bottom
             anchors.topMargin: 2
             width: parent.width
-            visible: card.why.length > 0
+            // (Whether it is worth saying is the view's to tell: on every
+            // card the same, it says nothing.)
+            visible: card.view.reasons && card.why.length > 0
             text: card.why.join("  ·  ")
             textFormat: Text.PlainText
             elide: Text.ElideRight
-            color: Style.accent
+            color: card.view.loudReasons ? Style.accent : Style.dim
             font.family: Style.font
             font.pixelSize: Style.small
         }

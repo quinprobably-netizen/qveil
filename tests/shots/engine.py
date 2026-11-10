@@ -141,7 +141,7 @@ def topic_groups():
     def found(prefix, phrase, names):
         return [{"id": "%s%07d" % (prefix, i), "title": "%s, number %d" % (phrase, i + 1), "channel": names[i % len(names)],
                  "channel_id": "UCzzzzzzzzzzzzzzzzzzzzz%d" % (i % len(names)), "published": NOW - (i + 1) * DAY,
-                 "duration": 900 + 300 * i, "views": 1000 * (i + 1), "why": [phrase]} for i in range(8)]
+                 "duration": 900 + 300 * i, "views": 1000 * (i + 1), "why": [phrase if i % 2 == 0 else phrase + " restoration"]} for i in range(8)]
     groups = [
         {"id": "aa11bb22cc33", "label": "hand plane, dovetail", "channels": ["Northlight Woodworks", "Kiln Notes"],
          "searches": ["hand plane", "dovetail"], "videos": found("tpw", "hand plane", ["Quiet Bench", "Old Iron", "Shavings"])},

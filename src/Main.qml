@@ -59,7 +59,8 @@ ApplicationWindow {
                                     channels: subsPage, history: historyPage,
                                     lenses: lensesPage, settings: settingsPage })
     // The bar marks where you are; a channel's page belongs to where you came from.
-    readonly property string place: page === "channel" || page === "search" ? returnPage : page
+    readonly property string place: page === "search" || (page === "channel" && channelFrom === "search") ? ""
+        : page === "channel" ? returnPage : page
 
     Settings {
         id: prefs

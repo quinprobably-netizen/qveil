@@ -14,6 +14,8 @@ Rectangle {
     property bool quiet: false
     // The one thing to do here: in the accent.
     property bool primary: false
+    // A mark after the word (a control that opens something has one).
+    property string trailing
     // Whether the keyboard's cursor is on it.
     property bool marked: false
     property string tip
@@ -58,6 +60,15 @@ Rectangle {
             font.family: Style.font
             font.pixelSize: Style.body
             font.weight: act.primary ? Style.strong : Font.Normal
+        }
+        Text {
+            anchors.verticalCenter: parent.verticalCenter
+            visible: text !== ""
+            text: act.trailing
+            textFormat: Text.PlainText
+            color: Style.faint
+            font.family: Style.font
+            font.pixelSize: Style.small
         }
     }
 

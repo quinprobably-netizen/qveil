@@ -833,7 +833,10 @@ private slots:
         QCOMPARE(app.page(), QString("search"));
         QTRY_VERIFY(app.item("reading-tags")->isVisible());
         QCOMPARE(app.item("reading-tags")->property("count").toInt(), 2);
-        QTRY_VERIFY(!app.items("card-why").isEmpty());
+        // Every result is there for the one reason, which the tags above already say:
+        // it isn't repeated under each card.
+        QTRY_VERIFY(app.item("searchPage")->property("grid").value<QQuickItem *>()->property("count").toInt() > 0);
+        QVERIFY(app.items("card-why").isEmpty());
         QQuickItem *keep = app.item("keep-lens");
         QVERIFY(keep && keep->isVisible());
         app.click(keep);
@@ -2008,6 +2011,70 @@ private slots:
         // Enter opens the channel's own page (which does ask).
         QTest::keyClick(app.window, Qt::Key_Return);
         QTRY_COMPARE(app.page(), QString("channel"));
+    }
+
+    void theSmallCorrectionsFromTheCouncil()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(1280, 1900));
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelf-aaaa0001") && app.item("shelf-aaaa0002"));
+        QTRY_VERIFY(App::count(app.item("shelf-aaaa0002"), "card") >= 4);
+        QTRY_VERIFY(App::count(app.item("shelf-aaaa0001"), "card") >= 4);
+        const auto reasons = [&](const char *shelf) {
+            QList<QQuickItem *> found;
+            App::collect(app.item(shelf), "card-why", found);
+            return found;
+        };
+        // Why a video is there is said only where it differs from card to card, and quietly;
+        // how much of a video is left keeps the accent.
+        QVERIFY(reasons("shelf-aaaa0001").isEmpty());
+        QVERIFY(!reasons("shelf-aaaa0002").isEmpty());
+        const QColor accent(app.theme->accent());
+        QVERIFY(reasons("shelf-aaaa0002").first()->property("color").value<QColor>() != accent);
+        QVERIFY(!reasons("shelf-resume").isEmpty());
+        QCOMPARE(reasons("shelf-resume").first()->property("color").value<QColor>(), accent);
+        // The sort control is a quiet word with a mark that it opens.
+        QQuickItem *sort = App::under(app.item("shelf-latest"), "shelf-sort");
+        QVERIFY(!sort->property("filled").toBool());
+        QCOMPARE(sort->property("trailing").toString(), QString("\u25be"));
+
+        // On search results no place is marked in the bar; nor on a channel opened from them.
+        QMetaObject::invokeMethod(app.item("search"), "edit");
+        app.type("rust");
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.page(), QString("search"));
+        for (const char *name : {"nav-home", "nav-lenses", "nav-channels", "nav-history"})
+            QVERIFY2(!app.item(name)->property("current").toBool(), name);
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+        QVERIFY(!app.item("nav-home")->property("current").toBool());
+        // A channel opened from home is still under Home.
+        QTest::keyClick(app.window, Qt::Key_1);
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+        QVERIFY(app.item("nav-home")->property("current").toBool());
+
+        // With the history off, its page shows what is kept all the same: the unfinished videos.
+        QTest::keyClick(app.window, Qt::Key_4);
+        QTRY_COMPARE(app.items("history-kept").size(), 3);
+        QCOMPARE(app.item("history-kept-note")->property("text").toString(),
+                 app.backend->privacy().value("pages").toMap().value("resume").toString());
+        app.click(App::under(app.items("history-kept").first(), "history-forget"));
+        QTRY_COMPARE(app.asked("POST api/resume/rm"), 1);
+        QTRY_COMPARE(app.items("history-kept").size(), 2);
+
+        // Words and places.
+        QTest::keyClick(app.window, Qt::Key_1);
+        app.seeAll();
+        QStringList said;
+        App::texts(app.item("feed-tabs"), said);
+        QVERIFY2(said.contains("Shorts: off"), qPrintable(said.join("|")));
+        QTest::keyClick(app.window, Qt::Key_5);
+        QQuickItem *forget = app.item("forget-positions"), *note = app.item("set-resume-note");
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        QVERIFY(forget->isVisible());
+        QVERIFY2(box(forget).top() >= box(note).bottom() - 1, qPrintable(QString::number(box(forget).top())));
+        QCOMPARE(box(app.item("settings-title")).left(), 24.0);
     }
 
     // --- What the council found in the code. ---

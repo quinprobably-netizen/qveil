@@ -156,7 +156,7 @@ FocusScope {
                 }
                 Act {
                     visible: !page.onLens && !page.noChannels
-                    text: page.shorts ? qsTr("Shorts on") : qsTr("Shorts off")
+                    text: page.shorts ? qsTr("Shorts: on") : qsTr("Shorts: off")
                     quiet: true
                     tip: qsTr("Show or hide Shorts in the feed")
                     onClicked: page.shortsToggled(!page.shorts)

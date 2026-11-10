@@ -47,7 +47,7 @@ FocusScope {
     Column {
         id: cats
         x: Style.gutter
-        y: Style.u * 7
+        y: Style.u * 3
         width: 200
         spacing: 2
         focus: true
@@ -60,7 +60,7 @@ FocusScope {
         }
 
         Text {
-            leftPadding: Style.u * 3
+            objectName: "settings-title"
             bottomPadding: Style.u * 3
             text: qsTr("Settings")
             textFormat: Text.PlainText
@@ -165,12 +165,11 @@ FocusScope {
                     name: qsTr("Resume")
                     note: page.pages.resume || ""
                     noteName: "set-resume-note"
-                    Act {
+                    under: Act {
                         objectName: "forget-positions"
-                        anchors.verticalCenter: parent.verticalCenter
                         visible: backend.resume.length > 0
                         text: qsTr("Forget all positions")
-                        quiet: true
+                        filled: true
                         onClicked: backend.clearResume()
                     }
                     Choices {

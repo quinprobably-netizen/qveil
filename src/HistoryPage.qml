@@ -80,6 +80,77 @@ FocusScope {
             width: parent.width
             visible: page.on
         }
+        // Off, there is still something kept: where unfinished videos were
+        // stopped. It is said here, in the engine's words, and can be forgotten.
+        Notice {
+            objectName: "history-kept-note"
+            width: parent.width
+            visible: !page.on && backend.resume.length > 0
+            text: backend.privacy.pages.resume || ""
+        }
+        Column {
+            width: parent.width
+            visible: !page.on
+            Repeater {
+                model: page.on ? [] : backend.resume
+                delegate: Rectangle {
+                    id: kept
+                    required property var modelData
+                    objectName: "history-kept"
+                    width: parent.width
+                    height: 52
+                    color: keptArea.containsMouse ? Style.hover : "transparent"
+                    MouseArea {
+                        id: keptArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: page.playRequested({ id: kept.modelData.id, title: kept.modelData.title || "", channel: kept.modelData.channel || "" })
+                    }
+                    Column {
+                        anchors.left: parent.left
+                        anchors.leftMargin: Style.u * 3
+                        anchors.right: gone.left
+                        anchors.rightMargin: Style.u * 3
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 2
+                        Text {
+                            width: parent.width
+                            text: kept.modelData.title || ""
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            color: Style.fg
+                            font.family: Style.font
+                            font.pixelSize: Style.body
+                        }
+                        Text {
+                            width: parent.width
+                            text: [kept.modelData.channel || "", qsTr("%1 left").arg(Format.clock(Math.max(0, kept.modelData.dur - kept.modelData.pos)))]
+                                      .filter(s => s !== "").join("  ·  ")
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            color: Style.dim
+                            font.family: Style.font
+                            font.pixelSize: Style.small
+                        }
+                    }
+                    Act {
+                        id: gone
+                        objectName: "history-forget"
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: qsTr("Forget")
+                        quiet: true
+                        onClicked: backend.forgetResume(kept.modelData.id)
+                    }
+                    Rule {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                    }
+                }
+            }
+        }
     }
 
     // The history is asked for again when it has just been turned on.

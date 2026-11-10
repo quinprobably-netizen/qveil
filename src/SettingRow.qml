@@ -14,6 +14,8 @@ Rectangle {
     property string would
     property string wouldName
     default property alias control: slot.data
+    // What goes under the notes.
+    property alias under: below.data
 
     implicitHeight: Math.max(words.height, slot.height) + Style.u * 7
     color: Style.rest
@@ -43,6 +45,10 @@ Rectangle {
             objectName: row.noteName
             width: parent.width
             text: row.note
+        }
+        Row {
+            id: below
+            topPadding: children.length > 0 && visibleChildren.length > 0 ? Style.u : 0
         }
         Notice {
             objectName: row.wouldName

@@ -170,7 +170,15 @@ Item {
         readonly property var progress: shelf.progress
         readonly property string estimateNote: shelf.estimateNote
         // The cards have a line saying why they are there when their videos do.
-        readonly property bool reasons: shelf.entries.length > 0 && (shelf.entries[0].why || []).length > 0
+        // (When they have reasons, and not all the same one; what is left
+        // of a video is always worth saying, and keeps the accent.)
+        readonly property bool loudReasons: shelf.key === "resume"
+        readonly property bool reasons: {
+            const all = shelf.entries.map(v => (v.why || []).join("|"))
+            if (loudReasons)
+                return all.some(w => w !== "")
+            return all.some(w => w !== all[0])
+        }
         signal channelRequested(string id)
         function pick(i) { shelf.activated(shelf.entries[i], i) }
         function pointed(at) { shelf.pointed(at) }

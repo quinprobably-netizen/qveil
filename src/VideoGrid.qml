@@ -35,7 +35,20 @@ GridView {
     readonly property int gutter: Style.gutter - Style.u * 2
     readonly property int columns: Math.max(1, Math.floor((width - 2 * gutter) / 280))
     // Whether the cards have a line saying why they are there.
-    readonly property bool reasons: count > 0 && ((at(0).why || []).length > 0)
+    // Whether the cards have a line saying why they are there: when they
+    // have reasons, and not all the same one (which the page already says).
+    readonly property bool reasons: {
+        let first = null
+        for (let i = 0; i < count; i++) {
+            const why = (at(i).why || []).join("|")
+            if (first === null)
+                first = why
+            else if (why !== first)
+                return true
+        }
+        return false
+    }
+    readonly property bool loudReasons: false
 
     leftMargin: gutter
     rightMargin: gutter
