@@ -917,7 +917,7 @@ private slots:
         QQmlEngine qml;
         qml.rootContext()->setContextProperty("backend", &backend);
         qml.rootContext()->setContextProperty("theme", &theme);
-        QQmlComponent component(&qml, QUrl::fromLocalFile(QString(SRCDIR) + "/PlayerView.qml"));
+        QQmlComponent component(&qml, QUrl::fromLocalFile(QString(SRCDIR) + "/PlayerSurface.qml"));
         QScopedPointer<QObject> player(component.create());
         QVERIFY2(player, qPrintable(component.errorString()));
         QSignalSpy closed(player.data(), SIGNAL(closed()));

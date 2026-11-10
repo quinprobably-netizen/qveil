@@ -12,7 +12,7 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 500
     visible: true
-    title: player.active && player.info.title ? player.info.title + " \u00b7 qveil" : "qveil"
+    title: watch.active && watch.info.title ? watch.info.title + " \u00b7 qveil" : "qveil"
     color: Style.bg
 
     // The pages that are not redrawn yet still use Material controls.
@@ -29,7 +29,9 @@ ApplicationWindow {
     property bool started: false
     readonly property bool fullscreen: visibility === Window.FullScreen
     // Whether a video has the window.
-    readonly property bool watching: player.active
+    readonly property bool watching: watch.active
+    // The player, wherever it is shown.
+    readonly property var player: watch.surface
     // Before the first subscription there is nothing to refresh or filter. Both
     // counts must say so, so a loading window doesn't flash the controls away.
     readonly property bool noSubs: backend.feedInfo.channels === 0 && backend.subs.length === 0
@@ -75,8 +77,8 @@ ApplicationWindow {
     function go(p) {
         if (!pages[p])
             return
-        if (player.active)
-            player.close()
+        if (watch.active)
+            watch.close()
         if (p !== "channel" && p !== "search")
             returnPage = p
         // What was typed in the search field belongs to the search page only.
@@ -106,8 +108,8 @@ ApplicationWindow {
     function openChannel(id) {
         if (!id)
             return
-        if (player.active)
-            player.close()
+        if (watch.active)
+            watch.close()
         if (page !== "channel" && page !== "search")
             returnPage = page
         search.text = ""
@@ -149,15 +151,20 @@ ApplicationWindow {
     function play(video, list, index) {
         playList = list || null
         playIndex = list ? index : -1
-        player.prepare(video)
+        watch.prepare(video)
+        watch.forceActiveFocus()
         backend.play(video.id)
     }
 
-    // Over a video the route popup hangs from the rail, which is hidden
-    // while the video has the window: bring the controls back first.
+    // Puts `text` on the clipboard. (Only a text item can.)
+    function copy(text) {
+        clipboard.text = text
+        clipboard.selectAll()
+        clipboard.copy()
+        clipboard.text = ""
+    }
+
     function openRoute() {
-        if (player.active)
-            player.reveal()
         route.open()
     }
 
@@ -182,8 +189,10 @@ ApplicationWindow {
             route.close()
         else if (fullscreen)
             showNormal()
-        else if (player.active)
-            player.close()
+        else if (watch.active && watch.theatre)
+            watch.theatre = false
+        else if (watch.active)
+            watch.close()
         else if (typing)
             focusPage(page)
         else if (page === "channel" || page === "search")
@@ -210,10 +219,10 @@ ApplicationWindow {
         // The engine ends the streams of the old route, so the player has
         // nothing left to play, and must not stay up as if it had.
         function onRouteChanged() {
-            if (player.active)
-                player.close()
+            if (watch.active)
+                watch.close()
         }
-        function onPlayReady(info) { player.open(info) }
+        function onPlayReady(info) { watch.open(info) }
         function onNotice(text) { toast.show(text) }
     }
 
@@ -223,22 +232,28 @@ ApplicationWindow {
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.goBack() }
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: help.opened ? help.close() : help.open() }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: Qt.quit() }
-    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: player.active ? player.mpv.togglePause() : win.playCurrent() }
+    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.watching ? player.mpv.togglePause() : win.playCurrent() }
     Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("home") }
     Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("lenses") }
     Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("channels") }
     Shortcut { sequence: "4"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("history") }
     Shortcut { sequence: "5"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("settings") }
-    Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !win.typing && !player.active; onActivated: win.refresh() }
+    Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.watching; onActivated: win.refresh() }
     Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.toggleRoute() }
-    Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: win.toggleFullscreen() }
-    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: player.mpv.muted = !player.mpv.muted }
-    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
-    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(5, true); player.reveal() } }
-    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(-10, true); player.reveal() } }
-    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(10, true); player.reveal() } }
-    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
-    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
+    Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: win.toggleFullscreen() }
+    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.mpv.muted = !player.mpv.muted }
+    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
+    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(5, true); player.reveal() } }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(-10, true); player.reveal() } }
+    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(10, true); player.reveal() } }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
+    Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.theatre = !watch.theatre }
+    Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { watch.theatre = false; watch.sheet.current = "comments" } }
+    Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.chapterStep(false) }
+    Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.chapterStep(true) }
+    Shortcut { sequence: "<"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.speedStep(false) }
+    Shortcut { sequence: ">"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.speedStep(true) }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
 
     // Mirrors for right-to-left languages. A top-level window ignores the
     // application's layout direction.
@@ -247,32 +262,14 @@ ApplicationWindow {
         LayoutMirroring.enabled: Qt.application.layoutDirection === Qt.RightToLeft
         LayoutMirroring.childrenInherit: true
 
-        // The player owns the whole window while a video is open, so it is
-        // the bottom layer: the rail and the pages above it are hidden then.
-        PlayerView {
-            id: player
-            anchors.fill: parent
-            topInset: errorBar.visible ? errorBar.height : 0
-            // The controls stay while something outside the player is in use.
-            hold: win.typing || route.opened || help.opened
-            savedVolume: prefs.volume
-            onSavedVolumeChanged: prefs.volume = savedVolume
-            onClosed: {
-                if (win.fullscreen)
-                    win.showNormal()
-                Qt.callLater(() => win.focusPage(win.page))
-            }
-            onChannelRequested: id => win.openChannel(id)
-            onFullscreenToggled: win.toggleFullscreen()
-        }
-
         Rail {
             id: rail
             anchors.left: parent.left
             anchors.top: parent.top
             anchors.bottom: parent.bottom
-            visible: !player.active
-            current: win.place
+            // In fullscreen the video has the whole window.
+            visible: !(win.watching && win.fullscreen)
+            current: win.watching ? "" : win.place
             route: backend.config.route || "direct"
             routeSummary: backend.privacy.summary
             onPicked: place => win.go(place)
@@ -324,7 +321,7 @@ ApplicationWindow {
                 anchors.rightMargin: Style.gutter
                 anchors.topMargin: Style.u * 5
                 spacing: Style.u * 2
-                visible: !player.active
+                visible: !win.watching
 
                 FindField {
                     id: search
@@ -357,7 +354,7 @@ ApplicationWindow {
                     id: feedPage
                     objectName: "feedPage"
                     anchors.fill: parent
-                    visible: win.page === "home" && !player.active
+                    visible: win.page === "home" && !win.watching
                     focus: visible
                     thumbs: win.thumbs
                     shorts: prefs.showShorts
@@ -378,7 +375,7 @@ ApplicationWindow {
                     id: searchPage
                     objectName: "searchPage"
                     anchors.fill: parent
-                    visible: win.page === "search" && !player.active
+                    visible: win.page === "search" && !win.watching
                     thumbs: win.thumbs
                     progress: win.watched
                     heading: backend.query ? qsTr("\u201c%1\u201d").arg(backend.query) : qsTr("Search")
@@ -394,7 +391,7 @@ ApplicationWindow {
                 VideoPage {
                     id: channelPage
                     anchors.fill: parent
-                    visible: win.page === "channel" && !player.active
+                    visible: win.page === "channel" && !win.watching
                     thumbs: win.thumbs
                     progress: win.watched
                     heading: backend.channel.name || ""
@@ -422,15 +419,41 @@ ApplicationWindow {
                 SubsPage {
                     id: subsPage
                     anchors.fill: parent
-                    visible: win.page === "channels" && !player.active
+                    visible: win.page === "channels" && !win.watching
                     onChannelRequested: id => win.openChannel(id)
                 }
 
                 HistoryPage {
                     id: historyPage
                     anchors.fill: parent
-                    visible: win.page === "history" && !player.active
+                    visible: win.page === "history" && !win.watching
                     onPlayRequested: video => win.play(video)
+                }
+
+                WatchPage {
+                    id: watch
+                    anchors.fill: parent
+                    visible: active
+                    list: win.playList
+                    index: win.playIndex
+                    thumbs: win.thumbs
+                    full: win.fullscreen
+                    hold: route.opened || help.opened
+                    savedVolume: prefs.volume
+                    onSavedVolumeChanged: prefs.volume = savedVolume
+                    onClosed: {
+                        if (win.fullscreen)
+                            win.showNormal()
+                        theatre = false
+                        Qt.callLater(() => win.focusPage(win.page))
+                    }
+                    onChannelRequested: id => win.openChannel(id)
+                    onVideoRequested: (video, list, index) => win.play(video, list, index)
+                    onFullscreenToggled: win.toggleFullscreen()
+                    onCopied: text => {
+                        win.copy(text)
+                        toast.show(qsTr("Link copied. qveil doesn't open browsers."))
+                    }
                 }
 
                 // Lenses and settings are drawn by the tasks that add them.
@@ -438,13 +461,13 @@ ApplicationWindow {
                     id: lensesPage
                     objectName: "page-lenses"
                     anchors.fill: parent
-                    visible: win.page === "lenses" && !player.active
+                    visible: win.page === "lenses" && !win.watching
                 }
                 Item {
                     id: settingsPage
                     objectName: "page-settings"
                     anchors.fill: parent
-                    visible: win.page === "settings" && !player.active
+                    visible: win.page === "settings" && !win.watching
                 }
 
                 // A thin line along the top of the page while anything is
@@ -459,13 +482,19 @@ ApplicationWindow {
                     anchors.top: parent.top
                     indeterminate: !(backend.refreshTotal > 0 && tasks.length === 1 && tasks[0] === "feed")
                     value: backend.refreshTotal > 0 ? backend.refreshDone / backend.refreshTotal : 0
-                    visible: !player.active && tasks.length > 0
+                    visible: !win.watching && tasks.length > 0
                 }
             }
         }
 
+        TextEdit {
+            id: clipboard
+            visible: false
+        }
+
         Toast {
             id: toast
+            objectName: "toast"
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
             anchors.bottomMargin: Style.gutter

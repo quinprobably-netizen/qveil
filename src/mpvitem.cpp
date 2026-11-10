@@ -174,7 +174,7 @@ MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_mpv(mp
         {"demuxer-cache-time", MPV_FORMAT_DOUBLE}, {"pause", MPV_FORMAT_FLAG},
         {"paused-for-cache", MPV_FORMAT_FLAG}, {"seeking", MPV_FORMAT_FLAG},
         {"eof-reached", MPV_FORMAT_FLAG},      {"volume", MPV_FORMAT_DOUBLE},
-        {"mute", MPV_FORMAT_FLAG},
+        {"mute", MPV_FORMAT_FLAG},             {"speed", MPV_FORMAT_DOUBLE},
     };
     for (const auto &[name, format] : observed)
         mpv_observe_property(m_mpv, 0, name, format);
@@ -270,6 +270,11 @@ void MpvItem::setVolume(double volume) {
     mpv_set_property(m_mpv, "volume", MPV_FORMAT_DOUBLE, &volume);
 }
 
+void MpvItem::setSpeed(double speed) {
+    speed = qBound(0.25, speed, 3.0);
+    mpv_set_property(m_mpv, "speed", MPV_FORMAT_DOUBLE, &speed);
+}
+
 void MpvItem::setMuted(bool muted) {
     int flag = muted;
     mpv_set_property(m_mpv, "mute", MPV_FORMAT_FLAG, &flag);
@@ -314,6 +319,8 @@ void MpvItem::onProperty(const mpv_event_property *p) {
         update(m_volume, number, &MpvItem::volumeChanged, this);
     else if (name == "mute")
         update(m_muted, flag, &MpvItem::mutedChanged, this);
+    else if (name == "speed" && has)
+        update(m_speed, number, &MpvItem::speedChanged, this);
 }
 
 void MpvItem::handleEvents() {

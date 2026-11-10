@@ -6,7 +6,6 @@
         <file alias="VideoCard.qml">VideoCard.qml</file>
         <file alias="VideoGrid.qml">VideoGrid.qml</file>
         <file alias="VideoPage.qml">VideoPage.qml</file>
-        <file alias="PlayerView.qml">PlayerView.qml</file>
         <file alias="RoutePopup.qml">RoutePopup.qml</file>
         <file alias="QuietList.qml">QuietList.qml</file>
         <file alias="QuietRow.qml">QuietRow.qml</file>
@@ -40,6 +39,13 @@
         <file alias="HomePage.qml">HomePage.qml</file>
         <file alias="ResumeRow.qml">ResumeRow.qml</file>
         <file alias="FeedTabs.qml">FeedTabs.qml</file>
+        <file alias="Linkify.js">Linkify.js</file>
+        <file alias="PlayerSurface.qml">PlayerSurface.qml</file>
+        <file alias="SeekBar.qml">SeekBar.qml</file>
+        <file alias="SideSheet.qml">SideSheet.qml</file>
+        <file alias="AboutTab.qml">AboutTab.qml</file>
+        <file alias="UpNextTab.qml">UpNextTab.qml</file>
+        <file alias="WatchPage.qml">WatchPage.qml</file>
         <file alias="Format.js">Format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="icons/play.svg">icons/play.svg</file>

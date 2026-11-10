@@ -1,3 +1,5 @@
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
 #include <QNetworkReply>
@@ -121,6 +123,28 @@ struct App {
             QTest::keyClick(window, *c);
     }
     QString page() const { return window->property("page").toString(); }
+
+    // Opens `video` the way a card does, from no list.
+    void play(const QVariantMap &video) const
+    {
+        QMetaObject::invokeMethod(window, "play", Q_ARG(QVariant, video), Q_ARG(QVariant, QVariant()), Q_ARG(QVariant, -1));
+    }
+    // What every piece of text that is showing under `root` says.
+    static void texts(QQuickItem *root, QStringList &found)
+    {
+        if (!root->isVisible())
+            return;
+        if (root->property("text").isValid() && root->property("font").isValid())
+            found << root->property("text").toString();
+        for (QQuickItem *child : root->childItems())
+            texts(child, found);
+    }
+    static int count(QQuickItem *root, const QString &name)
+    {
+        QList<QQuickItem *> found;
+        collect(root, name, found);
+        return found.size();
+    }
 
     // What the engine was asked so far: "GET api/feed?stream=1", …
     QStringList asked()
@@ -347,6 +371,145 @@ private slots:
     {
         for (const char *file : {":/DyeWash.qml", ":/Wordmark.qml", ":/shaders/dye.frag.qsb"})
             QVERIFY2(!QFile::exists(file), file);
+    }
+
+    void openingAVideoShowsTheWatchPageWithItsDetails()
+    {
+        App app;
+        READY(app);
+        QQuickItem *watch = app.item("watch");
+        QVERIFY(watch);
+        QVERIFY(!watch->isVisible());
+        app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}, {"channel", "Northlight Woodworks"}});
+        // At once, with what the card knew; the rest comes with the engine's answer.
+        QVERIFY(watch->isVisible());
+        QVERIFY(app.window->property("watching").toBool());
+        QCOMPARE(app.item("watch-title")->property("text").toString(), QString("A dovetail box with four hand tools"));
+        QTRY_VERIFY(app.item("watch-about")->property("text").toString().contains("The error everyone hits"));
+        QTRY_COMPARE(App::count(app.item("seek"), "segment"), 7);
+        QVERIFY(app.item("watch-stats")->property("text").toString().contains("59K views"));
+        QVERIFY(app.item("seek-chapter")->property("text").toString().startsWith("1/7"));
+        // The rail is still there, and the search field has made room.
+        QVERIFY(app.item("rail-home")->isVisible());
+        QVERIFY(!app.item("search")->isVisible());
+
+        // Escape goes back to where the video was opened from.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!watch->isVisible());
+        QCOMPARE(app.page(), QString("home"));
+        QVERIFY(app.item("search")->isVisible());
+    }
+
+    void aVideoWithNothingButStreamsStillLooksWhole()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "bare0000001"}});
+        QQuickItem *watch = app.item("watch");
+        QTRY_COMPARE(app.item("watch-title")->property("text").toString(), QString("A video with nothing but streams"));
+        QCOMPARE(App::count(app.item("seek"), "segment"), 1);
+        QVERIFY(!app.item("seek-chapter")->isVisible());
+        QVERIFY(!app.item("watch-stats")->isVisible());
+        app.click(app.item("tab-about"));
+        QVERIFY(app.items("chapter").isEmpty());
+        QStringList said;
+        App::texts(watch, said);
+        QVERIFY(said.size() > 3);
+        for (const QString &text : said)
+            QVERIFY2(!text.contains("undefined") && !text.contains("NaN") && !text.contains("null"), qPrintable(text));
+    }
+
+    void aKeptPositionIsResumedAndCanBeStartedOver()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000001"}, {"title", "Why the borrow checker says no"}});
+        QQuickItem *surface = app.item("surface");
+        QVERIFY(surface);
+        QTRY_COMPARE(surface->property("startedAt").toInt(), 845);
+        QQuickItem *resumed = app.item("resumed");
+        QVERIFY(resumed && resumed->isVisible());
+        QVERIFY(resumed->property("text").toString().contains("14:05"));
+        QCOMPARE(surface->property("lastSeek").toInt(), -1);
+        app.click(app.item("start-over"));
+        QCOMPARE(surface->property("lastSeek").toInt(), 0);
+        QVERIFY(!resumed->isVisible());
+
+        // A video nothing is remembered of starts at the start, and says nothing.
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        QCOMPARE(surface->property("startedAt").toInt(), 0);
+        QVERIFY(!resumed->isVisible());
+    }
+
+    void chaptersAndTheListItCameFromAreInTheSheet()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.items("card").size() >= 4);
+        // Opened from the feed's second card: what comes next is the rest of the feed.
+        app.click(app.items("card").at(1));
+        QQuickItem *surface = app.item("surface");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        app.click(app.item("tab-about"));
+        QTRY_COMPARE(app.items("chapter").size(), 7);
+        app.click(app.items("chapter").at(2));
+        QCOMPARE(surface->property("lastSeek").toInt(), 760);
+
+        app.click(app.item("tab-next"));
+        QTRY_VERIFY(!app.items("next-entry").isEmpty());
+        QCOMPARE(app.items("next-entry").first()->property("title").toString(), QString("The 1970s synth that refuses to stay in tune"));
+        app.click(app.items("next-entry").first());
+        QTRY_COMPARE(app.item("watch-title")->property("text").toString(), QString("The 1970s synth that refuses to stay in tune"));
+        // Nothing was asked of the engine for the list: it was already here.
+        QCOMPARE(app.asked("GET api/feed"), 2);
+    }
+
+    void theSheetMovesUnderTheVideoInANarrowWindow()
+    {
+        {
+            App app;
+            READY(app);
+            app.play({{"id", "vid00000002"}});
+            QQuickItem *sheet = app.item("sheet"), *surface = app.item("surface");
+            QVERIFY(sheet && surface);
+            QTRY_VERIFY(sheet->mapToScene(QPointF(0, 0)).x() >= surface->mapToScene(QPointF(surface->width(), 0)).x());
+            QVERIFY(sheet->mapToScene(QPointF(sheet->width(), 0)).x() <= 1280);
+            // Theatre: the video takes the width, and the sheet steps aside.
+            QTest::keyClick(app.window, Qt::Key_T);
+            QTRY_VERIFY(!sheet->isVisible());
+            QVERIFY(surface->width() > 1000);
+        }
+        App app(false, QSize(950, 600));
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QQuickItem *sheet = app.item("sheet"), *about = app.item("watch-about"), *surface = app.item("surface");
+        QVERIFY(sheet && about && surface);
+        QTRY_VERIFY(sheet->mapToScene(QPointF(0, 0)).y() >= about->mapToScene(QPointF(0, about->height())).y());
+        QVERIFY(surface->mapToScene(QPointF(surface->width(), 0)).x() <= 950);
+        QVERIFY(sheet->mapToScene(QPointF(sheet->width(), 0)).x() <= 950);
+    }
+
+    void aLinkInADescriptionLeadsBackIntoTheAppOrIsOnlyCopied()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QQuickItem *watch = app.item("watch"), *surface = app.item("surface");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        QMetaObject::invokeMethod(watch, "follow", Q_ARG(QVariant, "qveil:time/760"));
+        QCOMPARE(surface->property("lastSeek").toInt(), 760);
+        // Another site is never opened: its address goes to the clipboard, and the window says so.
+        QMetaObject::invokeMethod(watch, "follow", Q_ARG(QVariant, "qveil:copy/https%3A%2F%2Fexample.com%2Fa%3Fb%3D1"));
+        QCOMPARE(QGuiApplication::clipboard()->text(), QString("https://example.com/a?b=1"));
+        QTRY_VERIFY(app.item("toast")->isVisible());
+        // A video link plays that video here.
+        QMetaObject::invokeMethod(watch, "follow", Q_ARG(QVariant, "qveil:video/vid00000005"));
+        QTRY_COMPARE(app.item("watch-title")->property("text").toString(), QString("Crossing the Pamir on a steel bike, part 3"));
+        // Anything else is not followed at all.
+        QMetaObject::invokeMethod(watch, "follow", Q_ARG(QVariant, "https://example.com/"));
+        QMetaObject::invokeMethod(watch, "follow", Q_ARG(QVariant, "javascript:alert(1)"));
+        QCOMPARE(app.page(), QString("home"));
     }
 };
 

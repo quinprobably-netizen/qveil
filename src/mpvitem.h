@@ -45,6 +45,8 @@ class MpvItem : public QQuickFramebufferObject {
     Q_PROPERTY(bool started READ started NOTIFY startedChanged)
     Q_PROPERTY(double volume READ volume WRITE setVolume NOTIFY volumeChanged)
     Q_PROPERTY(bool muted READ muted WRITE setMuted NOTIFY mutedChanged)
+    // How fast it plays: 1 is as recorded.
+    Q_PROPERTY(double speed READ speed WRITE setSpeed NOTIFY speedChanged)
     // What mpv paints where there is no video: before the first frame and in
     // the letterbox. It has to be the scene's own colour behind the item.
     Q_PROPERTY(QColor backgroundColor READ backgroundColor WRITE setBackgroundColor NOTIFY backgroundColorChanged)
@@ -72,6 +74,8 @@ public:
     bool muted() const { return m_muted; }
     void setVolume(double volume);
     void setMuted(bool muted);
+    double speed() const { return m_speed; }
+    void setSpeed(double speed);
     QColor backgroundColor() const { return m_background; }
     void setBackgroundColor(const QColor &color);
 
@@ -86,6 +90,7 @@ signals:
     void startedChanged();
     void volumeChanged();
     void mutedChanged();
+    void speedChanged();
     void backgroundColorChanged();
     void failed(const QString &message);
 
@@ -99,7 +104,7 @@ private:
 
     mpv_handle *m_mpv = nullptr;
     std::shared_ptr<MpvShared> m_shared;
-    double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100;
+    double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100, m_speed = 1;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false, m_started = false;
     QColor m_background = Qt::black;
