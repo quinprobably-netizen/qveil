@@ -2,14 +2,10 @@
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
         <file alias="EmptyState.qml">EmptyState.qml</file>
-        <file alias="SearchBox.qml">SearchBox.qml</file>
         <file alias="VideoCard.qml">VideoCard.qml</file>
         <file alias="VideoGrid.qml">VideoGrid.qml</file>
         <file alias="VideoPage.qml">VideoPage.qml</file>
         <file alias="RoutePopup.qml">RoutePopup.qml</file>
-        <file alias="QuietList.qml">QuietList.qml</file>
-        <file alias="QuietRow.qml">QuietRow.qml</file>
-        <file alias="SubsPage.qml">SubsPage.qml</file>
         <file alias="HistoryPage.qml">HistoryPage.qml</file>
         <file alias="HelpOverlay.qml">HelpOverlay.qml</file>
         <file alias="Style.qml">Style.qml</file>
@@ -53,6 +49,10 @@
         <file alias="LensesPage.qml">LensesPage.qml</file>
         <file alias="PipWindow.qml">PipWindow.qml</file>
         <file alias="NowPlayingBar.qml">NowPlayingBar.qml</file>
+        <file alias="Notice.qml">Notice.qml</file>
+        <file alias="RouteChooser.qml">RouteChooser.qml</file>
+        <file alias="SettingsPage.qml">SettingsPage.qml</file>
+        <file alias="ChannelsPage.qml">ChannelsPage.qml</file>
         <file alias="Format.js">Format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="icons/play.svg">icons/play.svg</file>

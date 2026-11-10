@@ -1,4 +1,6 @@
 #include <QClipboard>
+#include <QDirIterator>
+#include <QQuickStyle>
 #include <QGuiApplication>
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
@@ -834,6 +836,172 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!app.pip()->isVisible(), 2000);
         QVERIFY(!app.inPip("pip-surface")->property("active").toBool());
         QVERIFY(!app.item("now-playing")->isVisible());
+    }
+
+    void settingsChangeTheEngineAndUseItsWords()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_5);
+        QCOMPARE(app.page(), QString("settings"));
+        QVERIFY(app.item("rail-settings")->property("current").toBool());
+        const auto pages = [&] { return app.backend->privacy().value("pages").toMap(); };
+
+        // Resume: the days, and the engine's sentence for them.
+        QVERIFY(app.item("resume-7")->property("current").toBool());
+        QCOMPARE(app.item("set-resume-note")->property("text").toString(), pages().value("resume").toString());
+        app.click(app.item("resume-30"));
+        QTRY_COMPARE(app.backend->config().value("resumeDays").toInt(), 30);
+        QTRY_VERIFY(app.item("resume-30")->property("current").toBool());
+        QVERIFY(app.item("set-resume-note")->property("text").toString().contains("30 days"));
+        QCOMPARE(app.item("set-resume-note")->property("text").toString(), pages().value("resume").toString());
+        QVERIFY(!app.backend->resume().isEmpty());
+        app.click(app.item("resume-0"));
+        QTRY_COMPARE(app.backend->config().value("resumeDays").toInt(), 0);
+        QTRY_VERIFY(app.backend->resume().isEmpty());
+        QVERIFY(app.item("set-resume-note")->property("text").toString().startsWith("Off:"));
+
+        // History, quality, thumbnails and the route.
+        QCOMPARE(app.item("set-history-note")->property("text").toString(), pages().value("history_off").toString());
+        app.click(app.item("history-on"));
+        QTRY_VERIFY(app.backend->config().value("history").toBool());
+        QTRY_COMPARE(app.item("set-history-note")->property("text").toString(), pages().value("history_on").toString());
+        app.click(app.item("quality-720"));
+        QTRY_COMPARE(app.backend->config().value("maxHeight").toInt(), 720);
+        app.click(app.item("thumbs-clear"));
+        QCOMPARE(app.window->property("thumbs").toString(), QString("clear"));
+        app.click(app.item("thumbs-off"));
+        QTRY_VERIFY(!app.backend->config().value("thumbnails").toBool());
+        app.click(app.item("thumbs-frosted"));
+        QTRY_VERIFY(app.backend->config().value("thumbnails").toBool());
+        QCOMPARE(app.window->property("thumbs").toString(), QString("frosted"));
+        app.click(app.item("route-tor"));
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
+        QTRY_COMPARE(app.item("rail-route")->property("label").toString(), QString("Tor"));
+        QCOMPARE(app.item("route-note")->property("text").toString(),
+                 app.backend->privacy().value("routes").toMap().value("tor").toString());
+    }
+
+    void unsubscribingAndClearingAskOnce()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_3);
+        QTRY_COMPARE(app.items("channel-row").size(), 5);
+        QQuickItem *unsubscribe = App::under(app.items("channel-row").first(), "unsubscribe");
+        QVERIFY(unsubscribe);
+        app.hover(app.items("channel-row").first());
+        app.click(unsubscribe);
+        QCOMPARE(unsubscribe->property("text").toString(), QString("Unsubscribe?"));
+        QCOMPARE(app.asked("POST api/subs/rm"), 0);
+        app.click(unsubscribe);
+        QTRY_COMPARE(app.items("channel-row").size(), 4);
+        QCOMPARE(app.asked("POST api/subs/rm"), 1);
+        // The line about what subscriptions are is the engine's.
+        QCOMPARE(app.item("channels-note")->property("text").toString(),
+                 app.backend->privacy().value("pages").toMap().value("subscriptions").toString());
+
+        // History: off says so in the engine's words, and offers to turn it on.
+        QTest::keyClick(app.window, Qt::Key_4);
+        QCOMPARE(app.page(), QString("history"));
+        QCOMPARE(app.item("history-note")->property("text").toString(),
+                 app.backend->privacy().value("pages").toMap().value("history_off").toString());
+        app.click(app.item("history-turn-on"));
+        QTRY_COMPARE(app.items("history-row").size(), 4);
+        QQuickItem *clear = app.item("clear-history");
+        app.click(clear);
+        QCOMPARE(clear->property("text").toString(), QString("Clear history?"));
+        QCOMPARE(app.asked("POST api/history/clear"), 0);
+        app.click(clear);
+        QTRY_COMPARE(app.asked("POST api/history/clear"), 1);
+    }
+
+    void everyPageLoadsCleanInBothDirections()
+    {
+        for (const Qt::LayoutDirection direction : {Qt::LeftToRight, Qt::RightToLeft}) {
+            App app;
+            READY(app);
+            // (After the window is up: the translator sets the direction of
+            // its language when it is made.)
+            QGuiApplication::setLayoutDirection(direction);
+            const auto check = [&](const QString &where) {
+                QTest::qWait(250);
+                QStringList said;
+                App::texts(app.window->contentItem(), said);
+                QVERIFY2(said.size() > 3, qPrintable(where));
+                for (const QString &text : said)
+                    QVERIFY2(!text.contains("undefined") && !text.contains("NaN"), qPrintable(where + ": " + text));
+            };
+            for (const char *page : {"home", "lenses", "channels", "history", "settings"}) {
+                QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString(page)));
+                QCOMPARE(app.page(), QString(page));
+                check(page);
+            }
+            QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+            QCOMPARE(app.page(), QString("channel"));
+            check("channel");
+            QMetaObject::invokeMethod(app.item("search"), "edit");
+            app.type("rust");
+            QTest::keyClick(app.window, Qt::Key_Return);
+            check("search");
+            app.play({{"id", "vid00000002"}});
+            QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+            check("watch");
+            QTest::keyClick(app.window, Qt::Key_C);
+            QTRY_COMPARE(app.items("comment").size(), 5);
+            check("comments");
+            // The rail is on the side reading starts from.
+            const qreal railX = app.item("rail-home")->mapToScene(QPointF(0, 0)).x();
+            QVERIFY2(direction == Qt::LeftToRight ? railX < 100 : railX > 1100, qPrintable(QString::number(railX)));
+        }
+        QGuiApplication::setLayoutDirection(Qt::LeftToRight);
+    }
+
+    void noMaterialIsLeft()
+    {
+        QDirIterator files(":/", {"*.qml"}, QDir::Files, QDirIterator::Subdirectories);
+        int read = 0;
+        while (files.hasNext()) {
+            const QString name = files.next();
+            if (name.startsWith(":/qt") || name.startsWith(":/qt-project.org"))
+                continue;
+            QFile file(name);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const QString text = QString::fromUtf8(file.readAll());
+            ++read;
+            QVERIFY2(!text.contains("Controls.Material"), qPrintable(name));
+            QVERIFY2(!text.contains("Material."), qPrintable(name));
+        }
+        QVERIFY2(read > 30, qPrintable(QString::number(read)));
+        QCOMPARE(QQuickStyle::name(), QString("Basic"));
+    }
+
+    void theHelpListsEveryKeyTheWindowBinds()
+    {
+        App app;
+        READY(app);
+        QFile main(":/Main.qml");
+        QVERIFY(main.open(QIODevice::ReadOnly));
+        const QString source = QString::fromUtf8(main.readAll());
+        QStringList bound;
+        QRegularExpressionMatchIterator one = QRegularExpression("sequence: \"([^\"]+)\"").globalMatch(source);
+        while (one.hasNext())
+            bound << one.next().captured(1);
+        QRegularExpressionMatchIterator many = QRegularExpression("sequences: \\[([^\\]]+)\\]").globalMatch(source);
+        while (many.hasNext())
+            for (const QString &key : many.next().captured(1).split(","))
+                bound << key.trimmed().remove('"');
+        QVERIFY2(bound.size() > 20, qPrintable(bound.join(" ")));
+        QObject *help = app.object("help");
+        QVERIFY(help);
+        const QString listed = " " + help->property("listed").toStringList().join(" ") + " ";
+        for (const QString &key : bound)
+            QVERIFY2(listed.contains(" " + key + " "), qPrintable("the help doesn't list " + key + "; it lists:" + listed));
+        // And it opens and closes.
+        QTest::keyClick(app.window, '?');
+        QTRY_VERIFY(help->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!help->property("opened").toBool());
     }
 };
 

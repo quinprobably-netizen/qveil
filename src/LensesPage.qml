@@ -79,7 +79,7 @@ FocusScope {
         }
         Text {
             width: parent.width
-            text: qsTr("A lens is a feed you describe in words. qveil turns the words into searches, then filters and sorts the results on this computer.")
+            text: qsTr("A lens is a feed you describe in words: what it is about, and any rules, such as a length or what to leave out.")
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             color: Style.dim

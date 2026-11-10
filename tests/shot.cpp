@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
         return 2;
     }
 
-    QQuickStyle::setStyle("Material");
+    QQuickStyle::setStyle("Basic");
     QGuiApplication app(argc, argv);
     std::setlocale(LC_NUMERIC, "C");
     // The window's settings are not the user's.
@@ -63,7 +63,9 @@ int main(int argc, char *argv[]) {
     qmlRegisterType<MpvItem>("Qveil", 1, 0, "MpvItem");
     qmlRegisterSingletonType(QUrl("qrc:/Style.qml"), "Qveil", 1, 0, "Style");
 
+    // Installed as the app installs it, so that counted strings read as they will.
     Translator translator;
+    app.installTranslator(&translator);
     Theme theme;
     Backend backend(QProcessEnvironment::systemEnvironment(), QStringLiteral(SHOTS_DIR "/engine.py"));
     QQmlApplicationEngine engine;

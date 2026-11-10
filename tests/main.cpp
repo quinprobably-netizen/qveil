@@ -15,7 +15,7 @@ int main(int argc, char *argv[]) {
     // The tests that put a scene on screen do so on the offscreen platform,
     // where only the software renderer is sure to exist. (No test draws video.)
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
-    QQuickStyle::setStyle("Material");
+    QQuickStyle::setStyle("Basic");
     QGuiApplication app(argc, argv);
     // As the app registers it: the parts and pages import it from Qveil.
     qmlRegisterSingletonType(QUrl("qrc:/Style.qml"), "Qveil", 1, 0, "Style");

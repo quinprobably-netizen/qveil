@@ -13,7 +13,7 @@ Column {
     property int days: 7
     // How many fit across.
     readonly property int across: Math.max(1, Math.min(3, Math.floor(width / 300)))
-    readonly property string note: qsTr("kept %n days, then deleted", "", days)
+    readonly property string note: qsTr("kept for %n days", "", days)
     signal picked(var video)
     signal forgotten(string id)
 

@@ -355,6 +355,9 @@ void Backend::setConfig(const QVariantMap &patch) {
              const bool newProxy = next.value("route").toString() == "proxy" && patch.contains("proxy")
                                    && patch.value("proxy").toString() != m_config.value("proxy").toString();
              adoptConfig(next, newProxy);
+             // Fewer days, or none, takes kept positions with it.
+             if (patch.contains("resumeDays"))
+                 loadResume();
              emit notice(tr("Settings saved"));
          });
 }

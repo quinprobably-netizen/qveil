@@ -79,7 +79,7 @@ int main(int argc, char *argv[]) {
         qunsetenv(variable);
     QNetworkProxy::setApplicationProxy(QNetworkProxy::NoProxy);
 
-    QQuickStyle::setStyle("Material");
+    QQuickStyle::setStyle("Basic");
     qmlRegisterType<MpvItem>("Qveil", 1, 0, "MpvItem");
     // What the window looks like: the tokens every part is drawn with.
     qmlRegisterSingletonType(QUrl("qrc:/Style.qml"), "Qveil", 1, 0, "Style");

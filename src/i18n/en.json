@@ -38,5 +38,21 @@
   "Imported %n new channel(s)": {
     "one": "Imported %n new channel",
     "other": "Imported %n new channels"
+  },
+  "kept for %n days": {
+    "one": "kept for %n day",
+    "other": "kept for %n days"
+  },
+  "%n searches": {
+    "one": "%n search",
+    "other": "%n searches"
+  },
+  "%n videos": {
+    "one": "%n video",
+    "other": "%n videos"
+  },
+  "%n days": {
+    "one": "%n day",
+    "other": "%n days"
   }
 }

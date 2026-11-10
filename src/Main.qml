@@ -1,8 +1,6 @@
 import QtCore
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Controls.Material
-import QtQuick.Layouts
 import Qveil
 
 ApplicationWindow {
@@ -14,12 +12,6 @@ ApplicationWindow {
     visible: true
     title: watch.active && watch.info.title ? watch.info.title + " \u00b7 qveil" : "qveil"
     color: Style.bg
-
-    // The pages that are not redrawn yet still use Material controls.
-    Material.theme: Material.Dark
-    Material.accent: theme.accent
-    Material.background: Style.bg
-    Material.roundedScale: theme.radius
 
     // The place that is showing: home, lenses, channels, channel, history,
     // search or settings.
@@ -338,7 +330,7 @@ ApplicationWindow {
             RoutePopup {
                 id: route
                 objectName: "routePopup"
-                prefs: prefs
+                onSettingsRequested: win.go("settings")
                 x: Style.u * 2
                 y: -height
             }
@@ -492,7 +484,7 @@ ApplicationWindow {
                     }
                 }
 
-                SubsPage {
+                ChannelsPage {
                     id: subsPage
                     anchors.fill: parent
                     visible: win.page === "channels" && !win.watching
@@ -543,12 +535,17 @@ ApplicationWindow {
                     onChannelRequested: id => win.openChannel(id)
                 }
 
-                // Settings are drawn by the task that adds them.
-                Item {
+                SettingsPage {
                     id: settingsPage
-                    objectName: "page-settings"
                     anchors.fill: parent
                     visible: win.page === "settings" && !win.watching
+                    thumbs: win.thumbs
+                    shorts: prefs.showShorts
+                    onThumbsPicked: mode => win.thumbs = mode
+                    onShortsPicked: shown => {
+                        prefs.showShorts = shown
+                        backend.refreshFeed(false, shown)
+                    }
                 }
 
                 // A thin line along the top of the page while anything is

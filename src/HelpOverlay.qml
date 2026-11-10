@@ -1,112 +1,120 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Controls.Material
-import QtQuick.Layouts
+import Qveil
 
+// Every key the window answers to.
 Popup {
     id: help
+    objectName: "help"
 
-    anchors.centerIn: Overlay.overlay
-    modal: true
-    padding: 26
-    width: 660
-
-    // A dark scrim. The style's own dim is a pale grey on a dark theme, which
-    // reads as a rendering fault. Every modal popup sets this.
-    Overlay.modal: Rectangle {
-        color: "#b0000000"
-        Behavior on opacity { NumberAnimation { duration: 150 } }
-    }
-
-    background: Rectangle {
-        color: "#16161b"
-        radius: theme.radius
-        border.color: "#2a2a32"
-    }
-
-    // Two groups, because the same key does different things in each: the
-    // arrows and Space move and play while browsing, and seek and pause while
-    // playing. Within a group, every key appears once.
+    // Two groups, because the same key does different things in each: what
+    // it does while browsing, and what it does while a video is playing.
     readonly property var groups: [
         {
-            title: qsTr("Browsing"),
+            title: qsTr("Anywhere"),
             keys: [
-                ["/", qsTr("Search")],
-                ["1  2  3", qsTr("Feed, subscriptions, history")],
-                ["← → ↑ ↓", qsTr("Move between videos")],
-                ["Enter  Space", qsTr("Play the selected video")],
-                ["R", qsTr("Refresh")],
-                ["P", qsTr("Route & privacy")],
-                ["Esc", qsTr("Back")],
-                ["?", qsTr("This help")],
-                ["Q", qsTr("Quit")],
+                [["/", "Ctrl+L"], qsTr("Search")],
+                [["1", "2", "3", "4", "5"], qsTr("Home, lenses, channels, history, settings")],
+                [["R"], qsTr("Refresh what is showing")],
+                [["P"], qsTr("Route")],
+                [["Esc"], qsTr("Back")],
+                [["?"], qsTr("This help")],
+                [["Q"], qsTr("Quit")],
             ]
         },
         {
             title: qsTr("Playing"),
             keys: [
-                ["Space", qsTr("Play or pause")],
-                ["← →", qsTr("Seek 5 s")],
-                ["J  L", qsTr("Seek 10 s")],
-                ["↑ ↓", qsTr("Volume")],
-                ["M", qsTr("Mute")],
-                ["F", qsTr("Fullscreen")],
+                [["Space"], qsTr("Play or pause (browsing: play the selected video)")],
+                [["Left", "Right"], qsTr("Back or forward 5 seconds")],
+                [["J", "L"], qsTr("Back or forward 10 seconds")],
+                [["[", "]"], qsTr("Previous or next chapter")],
+                [["<", ">"], qsTr("Slower or faster")],
+                [["Up", "Down"], qsTr("Volume")],
+                [["M"], qsTr("Mute")],
+                [["I"], qsTr("Picture in picture, and back")],
+                [["T"], qsTr("Theatre")],
+                [["F"], qsTr("Fullscreen")],
+                [["C"], qsTr("Comments")],
             ]
         },
     ]
+    // Every key that is listed, for checking against what is bound.
+    readonly property var listed: {
+        const all = []
+        for (const group of groups)
+            for (const entry of group.keys)
+                for (const key of entry[0])
+                    all.push(key)
+        return all
+    }
+    // How a key is written: arrows as arrows.
+    function shown(key) {
+        return ({ Left: "\u2190", Right: "\u2192", Up: "\u2191", Down: "\u2193" })[key] || key
+    }
 
-    ColumnLayout {
+    anchors.centerIn: Overlay.overlay
+    width: Math.min(560, (Overlay.overlay ? Overlay.overlay.width : 600) - Style.gutter * 2)
+    padding: Style.u * 5
+    modal: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    Overlay.modal: Rectangle { color: Style.scrim }
+
+    background: Rectangle {
+        color: Style.bg
+        radius: Style.radius
+        border.width: 1
+        border.color: Style.line
+    }
+
+    Column {
         width: parent.width
-        spacing: 14
+        spacing: Style.u * 3
 
-        Label {
+        Text {
             text: qsTr("Keyboard")
-            font.pixelSize: 17
-            font.weight: Font.DemiBold
+            textFormat: Text.PlainText
+            color: Style.fg
+            font.family: Style.font
+            font.pixelSize: Style.title
+            font.bold: true
         }
-
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 36
-
-            Repeater {
-                model: help.groups
-                delegate: ColumnLayout {
-                    id: group
-                    required property var modelData
-                    Layout.alignment: Qt.AlignTop
-                    Layout.fillWidth: true
-                    // Equal widths, whatever the text in each group.
-                    Layout.preferredWidth: 1
-                    spacing: 8
-
-                    Label {
-                        Layout.bottomMargin: 2
-                        text: group.modelData.title
-                        font.pixelSize: 13
-                        font.weight: Font.DemiBold
-                        color: "#8d8d98"
-                    }
-
-                    Repeater {
-                        model: group.modelData.keys
-                        delegate: RowLayout {
-                            required property var modelData
-                            Layout.fillWidth: true
-                            spacing: 14
-
-                            Label {
-                                Layout.preferredWidth: 88
-                                text: modelData[0]
-                                font.weight: Font.DemiBold
-                                color: theme.accent
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: modelData[1]
-                                wrapMode: Text.Wrap
-                                color: "#d0d0d8"
-                            }
+        Repeater {
+            model: help.groups
+            delegate: Column {
+                id: group
+                required property var modelData
+                width: help.availableWidth
+                spacing: Style.u
+                SectionHead {
+                    width: parent.width
+                    text: group.modelData.title
+                }
+                Repeater {
+                    model: group.modelData.keys
+                    delegate: Item {
+                        required property var modelData
+                        width: group.width
+                        height: Style.control - 4
+                        Text {
+                            width: 130
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData[0].map(help.shown).join("  ")
+                            textFormat: Text.PlainText
+                            color: Style.accent
+                            font.family: Style.font
+                            font.pixelSize: Style.small
+                        }
+                        Text {
+                            x: 140
+                            width: parent.width - 140
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData[1]
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            color: Style.fg
+                            font.family: Style.font
+                            font.pixelSize: Style.small
                         }
                     }
                 }
