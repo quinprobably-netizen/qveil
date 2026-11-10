@@ -47,6 +47,8 @@ if [ -f "$here/$kind-error" ]; then
   exit 1
 fi
 cid=$(printf '%s' "$target" | grep -o 'UC[A-Za-z0-9_-]\{22\}' | head -n 1)
+# A handle is the third channel's.
+case "$target" in */@*) cid=UCcccccccccccccccccccccc ;; esac
 case "$kind" in
 search)
   echo '{"id":"SSSSSSSSSS1","title":"First result","channel":"Alpha","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","view_count":1500,"duration":61,"timestamp":1700000000}'

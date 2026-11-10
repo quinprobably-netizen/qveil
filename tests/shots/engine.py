@@ -83,8 +83,14 @@ COMMENTS = [
 
 PRIVACY = {
     "summary": "Direct: YouTube sees your IP address.",
+    # As long as the engine's own, so that what holds them is tried at its real size.
     "points": ["YouTube sees your IP address with every request, which links them all.",
-               "You are never signed in, and cookies are never stored or read from a browser."],
+               "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits.",
+               "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
+               "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
+               "Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.",
+               "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing): on one address their timing links them, and even over Tor a set of related searches can be linked by content.",
+               "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry."],
     "routes": {"direct": "YouTube sees your IP address.",
                "tor": "Fresh SOCKS credentials per request, which Tor puts on separate circuits.",
                "proxy": "A proxy you trust, such as a VPN's: YouTube sees its address, not yours."},
@@ -94,7 +100,7 @@ PRIVACY = {
               "history_on": "On: kept only on this computer, until you clear it.",
               "resume": "On: qveil remembers where you stopped in an unfinished video for 7 days.",
               "comments": "Fetched only when you open them, as one more lookup of that video.",
-              "lenses": "A refresh sends one search per topic, each a request of its own."},
+              "lenses": "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer."},
 }
 
 state = {
@@ -119,6 +125,10 @@ state = {
 }
 if os.environ.get("QVEIL_STANDIN_EMPTY"):
     state["resume"], state["lenses"] = [], []
+# As many lenses as there can be.
+for _i in range(len(state["lenses"]), int(os.environ.get("QVEIL_STANDIN_LENSES", "0"))):
+    state["lenses"].append({"id": "aaaa%04d" % (_i + 1), "text": "lens number %d, about something specific and long enough to wrap" % (_i + 1),
+                            "created": NOW - DAY, "fetchedAt": NOW - HOUR})
 
 
 def read(text, lens):
@@ -258,6 +268,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(200, read(q.get("q", ""), q.get("for") == "lens"))
         elif path == "api/channel":
             cid = q.get("id", "")
+            # As the engine does: a handle is looked up, and anything else must be a channel's ID.
+            if cid.startswith("@"):
+                cid = CHANNELS[0][0]
+            elif not (cid.startswith("UC") and len(cid) == 24):
+                self.send(400, {"error": "%r is not a channel ID" % cid, "code": "other"})
+                return
             name = dict(CHANNELS).get(cid, "A channel")
             vids = [v for v in FEED if v["channel_id"] == cid] or FEED[:3]
             self.send(200, {"id": cid, "name": name, "subscribed": any(s["id"] == cid for s in state["subs"]), "videos": vids})

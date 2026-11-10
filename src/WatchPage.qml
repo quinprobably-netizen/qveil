@@ -40,6 +40,8 @@ FocusScope {
     signal copied(string text)
 
     function prepare(video) {
+        // A lookup of the last video's comments is for nobody now.
+        backend.closeComments()
         expanded = false
         sheet.current = "about"
         surface.prepare(video)

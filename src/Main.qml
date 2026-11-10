@@ -35,6 +35,14 @@ ApplicationWindow {
     // Whether keys are going into a text field. Every Qt Quick text input
     // has a cursor position and nothing else that takes focus does. While
     // this is true, no letter, digit or bracket is a shortcut.
+    // Whether the arrow keys are the video's: while it has the page, or in
+    // its small window. While it plays in the small window and this one is
+    // browsed, they move through what is browsed, as they always do.
+    // (A window counts as active while its parent window is, so that is
+    // not the question; whether something in it has the keyboard is.)
+    readonly property bool steering: watching || (pip && pipWindow.activeFocusItem !== null)
+    // Where a channel's page was opened from.
+    property string channelFrom: "home"
     readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
     readonly property var pages: ({ home: feedPage, search: searchPage, channel: channelPage,
                                     channels: subsPage, history: historyPage,
@@ -48,6 +56,8 @@ ApplicationWindow {
         property string thumbnails: "frosted"
         property bool showShorts: false
         property real volume: 80
+        // Whether it has been said that positions are kept.
+        property bool resumeTold: false
         // Before 0.4 this was a switch, called the veil.
         Component.onCompleted: {
             const old = value("veilThumbnails")
@@ -109,6 +119,8 @@ ApplicationWindow {
             watch.close()
         if (page !== "channel" && page !== "search")
             returnPage = page
+        if (page !== "channel")
+            channelFrom = page
         search.text = ""
         backend.read("")
         page = "channel"
@@ -225,7 +237,14 @@ ApplicationWindow {
             watch.close()
         else if (typing)
             focusPage(page)
-        else if (page === "channel" || page === "search")
+        else if (page === "channel" && channelFrom === "search") {
+            // Back to the results it was opened from, which are still
+            // there: nothing is searched for again.
+            page = "search"
+            search.text = backend.query
+            backend.read(backend.query)
+            Qt.callLater(() => win.focusPage("search"))
+        } else if (page === "channel" || page === "search")
             go(returnPage)
     }
 
@@ -266,6 +285,13 @@ ApplicationWindow {
                 win.go("lenses")
         }
         function onNotice(text) { toast.show(text) }
+        // The first time a position is kept, the window says so, once.
+        function onPositionKept() {
+            if (!prefs.resumeTold) {
+                prefs.resumeTold = true
+                resumeNotice.shown = true
+            }
+        }
     }
 
     // Escape and the keys that lead to a text field work while typing; every
@@ -284,11 +310,11 @@ ApplicationWindow {
     Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.toggleRoute() }
     Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: win.toggleFullscreen() }
     Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.mpv.muted = !player.mpv.muted }
-    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
-    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(5, true); player.reveal() } }
-    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(-10, true); player.reveal() } }
-    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(10, true); player.reveal() } }
-    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
+    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(-5) }
+    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(5) }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.nudge(-10) }
+    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.nudge(10) }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
     Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: win.togglePip() }
     Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.theatre = !watch.theatre }
     Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { watch.theatre = false; watch.sheet.current = "comments" } }
@@ -296,7 +322,7 @@ ApplicationWindow {
     Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(true) }
     Shortcut { sequence: "<"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.speedStep(false) }
     Shortcut { sequence: ">"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.speedStep(true) }
-    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
 
     // Mirrors for right-to-left languages. A top-level window ignores the
     // application's layout direction.
@@ -331,7 +357,8 @@ ApplicationWindow {
                 id: route
                 objectName: "routePopup"
                 onSettingsRequested: win.go("settings")
-                x: Style.u * 2
+                // Beside the rail, on the side the page is on.
+                x: Qt.application.layoutDirection === Qt.RightToLeft ? -width - Style.u * 2 : Style.u * 2
                 y: -height
             }
         }
@@ -370,6 +397,7 @@ ApplicationWindow {
                     id: search
                     objectName: "search"
                     width: Math.min(520, parent.width)
+                    onEscaped: win.focusPage(win.page)
                     onSubmitted: query => {
                         win.go("search")
                         search.text = query
@@ -585,6 +613,16 @@ ApplicationWindow {
             anchors.bottom: parent.bottom
             anchors.bottomMargin: Style.gutter
             z: 5
+        }
+
+        ResumeNotice {
+            id: resumeNotice
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: toast.visible ? toast.top : parent.bottom
+            anchors.bottomMargin: toast.visible ? Style.u * 2 : Style.gutter
+            width: Math.min(560, parent.width - 2 * Style.gutter)
+            z: 5
+            onSettingsRequested: win.go("settings")
         }
 
         // Dropping an export imports it.

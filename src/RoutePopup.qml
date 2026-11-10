@@ -10,8 +10,12 @@ Popup {
 
     signal settingsRequested()
 
-    width: 440
+    // How tall what is in it may be, for the popup to fit the window.
+    readonly property real room: (Overlay.overlay ? Overlay.overlay.height : 600) - 2 * margins - 2 * padding
+    width: Math.min(440, (Overlay.overlay ? Overlay.overlay.width : 600) - 2 * margins)
     padding: Style.u * 5
+    // Never over the window's edge, wherever it is opened from.
+    margins: Style.u * 2
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
     onAboutToShow: chooser.refresh()
 
@@ -29,11 +33,12 @@ Popup {
         }
     }
 
-    Column {
-        width: parent.width
+    contentItem: Column {
+        id: column
         spacing: Style.u * 3
 
         Text {
+            id: title
             text: qsTr("Route")
             textFormat: Text.PlainText
             color: Style.fg
@@ -46,16 +51,33 @@ Popup {
             width: parent.width
         }
         Rule { width: parent.width }
-        // What the engine says about what it does and keeps, sentence by sentence.
-        Repeater {
-            model: backend.privacy.points
-            delegate: Notice {
-                required property string modelData
-                width: popup.availableWidth
-                text: modelData
+        // What the engine says about what it does and keeps, sentence by
+        // sentence. There is a lot of it: it scrolls, so that the route and
+        // the way to the settings stay in reach.
+        Flickable {
+            width: parent.width
+            height: Math.max(48, Math.min(points.height,
+                popup.room - title.height - chooser.height - 1 - settings.height - 4 * column.spacing))
+            contentHeight: points.height
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+                id: points
+                width: parent.width
+                spacing: Style.u * 3
+                Repeater {
+                    model: backend.privacy.points
+                    delegate: Notice {
+                        required property string modelData
+                        width: points.width
+                        text: modelData
+                    }
+                }
             }
         }
         Act {
+            id: settings
             objectName: "all-settings"
             text: qsTr("All settings")
             filled: true

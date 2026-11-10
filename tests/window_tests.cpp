@@ -39,7 +39,7 @@ struct App {
     bool ok = false;
 
     // `empty`: an engine with no lenses and nothing to resume.
-    explicit App(bool empty = false, QSize size = QSize(1280, 720))
+    explicit App(bool empty = false, QSize size = QSize(1280, 720), const QMap<QString, QString> &extra = {})
     {
         // The window's settings (Shorts, volume) are not the user's.
         QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, settings.path());
@@ -57,6 +57,8 @@ struct App {
         if (empty)
             environment.insert("QVEIL_STANDIN_EMPTY", "1");
         environment.remove("QVEIL_STANDIN_CLIP");
+        for (auto it = extra.begin(); it != extra.end(); ++it)
+            environment.insert(it.key(), it.value());
         backend = std::make_unique<Backend>(environment, QFINDTESTDATA("shots/engine.py"));
 
         qml = std::make_unique<QQmlApplicationEngine>();
@@ -116,6 +118,24 @@ struct App {
         // What has only just appeared or moved is laid out with the next
         // frame; a click sent before that would go where the item was.
         QTest::qWait(40);
+        // What is outside the view of a page that scrolls is scrolled to first.
+        const qreal top = target->mapToScene(QPointF(0, 0)).y(), bottom = top + target->height();
+        qreal by = 0;
+        for (QQuickItem *up = target->parentItem(); up; up = up->parentItem()) {
+            if (!up->property("contentY").isValid() || !up->property("contentHeight").isValid())
+                continue;
+            const qreal viewTop = up->mapToScene(QPointF(0, 0)).y(), viewBottom = qMin(viewTop + up->height(), qreal(window->height()));
+            if (bottom > viewBottom - 8)
+                by = bottom - viewBottom + 40;
+            else if (top < viewTop + 8)
+                by = top - viewTop - 40;
+            if (by != 0) {
+                const qreal most = qMax(0.0, up->property("contentHeight").toReal() - up->height());
+                up->setProperty("contentY", qBound(0.0, up->property("contentY").toReal() + by, most));
+                QTest::qWait(40);
+            }
+            break;
+        }
         QTest::mouseClick(window, Qt::LeftButton, {}, target->mapToScene(QPointF(target->width() / 2, target->height() / 2)).toPoint());
     }
     void hover(QQuickItem *target) const
@@ -1002,6 +1022,239 @@ private slots:
         QTRY_VERIFY(help->property("opened").toBool());
         QTest::keyClick(app.window, Qt::Key_Escape);
         QTRY_VERIFY(!help->property("opened").toBool());
+    }
+
+    // --- What the review of the window found. ---
+
+    void homeShowsTheLensItsTabNames()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("feed-tab-aaaa0002"));
+        app.click(app.item("feed-tab-aaaa0002"));
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
+        // Another lens is opened on the lenses page...
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.items("lens-row").size(), 2);
+        app.click(app.items("lens-row").first());
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0001"));
+        // ...and home still shows the one its tab says.
+        QTest::keyClick(app.window, Qt::Key_1);
+        QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
+        QTRY_VERIFY(!app.items("card-why").isEmpty());
+        QVERIFY(app.items("card-why").first()->property("text").toString().contains("over 30:00"));
+        // Putting that right is no reason to search again.
+        QCOMPARE(app.asked("GET api/lens?id=aaaa0002&stream=1&refresh=2"), 0);
+    }
+
+    void arrowsMoveThroughTheGridWhileAVideoIsInTheSmallWindow()
+    {
+        App app;
+        READY(app);
+        QQuickItem *grid = app.item("home-grid");
+        QTRY_COMPARE(grid->property("count").toInt(), 12);
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        app.window->requestActivate();
+        QTRY_VERIFY(grid->hasActiveFocus());
+        QTRY_VERIFY2(!app.window->property("steering").toBool(),
+                     qPrintable(QString("main active %1, small active %2").arg(app.window->isActive()).arg(app.pip()->isActive())));
+        const int columns = grid->property("columns").toInt();
+        QVERIFY(columns > 1);
+        grid->setProperty("currentIndex", 0);
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(grid->property("currentIndex").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_COMPARE(grid->property("currentIndex").toInt(), 1 + columns);
+        // The keys that move nothing in a grid still reach the video.
+        QObject *mpv = app.inPip("pip-surface")->property("mpv").value<QObject *>();
+        QVERIFY(mpv);
+        const bool muted = mpv->property("muted").toBool();
+        QTest::keyClick(app.window, Qt::Key_M);
+        QTRY_COMPARE(mpv->property("muted").toBool(), !muted);
+    }
+
+    void theRoutePopupStaysInsideTheWindow()
+    {
+        for (const Qt::LayoutDirection direction : {Qt::LeftToRight, Qt::RightToLeft}) {
+            App app(false, QSize(950, 520));
+            READY(app);
+            QGuiApplication::setLayoutDirection(direction);
+            QTest::qWait(100);
+            QMetaObject::invokeMethod(app.window, "openRoute");
+            QObject *popup = app.object("routePopup");
+            QTRY_VERIFY(popup->property("opened").toBool());
+            QTest::qWait(300);
+            const auto inside = [&](const char *name) {
+                QQuickItem *found = nullptr;
+                for (QQuickItem *item : app.items(name))
+                    found = item;
+                if (!found)
+                    return QString("%1 isn't showing").arg(name);
+                const QRectF at = found->mapRectToScene(QRectF(0, 0, found->width(), found->height()));
+                return QRectF(0, 0, 950, 520).contains(at) && at.width() > 20 ? QString()
+                    : QString("%1 is at %2,%3 %4x%5").arg(name).arg(at.x()).arg(at.y()).arg(at.width()).arg(at.height());
+            };
+            QVERIFY2(inside("route-direct").isEmpty(), qPrintable(inside("route-direct")));
+            QVERIFY2(inside("route-proxy").isEmpty(), qPrintable(inside("route-proxy")));
+            QVERIFY2(inside("all-settings").isEmpty(), qPrintable(inside("all-settings")));
+            QQuickItem *background = popup->property("background").value<QQuickItem *>();
+            QVERIFY(background && background->width() >= 300);
+            QGuiApplication::setLayoutDirection(Qt::LeftToRight);
+        }
+    }
+
+    void twelveLensesCanAllBeReachedInASmallWindow()
+    {
+        App app(false, QSize(950, 520), {{"QVEIL_STANDIN_LENSES", "12"}});
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.backend->lenses().size(), 12);
+        QQuickItem *list = app.item("lens-list");
+        QVERIFY2(list, "the lenses are not in a list that scrolls");
+        QTRY_VERIFY(list->property("contentHeight").toReal() > list->height());
+        const auto bottom = [](QQuickItem *item) { return item->mapToScene(QPointF(0, item->height())).y(); };
+        QVERIFY2(bottom(list) <= 520, qPrintable(QString::number(bottom(list))));
+        // The way to a new one is never scrolled out of reach, and the results keep room.
+        QQuickItem *fresh = app.item("lens-new");
+        QVERIFY(fresh->isVisible() && bottom(fresh) <= 520);
+        QQuickItem *grid = app.item("lens-grid");
+        QTRY_VERIFY2(grid->height() >= 200, qPrintable(QString::number(grid->height())));
+        // The last lens can be brought into view and opened.
+        QMetaObject::invokeMethod(list, "positionViewAtEnd");
+        QTest::qWait(100);
+        QQuickItem *last = nullptr;
+        for (QQuickItem *row : app.items("lens-row"))
+            if (!last || row->mapToScene(QPointF(0, 0)).y() > last->mapToScene(QPointF(0, 0)).y())
+                last = row;
+        QVERIFY(last && bottom(last) <= bottom(list) + 1);
+        app.click(last);
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0012"));
+    }
+
+    void commentsLoadForTheVideoThatIsShowing()
+    {
+        App app;
+        READY(app);
+        // A video whose comments take long to come...
+        app.play({{"id", "slowslowslo"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_C);
+        QTRY_VERIFY(app.backend->busy().contains("comments"));
+        // ...is left for another, whose comments are asked for at once.
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(!app.backend->busy().contains("comments"), 1000);
+        QTest::keyClick(app.window, Qt::Key_C);
+        QTRY_COMPARE_WITH_TIMEOUT(app.items("comment").size(), 5, 3000);
+    }
+
+    void aPositionIsReportedAndTheFirstTimeTheWindowSaysSo()
+    {
+        // Something to play: the stand-in engine serves it as the video.
+        QTemporaryDir dir;
+        const QString clip = dir.filePath("clip.mkv");
+        QProcess make;
+        make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=d=120:s=160x90:r=5", "-f", "lavfi", "-i", "anullsrc",
+                              "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", clip});
+        if (!make.waitForFinished(60000) || make.exitCode() != 0 || !QFile::exists(clip))
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
+        QQuickItem *surface = app.item("surface");
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        QVERIFY(mpv);
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("duration").toDouble() > 0, 15000);
+        QCOMPARE(app.asked("POST api/resume"), 0);
+        QQuickItem *note = app.item("resume-notice");
+        QVERIFY(note && !note->isVisible());
+
+        // Going to another place in the video says where it is...
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 40));
+        QTRY_COMPARE(app.asked("POST api/resume"), 1);
+        // ...and the first time a position is kept, the window says that it
+        // is, in the engine's words, with the way to the setting.
+        QTRY_VERIFY(note->isVisible());
+        QCOMPARE(app.item("resume-notice-text")->property("text").toString(),
+                 app.backend->privacy().value("pages").toMap().value("resume").toString());
+        QTRY_COMPARE(app.backend->resume().first().toMap().value("id").toString(), QString("vid00000002"));
+        // So does pausing...
+        QTest::keyClick(app.window, Qt::Key_Space);
+        QTRY_VERIFY(mpv->property("paused").toBool());
+        QTRY_COMPARE(app.asked("POST api/resume"), 2);
+        // ...a step with the keyboard...
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(app.asked("POST api/resume"), 3);
+        // ...and leaving.
+        app.click(app.item("resume-notice-settings"));
+        QTRY_COMPARE(app.page(), QString("settings"));
+        QTRY_COMPARE(app.asked("POST api/resume"), 4);
+        QVERIFY(!note->isVisible());
+
+        // It is said once.
+        app.play({{"id", "vid00000003"}});
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("duration").toDouble() > 0, 15000);
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 50));
+        QTRY_COMPARE(app.asked("POST api/resume"), 5);
+        QTRY_COMPARE(app.backend->resume().first().toMap().value("id").toString(), QString("vid00000003"));
+        QVERIFY(!note->isVisible());
+    }
+
+    void escapeFromTheSearchFieldGivesTheKeysBackToTheGrid()
+    {
+        App app;
+        READY(app);
+        QQuickItem *grid = app.item("home-grid");
+        QTRY_COMPARE(grid->property("count").toInt(), 12);
+        grid->setProperty("currentIndex", 0);
+        QTest::keyClick(app.window, '/');
+        QTRY_VERIFY(app.window->property("typing").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.window->property("typing").toBool());
+        QTRY_VERIFY(grid->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(grid->property("currentIndex").toInt(), 1);
+    }
+
+    void aChannelOpenedFromSearchGoesBackToTheResults()
+    {
+        App app;
+        READY(app);
+        QMetaObject::invokeMethod(app.item("search"), "edit");
+        app.type("rust");
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.page(), QString("search"));
+        QTRY_VERIFY(app.asked("GET api/search") >= 1);
+        const int searches = app.asked("GET api/search");
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+        QCOMPARE(app.page(), QString("channel"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        // Back at the results, with what was searched for, and without asking again.
+        QCOMPARE(app.page(), QString("search"));
+        QCOMPARE(app.item("search")->property("text").toString(), QString("rust"));
+        QCOMPARE(app.asked("GET api/search"), searches);
+        // And from there, back to where the search started.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QCOMPARE(app.page(), QString("home"));
+    }
+
+    void aLinkToAChannelsHandleOpensThatChannel()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QMetaObject::invokeMethod(app.item("watch"), "follow", Q_ARG(QVariant, QString("qveil:channel/%40lowlevelhours")));
+        QTRY_COMPARE(app.page(), QString("channel"));
+        // The page is the channel's, under its ID, so that it can be subscribed to and refreshed.
+        QTRY_COMPARE(app.backend->channel().value("id").toString(), QString("UCaaaaaaaaaaaaaaaaaaaaaa"));
+        QVERIFY(!app.item("errorBar")->isVisible());
     }
 };
 

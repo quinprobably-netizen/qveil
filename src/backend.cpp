@@ -709,6 +709,8 @@ void Backend::noteResume(const QVariantMap &video, double position, double durat
                  listed = listed || kept.toMap().value("id").toString() == id;
              if (noted == "kept" || listed)
                  loadResume();
+             if (noted == "kept")
+                 emit positionKept();
          },
          true);
 }

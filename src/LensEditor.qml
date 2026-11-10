@@ -97,18 +97,6 @@ Column {
             anchors.rightMargin: Style.u * 3
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2
-            // What a refresh means, in the engine's words.
-            Text {
-                objectName: "lens-note"
-                width: parent.width
-                visible: text !== ""
-                text: backend.privacy.pages.lenses || ""
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-                color: Style.faint
-                font.family: Style.font
-                font.pixelSize: Style.small
-            }
             Text {
                 objectName: "lens-searches"
                 width: parent.width
@@ -163,5 +151,18 @@ Column {
                 onClicked: editor.arming = false
             }
         }
+    }
+    // What a refresh means, in the engine's words, across the width.
+    Text {
+        objectName: "lens-note"
+        width: parent.width
+        visible: text !== ""
+        text: backend.privacy.pages.lenses || ""
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        lineHeight: 1.2
+        color: Style.faint
+        font.family: Style.font
+        font.pixelSize: Style.small
     }
 }

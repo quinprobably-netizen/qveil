@@ -99,6 +99,13 @@ FocusScope {
         note.shown = false
         mpv.seek(seconds, false)
         reveal()
+        afterSeek.restart()
+    }
+    // A step back or forward, by the keyboard.
+    function nudge(seconds) {
+        mpv.seek(seconds, true)
+        reveal()
+        afterSeek.restart()
     }
 
     // To the start of the chapter after this one, or (back) of this one,
@@ -156,6 +163,14 @@ FocusScope {
         onEndedChanged: if (ended) surface.report()
     }
 
+    // After a seek, once the keys have rested and the player has got
+    // there (over a slow route that takes a while, and until then the
+    // position is still the old one).
+    Timer {
+        id: afterSeek
+        interval: 700
+        onTriggered: mpv.buffering ? restart() : surface.report()
+    }
     // While it plays, every so often.
     Timer {
         interval: 15000

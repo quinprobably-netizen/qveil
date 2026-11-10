@@ -24,9 +24,13 @@ Item {
     readonly property var count: answer.count
     signal linkActivated(string link)
 
+    // The video this tab last asked about.
+    property string asked
     function load() {
-        if (video !== "")
+        if (video !== "") {
+            asked = video
             backend.loadComments(video, sort, n, replies)
+        }
     }
     function more() {
         n = Math.min(200, n + 40)
@@ -41,6 +45,10 @@ Item {
             load()
     }
     onActiveChanged: if (active && !loaded && !loading) load()
+    // A lookup for another video was still running when this was shown, so
+    // nothing was asked: it is now. (A lookup of this video that failed is
+    // not asked again by itself.)
+    onLoadingChanged: if (!loading && active && !loaded && asked !== video) load()
 
     Flickable {
         id: flick

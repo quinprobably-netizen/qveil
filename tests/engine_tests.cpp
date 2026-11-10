@@ -233,6 +233,25 @@ private slots:
             QVERIFY2(call.contains(Gamma), qPrintable(call));
     }
 
+    void aHandleOpensTheChannelItNames() {
+        // Links to a channel are mostly written with its handle.
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+        QSignalSpy errors(&window, &Backend::errorChanged);
+        window.openChannel("@gamma");
+        WAIT_FOR(window.channel().value("id").toString() == Gamma, 10000);
+        QCOMPARE(window.channelVideos()->count(), 1);
+        QVERIFY2(window.error().isEmpty(), qPrintable(window.error()));
+        // Something that is neither is still refused, without asking anybody.
+        const int before = rig.calls().size();
+        window.openChannel("not a channel");
+        WAIT_FOR(!window.error().isEmpty(), 10000);
+        QCOMPARE(rig.calls().size(), before);
+    }
+
     void aClosedPlayerDropsTheAnswerOfItsVideo() {
         Rig rig;
         if (Rig::core().isEmpty())

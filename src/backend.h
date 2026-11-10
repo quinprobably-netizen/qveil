@@ -181,6 +181,8 @@ signals:
     void refreshProgressChanged();
     void queryChanged();
     void channelChanged();
+    // The engine kept a position (see noteResume).
+    void positionKept();
     void subsChanged();
     void historyChanged();
     void resumeChanged();

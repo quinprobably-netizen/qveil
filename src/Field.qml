@@ -16,6 +16,8 @@ Rectangle {
     readonly property bool editing: input.activeFocus
     signal submitted(string text)
     signal edited(string text)
+    // Escape was pressed in the empty field: whoever has the field decides where the keys go.
+    signal escaped()
 
     function edit() {
         input.forceActiveFocus()
@@ -66,6 +68,7 @@ Rectangle {
                 field.edited("")
             } else {
                 focus = false
+                field.escaped()
             }
         }
 

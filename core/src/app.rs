@@ -547,10 +547,20 @@ pub struct ChannelPage {
     pub videos: Vec<Entry>,
 }
 
+/// A channel's page. `id` is the channel's ID, or its `@handle` (how a link
+/// in a description usually names a channel), which is looked up first.
 pub fn channel(rt: &Runtime, paths: &Paths, id: &str) -> Result<ChannelPage> {
-    if !ids::is_channel_id(id) {
-        bail!("{id:?} is not a channel ID");
-    }
+    let id = id.trim();
+    let id = if ids::is_channel_id(id) {
+        id.to_string()
+    } else if let (true, Some(ids::ChannelRef::Url(url))) =
+        (id.starts_with('@'), ids::parse_channel(id))
+    {
+        rt.yt.channel_info(&url)?.0
+    } else {
+        bail!("{id:?} is not a channel ID or a handle");
+    };
+    let id = id.as_str();
     let videos = rt.yt.channel_videos(id, 30)?;
     let sub = load_subs(paths)?.channels.into_iter().find(|s| s.id == id);
     let name = sub

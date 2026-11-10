@@ -89,16 +89,26 @@ FocusScope {
     }
 
     // The list. In a narrow window it gives way to the lens itself.
-    Column {
+    // It scrolls when there are more lenses than fit; the way to a new one
+    // stays under it, in reach.
+    Item {
         id: list
         anchors.left: parent.left
         anchors.top: head.bottom
+        anchors.bottom: parent.bottom
         anchors.leftMargin: Style.gutter
         anchors.topMargin: Style.u * 4
+        anchors.bottomMargin: Style.gutter
         width: page.width >= 900 ? 300 : 220
-        spacing: Style.u
 
-        Repeater {
+        ListView {
+            id: rows
+            objectName: "lens-list"
+            width: parent.width
+            height: Math.min(contentHeight, parent.height - fresh.height - Style.u * 2)
+            spacing: Style.u
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
             model: backend.lenses
             delegate: Rectangle {
                 required property var modelData
@@ -149,6 +159,9 @@ FocusScope {
             }
         }
         Act {
+            id: fresh
+            anchors.top: rows.bottom
+            anchors.topMargin: Style.u * 2
             objectName: "lens-new"
             text: qsTr("New lens")
             glyph: "qrc:/icons/plus.svg"
@@ -158,14 +171,24 @@ FocusScope {
         }
     }
 
-    LensEditor {
-        id: editor
+    // The lens's words and what goes with them. In a short window they
+    // scroll, so that what the lens found keeps room under them.
+    Flickable {
+        id: editorView
         anchors.left: list.right
         anchors.right: parent.right
         anchors.top: head.bottom
         anchors.leftMargin: Style.u * 5
         anchors.rightMargin: Style.gutter
         anchors.topMargin: Style.u * 4
+        height: Math.min(editor.height, Math.max(96, page.height - head.y - head.height - Style.u * 4 - (page.writing ? Style.gutter : 240)))
+        contentHeight: editor.height
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+
+    LensEditor {
+        id: editor
+        width: parent.width
         lens: page.lens
         onSaved: text => {
             if (fresh)
@@ -176,17 +199,18 @@ FocusScope {
         onRefreshRequested: page.refresh()
         onDeleted: backend.removeLens(lens.id)
     }
+    }
     Rule {
         id: under
-        anchors.left: editor.left
-        anchors.right: editor.right
-        anchors.top: editor.bottom
+        anchors.left: editorView.left
+        anchors.right: editorView.right
+        anchors.top: editorView.bottom
         anchors.topMargin: Style.u * 3
     }
     VideoGrid {
         id: grid
         objectName: "lens-grid"
-        anchors.left: editor.left
+        anchors.left: editorView.left
         anchors.right: parent.right
         anchors.top: under.bottom
         anchors.bottom: parent.bottom

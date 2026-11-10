@@ -46,6 +46,7 @@ FocusScope {
                 width: Math.min(380, top.width - 120)
                 placeholder: qsTr("@handle, channel link or ID")
                 onSubmitted: text => page.submit(text)
+                onEscaped: list.forceActiveFocus()
             }
             Act {
                 text: qsTr("Subscribe")

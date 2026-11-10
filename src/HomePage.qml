@@ -58,6 +58,10 @@ FocusScope {
     }
     // (`onLens` may not have caught up with `feed` yet when this runs.)
     onFeedChanged: if (feed !== "latest") backend.openLens(feed, 1)
+    // There is one open lens, and the lenses page may have opened another
+    // meanwhile: coming back, the one this page's tab names is opened again
+    // (from what the engine has; that is no reason to search).
+    onVisibleChanged: if (visible && feed !== "latest" && backend.lensInfo.id !== feed) backend.openLens(feed, 0)
 
     Column {
         id: top
