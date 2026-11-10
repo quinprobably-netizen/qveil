@@ -11,7 +11,9 @@ Popup {
     signal settingsRequested()
 
     // How tall what is in it may be, for the popup to fit the window.
-    readonly property real room: (Overlay.overlay ? Overlay.overlay.height : 600) - 2 * margins - 2 * padding
+    // How much of the window's height lies above where it opens (the bar).
+    property real above: 0
+    readonly property real room: (Overlay.overlay ? Overlay.overlay.height : 600) - above - 2 * margins - 2 * padding
     width: Math.min(440, (Overlay.overlay ? Overlay.overlay.width : 600) - 2 * margins)
     padding: Style.u * 5
     // Never over the window's edge, wherever it is opened from.
@@ -49,6 +51,7 @@ Popup {
         RouteChooser {
             id: chooser
             width: parent.width
+            height: implicitHeight
         }
         Rule { width: parent.width }
         // What the engine says about what it does and keeps, sentence by

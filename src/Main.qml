@@ -47,7 +47,7 @@ ApplicationWindow {
     readonly property var pages: ({ home: feedPage, search: searchPage, channel: channelPage,
                                     channels: subsPage, history: historyPage,
                                     lenses: lensesPage, settings: settingsPage })
-    // The rail marks where you are; a channel's page belongs to where you came from.
+    // The bar marks where you are; a channel's page belongs to where you came from.
     readonly property string place: page === "channel" || page === "search" ? returnPage : page
 
     Settings {
@@ -340,72 +340,29 @@ ApplicationWindow {
         LayoutMirroring.enabled: Qt.application.layoutDirection === Qt.RightToLeft
         LayoutMirroring.childrenInherit: true
 
-        Rail {
-            id: rail
-            anchors.left: parent.left
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            // In fullscreen the video has the whole window.
-            visible: !(win.watching && win.fullscreen)
-            current: win.watching ? "" : win.place
-            route: backend.config.route || "direct"
-            routeSummary: backend.privacy.summary
-            onPicked: place => win.go(place)
-            onRouteClicked: win.toggleRoute()
-        }
-
-        // The route popup opens beside the foot of the rail, where the
-        // route is shown.
-        Item {
-            anchors.left: rail.right
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: Style.u * 3
-            width: 1
-            height: 1
-            RoutePopup {
-                id: route
-                objectName: "routePopup"
-                onSettingsRequested: win.go("settings")
-                // Beside the rail, on the side the page is on.
-                x: Qt.application.layoutDirection === Qt.RightToLeft ? -width - Style.u * 2 : Style.u * 2
-                y: -height
-            }
-        }
-
         Item {
             id: content
-            anchors.left: rail.visible ? rail.right : parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
+            anchors.fill: parent
 
-            // Errors stay until dismissed. Over a video they sit on its top edge.
-            ErrorBar {
-                id: errorBar
-                objectName: "errorBar"
+            // The places, the search field and the route, across the top.
+            TopBar {
+                id: bar
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.top: parent.top
-                z: 2
-                onRouteRequested: win.openRoute()
-            }
-
-            // The search field, and under it how what is typed was read.
-            Column {
-                id: top
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.top: errorBar.visible ? errorBar.bottom : parent.top
-                anchors.leftMargin: Style.gutter
-                anchors.rightMargin: Style.gutter
-                anchors.topMargin: Style.u * 5
-                spacing: Style.u * 2
-                visible: !win.watching
+                // In fullscreen the video has the whole window.
+                visible: !(win.watching && win.fullscreen)
+                current: win.watching ? "" : win.place
+                route: backend.config.route || "direct"
+                routeSummary: backend.privacy.summary
+                onPicked: place => win.go(place)
+                onRouteClicked: win.toggleRoute()
 
                 FindField {
                     id: search
                     objectName: "search"
-                    width: Math.min(520, parent.width)
+                    anchors.centerIn: parent
+                    width: Math.min(460, parent.width)
                     onEscaped: win.focusPage(win.page)
                     onSubmitted: query => {
                         win.go("search")
@@ -413,8 +370,43 @@ ApplicationWindow {
                         backend.search(query)
                     }
                 }
+            }
+            // The route opens under where it is shown.
+            RoutePopup {
+                id: route
+                objectName: "routePopup"
+                parent: bar.routeAnchor
+                x: Qt.application.layoutDirection === Qt.RightToLeft ? 0 : parent.width - width
+                y: parent.height
+                above: bar.height
+                onSettingsRequested: win.go("settings")
+            }
+
+            // Errors stay until dismissed, under the bar.
+            ErrorBar {
+                id: errorBar
+                objectName: "errorBar"
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: bar.visible ? bar.bottom : parent.top
+                z: 2
+                onRouteRequested: win.openRoute()
+            }
+
+            // Under the bar, how what is typed in the search field was read.
+            Item {
+                id: top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: errorBar.visible ? errorBar.bottom : bar.visible ? bar.bottom : parent.top
+                anchors.leftMargin: Style.gutter
+                anchors.rightMargin: Style.gutter
+                height: tags.visible ? tags.height + Style.u * 3 : 0
+
                 ReadingTags {
+                    id: tags
                     objectName: "reading-tags"
+                    y: Style.u * 3
                     width: parent.width
                     // Only for what is in the field now, and only when there is a rule to show.
                     visible: backend.reading.rules === true && backend.reading.text === search.text.trim()
@@ -438,9 +430,8 @@ ApplicationWindow {
                 id: stage
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.top: top.visible ? top.bottom : parent.top
+                anchors.top: top.bottom
                 anchors.bottom: nowPlaying.visible ? nowPlaying.top : parent.bottom
-                anchors.topMargin: top.visible ? Style.u * 2 : 0
 
                 HomePage {
                     id: feedPage

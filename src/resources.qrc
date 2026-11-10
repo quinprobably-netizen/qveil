@@ -25,7 +25,6 @@
         <file alias="icons/plus.svg">icons/plus.svg</file>
         <file alias="icons/pip.svg">icons/pip.svg</file>
         <file alias="icons/theatre.svg">icons/theatre.svg</file>
-        <file alias="Rail.qml">Rail.qml</file>
         <file alias="ReadingTags.qml">ReadingTags.qml</file>
         <file alias="FindField.qml">FindField.qml</file>
         <file alias="ErrorBar.qml">ErrorBar.qml</file>
@@ -55,6 +54,9 @@
         <file alias="ResumeNotice.qml">ResumeNotice.qml</file>
         <file alias="Shelf.qml">Shelf.qml</file>
         <file alias="ShelvesHome.qml">ShelvesHome.qml</file>
+        <file alias="TopBar.qml">TopBar.qml</file>
+        <file alias="Choices.qml">Choices.qml</file>
+        <file alias="SettingRow.qml">SettingRow.qml</file>
         <file alias="Format.js">Format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="icons/play.svg">icons/play.svg</file>

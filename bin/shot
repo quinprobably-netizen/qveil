@@ -6,8 +6,8 @@
 # The app is built as it is in the tree and run against the stand-in engine
 # (tests/shots/engine.py), inside a headless compositor of its own, so it
 # renders on the GPU without opening anything on the desktop. Views: home,
-# feed, narrow, lenses, channels, history, settings, search, watch,
-# watch-comments.
+# feed, narrow, lenses, channels, history, settings, settings-about, search,
+# watch, watch-comments.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"

@@ -312,8 +312,18 @@ privacy rules and every behaviour above stand.
   pills and no avatar circles. Sections are headings without hairline rules;
   tabs are marked by a line under them; a choice among settings keeps the
   selected fill.
-- **The rail** is slim (56 px): glyphs only, each saying what it is when
-  pointed at, with the route's dot and the settings at its foot.
+- **A bar across the top** in place of the rail (the owner, of the slim icon
+  rail: "not a fan of the sidebar"; chosen from mockups): the wordmark, the
+  places as words (Home, Lenses, Channels, History), the search field in the
+  middle, and at the far end the route (its dot and its name; the dot alone in
+  a narrow window) and the settings. It stays while a video is watched, and
+  goes in fullscreen. The route's popup opens under where the route is shown.
+  How a search was read is shown under the bar.
+- **Settings** (also chosen from mockups) have categories down the side
+  (Privacy, Playback, Home, About) and, beside them, the rows of the one that
+  is showing: a setting's name and what it means on one side, its control on
+  the other. Privacy has the route, history and resume; About has the
+  engine's own account in full, and where the settings file is.
 - **Home** opens on the video most recently left unfinished, as a lead: its
   picture, its title large, what is left of it, and Resume, Start over and
   Forget. With nothing unfinished there is no lead. Under it every feed is a
@@ -322,7 +332,7 @@ privacy rules and every behaviour above stand.
   lens. A lens's shelf shows what the engine already has for it and never
   searches; shelves out of view are neither made nor filled. A shelf's heading
   (or "See all") opens that feed in full: the grid with its tabs, as before.
-  Escape, the back arrow in the tab row, `1` and the rail return to the
+  Escape, the back arrow in the tab row, `1` and the bar return to the
   shelves. Arrows move along a shelf and between shelves; Enter plays.
 - **Watching**: "Up next" shows pictures and is the sheet's first tab when the
   video was opened from a list with something after it; otherwise the sheet

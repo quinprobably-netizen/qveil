@@ -236,33 +236,77 @@ private slots:
                                                            : "qrc:/|\\.qml|QML|TypeError|ReferenceError"));
     }
 
-    void theWindowLoadsCleanWithARailAndNoTabBar()
+    void theBarAcrossTheTopHasThePlacesSearchAndTheRoute()
     {
         App app;
         READY(app);
-        for (const char *name : {"rail-home", "rail-lenses", "rail-channels", "rail-history", "rail-route", "rail-settings", "search"})
+        QQuickItem *bar = app.item("bar");
+        QVERIFY(bar);
+        QCOMPARE(bar->mapToScene(QPointF(0, 0)), QPointF(0, 0));
+        QCOMPARE(bar->width(), qreal(1280));
+        for (const char *name : {"wordmark", "nav-home", "nav-lenses", "nav-channels", "nav-history", "nav-route", "nav-settings", "search"}) {
             QVERIFY2(app.item(name), name);
-        QVERIFY(!app.object("topBar"));
+            // All of it is in the bar.
+            QVERIFY2(app.item(name)->mapToScene(QPointF(0, app.item(name)->height())).y() <= bar->height(), name);
+        }
+        // The places are words.
+        QStringList said;
+        App::texts(bar, said);
+        for (const char *word : {"Home", "Lenses", "Channels", "History", "Direct"})
+            QVERIFY2(said.contains(word), word);
         QCOMPARE(app.page(), QString("home"));
-        QVERIFY(app.item("rail-home")->property("current").toBool());
+        QVERIFY(app.item("nav-home")->property("current").toBool());
+        // There is nothing down the side: the page starts at the window's edge.
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QVERIFY(app.item("lead")->mapToScene(QPointF(0, 0)).x() <= 40);
 
-        app.click(app.item("rail-channels"));
+        app.click(app.item("nav-channels"));
         QCOMPARE(app.page(), QString("channels"));
-        QVERIFY(app.item("rail-channels")->property("current").toBool());
-        QVERIFY(!app.item("rail-home")->property("current").toBool());
-        app.click(app.item("rail-history"));
+        QVERIFY(app.item("nav-channels")->property("current").toBool());
+        QVERIFY(!app.item("nav-home")->property("current").toBool());
+        app.click(app.item("nav-history"));
         QCOMPARE(app.page(), QString("history"));
+        app.click(app.item("nav-settings"));
+        QCOMPARE(app.page(), QString("settings"));
+        QVERIFY(app.item("nav-settings")->property("current").toBool());
 
-        // What the route indicator says when pointed at is the engine's sentence.
-        QCOMPARE(app.item("rail-route")->property("tip").toString(), app.backend->privacy().value("summary").toString());
-        QVERIFY(!app.item("rail-route")->property("tip").toString().isEmpty());
+        // What the route indicator says when pointed at is the engine's sentence,
+        // and pressing it opens the route, under it and inside the window.
+        QCOMPARE(app.item("nav-route")->property("tip").toString(), app.backend->privacy().value("summary").toString());
+        QVERIFY(!app.item("nav-route")->property("tip").toString().isEmpty());
+        app.click(app.item("nav-route"));
+        QObject *popup = app.object("routePopup");
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QQuickItem *background = popup->property("background").value<QQuickItem *>();
+        QTest::qWait(200);
+        const QRectF at = background->mapRectToScene(QRectF(0, 0, background->width(), background->height()));
+        QVERIFY2(at.top() >= bar->height() - 1 && at.right() <= 1280 && at.left() > 640,
+                 qPrintable(QString("%1,%2 %3x%4").arg(at.x()).arg(at.y()).arg(at.width()).arg(at.height())));
+    }
+
+    void theBarFitsANarrowWindow()
+    {
+        App app(false, QSize(760, 520));
+        READY(app);
+        const auto edges = [&](const char *name) {
+            QQuickItem *item = app.item(name);
+            return item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+        };
+        QVERIFY2(edges("nav-settings").right() <= 760, qPrintable(QString::number(edges("nav-settings").right())));
+        QVERIFY2(edges("search").width() >= 150, qPrintable(QString::number(edges("search").width())));
+        // Nothing lies over anything else.
+        QVERIFY(edges("nav-history").right() <= edges("search").left());
+        QVERIFY(edges("search").right() <= edges("nav-route").left());
+        QVERIFY(edges("nav-route").right() <= edges("nav-settings").left());
+        // The route is still said, by its colour and when pointed at.
+        QVERIFY(!app.item("nav-route")->property("tip").toString().isEmpty());
     }
 
     void theRouteIndicatorSaysWhereYouStand()
     {
         App app;
         READY(app);
-        QQuickItem *route = app.item("rail-route");
+        QQuickItem *route = app.item("nav-route");
         QVERIFY(route);
         QCOMPARE(route->property("label").toString(), QString("Direct"));
         QCOMPARE(route->property("tone").value<QColor>(), QColor("#e0a93b"));
@@ -480,9 +524,10 @@ private slots:
         QTRY_COMPARE(App::count(app.item("seek"), "segment"), 7);
         QVERIFY(app.item("watch-stats")->property("text").toString().contains("59K views"));
         QVERIFY(app.item("seek-chapter")->property("text").toString().startsWith("1/7"));
-        // The rail is still there, and the search field has made room.
-        QVERIFY(app.item("rail-home")->isVisible());
-        QVERIFY(!app.item("search")->isVisible());
+        // The bar is still there, with the search field in it.
+        QVERIFY(app.item("nav-home")->isVisible());
+        QVERIFY(!app.item("nav-home")->property("current").toBool());
+        QVERIFY(app.item("search")->isVisible());
 
         // Escape goes back to where the video was opened from.
         QTest::keyClick(app.window, Qt::Key_Escape);
@@ -923,7 +968,7 @@ private slots:
         READY(app);
         QTest::keyClick(app.window, Qt::Key_5);
         QCOMPARE(app.page(), QString("settings"));
-        QVERIFY(app.item("rail-settings")->property("current").toBool());
+        QVERIFY(app.item("nav-settings")->property("current").toBool());
         const auto pages = [&] { return app.backend->privacy().value("pages").toMap(); };
 
         // Resume: the days, and the engine's sentence for them.
@@ -945,8 +990,10 @@ private slots:
         app.click(app.item("history-on"));
         QTRY_VERIFY(app.backend->config().value("history").toBool());
         QTRY_COMPARE(app.item("set-history-note")->property("text").toString(), pages().value("history_on").toString());
+        app.click(app.item("settings-cat-playback"));
         app.click(app.item("quality-720"));
         QTRY_COMPARE(app.backend->config().value("maxHeight").toInt(), 720);
+        app.click(app.item("settings-cat-home"));
         app.click(app.item("thumbs-clear"));
         QCOMPARE(app.window->property("thumbs").toString(), QString("clear"));
         app.click(app.item("thumbs-off"));
@@ -954,9 +1001,10 @@ private slots:
         app.click(app.item("thumbs-frosted"));
         QTRY_VERIFY(app.backend->config().value("thumbnails").toBool());
         QCOMPARE(app.window->property("thumbs").toString(), QString("frosted"));
+        app.click(app.item("settings-cat-privacy"));
         app.click(app.item("route-tor"));
         QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
-        QTRY_COMPARE(app.item("rail-route")->property("label").toString(), QString("Tor"));
+        QTRY_COMPARE(app.item("nav-route")->property("label").toString(), QString("Tor"));
         QCOMPARE(app.item("route-note")->property("text").toString(),
                  app.backend->privacy().value("routes").toMap().value("tor").toString());
     }
@@ -1029,9 +1077,9 @@ private slots:
             QTest::keyClick(app.window, Qt::Key_C);
             QTRY_COMPARE(app.items("comment").size(), 5);
             check("comments");
-            // The rail is on the side reading starts from.
-            const qreal railX = app.item("rail-home")->mapToScene(QPointF(0, 0)).x();
-            QVERIFY2(direction == Qt::LeftToRight ? railX < 100 : railX > 1100, qPrintable(QString::number(railX)));
+            // The bar starts on the side reading starts from.
+            const qreal markX = app.item("wordmark")->mapToScene(QPointF(0, 0)).x();
+            QVERIFY2(direction == Qt::LeftToRight ? markX < 100 : markX > 1100, qPrintable(QString::number(markX)));
         }
         QGuiApplication::setLayoutDirection(Qt::LeftToRight);
     }
@@ -1171,7 +1219,7 @@ private slots:
         QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
         QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
         QTRY_COMPARE(grid->property("count").toInt(), 6);
-        // Home, by its key or the rail, is the shelves again.
+        // Home, by its key or the bar, is the shelves again.
         QTest::keyClick(app.window, Qt::Key_1);
         QTRY_VERIFY(shelves->isVisible());
     }
@@ -1243,22 +1291,70 @@ private slots:
         QTRY_COMPARE(app.asked("GET api/lens?id=aaaa0012&refresh=0"), 1);
     }
 
-    void theRailIsSlimAndSaysItsPlacesWhenPointedAt()
+    void settingsAreRowsUnderCategoriesDownTheSide()
     {
         App app;
         READY(app);
-        QQuickItem *home = app.item("rail-home");
-        QVERIFY(home);
-        QVERIFY(home->parentItem());
-        QVERIFY2(home->width() <= 48, qPrintable(QString::number(home->width())));
-        QCOMPARE(home->property("tip").toString(), QString("Home"));
-        QStringList said;
-        App::texts(home, said);
-        QVERIFY2(!said.contains("Home"), qPrintable(said.join("|")));
-        // The route still says where you stand, when asked.
-        QVERIFY(app.item("rail-route")->property("tip").toString().startsWith("Direct"));
-        // The page starts right beside it.
-        QVERIFY(app.item("search")->mapToScene(QPointF(0, 0)).x() < 90);
+        QTest::keyClick(app.window, Qt::Key_5);
+        QQuickItem *page = app.item("settings");
+        QVERIFY(page);
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        // The categories, down the starting side; the first is showing.
+        qreal lastY = -1;
+        for (const char *name : {"settings-cat-privacy", "settings-cat-playback", "settings-cat-home", "settings-cat-about"}) {
+            QQuickItem *cat = App::under(page, name);
+            QVERIFY2(cat && cat->isVisible(), name);
+            QVERIFY(box(cat).left() < 60 && box(cat).top() > lastY);
+            lastY = box(cat).top();
+        }
+        QVERIFY(App::under(page, "settings-cat-privacy")->property("current").toBool());
+        QCOMPARE(page->property("category").toString(), QString("privacy"));
+
+        // Which rows a category has, and a control of each.
+        const QList<std::tuple<QString, QString, QString>> rows{
+            {"privacy", "set-route", "route-tor"},     {"privacy", "set-history", "history-on"},
+            {"privacy", "set-resume", "resume-7"},     {"playback", "set-quality", "quality-1080"},
+            {"home", "set-thumbs", "thumbs-clear"},    {"home", "set-shorts", "shorts-hidden"}};
+        qreal left = -1, right = -1;
+        for (const auto &[category, rowName, controlName] : rows) {
+            app.click(App::under(page, qPrintable("settings-cat-" + category)));
+            QCOMPARE(page->property("category").toString(), category);
+            QQuickItem *row = App::under(page, rowName);
+            QVERIFY2(row && row->isVisible(), qPrintable(rowName));
+            QQuickItem *name = App::under(row, "setting-name"), *control = App::under(row, controlName);
+            QVERIFY2(name && control && control->isVisible(), qPrintable(rowName));
+            QVERIFY(!name->property("text").toString().isEmpty());
+            const QRectF n = box(name), c = box(control), r = box(row);
+            // The control is beside the name, on the row, towards its far end.
+            QVERIFY2(c.left() > n.right(), qPrintable(rowName));
+            QVERIFY2(r.contains(c) && r.contains(n), qPrintable(rowName));
+            QVERIFY2(c.center().x() > r.center().x(), qPrintable(rowName));
+            // The rows share their edges, beside the categories, and are no wider than reads well.
+            if (left < 0) {
+                left = r.left();
+                right = r.right();
+            }
+            QCOMPARE(r.left(), left);
+            QCOMPARE(r.right(), right);
+            QVERIFY2(r.width() <= 780 && r.left() > box(App::under(page, "settings-cat-privacy")).right(), qPrintable(rowName));
+            // Only the rows of the category that is showing are showing.
+            for (const auto &[other, otherRow, unused] : rows)
+                QCOMPARE(App::under(page, otherRow)->isVisible(), other == category);
+        }
+        // The route's row says what the engine says of the route chosen.
+        app.click(App::under(page, "settings-cat-privacy"));
+        QCOMPARE(App::under(App::under(page, "set-route"), "route-note")->property("text").toString(),
+                 app.backend->privacy().value("routes").toMap().value("direct").toString());
+        // About has the engine's own account, in full.
+        QCOMPARE(App::count(page, "privacy-point"), 0);
+        app.click(App::under(page, "settings-cat-about"));
+        QTRY_COMPARE(App::count(page, "privacy-point"), int(app.backend->privacy().value("points").toList().size()));
+        // The arrow keys step through the categories.
+        QTest::keyClick(app.window, Qt::Key_Up);
+        QTRY_COMPARE(page->property("category").toString(), QString("home"));
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QCOMPARE(page->property("category").toString(), QString("about"));
     }
 
     void typeIsTheSystemsAndPicturesAreClearUnlessAskedOtherwise()
@@ -1277,6 +1373,7 @@ private slots:
         QVERIFY(!App::under(app.item("shelf-resume"), "frost")->property("veiled").toBool());
         // Frosted is still there for whoever wants it.
         QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-home"));
         app.click(app.item("thumbs-frosted"));
         QCOMPARE(app.window->property("thumbs").toString(), QString("frosted"));
         QTest::keyClick(app.window, Qt::Key_1);
@@ -1412,13 +1509,18 @@ private slots:
         QQuickItem *grid = app.item("lens-grid");
         QTRY_VERIFY2(grid->height() >= 200, qPrintable(QString::number(grid->height())));
         // The last lens can be brought into view and opened.
-        QMetaObject::invokeMethod(list, "positionViewAtEnd");
-        QTest::qWait(100);
+        // (Twice: the rows differ in height, and the list only knows the
+        // height of those it has made.)
+        for (int i = 0; i < 2; ++i) {
+            QMetaObject::invokeMethod(list, "positionViewAtEnd");
+            QTest::qWait(100);
+        }
         QQuickItem *last = nullptr;
+        // (The list keeps some rows ready just outside its view; the last one in view is meant.)
         for (QQuickItem *row : app.items("lens-row"))
-            if (!last || row->mapToScene(QPointF(0, 0)).y() > last->mapToScene(QPointF(0, 0)).y())
+            if (bottom(row) <= bottom(list) + 1 && (!last || bottom(row) > bottom(last)))
                 last = row;
-        QVERIFY(last && bottom(last) <= bottom(list) + 1);
+        QVERIFY(last);
         app.click(last);
         QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0012"));
     }

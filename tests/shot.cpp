@@ -44,6 +44,7 @@ int main(int argc, char *argv[]) {
         {"channels", "go('channels')"},
         {"history", "go('history')"},
         {"settings", "go('settings')"},
+        {"settings-about", "go('settings'); settingsPage.category = 'about'"},
         {"search", "go('search'); backend.search('talks over 30 min')"},
         {"watch", "play(backend.feed.get(0), backend.feed, 0)"},
         {"feed", "feedPage.showAll('latest')"},

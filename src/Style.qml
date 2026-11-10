@@ -42,7 +42,8 @@ QtObject {
     readonly property int radius: theme.radius
     // The unit spacing is counted in.
     readonly property int u: 4
-    readonly property int rail: 56
+    // How tall the bar across the top is.
+    readonly property int bar: 56
     readonly property int gutter: 24
     readonly property int control: 28
     // How long a fill or a veil takes to change.
