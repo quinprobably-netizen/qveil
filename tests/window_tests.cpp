@@ -511,6 +511,94 @@ private slots:
         QMetaObject::invokeMethod(watch, "follow", Q_ARG(QVariant, "javascript:alert(1)"));
         QCOMPARE(app.page(), QString("home"));
     }
+
+    void commentsAreOnlyFetchedWhenTheTabIsOpened()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::qWait(300);
+        QCOMPARE(app.asked("GET api/comments"), 0);
+
+        app.click(app.item("tab-comments"));
+        QTRY_COMPARE(app.items("comment").size(), 5);
+        QCOMPARE(app.asked("GET api/comments"), 1);
+        QVERIFY(app.asked().filter("GET api/comments").first().contains("sort=top&n=40&replies=0"));
+        QQuickItem *first = app.items("comment").first();
+        QVERIFY(first->property("pinned").toBool());
+        QCOMPARE(first->property("author").toString(), QString("Low Level Hours"));
+        // How many there are in all is on the tab.
+        QVERIFY(app.item("tab-comments")->property("text").toString().contains("1,204"));
+        QVERIFY(app.items("reply").isEmpty());
+
+        // Coming back to the tab asks for nothing.
+        app.click(app.item("tab-about"));
+        app.click(app.item("tab-comments"));
+        QTest::qWait(300);
+        QCOMPARE(app.asked("GET api/comments"), 1);
+        QCOMPARE(app.items("comment").size(), 5);
+    }
+
+    void moreNewestAndRepliesAskAgain()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        app.click(app.item("tab-comments"));
+        QTRY_COMPARE(app.items("comment").size(), 5);
+
+        app.click(app.item("comments-replies"));
+        QTRY_VERIFY(!app.items("reply").isEmpty());
+        QVERIFY(app.asked().filter("GET api/comments").last().contains("replies=1"));
+        QVERIFY(!app.item("comments-replies")->isVisible());
+
+        app.click(app.item("comments-new"));
+        QTRY_VERIFY(app.asked().filter("GET api/comments").last().contains("sort=new"));
+        QTRY_COMPARE(app.items("comment").first()->property("author").toString(), QString("perennial_nico"));
+
+        QMetaObject::invokeMethod(app.item("comments"), "more");
+        QTRY_VERIFY(app.asked().filter("GET api/comments").last().contains("n=80"));
+        QTRY_COMPARE(app.item("comments")->property("shown").toInt(), 45);
+    }
+
+    void aTimestampInACommentSeeksAndLeavingStopsTheLookup()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QQuickItem *surface = app.item("surface");
+        app.click(app.item("tab-comments"));
+        QTRY_COMPARE(app.items("comment").size(), 5);
+        QQuickItem *text = App::under(app.items("comment").at(1), "comment-text");
+        QVERIFY(text);
+        QVERIFY(text->property("text").toString().contains("<a href=\"qveil:time/760\">12:40</a>"));
+        QMetaObject::invokeMethod(text, "linkActivated", Q_ARG(QString, "qveil:time/760"));
+        QCOMPARE(surface->property("lastSeek").toInt(), 760);
+
+        // A lookup that is still running when the page is left is hung up on.
+        app.play({{"id", "slowslowslo"}});
+        app.click(app.item("tab-comments"));
+        QTRY_VERIFY(app.backend->busy().contains("comments"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY_WITH_TIMEOUT(!app.backend->busy().contains("comments"), 1000);
+        QVERIFY(app.backend->comments().isEmpty());
+        QVERIFY2(app.backend->error().isEmpty(), qPrintable(app.backend->error()));
+    }
+
+    void theCommentsNoteIsTheEnginesOwnSentenceAndNoneIsSaidPlainly()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "nocomments0"}});
+        app.click(app.item("tab-comments"));
+        QTRY_VERIFY(app.item("comments-empty")->isVisible());
+        QCOMPARE(app.item("comments-empty")->property("text").toString(), QString("No comments here, or they are turned off."));
+        QCOMPARE(app.item("comments-note")->property("text").toString(),
+                 app.backend->privacy().value("pages").toMap().value("comments").toString());
+        QVERIFY(!app.item("comments-note")->property("text").toString().isEmpty());
+        QVERIFY(app.items("comment").isEmpty());
+    }
 };
 
 QVEIL_SUITE(WindowTests)

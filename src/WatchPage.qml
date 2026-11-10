@@ -46,7 +46,11 @@ FocusScope {
         flick.contentY = 0
     }
     function open(i) { surface.open(i) }
-    function close() { surface.stop() }
+    function close() {
+        // A lookup of comments that is still running is for nobody now.
+        backend.closeComments()
+        surface.stop()
+    }
 
     // Where a link in a description or a comment leads: back into the app,
     // or (for another site) nowhere but the clipboard.
@@ -193,7 +197,7 @@ FocusScope {
         y: page.beside ? Style.u * 5 : 0
         width: page.beside ? page.sheetWidth : below.width
         height: page.beside ? page.height - Style.u * 5 - Style.gutter : below.height
-        commentCount: undefined
+        commentCount: comments.count
 
         about: AboutTab {
             anchors.fill: parent
@@ -202,6 +206,13 @@ FocusScope {
             current: bar.chapter
             onLinkActivated: link => page.follow(link)
             onChapterPicked: seconds => surface.seekTo(seconds)
+        }
+        comments: CommentsTab {
+            id: comments
+            anchors.fill: parent
+            video: page.info.id || ""
+            active: sheet.visible && sheet.current === "comments" && page.active
+            onLinkActivated: link => page.follow(link)
         }
         next: UpNextTab {
             anchors.fill: parent

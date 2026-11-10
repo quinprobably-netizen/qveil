@@ -12,6 +12,7 @@
 #include <QProcessEnvironment>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QQmlEngine>
 #include <QQmlExpression>
 #include <QQuickStyle>
 #include <QQuickWindow>
@@ -45,6 +46,7 @@ int main(int argc, char *argv[]) {
         {"settings", "go('settings')"},
         {"search", "go('search'); backend.search('talks over 30 min')"},
         {"watch", "play(backend.feed.get(0))"},
+        {"watch-comments", "play(backend.feed.get(0)); watch.sheet.current = 'comments'"},
     };
     if (!views.contains(view)) {
         std::fprintf(stderr, "no view %s; there are: %s\n", argv[1], qPrintable(QStringList(views.keys()).join(", ")));
@@ -81,7 +83,8 @@ int main(int argc, char *argv[]) {
     // view, give it time to load and settle, and take the picture.
     QTimer::singleShot(2500, &app, [&] {
         if (!views.value(view).isEmpty()) {
-            QQmlExpression go(engine.rootContext(), window, views.value(view));
+            // In the window's own context, so that its parts can be named.
+            QQmlExpression go(qmlContext(window), window, views.value(view));
             go.evaluate();
             if (go.hasError())
                 std::fprintf(stderr, "%s\n", qPrintable(go.error().toString()));

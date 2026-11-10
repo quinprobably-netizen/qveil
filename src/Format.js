@@ -62,3 +62,15 @@ function thumb(base, id, batch) {
         return ""
     return base + id + (batch > 0 ? "?batch=" + batch : "")
 }
+
+// A count in few characters: 640, 1.2K, 3.4M.
+function count(n) {
+    if (n === undefined || n === null)
+        return ""
+    const short = (v, digits) => v.toLocaleString(Qt.locale(), 'f', digits)
+    if (n >= 1e6)
+        return short(n / 1e6, 1) + "M"
+    if (n >= 1e3)
+        return short(n / 1e3, n >= 1e4 ? 0 : 1) + "K"
+    return String(n)
+}

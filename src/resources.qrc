@@ -46,6 +46,8 @@
         <file alias="AboutTab.qml">AboutTab.qml</file>
         <file alias="UpNextTab.qml">UpNextTab.qml</file>
         <file alias="WatchPage.qml">WatchPage.qml</file>
+        <file alias="CommentsTab.qml">CommentsTab.qml</file>
+        <file alias="CommentItem.qml">CommentItem.qml</file>
         <file alias="Format.js">Format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="icons/play.svg">icons/play.svg</file>
