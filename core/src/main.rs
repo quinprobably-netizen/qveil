@@ -34,6 +34,7 @@ mod errors;
 mod feed;
 mod ids;
 mod inflight;
+mod lens;
 mod net;
 mod pick;
 mod player;
