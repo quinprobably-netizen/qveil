@@ -18,7 +18,7 @@ Decisions the owner made when asked:
 | What "remembers position" means | Saved on disk, deleted after a set time. |
 | Mobile | Android, after the desktop release. |
 | Other frontends | Parked. |
-| Interface direction | Direction A from the stills, without the dye ("not really a fan of the dye bath but like A's design direction"). |
+| Interface direction | Direction A's layout from the stills, without the dye, drawn in the language of the recent panels with the system font. |
 
 Stills of the chosen direction: <https://claude.ai/artifact/Xpv4ujGSAWYU7LRE4HGT1z>.
 
@@ -130,7 +130,7 @@ conversation.
 
 **The reader** (`lens.rs`, pure functions, no I/O). Text in, a `Reading` out:
 topics, excluded words, length bounds, earliest date, shorts or not,
-subscriptions only / excluded, order. It also returns the chips the window
+subscriptions only / excluded, order. It also returns the tags the window
 shows ("about *hand tool woodworking*", "longer than *15:00*"), so what was
 understood is always visible. English only in this release.
 
@@ -198,32 +198,36 @@ ranking stay on this computer. On one address, their timing links them.*
 
 The stills are the reference. What they commit to:
 
-**Look.**
-- A plain dark room, neutrals tinted slightly toward the accent. Three
-  surface levels: rail, panel, raised.
-- Soft shapes that qveil owns: large radii on cards and sheets, full pills for
-  chips and buttons. The accent still follows the Omarchy theme live; window
-  rounding no longer drives the shapes.
-- An italic serif for page headings and video titles, a sans for everything
-  else, tabular figures for times. Fonts ship inside the app (open licences),
-  so nothing is fetched and it looks the same everywhere. Final faces are
-  chosen during the build.
+**Look.** The language of the owner's recent Omarchy panels (qnet, oc, Sound
+Hub), at window size. The owner on the first drawing: the pills "feel too
+apple and not like our recent design directions", and asked for system fonts.
+- **System typeface.** One family for everything: the `monospace` alias the
+  Omarchy bar uses, so `omarchy font set` changes qveil live. No bundled
+  fonts. Hierarchy comes from size and weight, as in the panels. Tabular
+  figures for times.
+- **Square, flat surfaces.** Corners follow Hyprland's rounding (0 today), as
+  the app already does. Surfaces are the foreground colour at the panels'
+  alphas: rest 0.04, hover 0.08, selected 0.18. Hairlines divide; a section
+  is a small dim label with a rule running to the edge. No pills, no shadows,
+  no avatar circles, no glow behind the video.
+- **Buttons are words** (optionally with a glyph) that take the hover fill;
+  tabs are words that take the selected fill.
 - **No dye.** The dye shader, the dye wash and the dyed wordmark go. The veil
   becomes frost: the thumbnail blurred and muted, clearing on hover or
   keyboard selection. Setting: Frosted (default), Clear, or no thumbnails.
-- Accent is for the wordmark, links and timestamps, focus, and "why" lines.
-  Green still means a protected route and amber means Direct.
+- Accent is for the wordmark, progress, links and timestamps, and "why"
+  lines. Green still means a protected route and amber means Direct.
 
 **Shell.** A slim rail on the left: wordmark, Home, Lenses, Channels, History,
-Settings, and the route seal at the bottom (opens the route popup). The top
-tab bar goes. A search pill sits at the top of the content; the reading's
-chips appear under it while typing.
+then the route indicator and Settings at the bottom (the indicator opens the
+route popup). The top tab bar goes. A search field sits at the top of the
+content; the reading's tags appear under it while typing.
 
 **Home.** "Pick up where you stopped" (unfinished videos with time left, only
-when there are any), then a switcher: Latest, one chip per lens, New lens.
-Below it the grid. Shorts toggle and Refresh sit on the switcher row.
+when there are any), then a row of tabs: Latest, one per lens, New lens.
+Below it the grid. Shorts and Refresh sit at the end of that row.
 
-**Lenses.** List on the left, editor on the right: the prompt, its chips, the
+**Lenses.** List on the left, editor on the right: the prompt, its tags, the
 exact searches a refresh will send, Refresh and Delete, then the results with
 their "why" lines. A search can be kept as a lens.
 
@@ -288,8 +292,8 @@ drop-to-import, engine restart handling.
 ## Release
 
 Version 0.4.0 in `Cargo.toml`, `Cargo.lock` and `pkgver`; README features,
-keys, screenshot and generated privacy section; font licences installed with
-the package. Nothing is pushed or tagged until the owner says so.
+keys, screenshot and generated privacy section. Nothing is pushed or tagged
+until the owner says so.
 
 ## Not in 0.4.0
 
