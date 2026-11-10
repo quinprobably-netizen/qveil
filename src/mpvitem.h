@@ -47,6 +47,10 @@ class MpvItem : public QQuickFramebufferObject {
     Q_PROPERTY(bool muted READ muted WRITE setMuted NOTIFY mutedChanged)
     // How fast it plays: 1 is as recorded.
     Q_PROPERTY(double speed READ speed WRITE setSpeed NOTIFY speedChanged)
+    // How much larger than its own size the item is drawn on screen (the
+    // window draws itself larger when it is wide). The video is rendered at
+    // that size, so that it isn't rendered small and stretched.
+    Q_PROPERTY(double renderScale READ renderScale WRITE setRenderScale NOTIFY renderScaleChanged)
     // What mpv paints where there is no video: before the first frame and in
     // the letterbox. It has to be the scene's own colour behind the item.
     Q_PROPERTY(QColor backgroundColor READ backgroundColor WRITE setBackgroundColor NOTIFY backgroundColorChanged)
@@ -75,6 +79,8 @@ public:
     void setVolume(double volume);
     void setMuted(bool muted);
     double speed() const { return m_speed; }
+    double renderScale() const { return m_renderScale; }
+    void setRenderScale(double scale);
     void setSpeed(double speed);
     QColor backgroundColor() const { return m_background; }
     void setBackgroundColor(const QColor &color);
@@ -91,6 +97,7 @@ signals:
     void volumeChanged();
     void mutedChanged();
     void speedChanged();
+    void renderScaleChanged();
     void backgroundColorChanged();
     void failed(const QString &message);
 
@@ -104,7 +111,7 @@ private:
 
     mpv_handle *m_mpv = nullptr;
     std::shared_ptr<MpvShared> m_shared;
-    double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100, m_speed = 1;
+    double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100, m_speed = 1, m_renderScale = 1;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false, m_started = false;
     QColor m_background = Qt::black;

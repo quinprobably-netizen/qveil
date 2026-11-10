@@ -334,6 +334,15 @@ privacy rules and every behaviour above stand.
   (or "See all") opens that feed in full: the grid with its tabs, as before.
   Escape, the back arrow in the tab row, `1` and the bar return to the
   shelves. Arrows move along a shelf and between shelves; Enter plays.
+- **The window adapts to its size** (the owner, trying the build: "i think the
+  scaling is broken"; fixed sizes cut a card off in a 941×508 tile and left a
+  full screen nearly empty; chosen from mockups). A shelf shows whole cards,
+  sized to the width (about 280 px and up: three across in the tile, four at
+  1280). The latest take the rows the window has free, so that a window with
+  no lead and no other shelves is filled; with no room for more they are one
+  row that scrolls sideways. From 1600 px wide the whole window, and what
+  opens over it, is drawn half again as large (four large cards across a full
+  HD screen), and the video is rendered at the size it covers.
 - **Watching**: "Up next" shows pictures and is the sheet's first tab when the
   video was opened from a list with something after it; otherwise the sheet
   opens on About.

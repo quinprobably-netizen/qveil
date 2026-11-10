@@ -25,6 +25,19 @@ Item {
     property int column: 0
     // Actions, after the note.
     default property alias actions: tail.data
+    // How many cards fit across: whole ones, sized to the width.
+    readonly property int across: Math.max(2, Math.floor((width + Style.u * 4) / 280))
+    // How many rows it may take. More than one, and it doesn't scroll sideways.
+    property int rows: 1
+    readonly property bool wrapped: rows > 1
+    // (While it is still empty it is as tall as it will be, so that the page doesn't jump as it fills.)
+    readonly property int shownRows: !wrapped ? 1
+        : entries.length > 0 ? Math.min(rows, Math.ceil(entries.length / across)) : rows
+    readonly property alias cellHeight: row.cellHeight
+    // Where the row of the video at `index` starts, from the shelf's top.
+    function rowTop(index) {
+        return head.height + Style.u * 2 + (wrapped ? Math.floor(index / across) * row.cellHeight : 0)
+    }
     signal activated(var video, int index)
     signal channelRequested(string id)
     signal allRequested()
@@ -34,9 +47,9 @@ Item {
     objectName: "shelf-" + key
     // As tall while it is still empty as it will be with its videos, so
     // that the page doesn't jump as the shelves fill.
-    implicitHeight: head.height + Style.u * 2 + row.cellHeight
+    implicitHeight: head.height + Style.u * 2 + row.cellHeight * shownRows
 
-    onColumnChanged: if (current) row.positionViewAtIndex(column, ListView.Contain)
+    onColumnChanged: if (current && !wrapped) row.positionViewAtIndex(column, GridView.Contain)
 
     Item {
         id: head
@@ -93,16 +106,16 @@ Item {
         }
     }
 
-    ListView {
+    // One row that scrolls sideways, or (when there are more rows than one)
+    // rows that fill the width and don't scroll.
+    GridView {
         id: row
         // What a card asks of what it is in.
         readonly property string thumbs: shelf.thumbs
         readonly property var progress: shelf.progress
         readonly property string estimateNote: shelf.estimateNote
-        readonly property int cellWidth: 288
         // The cards have a line saying why they are there when their videos do.
         readonly property bool reasons: shelf.entries.length > 0 && (shelf.entries[0].why || []).length > 0
-        readonly property int cellHeight: Math.round((cellWidth - Style.u * 4) * 9 / 16) + 104 + (reasons ? 18 : 0)
         signal channelRequested(string id)
         function pick(i) { shelf.activated(shelf.entries[i], i) }
         function pointed() { shelf.pointed() }
@@ -110,14 +123,19 @@ Item {
 
         anchors.top: head.bottom
         anchors.topMargin: Style.u * 2
-        // The cards have a margin of their own: the first picture starts under the heading.
+        // The cards have a margin of their own: the first picture starts
+        // under the heading, and the last one ends at the page's edge.
         x: -Style.u * 2
         width: parent.width + Style.u * 4
-        height: cellHeight
+        height: cellHeight * shelf.shownRows
+        cellWidth: Math.floor(width / shelf.across)
+        cellHeight: Math.round((cellWidth - Style.u * 4) * 9 / 16) + 104 + (reasons ? 18 : 0)
+        flow: shelf.wrapped ? GridView.FlowLeftToRight : GridView.FlowTopToBottom
+        interactive: !shelf.wrapped
         visible: shelf.entries.length > 0
-        orientation: ListView.Horizontal
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        keyNavigationEnabled: false
         model: shelf.entries
         delegate: VideoCard {
             required property var modelData

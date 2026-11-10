@@ -55,7 +55,14 @@ public:
 
     // Runs on the render thread while the GUI thread waits; the only moment
     // the item can be read safely.
-    void synchronize(QQuickFramebufferObject *item) override { m_window = item->window(); }
+    void synchronize(QQuickFramebufferObject *item) override {
+        m_window = item->window();
+        const double scale = static_cast<MpvItem *>(item)->renderScale();
+        if (scale != m_scale) {
+            m_scale = scale;
+            invalidateFramebufferObject();
+        }
+    }
 
     QOpenGLFramebufferObject *createFramebufferObject(const QSize &size) override {
         if (!m_shared->render) {
@@ -79,7 +86,7 @@ public:
                 mpv_render_context_set_update_callback(context, onRenderUpdate, m_shared.get());
             }
         }
-        return QQuickFramebufferObject::Renderer::createFramebufferObject(size);
+        return QQuickFramebufferObject::Renderer::createFramebufferObject(size * m_scale);
     }
 
     void render() override {
@@ -102,6 +109,7 @@ public:
 private:
     std::shared_ptr<MpvShared> m_shared;
     QQuickWindow *m_window = nullptr;
+    double m_scale = 1;
 };
 
 } // namespace
@@ -268,6 +276,14 @@ void MpvItem::seek(double seconds, bool relative) {
 void MpvItem::setVolume(double volume) {
     volume = qBound(0.0, volume, 100.0);
     mpv_set_property(m_mpv, "volume", MPV_FORMAT_DOUBLE, &volume);
+}
+
+void MpvItem::setRenderScale(double scale) {
+    if (!(scale > 0) || qFuzzyCompare(scale, m_renderScale))
+        return;
+    m_renderScale = scale;
+    emit renderScaleChanged();
+    update();
 }
 
 void MpvItem::setSpeed(double speed) {

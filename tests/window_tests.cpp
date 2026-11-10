@@ -1397,6 +1397,121 @@ private slots:
         QCOMPARE(app.item("sheet")->property("current").toString(), QString("about"));
     }
 
+    // --- The window adapts to its size. ---
+
+    void aShelfShowsWholeCardsAndTheLatestFillTheWindow()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        // Nothing unfinished and no lenses, in a small tile: the latest are the page.
+        {
+            App app(true, QSize(941, 508));
+            READY(app);
+            QQuickItem *shelf = nullptr;
+            QTRY_VERIFY((shelf = app.item("shelf-latest")));
+            QTRY_VERIFY(App::count(shelf, "card") >= 6);
+            QCOMPARE(shelf->property("across").toInt(), 3);
+            QVERIFY(shelf->property("rows").toInt() >= 2);
+            // Whole cards: none reaches past the window's edge, and the first row has three.
+            QList<QQuickItem *> cards;
+            App::collect(shelf, "card", cards);
+            int top = 0;
+            for (QQuickItem *card : cards) {
+                QVERIFY2(box(card).right() <= 941 && box(card).left() >= 0, qPrintable(QString::number(box(card).right())));
+                if (qAbs(box(card).top() - box(cards.first()).top()) < 1)
+                    ++top;
+            }
+            QCOMPARE(top, 3);
+            // The arrows move through the rows of the one shelf.
+            QQuickItem *home = app.item("shelves-home");
+            QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+            QTest::keyClick(app.window, Qt::Key_Right);
+            QTRY_COMPARE(home->property("column").toInt(), 1);
+            QTest::keyClick(app.window, Qt::Key_Down);
+            QTRY_COMPARE(home->property("column").toInt(), 4);
+            QCOMPARE(home->property("row").toInt(), 0);
+            QTest::keyClick(app.window, Qt::Key_Up);
+            QTRY_COMPARE(home->property("column").toInt(), 1);
+            // What the keyboard is on is in view.
+            QTest::keyClick(app.window, Qt::Key_Down);
+            QTest::keyClick(app.window, Qt::Key_Down);
+            QQuickItem *selected = nullptr;
+            QTRY_VERIFY2(([&] {
+                for (QQuickItem *card : app.items("card"))
+                    if (card->property("selected").toBool())
+                        selected = card;
+                return selected && box(selected).bottom() <= 508 && box(selected).top() >= 56;
+            })(), "the selected card is out of view");
+        }
+        // With a lead and other shelves there is a row of the latest, of whole cards, that scrolls sideways.
+        {
+            App app;
+            READY(app);
+            QTRY_VERIFY(app.item("lead")->isVisible());
+            QQuickItem *shelf = nullptr;
+            QTRY_VERIFY((shelf = app.item("shelf-latest")));
+            QTRY_VERIFY(App::count(shelf, "card") >= 5);
+            QCOMPARE(shelf->property("across").toInt(), 4);
+            QCOMPARE(shelf->property("rows").toInt(), 1);
+            QList<QQuickItem *> cards;
+            App::collect(shelf, "card", cards);
+            std::sort(cards.begin(), cards.end(), [&](QQuickItem *a, QQuickItem *b) { return box(a).left() < box(b).left(); });
+            // The fourth ends at the page's edge, where the fifth begins.
+            QVERIFY2(qAbs(box(cards.at(3)).right() - (1280 - 16)) <= 12, qPrintable(QString::number(box(cards.at(3)).right())));
+            QVERIFY(box(cards.at(4)).left() >= 1280 - 28);
+        }
+    }
+
+    void aWideWindowIsDrawnHalfAgainAsLarge()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(1920, 1080));
+        READY(app);
+        QCOMPARE(app.window->property("zoom").toReal(), 1.5);
+        // The bar, its type and the cards are all half again as large, and span the window.
+        QQuickItem *bar = app.item("bar");
+        QCOMPARE(box(bar), QRectF(0, 0, 1920, 84));
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")));
+        QTRY_VERIFY(App::count(shelf, "card") >= 4);
+        QCOMPARE(shelf->property("across").toInt(), 4);
+        QQuickItem *card = App::under(shelf, "card");
+        QVERIFY2(box(card).width() > 440 && box(card).width() < 480, qPrintable(QString::number(box(card).width())));
+        // Pressing things still presses them.
+        app.click(app.item("nav-channels"));
+        QCOMPARE(app.page(), QString("channels"));
+        // What opens over the window is as large, and inside it.
+        app.click(app.item("nav-route"));
+        QObject *popup = app.object("routePopup");
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QTest::qWait(200);
+        QQuickItem *background = popup->property("background").value<QQuickItem *>();
+        QVERIFY2(qAbs(box(background).width() - 660) < 2, qPrintable(QString::number(box(background).width())));
+        QVERIFY2(QRectF(0, 0, 1920, 1080).contains(box(background)) && box(background).top() >= 83,
+                 qPrintable(QString("%1,%2 %3x%4").arg(box(background).x()).arg(box(background).y()).arg(box(background).width()).arg(box(background).height())));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!popup->property("opened").toBool());
+        QObject *help = app.object("help");
+        QTest::keyClick(app.window, '?');
+        QTRY_VERIFY(help->property("opened").toBool());
+        QTest::qWait(200);
+        QQuickItem *sheet = help->property("background").value<QQuickItem *>();
+        QVERIFY2(qAbs(box(sheet).center().x() - 960) < 3 && qAbs(box(sheet).center().y() - 540) < 3 && box(sheet).top() >= 0,
+                 qPrintable(QString("%1,%2").arg(box(sheet).center().x()).arg(box(sheet).center().y())));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        // The video is drawn for the pixels it covers, not drawn small and stretched.
+        app.play({{"id", "vid00000002"}});
+        QObject *mpv = app.item("surface")->property("mpv").value<QObject *>();
+        QTRY_COMPARE(mpv->property("renderScale").toReal(), 1.5);
+
+        // A window of the usual size is drawn as it was.
+        App usual;
+        READY(usual);
+        QCOMPARE(usual.window->property("zoom").toReal(), 1.0);
+        QCOMPARE(box(usual.item("bar")).height(), 56.0);
+        QCOMPARE(usual.item("surface")->property("mpv").value<QObject *>()->property("renderScale").toReal(), 1.0);
+    }
+
     // --- What the review of the window found. ---
 
     void homeShowsTheLensItsTabNames()

@@ -35,6 +35,16 @@ ApplicationWindow {
     // Whether keys are going into a text field. Every Qt Quick text input
     // has a cursor position and nothing else that takes focus does. While
     // this is true, no letter, digit or bracket is a shortcut.
+    // A wide window (a full screen, a television) is drawn half again as
+    // large: everything in it, by the one factor.
+    readonly property real zoom: width >= 1600 ? 1.5 : 1
+    // What opens over the window is drawn as large as what is in it.
+    function scaleOverlay() {
+        Overlay.overlay.transformOrigin = Item.TopLeft
+        Overlay.overlay.scale = zoom
+    }
+    onZoomChanged: scaleOverlay()
+    Component.onCompleted: scaleOverlay()
     // Whether the arrow keys are the video's: while it has the page, or in
     // its small window. While it plays in the small window and this one is
     // browsed, they move through what is browsed, as they always do.
@@ -336,7 +346,11 @@ ApplicationWindow {
     // Mirrors for right-to-left languages. A top-level window ignores the
     // application's layout direction.
     Item {
-        anchors.fill: parent
+        id: root
+        width: win.width / win.zoom
+        height: win.height / win.zoom
+        scale: win.zoom
+        transformOrigin: Item.TopLeft
         LayoutMirroring.enabled: Qt.application.layoutDirection === Qt.RightToLeft
         LayoutMirroring.childrenInherit: true
 
@@ -379,6 +393,8 @@ ApplicationWindow {
                 x: Qt.application.layoutDirection === Qt.RightToLeft ? 0 : parent.width - width
                 y: parent.height
                 above: bar.height
+                windowWidth: root.width
+                windowHeight: root.height
                 onSettingsRequested: win.go("settings")
             }
 
@@ -651,5 +667,15 @@ ApplicationWindow {
         }
     }
 
-    HelpOverlay { id: help }
+    HelpOverlay {
+        id: help
+        parent: root
+        windowWidth: root.width
+    }
+    // The video is rendered for the pixels it covers.
+    Binding {
+        target: watch.surface.mpv
+        property: "renderScale"
+        value: win.zoom
+    }
 }

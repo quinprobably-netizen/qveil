@@ -34,6 +34,19 @@ FocusScope {
     property bool navigating: false
     // How many videos a shelf shows; the rest is a step away, in full.
     readonly property int most: 12
+    // How many cards fit across, and how tall one is (as in Shelf).
+    readonly property int across: Math.max(2, Math.floor((view.width + Style.u * 4) / 280))
+    readonly property int cardHeight: Math.round((Math.floor((view.width + Style.u * 4) / across) - Style.u * 4) * 9 / 16) + 104
+    // The latest take the rows the window has free under the lead and beside
+    // the other shelves, so that a window with little else in it is not left
+    // empty: one row that scrolls sideways when there is no room for more.
+    readonly property int latestRows: {
+        const shelf = Style.control + Style.u * 2 + cardHeight + 18 + view.spacing
+        const lead = first !== null ? (view.width < 840 ? 200 : 264) + view.spacing : 0
+        const free = view.height - view.topMargin - lead - (keys.length - 1) * shelf
+                     - Style.control - Style.u * 2 - (Style.control + 2 * view.spacing)
+        return Math.max(1, Math.min(6, Math.ceil(free / cardHeight)))
+    }
 
     signal activated(var video, var list, int index)
     signal resumed(var video)
@@ -78,7 +91,8 @@ FocusScope {
                 out.push({ id: kept.id, title: kept.title || "", channel: kept.channel || "", duration: kept.dur,
                            why: [qsTr("%1 left").arg(Format.clock(Math.max(0, kept.dur - kept.pos)))] })
         } else if (key === "latest") {
-            for (let i = 0; i < backend.feed.count && i < most; i++)
+            const n = latestRows > 1 ? latestRows * across : most
+            for (let i = 0; i < backend.feed.count && i < n; i++)
                 out.push(backend.feed.get(i))
         } else {
             return (backend.shelves[key] || []).slice(0, most)
@@ -106,10 +120,35 @@ FocusScope {
     }
     function step(by) {
         navigating = true
+        // Within the rows of the latest first; then to the shelf before or after.
+        if (keys[row] === "latest" && latestRows > 1) {
+            const to = column + by * across
+            if (to >= 0 && to < entriesOf("latest").length) {
+                const next = Object.assign({}, columns)
+                next.latest = to
+                columns = next
+                Qt.callLater(ensure)
+                return
+            }
+        }
         row = Math.max(0, Math.min(keys.length - 1, row + by))
-        view.positionViewAtIndex(row, ListView.Contain)
-        if (row === 0 && by < 0)
+        Qt.callLater(ensure)
+    }
+    // Brings what the keyboard is on into view.
+    function ensure() {
+        const shelf = view.itemAtIndex(row)
+        if (!shelf) {
+            view.positionViewAtIndex(row, ListView.Contain)
+            return
+        }
+        const top = shelf.y + shelf.rowTop(column)
+        const bottom = top + shelf.cellHeight
+        if (row === 0 && top - shelf.y < shelf.cellHeight)
             view.positionViewAtBeginning()
+        else if (bottom > view.contentY + view.height)
+            view.contentY = bottom - view.height + Style.u * 2
+        else if (top < view.contentY)
+            view.contentY = shelf.y
     }
     function pickCurrent() {
         const key = keys[row]
@@ -364,6 +403,7 @@ FocusScope {
                  : modelData === "latest" ? qsTr("Latest from your channels") : (lens.text || "")
             note: modelData === "latest" ? page.status : isLens ? qsTr("Lens") : ""
             all: modelData !== "resume"
+            rows: modelData === "latest" ? page.latestRows : 1
             entries: page.entriesOf(modelData)
             empty: modelData === "latest"
                    ? (page.loading ? "" : page.noChannels

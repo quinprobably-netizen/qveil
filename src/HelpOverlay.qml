@@ -53,8 +53,10 @@ Popup {
         return ({ Left: "\u2190", Right: "\u2192", Up: "\u2191", Down: "\u2193" })[key] || key
     }
 
-    anchors.centerIn: Overlay.overlay
-    width: Math.min(560, (Overlay.overlay ? Overlay.overlay.width : 600) - Style.gutter * 2)
+    // The window's width, in the units it is drawn in.
+    property real windowWidth: Overlay.overlay ? Overlay.overlay.width : 600
+    anchors.centerIn: parent
+    width: Math.min(560, windowWidth - Style.gutter * 2)
     padding: Style.u * 5
     modal: true
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
