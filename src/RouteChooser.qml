@@ -36,6 +36,12 @@ Item {
         if (value !== (config.route || "direct"))
             backend.setConfig({ route: value })
     }
+    // The route before or after this one, for the keyboard.
+    function turn(by) {
+        const order = ["direct", "tor", "proxy"]
+        const to = Math.max(0, Math.min(2, order.indexOf(route) + by))
+        choose(order[to])
+    }
     function applyProxy(address) {
         // The field goes as it is: an untouched redacted value keeps the saved proxy.
         backend.setConfig({ route: "proxy", proxy: address })

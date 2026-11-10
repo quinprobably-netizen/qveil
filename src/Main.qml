@@ -310,6 +310,8 @@ ApplicationWindow {
             watch.close()
         else if (typing)
             focusPage(page)
+        else if (page === "settings" && settingsPage.inRows)
+            settingsPage.leaveRows()
         else if (page === "home" && !feedPage.overview)
             feedPage.showShelves()
         else if (page === "channel" && channelFrom === "search") {
@@ -393,6 +395,8 @@ ApplicationWindow {
     Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: win.togglePip() }
     Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.theatre = !watch.theatre }
     Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.enterSheet("comments") }
+    Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.watching; onActivated: { const p = win.pages[win.page]; if (p && p.openSort) p.openSort() } }
+    Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.watching && win.page === "home"; onActivated: feedPage.openCurrent() }
     Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.playNext() }
     Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(false) }
     Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(true) }
@@ -768,6 +772,7 @@ ApplicationWindow {
         id: help
         parent: root
         windowWidth: root.width
+        windowHeight: root.height
     }
     // The video is rendered for the pixels it covers.
     Binding {

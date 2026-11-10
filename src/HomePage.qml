@@ -82,6 +82,8 @@ FocusScope {
         overview = true
         shelves.forceActiveFocus()
     }
+    function openSort() { overview ? shelves.openSort() : feedSort.open() }
+    function openCurrent() { if (overview) shelves.openCurrent() }
     // Plays what the keyboard is on, on the shelves.
     function pickCurrent() { shelves.pickCurrent() }
 
@@ -149,6 +151,7 @@ FocusScope {
                 onNewLens: page.newLensRequested()
 
                 SortMenu {
+                    id: feedSort
                     objectName: "feed-sort"
                     setting: page.arrangements[page.feed] || ({})
                     sourceLabel: page.onLens ? qsTr("Best match") : qsTr("Newest")

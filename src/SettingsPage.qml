@@ -27,6 +27,26 @@ FocusScope {
     signal thumbsPicked(string mode)
     signal shortsPicked(bool shown)
 
+    // Whether the keyboard is in the rows of the category that is showing,
+    // and on which of them.
+    property bool inRows: false
+    property int rowAt: 0
+    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume], playback: [qualityRow], home: [pictures, topicsRow, shortsRow], about: [] })
+    onCategoryChanged: {
+        inRows = false
+        rowAt = 0
+    }
+    function enterRows() {
+        if (rowsIn[category].length === 0)
+            return
+        rowAt = 0
+        inRows = true
+        pane.forceActiveFocus()
+    }
+    function leaveRows() {
+        inRows = false
+        cats.forceActiveFocus()
+    }
     function step(by) {
         let at = 0
         for (let i = 0; i < categories.length; i++)
@@ -53,10 +73,15 @@ FocusScope {
         focus: true
         Keys.onUpPressed: page.step(-1)
         Keys.onDownPressed: page.step(1)
+        // Enter (or right) goes into the rows of the category.
         Keys.onPressed: event => {
-            event.accepted = event.key === Qt.Key_J || event.key === Qt.Key_K
-            if (event.accepted)
+            event.accepted = true
+            if (event.key === Qt.Key_J || event.key === Qt.Key_K)
                 page.step(event.key === Qt.Key_J ? 1 : -1)
+            else if ([Qt.Key_Return, Qt.Key_Enter, Qt.Key_L, Qt.Key_Right].indexOf(event.key) >= 0)
+                page.enterRows()
+            else
+                event.accepted = false
         }
 
         Text {
@@ -117,6 +142,21 @@ FocusScope {
         contentHeight: rows.height
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        // In the rows: up and down (k, j) move, left and right (h, l) change the choice.
+        Keys.onPressed: event => {
+            const list = page.rowsIn[page.category]
+            event.accepted = true
+            if (event.key === Qt.Key_J || event.key === Qt.Key_Down)
+                page.rowAt = Math.min(list.length - 1, page.rowAt + 1)
+            else if (event.key === Qt.Key_K || event.key === Qt.Key_Up)
+                page.rowAt = Math.max(0, page.rowAt - 1)
+            else if (event.key === Qt.Key_H || event.key === Qt.Key_Left)
+                list[page.rowAt].turn(-1)
+            else if (event.key === Qt.Key_L || event.key === Qt.Key_Right)
+                list[page.rowAt].turn(1)
+            else
+                event.accepted = false
+        }
 
         Item {
             id: rows
@@ -131,7 +171,12 @@ FocusScope {
                 visible: page.category === "privacy"
 
                 Rectangle {
+                    id: routeRow
                     objectName: "set-route"
+                    readonly property bool marked: page.inRows && page.rowsIn[page.category][page.rowAt] === routeRow
+                    function turn(by) { chooser.turn(by) }
+                    border.width: marked ? 2 : 0
+                    border.color: Style.accent
                     width: parent.width
                     height: chooser.implicitHeight + Style.u * 7
                     color: Style.rest
@@ -147,7 +192,9 @@ FocusScope {
                     }
                 }
                 SettingRow {
+                    id: historyRow
                     objectName: "set-history"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === historyRow
                     width: parent.width
                     name: qsTr("History")
                     note: (page.config.history ? page.pages.history_on : page.pages.history_off) || ""
@@ -160,6 +207,7 @@ FocusScope {
                 SettingRow {
                     id: resume
                     objectName: "set-resume"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === resume
                     readonly property int days: page.config.resumeDays === undefined ? 7 : page.config.resumeDays
                     width: parent.width
                     name: qsTr("Resume")
@@ -195,7 +243,9 @@ FocusScope {
                 visible: page.category === "playback"
 
                 SettingRow {
+                    id: qualityRow
                     objectName: "set-quality"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === qualityRow
                     width: parent.width
                     name: qsTr("Quality")
                     note: qsTr("The most a video is played at. It applies from the next video.")
@@ -223,6 +273,7 @@ FocusScope {
                 SettingRow {
                     id: pictures
                     objectName: "set-thumbs"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === pictures
                     readonly property bool off: page.config.thumbnails === false
                     width: parent.width
                     name: qsTr("Thumbnails")
@@ -257,7 +308,9 @@ FocusScope {
                     }
                 }
                 SettingRow {
+                    id: topicsRow
                     objectName: "set-topics"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === topicsRow
                     width: parent.width
                     name: qsTr("Topic feeds")
                     // What it is now, and (before it is turned on) what
@@ -272,7 +325,9 @@ FocusScope {
                     }
                 }
                 SettingRow {
+                    id: shortsRow
                     objectName: "set-shorts"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === shortsRow
                     width: parent.width
                     name: qsTr("Shorts")
                     note: qsTr("Whether Shorts appear among the latest from your channels.")

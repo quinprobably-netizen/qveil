@@ -170,6 +170,8 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 | `/` | Search |
 | `1` `2` `3` `4` `5` | Home, lenses, channels, history, settings |
 | Arrows or `h` `j` `k` `l`, `Enter` | Move and play |
+| `S` | Sort and filter what the keyboard is on |
+| `O` | Open the shelf in full |
 | `R` | Refresh what is showing |
 | `P` | Route |
 | `Space` | Play or pause |
@@ -181,7 +183,9 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 | `I` | Picture in picture, and back |
 | `T` | Theatre |
 | `F` | Fullscreen |
-| `C` | Comments |
+| `C` | Comments, with the keyboard in the sheet (`Esc` gives it back) |
+| `N` | Next video |
+| `U` | Unsubscribe, on the channels page (asked twice) |
 | `Esc` | Back |
 | `?` | All shortcuts |
 | `Q` | Quit |

@@ -45,6 +45,7 @@ Item {
     function rowTop(index) {
         return head.height + Style.u * 2 + (wrapped ? Math.floor(index / across) * row.cellHeight : 0)
     }
+    function openSort() { sortMenu.open() }
     signal activated(var video, int index)
     signal channelRequested(string id)
     signal allRequested()
@@ -145,6 +146,7 @@ Item {
                 font.pixelSize: Style.small
             }
             SortMenu {
+                id: sortMenu
                 objectName: "shelf-sort"
                 setting: shelf.arrange
                 sourceLabel: shelf.sourceLabel

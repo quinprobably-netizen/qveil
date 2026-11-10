@@ -33,6 +33,7 @@ FocusScope {
     signal activated(var video, int index)
     signal channelRequested(string id)
 
+    function openSort() { if (!writing && current !== "") lensSort.open() }
     function startNew() {
         writing = true
         Qt.callLater(() => editor.edit())
@@ -163,6 +164,7 @@ FocusScope {
             onDeleted: backend.removeLens(lens.id)
 
             SortMenu {
+                id: lensSort
                 objectName: "lens-sort"
                 visible: !page.writing && page.current !== ""
                 setting: page.arrangements[page.current] || ({})

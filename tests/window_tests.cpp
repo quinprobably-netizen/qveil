@@ -2077,6 +2077,119 @@ private slots:
         QCOMPARE(box(app.item("settings-title")).left(), 24.0);
     }
 
+    void theSortMenuTheRouteAndTheSettingsHaveKeys()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTRY_VERIFY(!home->property("onLead").toBool());
+
+        // S opens the sort menu of the shelf the keyboard is on; j, k and Enter work in it.
+        QQuickItem *sort = App::under(app.item("shelf-latest"), "shelf-sort");
+        QTest::keyClick(app.window, Qt::Key_S);
+        QTRY_VERIFY(sort->property("opened").toBool());
+        QQuickItem *views = nullptr;
+        QTRY_VERIFY((views = app.item("sort-views")) && views->isVisible());
+        QVERIFY(app.item("sort-default")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_VERIFY(views->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_VERIFY(sort->property("text").toString().contains("Most viewed"));
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(sort->property("text").toString(), QString("Newest"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!sort->property("opened").toBool());
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+
+        // O opens that shelf in full, where S is the grid's own sort menu.
+        QTest::keyClick(app.window, Qt::Key_O);
+        QQuickItem *grid = app.item("home-grid");
+        QTRY_VERIFY(grid->isVisible());
+        QVERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QTest::keyClick(app.window, Qt::Key_S);
+        QTRY_VERIFY(app.item("feed-sort")->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.item("feed-sort")->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(app.item("shelves")->isVisible());
+
+        // P opens the route with the keyboard in it: left and right choose.
+        QObject *popup = app.object("routePopup");
+        QTest::keyClick(app.window, Qt::Key_P);
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("direct"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!popup->property("opened").toBool());
+
+        // Settings: Enter goes from the categories into their rows, where up and down
+        // move and left and right change the choice; Escape comes back out.
+        QTest::keyClick(app.window, Qt::Key_5);
+        QQuickItem *settings = app.item("settings");
+        QTRY_COMPARE(app.page(), QString("settings"));
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(settings->property("category").toString(), QString("playback"));
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_VERIFY(settings->property("inRows").toBool());
+        QVERIFY(app.item("set-quality")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_COMPARE(app.backend->config().value("maxHeight").toInt(), 720);
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTRY_COMPARE(app.backend->config().value("maxHeight").toInt(), 1080);
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!settings->property("inRows").toBool());
+        QCOMPARE(app.page(), QString("settings"));
+        // In a category with several rows, down goes to the next.
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_VERIFY(app.item("set-route")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_VERIFY(app.item("set-history")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_VERIFY(app.backend->config().value("history").toBool());
+    }
+
+    void theHelpFitsAQuarterTile()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        {
+            App app(false, QSize(941, 508));
+            READY(app);
+            QObject *help = app.object("help");
+            QTest::keyClick(app.window, '?');
+            QTRY_VERIFY(help->property("opened").toBool());
+            QTest::qWait(250);
+            const QRectF sheet = box(help->property("background").value<QQuickItem *>());
+            QVERIFY2(QRectF(0, 0, 941, 508).contains(sheet),
+                     qPrintable(QString("%1,%2 %3x%4").arg(sheet.x()).arg(sheet.y()).arg(sheet.width()).arg(sheet.height())));
+            // Its two groups stand side by side, and all of it is in view.
+            QQuickItem *first = app.item("help-group-0"), *second = app.item("help-group-1");
+            QVERIFY(first && second);
+            QVERIFY(qAbs(box(first).top() - box(second).top()) < 1);
+            QVERIFY(sheet.contains(box(first)) && sheet.contains(box(second)));
+            const QStringList listed = help->property("listed").toStringList();
+            for (const char *key : {"S", "O", "N", "U", "H"})
+                QVERIFY2(listed.contains(key), key);
+        }
+        // In a narrow column they are one under the other, and the sheet scrolls if it has to.
+        App app(false, QSize(630, 600));
+        READY(app);
+        QObject *help = app.object("help");
+        QTest::keyClick(app.window, '?');
+        QTRY_VERIFY(help->property("opened").toBool());
+        QTest::qWait(250);
+        const QRectF sheet = box(help->property("background").value<QQuickItem *>());
+        QVERIFY2(QRectF(0, 0, 630, 600).contains(sheet), qPrintable(QString("%1x%2").arg(sheet.width()).arg(sheet.height())));
+        QVERIFY(box(app.item("help-group-1")).top() > box(app.item("help-group-0")).bottom() - 1);
+    }
+
     // --- What the council found in the code. ---
 
     void turningTopicFeedsOffDuringARefreshKeepsThemOff()

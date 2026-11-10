@@ -41,8 +41,21 @@ Popup {
         }
     }
 
+    focus: true
+    onOpened: column.forceActiveFocus()
+
     contentItem: Column {
         id: column
+        // Left and right (h, l) choose the route.
+        Keys.onPressed: event => {
+            event.accepted = true
+            if (event.key === Qt.Key_H || event.key === Qt.Key_Left)
+                chooser.turn(-1)
+            else if (event.key === Qt.Key_L || event.key === Qt.Key_Right)
+                chooser.turn(1)
+            else
+                event.accepted = false
+        }
         spacing: Style.u * 3
 
         Text {

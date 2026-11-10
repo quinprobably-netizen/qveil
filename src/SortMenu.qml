@@ -18,6 +18,8 @@ Act {
     // Whether the list came newest first, so that "Newest" is not a choice of its own.
     readonly property bool sourceIsNewest: sourceLabel === qsTr("Newest")
     signal changed(var setting)
+    readonly property bool opened: menu.opened
+    function open() { menu.open() }
 
     function sortName(key) {
         return key === "" ? sourceLabel : key === "newest" ? qsTr("Newest") : key === "views" ? qsTr("Most viewed")
@@ -55,11 +57,16 @@ Act {
         id: option
         property string text
         property bool current: false
+        // Its place in the menu, from the top, and whether the keyboard is on it.
+        property int order: 0
+        readonly property bool marked: menu.opened && list.at === order
         signal picked()
         width: list.width
         height: Style.control
         radius: Style.radius
         color: current ? Style.sel : area.containsMouse ? Style.hover : "transparent"
+        border.width: marked ? 2 : 0
+        border.color: Style.accent
         Text {
             anchors.left: parent.left
             anchors.leftMargin: Style.u * 2
@@ -100,8 +107,16 @@ Act {
         enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.quick } }
         exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: Style.quick } }
         // Escape is the window's key: it is told which menu is open, and closes it.
-        onOpened: if (control.Window.window) control.Window.window.openMenu = menu
-        onClosed: if (control.Window.window && control.Window.window.openMenu === menu) control.Window.window.openMenu = null
+        onOpened: {
+            if (control.Window.window)
+                control.Window.window.openMenu = menu
+            // The keyboard starts on the order that holds.
+            list.at = control.now.sort === "" ? 0 : control.now.sort === "newest" ? 1 : control.now.sort === "views" ? 2
+                    : control.now.sort === "longest" ? 3 : 4
+            list.forceActiveFocus()
+        }
+        // (As it starts to go, not when it has gone: the next Escape is the page's.)
+        onAboutToHide: if (control.Window.window && control.Window.window.openMenu === menu) control.Window.window.openMenu = null
 
         background: Rectangle {
             color: Style.bg
@@ -117,26 +132,58 @@ Act {
         }
         contentItem: Column {
             id: list
+            // Which option the keyboard is on (see Option.order). Up and
+            // down (k, j) move over the options that are showing; Enter picks.
+            property int at: 0
+            function option(order) {
+                for (let i = 0; i < children.length; i++)
+                    if (children[i].picked && children[i].order === order)
+                        return children[i]
+                return null
+            }
+            function step(by) {
+                for (let to = at + by; to >= 0 && to <= 10; to += by) {
+                    const there = option(to)
+                    if (there && there.visible) {
+                        at = to
+                        return
+                    }
+                }
+            }
+            Keys.onPressed: event => {
+                event.accepted = true
+                if (event.key === Qt.Key_J || event.key === Qt.Key_Down)
+                    step(1)
+                else if (event.key === Qt.Key_K || event.key === Qt.Key_Up)
+                    step(-1)
+                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                    const there = option(at)
+                    if (there)
+                        there.picked()
+                } else
+                    event.accepted = false
+            }
             Head { text: qsTr("Sort") }
-            Option { objectName: "sort-default"; text: control.sourceLabel; current: control.now.sort === ""; onPicked: control.set("sort", "") }
+            Option { objectName: "sort-default"; order: 0; text: control.sourceLabel; current: control.now.sort === ""; onPicked: control.set("sort", "") }
             Option {
                 objectName: "sort-newest"
+                order: 1
                 visible: !control.sourceIsNewest
                 text: qsTr("Newest")
                 current: control.now.sort === "newest"
                 onPicked: control.set("sort", "newest")
             }
-            Option { objectName: "sort-views"; text: qsTr("Most viewed"); current: control.now.sort === "views"; onPicked: control.set("sort", "views") }
-            Option { objectName: "sort-longest"; text: qsTr("Longest"); current: control.now.sort === "longest"; onPicked: control.set("sort", "longest") }
-            Option { objectName: "sort-shortest"; text: qsTr("Shortest"); current: control.now.sort === "shortest"; onPicked: control.set("sort", "shortest") }
+            Option { objectName: "sort-views"; order: 2; text: qsTr("Most viewed"); current: control.now.sort === "views"; onPicked: control.set("sort", "views") }
+            Option { objectName: "sort-longest"; order: 3; text: qsTr("Longest"); current: control.now.sort === "longest"; onPicked: control.set("sort", "longest") }
+            Option { objectName: "sort-shortest"; order: 4; text: qsTr("Shortest"); current: control.now.sort === "shortest"; onPicked: control.set("sort", "shortest") }
             Head { text: qsTr("Length") }
-            Option { objectName: "length-any"; text: qsTr("Any"); current: control.now.length === "any"; onPicked: control.set("length", "any") }
-            Option { objectName: "length-short"; text: qsTr("Under 10 min"); current: control.now.length === "short"; onPicked: control.set("length", "short") }
-            Option { objectName: "length-medium"; text: qsTr("10 to 30 min"); current: control.now.length === "medium"; onPicked: control.set("length", "medium") }
-            Option { objectName: "length-long"; text: qsTr("Over 30 min"); current: control.now.length === "long"; onPicked: control.set("length", "long") }
+            Option { objectName: "length-any"; order: 5; text: qsTr("Any"); current: control.now.length === "any"; onPicked: control.set("length", "any") }
+            Option { objectName: "length-short"; order: 6; text: qsTr("Under 10 min"); current: control.now.length === "short"; onPicked: control.set("length", "short") }
+            Option { objectName: "length-medium"; order: 7; text: qsTr("10 to 30 min"); current: control.now.length === "medium"; onPicked: control.set("length", "medium") }
+            Option { objectName: "length-long"; order: 8; text: qsTr("Over 30 min"); current: control.now.length === "long"; onPicked: control.set("length", "long") }
             Head { text: qsTr("Watched") }
-            Option { objectName: "watched-show"; text: qsTr("Show"); current: control.now.watched === "show"; onPicked: control.set("watched", "show") }
-            Option { objectName: "watched-hide"; text: qsTr("Hide"); current: control.now.watched === "hide"; onPicked: control.set("watched", "hide") }
+            Option { objectName: "watched-show"; order: 9; text: qsTr("Show"); current: control.now.watched === "show"; onPicked: control.set("watched", "show") }
+            Option { objectName: "watched-hide"; order: 10; text: qsTr("Hide"); current: control.now.watched === "hide"; onPicked: control.set("watched", "hide") }
         }
     }
 }

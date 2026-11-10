@@ -14,6 +14,15 @@ Rectangle {
     property string would
     property string wouldName
     default property alias control: slot.data
+    // Whether the keyboard is on the row; and its choice changed by it.
+    property bool marked: false
+    function turn(by) {
+        for (let i = 0; i < slot.children.length; i++)
+            if (slot.children[i].turn)
+                slot.children[i].turn(by)
+    }
+    border.width: marked ? 2 : 0
+    border.color: Style.accent
     // What goes under the notes.
     property alias under: below.data
 

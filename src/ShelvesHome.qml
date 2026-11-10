@@ -249,6 +249,17 @@ FocusScope {
         duration: Style.move * 1.4
         easing.type: Easing.OutCubic
     }
+    // The sort menu of the shelf the keyboard is on, and that shelf in full.
+    function openSort() {
+        const shelf = view.itemAtIndex(row)
+        if (shelf)
+            shelf.openSort()
+    }
+    function openCurrent() {
+        const key = keys[row]
+        if (key !== "resume" && key.indexOf("topic-") !== 0)
+            page.allRequested(key)
+    }
     function pickCurrent() {
         if (onLead && first !== null) {
             const kept = first

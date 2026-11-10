@@ -52,6 +52,8 @@ int main(int argc, char *argv[]) {
         // The video, moved to its small window once it plays there.
         {"pip", "play(backend.feed.get(0), backend.feed, 0); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: win.togglePip() }', win)"},
+        {"help", "help.open()"},
+        {"sort", "feedPage.openSort()"},
         {"watch-comments", "play(backend.feed.get(0)); watch.enterSheet('comments')"},
     };
     if (!views.contains(view)) {

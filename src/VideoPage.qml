@@ -20,6 +20,7 @@ FocusScope {
     property string sourceLabel: qsTr("Newest")
     property var watched: ({})
     signal arranged(var setting)
+    function openSort() { pageSort.open() }
     // Where focus belongs when the page is shown.
     readonly property Item content: grid
     property alias thumbs: grid.thumbs
@@ -79,6 +80,7 @@ FocusScope {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.u
                 SortMenu {
+                    id: pageSort
                     objectName: "page-sort"
                     setting: page.arrange
                     sourceLabel: page.sourceLabel

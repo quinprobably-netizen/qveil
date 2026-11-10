@@ -411,6 +411,49 @@ Where this differs from "The window adapts to its size" above, this stands.
   arrow at each edge where there is more, which glides it by a row; the
   keyboard glides it too, and the page glides to what the keyboard is on.
 
+### After the review council (2026-11-10)
+
+The owner asked for a council before finishing. Its code seats found no
+critical defect; what its chair verified is fixed (see the commits). Its
+design seats scored the look below the owner's own view, and of the chair's
+list the owner chose, from mockups, the following. Where these differ from
+the text above, these stand.
+
+- **The keyboard's cursor** is a 2 px frame in the accent on the picture
+  (a card's, an up-next row's), there from the moment a page opens. On home
+  it starts on the lead: Enter resumes, left and right choose between Resume,
+  Start over and Forget, Down goes to the first shelf. It steps aside when
+  the pointer moves and returns with the next key.
+- **Watching.** The sheet stands beside the video whenever that costs the
+  picture nothing (so also in a quarter tile), and under it only in a narrow
+  column. Its tabs are Up next, Comments and, when there are any, Chapters;
+  the description is under the video only. C gives the sheet the keyboard:
+  left and right change the tab, up and down move in it, Enter acts, Escape
+  gives the keys back to the video. N plays the next video.
+- **Lenses.** The lenses are a strip along the top with "New lens" at its
+  end; under it the open lens's words head the page, then how they read with
+  its actions beside, then what a refresh searches for with the first
+  sentence of the engine's text and "More" for the rest of it, in place;
+  then its videos across the whole width.
+- **Channels** are two panes: the channels down one side, each with its
+  latest video's picture, and beside them the latest of the one the keyboard
+  is on, from what the feed already has. Right goes into that pane; Enter on
+  a channel opens its page; u unsubscribes, asked twice.
+- **Small corrections.** A card says why it is there only where that differs
+  from card to card, and quietly (what is left of an unfinished video keeps
+  the accent). The bar marks no place on search results. The sort control is
+  a quiet word with a mark. With the history off, its page lists the
+  unfinished videos that are kept, each with Forget.
+- **Keys for the rest.** S opens the sort menu of what the keyboard is on
+  (up, down and Enter in it), O opens a shelf in full, the route's popup
+  takes left and right, and in Settings Enter goes from the categories into
+  their rows, where left and right change the choice. The help has two
+  columns where there is room and never exceeds the window.
+- **Topic feeds, corrected.** A day has a budget of twelve searches whatever
+  the groups; results are kept by what was searched for; hiding a topic hides
+  its channels and phrases; turning the setting off stops a running refresh
+  and deletes what was found; what turning it on would send is shown first.
+
 ## Verification
 
 - `bin/test`: Rust and Qt suites. The Qt suite is tied to today's object
