@@ -23,7 +23,9 @@ Rectangle {
     }
 
     implicitWidth: 400
-    implicitHeight: Math.max(62, input.contentHeight + Style.u * 6)
+    // The least it is tall.
+    property int least: 62
+    implicitHeight: Math.max(least, input.contentHeight + Style.u * 6)
     radius: Style.radius
     color: Style.rest
     border.width: 1

@@ -1,8 +1,9 @@
 import QtQuick
 import Qveil
 
-// Lenses: feeds described in words. The list, the one that is open (its
-// words, how they read, what a refresh asks for), and what it found.
+// Lenses: feeds described in words. They are a strip along the top; under it
+// the one that is open: its words, how they read, what a refresh asks for,
+// and what it found, across the whole width.
 FocusScope {
     id: page
     objectName: "lenses"
@@ -20,7 +21,12 @@ FocusScope {
         return ({})
     }
     readonly property alias grid: grid
-    readonly property var model: grid.model
+    readonly property var model: grid.list
+    // How each list is sorted and filtered, by its key, and what is known to
+    // have been watched.
+    property var arrangements: ({})
+    property var watched: ({})
+    signal arranged(string key, var setting)
     // Where focus belongs when the page is shown.
     readonly property Item content: writing ? editor.field : grid
 
@@ -60,114 +66,71 @@ FocusScope {
         function onLensAdded(id) { page.show(id) }
     }
 
-    Column {
+    // The lenses, along the top: the open one marked, and the way to a new
+    // one at the end, where it is never scrolled out of reach.
+    Item {
         id: head
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.leftMargin: Style.gutter
         anchors.rightMargin: Style.gutter
-        anchors.topMargin: Style.u * 3
-        spacing: 3
-        Text {
-            text: qsTr("Lenses")
-            textFormat: Text.PlainText
-            color: Style.fg
-            font.family: Style.font
-            font.pixelSize: Style.head
-            font.weight: Style.strong
-        }
-        Text {
-            width: parent.width
-            text: qsTr("A lens is a feed you describe in words: what it is about, and any rules, such as a length or what to leave out.")
-            textFormat: Text.PlainText
-            wrapMode: Text.Wrap
-            color: Style.dim
-            font.family: Style.font
-            font.pixelSize: Style.small
-        }
-    }
+        anchors.topMargin: Style.u * 2
+        height: Style.control + Style.u
 
-    // The list. In a narrow window it gives way to the lens itself.
-    // It scrolls when there are more lenses than fit; the way to a new one
-    // stays under it, in reach.
-    Item {
-        id: list
-        anchors.left: parent.left
-        anchors.top: head.bottom
-        anchors.bottom: parent.bottom
-        anchors.leftMargin: Style.gutter
-        anchors.topMargin: Style.u * 4
-        anchors.bottomMargin: Style.gutter
-        width: page.width >= 900 ? 300 : 220
-
-        ListView {
-            id: rows
+        Flickable {
+            id: strip
             objectName: "lens-list"
-            width: parent.width
-            height: Math.min(contentHeight, parent.height - fresh.height - Style.u * 2)
-            spacing: Style.u
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(lensRow.width, parent.width - fresh.width - Style.u * 3)
+            height: Style.control
+            contentWidth: lensRow.width
             clip: true
             boundsBehavior: Flickable.StopAtBounds
-            model: backend.lenses
-            delegate: Rectangle {
-                required property var modelData
-                readonly property bool current: page.current === modelData.id
-                objectName: "lens-row"
-                width: list.width
-                height: words.height + Style.u * 5
-                color: current ? Style.sel : rowArea.containsMouse ? Style.hover : Style.rest
-                Behavior on color { ColorAnimation { duration: Style.quick } }
-                Column {
-                    id: words
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.margins: Style.u * 3
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: 3
-                    Text {
-                        width: parent.width
-                        text: modelData.text
-                        textFormat: Text.PlainText
-                        wrapMode: Text.Wrap
-                        maximumLineCount: 2
-                        elide: Text.ElideRight
-                        color: Style.fg
-                        font.family: Style.font
-                        font.pixelSize: Style.body
-                        font.weight: Style.strong
+            flickableDirection: Flickable.HorizontalFlick
+
+            Row {
+                id: lensRow
+                Repeater {
+                    model: backend.lenses
+                    delegate: TabWord {
+                        required property var modelData
+                        objectName: "lens-row"
+                        underlined: true
+                        activeFocusOnTab: false
+                        // A lens can be a long sentence; its tab is the start of it.
+                        text: modelData.text.length > 34 ? modelData.text.slice(0, 33) + "\u2026" : modelData.text
+                        current: page.current === modelData.id
+                        onClicked: page.show(modelData.id)
+                        // The open one is kept in view.
+                        onCurrentChanged: if (current) {
+                            if (x < strip.contentX)
+                                strip.contentX = x
+                            else if (x + width > strip.contentX + strip.width)
+                                strip.contentX = x + width - strip.width
+                        }
                     }
-                    Text {
-                        width: parent.width
-                        text: modelData.fetchedAt
-                              ? qsTr("%n searches", "", (modelData.searches || []).length) + "  ·  " + qsTr("%n videos", "", modelData.count || 0)
-                              : qsTr("not fetched yet")
-                        textFormat: Text.PlainText
-                        elide: Text.ElideRight
-                        color: Style.dim
-                        font.family: Style.font
-                        font.pixelSize: Style.small
-                    }
-                }
-                MouseArea {
-                    id: rowArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: page.show(modelData.id)
                 }
             }
         }
         Act {
             id: fresh
-            anchors.top: rows.bottom
-            anchors.topMargin: Style.u * 2
             objectName: "lens-new"
+            anchors.left: strip.right
+            anchors.leftMargin: Style.u
+            anchors.verticalCenter: parent.verticalCenter
             text: qsTr("New lens")
             glyph: "qrc:/icons/plus.svg"
+            quiet: !page.writing
             enabled: backend.lenses.length < 12
             tip: backend.lenses.length < 12 ? "" : qsTr("12 lenses is the most; remove one first")
             onClicked: page.startNew()
+        }
+        Rule {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
         }
     }
 
@@ -175,50 +138,50 @@ FocusScope {
     // scroll, so that what the lens found keeps room under them.
     Flickable {
         id: editorView
-        anchors.left: list.right
+        anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: head.bottom
-        anchors.leftMargin: Style.u * 5
+        anchors.leftMargin: Style.gutter
         anchors.rightMargin: Style.gutter
-        anchors.topMargin: Style.u * 4
-        height: Math.min(editor.height, Math.max(96, page.height - head.y - head.height - Style.u * 4 - (page.writing ? Style.gutter : 240)))
+        anchors.topMargin: Style.u * 3
+        height: Math.min(editor.height, Math.max(96, page.height - head.y - head.height - Style.u * 3 - (page.writing ? Style.gutter : 240)))
         contentHeight: editor.height
         clip: true
         boundsBehavior: Flickable.StopAtBounds
 
-    LensEditor {
-        id: editor
-        width: parent.width
-        lens: page.lens
-        onSaved: text => {
-            if (fresh)
-                backend.addLens(text)
-            else
-                backend.editLens(lens.id, text)
+        LensEditor {
+            id: editor
+            width: parent.width
+            lens: page.lens
+            onSaved: text => {
+                if (fresh)
+                    backend.addLens(text)
+                else
+                    backend.editLens(lens.id, text)
+            }
+            onRefreshRequested: page.refresh()
+            onDeleted: backend.removeLens(lens.id)
+
+            SortMenu {
+                objectName: "lens-sort"
+                visible: !page.writing && page.current !== ""
+                setting: page.arrangements[page.current] || ({})
+                sourceLabel: qsTr("Best match")
+                onChanged: setting => page.arranged(page.current, setting)
+            }
         }
-        onRefreshRequested: page.refresh()
-        onDeleted: backend.removeLens(lens.id)
-    }
-    }
-    Rule {
-        id: under
-        anchors.left: editorView.left
-        anchors.right: editorView.right
-        anchors.top: editorView.bottom
-        anchors.topMargin: Style.u * 3
     }
     VideoGrid {
         id: grid
         objectName: "lens-grid"
-        anchors.left: editorView.left
+        anchors.left: parent.left
         anchors.right: parent.right
-        anchors.top: under.bottom
+        anchors.top: editorView.bottom
         anchors.bottom: parent.bottom
         anchors.topMargin: Style.u * 2
-        // The cards have a margin of their own.
-        anchors.leftMargin: -Style.u * 2 - gutter
-        anchors.rightMargin: Style.gutter - Style.u * 2 - gutter
-        model: backend.lensVideos
+        source: backend.lensVideos
+        arrange: page.arrangements[page.current] || ({})
+        watched: page.watched
         visible: !page.writing
         thumbs: page.thumbs
         progress: page.progress

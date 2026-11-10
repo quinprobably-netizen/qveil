@@ -774,7 +774,7 @@ private slots:
         QTRY_COMPARE(app.items("lens-row").size(), 1);
         QVERIFY(app.items("lens-row").first()->property("current").toBool());
         QTRY_COMPARE(app.item("lens-grid")->property("count").toInt(), 6);
-        QVERIFY(!app.items("card-why").isEmpty());
+        QTRY_VERIFY(!app.items("card-why").isEmpty());
         QCOMPARE(text->property("text").toString(), QString("bread, sourdough over 30 min"));
         // Saved, and nothing changed since: there is nothing to save.
         QVERIFY(!app.item("lens-save")->isEnabled());
@@ -866,10 +866,19 @@ private slots:
         App app;
         READY(app);
         QTest::keyClick(app.window, Qt::Key_2);
-        QQuickItem *note = app.item("lens-note");
-        QVERIFY(note);
-        QTRY_COMPARE(note->property("text").toString(), app.backend->privacy().value("pages").toMap().value("lenses").toString());
-        QVERIFY(!note->property("text").toString().isEmpty());
+        const QString said = app.backend->privacy().value("pages").toMap().value("lenses").toString();
+        QVERIFY(said.contains(". "));
+        // Its first sentence is always there, as the engine wrote it...
+        QQuickItem *first = app.item("lens-note-first"), *note = app.item("lens-note");
+        QVERIFY(first && note);
+        QTRY_COMPARE(first->property("text").toString(), said.left(said.indexOf(". ") + 1));
+        QVERIFY(first->isVisible() && !note->isVisible());
+        // ...and the whole of it opens in place.
+        app.click(app.item("lens-note-more"));
+        QTRY_VERIFY(note->isVisible());
+        QCOMPARE(note->property("text").toString(), said);
+        app.click(app.item("lens-note-more"));
+        QTRY_VERIFY(!note->isVisible());
     }
 
     void pictureInPictureMovesTheVideoOutAndBack()
@@ -1916,6 +1925,37 @@ private slots:
         QTRY_VERIFY(!app.window->property("watching").toBool());
     }
 
+    void theLensesPageIsAStripASentenceAndAGrid()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.items("lens-row").size(), 2);
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        // The lenses are a strip along the top, the open one marked, with the way to a new one.
+        const QList<QQuickItem *> lenses = app.items("lens-row");
+        QVERIFY(qAbs(box(lenses.at(0)).top() - box(lenses.at(1)).top()) < 1);
+        QVERIFY(box(lenses.at(1)).left() >= box(lenses.at(0)).right() - 1);
+        QVERIFY(lenses.at(0)->property("current").toBool());
+        QVERIFY(app.item("lens-new")->isVisible() && box(app.item("lens-new")).right() <= 941);
+        // Under it the lens's own words, and then its videos across the whole width:
+        // a whole row of them fits in the tile.
+        QQuickItem *grid = app.item("lens-grid");
+        QTRY_VERIFY(grid->property("count").toInt() >= 3);
+        QVERIFY2(box(grid).left() <= 24 && box(grid).right() >= 917, qPrintable(QString::number(box(grid).left())));
+        QQuickItem *card = App::under(grid, "card");
+        QTRY_VERIFY(card);
+        QTRY_VERIFY2(box(card).bottom() <= 508, qPrintable(QString::number(box(card).bottom())));
+        QVERIFY(box(app.item("lens-text")).top() >= box(lenses.at(0)).bottom());
+        // The other lens is a press on the strip away.
+        app.click(lenses.at(1));
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
+        QTRY_VERIFY(app.items("lens-row").at(1)->property("current").toBool());
+        // It has the sort control every list has.
+        QVERIFY(app.item("lens-sort") && app.item("lens-sort")->isVisible());
+    }
+
     // --- What the council found in the code. ---
 
     void turningTopicFeedsOffDuringARefreshKeepsThemOff()
@@ -2321,35 +2361,38 @@ private slots:
 
     void twelveLensesCanAllBeReachedInASmallWindow()
     {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
         App app(false, QSize(950, 520), {{"QVEIL_STANDIN_LENSES", "12"}});
         READY(app);
         QTest::keyClick(app.window, Qt::Key_2);
         QTRY_COMPARE(app.backend->lenses().size(), 12);
         QQuickItem *list = app.item("lens-list");
-        QVERIFY2(list, "the lenses are not in a list that scrolls");
-        QTRY_VERIFY(list->property("contentHeight").toReal() > list->height());
-        const auto bottom = [](QQuickItem *item) { return item->mapToScene(QPointF(0, item->height())).y(); };
-        QVERIFY2(bottom(list) <= 520, qPrintable(QString::number(bottom(list))));
+        QVERIFY2(list, "the lenses are not in a strip that scrolls");
+        QTRY_VERIFY(list->property("contentWidth").toReal() > list->width());
+        QVERIFY(box(list).right() <= 950);
         // The way to a new one is never scrolled out of reach, and the results keep room.
         QQuickItem *fresh = app.item("lens-new");
-        QVERIFY(fresh->isVisible() && bottom(fresh) <= 520);
+        QVERIFY(fresh->isVisible() && box(fresh).right() <= 950 && box(fresh).left() >= box(list).right() - 1);
         QQuickItem *grid = app.item("lens-grid");
         QTRY_VERIFY2(grid->height() >= 200, qPrintable(QString::number(grid->height())));
         // The last lens can be brought into view and opened.
-        // (Twice: the rows differ in height, and the list only knows the
-        // height of those it has made.)
-        for (int i = 0; i < 2; ++i) {
-            QMetaObject::invokeMethod(list, "positionViewAtEnd");
-            QTest::qWait(100);
-        }
+        // (Once the strip has its tabs' widths.)
+        QTest::qWait(200);
+        list->setProperty("contentX", list->property("contentWidth").toReal() - list->width());
+        QTest::qWait(100);
         QQuickItem *last = nullptr;
-        // (The list keeps some rows ready just outside its view; the last one in view is meant.)
         for (QQuickItem *row : app.items("lens-row"))
-            if (bottom(row) <= bottom(list) + 1 && (!last || bottom(row) > bottom(last)))
+            if (box(row).right() <= box(list).right() + 3 && (!last || box(row).right() > box(last).right()))
                 last = row;
         QVERIFY(last);
+        QStringList where;
+        for (QQuickItem *row : app.items("lens-row"))
+            where << QString::number(box(row).right());
         app.click(last);
-        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0012"));
+        QTRY_VERIFY2(app.backend->lensInfo().value("id").toString() == "aaaa0012",
+                     qPrintable(QString("list ends at %1 (contentX %2 of %3, width %4); rows end at %5")
+                                    .arg(box(list).right()).arg(list->property("contentX").toReal())
+                                    .arg(list->property("contentWidth").toReal()).arg(list->width()).arg(where.join(" "))));
     }
 
     void commentsLoadForTheVideoThatIsShowing()

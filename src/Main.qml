@@ -666,7 +666,10 @@ ApplicationWindow {
                     visible: win.page === "lenses" && !win.watching
                     thumbs: win.thumbs
                     progress: win.watched
-                    onActivated: (video, index) => win.play(video, backend.lensVideos, index)
+                    arrangements: win.arrangements
+                    watched: win.watchedIds
+                    onArranged: (key, setting) => win.arrange(key, setting)
+                    onActivated: (video, index) => win.play(video, lensesPage.grid.list, index)
                     onChannelRequested: id => win.openChannel(id)
                 }
 
