@@ -126,7 +126,7 @@ pub fn search_each(
     if query.is_empty() {
         bail!("empty search");
     }
-    rt.yt.search_each(query, limit, each)
+    rt.yt.search_each(query, limit, None, each)
 }
 
 /// Whether a lens's searches are run before it is answered.
@@ -223,14 +223,28 @@ fn search_topics(
     reading.check()?;
     let total = reading.topics.len();
     progress(0, total);
+    // Where YouTube has a filter that contains a rule, it does the first
+    // pass; the rules are applied here afterwards either way.
+    let filter = lens::sp::sp(reading, now());
     let mut found = Vec::new();
     for (topic, query) in reading.topics.iter().enumerate() {
-        let mut rank = 0;
-        rt.yt.search_each(query, per_topic, &mut |video| {
-            found.push(Found { video, topic, rank });
-            rank += 1;
-            wanted()
-        })?;
+        let mut search = |sp: Option<&str>| {
+            let mut rank = 0;
+            rt.yt.search_each(query, per_topic, sp, &mut |video| {
+                found.push(Found { video, topic, rank });
+                rank += 1;
+                wanted()
+            })
+        };
+        // The filter is undocumented and may stop working. If it fails or
+        // finds nothing, the topic is searched once more without it.
+        let filtered = match filter.as_deref() {
+            Some(sp) => matches!(search(Some(sp)), Ok(n) if n > 0),
+            None => false,
+        };
+        if !filtered && wanted() {
+            search(None)?;
+        }
         if !wanted() {
             bail!(crate::ytdlp::CANCELLED);
         }

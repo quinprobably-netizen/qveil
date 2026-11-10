@@ -652,3 +652,31 @@ fn read_and_lens_commands() {
     let out = home.run(&["lens", "ls"], "");
     assert!(text(&out.stdout).contains("no lenses"));
 }
+
+#[test]
+fn a_search_with_rules_is_filtered_on_the_command_line_too() {
+    let home = Home::new();
+    let ytdlp = script(
+        &home.0.join("bin/yt-dlp"),
+        r#"d=$(dirname "$0")
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" >> "$d/asked"; shift; done
+echo '{"id":"aaaaaaaaaaa","title":"Long","channel":"c","duration":1900.0}'
+echo '{"id":"bbbbbbbbbbb","title":"Brief","channel":"c","duration":100.0}'
+"#,
+    );
+    write(
+        &home.config().join("qveil/config.toml"),
+        &format!("ytdlp = \"{}\"\n", ytdlp.display()),
+    );
+    let out = home.run(&["search", "talks", "over", "10", "min", "--list"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let listed = text(&out.stdout);
+    assert!(
+        listed.contains("Long") && !listed.contains("Brief"),
+        "{listed}"
+    );
+    let asked = fs::read_to_string(home.0.join("bin/asked")).unwrap();
+    assert_eq!(asked.trim(), "'ytsearch20:talks'");
+    let out = home.run(&["search", "talks", "over", "10", "min", "--json"], "");
+    assert!(text(&out.stdout).contains(r#""over 10:00""#));
+}

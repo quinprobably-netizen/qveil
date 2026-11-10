@@ -259,25 +259,45 @@ impl Ytdlp {
     /// page needn't wait for the second. The requests are the same as
     /// `search`'s. `each` returns false to stop (the window went away), and
     /// yt-dlp is then killed. Returns how many results there were.
+    ///
+    /// With `sp`, one of YouTube's own filters (see `lens::sp`), the search
+    /// is asked for as the results page the filter menu links to, which is
+    /// the only form that takes one.
     pub fn search_each(
         &self,
         query: &str,
         limit: usize,
+        sp: Option<&str>,
         each: &mut dyn FnMut(Video) -> bool,
     ) -> Result<usize> {
-        let q = format!("ytsearch{limit}:{query}");
+        let encode =
+            |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+        let (q, range) = match sp {
+            None => (format!("ytsearch{limit}:{query}"), None),
+            Some(sp) => (
+                format!(
+                    "https://www.youtube.com/results?search_query={}&sp={}",
+                    encode(query),
+                    encode(sp)
+                ),
+                // A results page has no end of its own.
+                Some(format!("1:{limit}")),
+            ),
+        };
         crate::store::ensure_dir(&self.cache_dir)?;
         let call = Call::new(&self.net, None, &q)?;
-        let mut run = self.start(
-            self.command(&call).args([
-                "--flat-playlist",
-                "--lazy-playlist",
-                "--extractor-args",
-                "youtubetab:approximate_date",
-                "-j",
-            ]),
-            &call,
-        )?;
+        let mut cmd = self.command(&call);
+        cmd.args([
+            "--flat-playlist",
+            "--lazy-playlist",
+            "--extractor-args",
+            "youtubetab:approximate_date",
+            "-j",
+        ]);
+        if let Some(range) = &range {
+            cmd.args(["-I", range]);
+        }
+        let mut run = self.start(&mut cmd, &call)?;
         let stdout = run.stdout.take().context("no stdout")?;
         let stderr = drain(run.stderr.take());
         // Kills yt-dlp at the deadline, or as soon as `done` is sent.

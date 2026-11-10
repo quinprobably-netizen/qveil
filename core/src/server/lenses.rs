@@ -212,7 +212,7 @@ mod tests {
     /// A yt-dlp that answers every search with two videos, as lines (`-j`)
     /// or as one object (`-J`), and keeps a list of what it was asked. The
     /// files beside it steer it: `dur` is the videos' length in seconds
-    /// (1900 without it) and `delay` a number of seconds to wait first.
+    /// (1900 without it), `delay` a number of seconds to wait first.
     fn searching_ytdlp(dir: &std::path::Path) -> String {
         script(
             &dir.join("yt-dlp"),
@@ -221,6 +221,8 @@ whole=
 for a in "$@"; do [ "$a" = -J ] && whole=1; done
 while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" >> "$d/asked"; shift; done
 [ -f "$d/delay" ] && sleep "$(cat "$d/delay")"
+# `nofilter`: a search through YouTube's own filter finds nothing.
+if [ -f "$d/nofilter" ] && tail -n 1 "$d/asked" | grep -q "results?"; then exit 0; fi
 n=$(wc -l < "$d/asked")
 dur=$(cat "$d/dur" 2>/dev/null || echo 1900)
 now=$(date +%s)
@@ -264,7 +266,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
     #[test]
     fn a_lens_sends_one_search_per_topic_then_answers_from_its_cache() {
         let (bin, base, _d) = rig();
-        let lens = add(&base, "bread, sourdough over 30 min");
+        let lens = add(&base, "bread, sourdough over 10 min");
         let id = lens["id"].as_str().unwrap().to_string();
         assert_eq!(lens["searches"], serde_json::json!(["bread", "sourdough"]));
         assert_eq!(lens["tags"][2]["label"], "longer than");
@@ -294,7 +296,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
                 .map(|w| w.as_str().unwrap())
                 .collect();
             assert!(why[0] == "bread" || why[0] == "sourdough", "{why:?}");
-            assert_eq!(why[1], "over 30:00");
+            assert_eq!(why[1], "over 10:00");
             assert!(video["id"].is_string() && video["title"].is_string());
         }
         // The topics take turns.
@@ -431,13 +433,38 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         );
         assert!(v[0].get("why").is_none());
         // A rule and a topic: the topic is searched, the rule is applied here.
-        let v = search("talks%20over%2030%20min");
+        let v = search("talks%20over%2010%20min");
         assert_eq!(asked(&bin).last().unwrap(), "'ytsearch40:talks'");
         assert_eq!(v.as_array().unwrap().len(), 2);
-        assert_eq!(v[0]["why"], serde_json::json!(["talks", "over 30:00"]));
+        assert_eq!(v[0]["why"], serde_json::json!(["talks", "over 10:00"]));
         // Videos that are too short for it are not shown.
         std::fs::write(bin.0.join("dur"), "100").unwrap();
-        assert_eq!(search("talks%20over%2030%20min"), serde_json::json!([]));
+        assert_eq!(search("talks%20over%2010%20min"), serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_filtered_topic_asks_youtube_with_the_filter_and_falls_back_without_it() {
+        let (bin, base, _d) = rig();
+        let id = add(&base, "conference talks over 30 min")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, v) = json(&base, "GET", &format!("api/lens?id={id}&refresh=1"), "");
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(
+            asked(&bin),
+            ["'https://www.youtube.com/results?search_query=conference+talks&sp=EgQQARgC'"]
+        );
+        assert_eq!(v["videos"].as_array().unwrap().len(), 2);
+        // The window is told what is searched for, not how.
+        assert_eq!(v["searches"], serde_json::json!(["conference talks"]));
+
+        // A filter that finds nothing is not trusted: the topic is searched plainly.
+        std::fs::write(bin.0.join("nofilter"), "").unwrap();
+        let (_, v) = json(&base, "GET", &format!("api/lens?id={id}&force=1"), "");
+        assert_eq!(asked(&bin).len(), 3);
+        assert_eq!(asked(&bin)[2], "'ytsearch30:conference talks'");
+        assert_eq!(v["videos"].as_array().unwrap().len(), 2);
     }
 
     #[test]

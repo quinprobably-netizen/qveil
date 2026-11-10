@@ -8,6 +8,7 @@
 
 pub mod rank;
 pub mod read;
+pub mod sp;
 
 use crate::store::{self, Paths};
 use anyhow::{Context, Result, bail};
@@ -165,7 +166,7 @@ mod tests {
         let lens = add(&p, "  bread, sourdough  ", 5).unwrap();
         assert_eq!((lens.text.as_str(), lens.created), ("bread, sourdough", 5));
         assert!(lens.id.len() == 8 && lens.id.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(load(&p).unwrap(), [lens.clone()]);
+        assert_eq!(load(&p).unwrap(), std::slice::from_ref(&lens));
         assert_eq!(
             std::fs::metadata(p.lenses()).unwrap().permissions().mode() & 0o777,
             0o600
