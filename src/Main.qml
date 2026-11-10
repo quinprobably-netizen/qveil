@@ -30,8 +30,13 @@ ApplicationWindow {
     readonly property bool fullscreen: visibility === Window.FullScreen
     // Whether a video has the window.
     readonly property bool watching: watch.active
-    // The player, wherever it is shown.
-    readonly property var player: watch.surface
+    // Whether the video is in the small window of picture in picture.
+    readonly property bool pip: pipWindow.surface.active
+    readonly property alias pipWindow: pipWindow
+    // The player, wherever it is shown: in the page, or in the small window.
+    readonly property var player: pip ? pipWindow.surface : watch.surface
+    // Whether anything is playing, in either.
+    readonly property bool playing: watching || pip
     // Before the first subscription there is nothing to refresh or filter. Both
     // counts must say so, so a loading window doesn't flash the controls away.
     readonly property bool noSubs: backend.feedInfo.channels === 0 && backend.subs.length === 0
@@ -153,9 +158,37 @@ ApplicationWindow {
     function play(video, list, index) {
         playList = list || null
         playIndex = list ? index : -1
-        watch.prepare(video)
-        watch.forceActiveFocus()
+        // While a video is in the small window, the next one plays there
+        // too, and the main window stays where it is.
+        if (pip) {
+            pipWindow.surface.prepare(video)
+        } else {
+            watch.prepare(video)
+            watch.forceActiveFocus()
+        }
         backend.play(video.id)
+    }
+
+    // Picture in picture: the video leaves the page for a small window of
+    // its own, or comes back from it. Each has a player of its own; the
+    // video carries on in the other from where it was, and only one plays.
+    function togglePip() {
+        const from = pip ? pipWindow.surface : watch.surface
+        if (!from.active || from.pending)
+            return
+        const info = from.info
+        // Before the first frame, where it was going to start is where it is.
+        const at = from.mpv.started ? from.mpv.position : from.startedAt
+        if (pip) {
+            pipWindow.end()
+            watch.prepare(info)
+            watch.surface.openAt(info, at)
+            watch.forceActiveFocus()
+            win.requestActivate()
+        } else {
+            watch.close()
+            pipWindow.take(info, at)
+        }
     }
 
     // Puts `text` on the clipboard. (Only a text item can.)
@@ -185,7 +218,10 @@ ApplicationWindow {
     }
 
     function goBack() {
-        if (help.opened)
+        // In the small window, Escape brings the video back.
+        if (pip && pipWindow.active)
+            togglePip()
+        else if (help.opened)
             help.close()
         else if (route.opened)
             route.close()
@@ -223,8 +259,15 @@ ApplicationWindow {
         function onRouteChanged() {
             if (watch.active)
                 watch.close()
+            if (win.pip)
+                pipWindow.end()
         }
-        function onPlayReady(info) { watch.open(info) }
+        function onPlayReady(info) {
+            if (win.pip)
+                pipWindow.surface.open(info)
+            else
+                watch.open(info)
+        }
         // A lens that was just added is shown, wherever it was added from.
         function onLensAdded(id) {
             if (win.page !== "lenses")
@@ -239,7 +282,7 @@ ApplicationWindow {
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.goBack() }
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: help.opened ? help.close() : help.open() }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: Qt.quit() }
-    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.watching ? player.mpv.togglePause() : win.playCurrent() }
+    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.playing ? player.mpv.togglePause() : win.playCurrent() }
     Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("home") }
     Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("lenses") }
     Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("channels") }
@@ -248,19 +291,20 @@ ApplicationWindow {
     Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.watching; onActivated: win.refresh() }
     Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.toggleRoute() }
     Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: win.toggleFullscreen() }
-    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.mpv.muted = !player.mpv.muted }
-    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
-    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(5, true); player.reveal() } }
-    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(-10, true); player.reveal() } }
-    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.seek(10, true); player.reveal() } }
-    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
+    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.mpv.muted = !player.mpv.muted }
+    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
+    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(5, true); player.reveal() } }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(-10, true); player.reveal() } }
+    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.seek(10, true); player.reveal() } }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
+    Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: win.togglePip() }
     Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.theatre = !watch.theatre }
     Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { watch.theatre = false; watch.sheet.current = "comments" } }
-    Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.chapterStep(false) }
-    Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.chapterStep(true) }
-    Shortcut { sequence: "<"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.speedStep(false) }
-    Shortcut { sequence: ">"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: player.speedStep(true) }
-    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
+    Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(false) }
+    Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(true) }
+    Shortcut { sequence: "<"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.speedStep(false) }
+    Shortcut { sequence: ">"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.speedStep(true) }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
 
     // Mirrors for right-to-left languages. A top-level window ignores the
     // application's layout direction.
@@ -349,12 +393,24 @@ ApplicationWindow {
                 }
             }
 
+            // What plays in the small window, along the foot of this one.
+            NowPlayingBar {
+                id: nowPlaying
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                visible: win.pip
+                surface: pipWindow.surface
+                onBackRequested: win.togglePip()
+                onCloseRequested: pipWindow.end()
+            }
+
             Item {
                 id: stage
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.top: top.visible ? top.bottom : parent.top
-                anchors.bottom: parent.bottom
+                anchors.bottom: nowPlaying.visible ? nowPlaying.top : parent.bottom
                 anchors.topMargin: top.visible ? Style.u * 2 : 0
 
                 HomePage {
@@ -470,6 +526,7 @@ ApplicationWindow {
                     onChannelRequested: id => win.openChannel(id)
                     onVideoRequested: (video, list, index) => win.play(video, list, index)
                     onFullscreenToggled: win.toggleFullscreen()
+                    onPipRequested: win.togglePip()
                     onCopied: text => {
                         win.copy(text)
                         toast.show(qsTr("Link copied. qveil doesn't open browsers."))
@@ -509,6 +566,14 @@ ApplicationWindow {
                     visible: !win.watching && tasks.length > 0
                 }
             }
+        }
+
+        PipWindow {
+            id: pipWindow
+            thumbs: win.thumbs
+            savedVolume: prefs.volume
+            onSavedVolumeChanged: prefs.volume = savedVolume
+            onBackRequested: win.togglePip()
         }
 
         TextEdit {

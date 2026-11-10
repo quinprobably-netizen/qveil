@@ -127,6 +127,17 @@ struct App {
     }
     QString page() const { return window->property("page").toString(); }
 
+    // The small window of picture in picture, and something in it.
+    QQuickWindow *pip() const { return window->property("pipWindow").value<QQuickWindow *>(); }
+    QQuickItem *inPip(const char *name) const { return pip() ? under(pip()->contentItem(), name) : nullptr; }
+    // Makes the engine exit, as if it had crashed.
+    void killEngine()
+    {
+        const QString base = backend->thumbBase().chopped(QString("/thumb/").size());
+        QNetworkReply *reply = web.post(QNetworkRequest(QUrl(base + "/api/_die")), QByteArray());
+        QObject::connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
+    }
+
     // Opens `video` the way a card does, from no list.
     void play(const QVariantMap &video) const
     {
@@ -177,8 +188,12 @@ private slots:
 
     void init()
     {
-        // No test may leave a QML warning behind.
-        QTest::failOnWarning(QRegularExpression("qrc:/|\\.qml|QML|TypeError|ReferenceError"));
+        // No test may leave a QML warning behind. Where the engine is killed
+        // on purpose, pictures that were loading from it say so, which is not
+        // a fault; a script error still is.
+        const bool engineDies = QByteArray(QTest::currentTestFunction()) == "theSmallWindowGoesWhenTheEngineDoes";
+        QTest::failOnWarning(QRegularExpression(engineDies ? "TypeError|ReferenceError|Binding loop"
+                                                           : "qrc:/|\\.qml|QML|TypeError|ReferenceError"));
     }
 
     void theWindowLoadsCleanWithARailAndNoTabBar()
@@ -715,6 +730,110 @@ private slots:
         QVERIFY(note);
         QTRY_COMPARE(note->property("text").toString(), app.backend->privacy().value("pages").toMap().value("lenses").toString());
         QVERIFY(!note->property("text").toString().isEmpty());
+    }
+
+    void pictureInPictureMovesTheVideoOutAndBack()
+    {
+        App app;
+        READY(app);
+        QQuickWindow *pip = app.pip();
+        QVERIFY(pip);
+        QVERIFY(!pip->isVisible());
+        // A video that is picked up at 14:05.
+        app.play({{"id", "vid00000001"}, {"title", "Why the borrow checker says no"}});
+        QQuickItem *main = app.item("surface");
+        QTRY_COMPARE(main->property("startedAt").toInt(), 845);
+        QVERIFY(!app.item("now-playing")->isVisible());
+
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(pip->isVisible());
+        QCOMPARE(pip->title(), QString("Picture-in-Picture"));
+        QVERIFY(app.window->property("pip").toBool());
+        QQuickItem *small = app.inPip("pip-surface");
+        QVERIFY(small);
+        // The video left the page for the small window, and carried on where it was.
+        QVERIFY(small->property("active").toBool() && !main->property("active").toBool());
+        QCOMPARE(small->property("startedAt").toInt(), 845);
+        QCOMPARE(small->property("info").toMap().value("title").toString(), QString("Why the borrow checker says no"));
+        QVERIFY(!app.item("watch")->isVisible());
+        QCOMPARE(app.page(), QString("home"));
+        QVERIFY(app.item("search")->isVisible());
+        QQuickItem *bar = app.item("now-playing");
+        QVERIFY(bar->isVisible());
+        QCOMPARE(bar->property("title").toString(), QString("Why the borrow checker says no"));
+
+        // And back, by the bar's own action.
+        app.click(app.item("now-back"));
+        QTRY_VERIFY(!pip->isVisible());
+        QVERIFY(main->property("active").toBool() && !small->property("active").toBool());
+        QCOMPARE(main->property("startedAt").toInt(), 845);
+        QVERIFY(app.item("watch")->isVisible());
+        QVERIFY(!bar->isVisible());
+        QVERIFY(!app.window->property("pip").toBool());
+    }
+
+    void anotherVideoOpenedMeanwhilePlaysInTheSmallWindow()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QTRY_VERIFY(app.items("card").size() >= 4);
+        app.click(app.items("card").at(2));
+        QQuickItem *small = app.inPip("pip-surface");
+        QTRY_COMPARE(small->property("info").toMap().value("id").toString(), QString("vid00000003"));
+        QTRY_VERIFY(!small->property("pending").toBool());
+        // The main window stays where it was, browsing.
+        QVERIFY(!app.item("watch")->isVisible());
+        QVERIFY(!app.item("surface")->property("active").toBool());
+        QCOMPARE(app.item("now-playing")->property("title").toString(), QString("The 1970s synth that refuses to stay in tune"));
+    }
+
+    void closingTheSmallWindowStopsTheVideo()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        app.pip()->close();
+        QTRY_VERIFY(!app.pip()->isVisible());
+        QVERIFY(!app.inPip("pip-surface")->property("active").toBool());
+        QVERIFY(!app.item("surface")->property("active").toBool());
+        QVERIFY(!app.item("now-playing")->isVisible());
+        QVERIFY(!app.window->property("pip").toBool());
+
+        // The bar's Close does the same.
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        app.click(app.item("now-close"));
+        QTRY_VERIFY(!app.pip()->isVisible());
+        QVERIFY(!app.window->property("pip").toBool());
+        // Nothing is playing, so there is nothing to send to a small window.
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTest::qWait(200);
+        QVERIFY(!app.pip()->isVisible());
+    }
+
+    void theSmallWindowGoesWhenTheEngineDoes()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QSignalSpy readiness(app.backend.get(), &Backend::readyChanged);
+        app.killEngine();
+        QTRY_VERIFY_WITH_TIMEOUT(readiness.count() >= 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!app.pip()->isVisible(), 2000);
+        QVERIFY(!app.inPip("pip-surface")->property("active").toBool());
+        QVERIFY(!app.item("now-playing")->isVisible());
     }
 };
 

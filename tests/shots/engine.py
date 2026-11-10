@@ -333,6 +333,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path, q = self.parts()
         body = self.body()
         base = "http://%s/t" % self.headers.get("Host", "127.0.0.1")
+        if path == "api/_die":
+            # For the tests of what the window does when the engine is gone.
+            os._exit(3)
         if path == "api/config":
             cfg = state["config"]
             for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays"):
