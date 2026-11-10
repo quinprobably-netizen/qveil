@@ -586,3 +586,38 @@ fn resume_lists_and_clears() {
     let out = home.run(&["resume"], "");
     assert!(text(&out.stdout).contains("nothing kept"));
 }
+
+#[test]
+fn comments_print_as_text_and_json() {
+    let home = Home::new();
+    let ytdlp = script(
+        &home.0.join("bin/yt-dlp"),
+        r#"cat <<'JSON'
+{"comment_count":3,"comments":[
+ {"id":"a","parent":"root","author":"@chan","text":"Fixed","like_count":640,"_time_text":"9 hours ago","is_pinned":true,"author_is_uploader":true},
+ {"id":"b","parent":"root","author":"@mara","text":"Nice"},
+ {"id":"b.1","parent":"b","author":"@x","text":"Agreed"}]}
+JSON
+"#,
+    );
+    write(
+        &home.config().join("qveil/config.toml"),
+        &format!("ytdlp = \"{}\"\n", ytdlp.display()),
+    );
+    let out = home.run(&["comments", "dQw4w9WgXcQ"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let shown = text(&out.stdout);
+    assert!(
+        shown.contains("@chan  \u{b7}  pinned  \u{b7}  9 hours ago  \u{b7}  \u{2665} 640\nFixed"),
+        "{shown}"
+    );
+    assert!(shown.contains("@mara\nNice\n  @x\n  Agreed"), "{shown}");
+    let out = home.run(
+        &["comments", "dQw4w9WgXcQ", "--json", "--replies", "--new"],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains(r#""text": "Agreed""#));
+    let out = home.run(&["comments", "https://evil.example/x"], "");
+    assert!(!out.status.success());
+}

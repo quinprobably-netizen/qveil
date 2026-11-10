@@ -28,6 +28,7 @@ macro_rules! out {
 }
 
 mod app;
+mod comments;
 mod config;
 mod errors;
 mod feed;
@@ -112,6 +113,26 @@ enum Cmd {
     Play {
         /// A YouTube video URL, or its 11-character ID
         target: String,
+        #[command(flatten)]
+        route: Route,
+    },
+    /// Read a video's comments
+    #[command(after_help = IN_PROC)]
+    Comments {
+        /// A YouTube video URL, or its 11-character ID
+        target: String,
+        /// Newest first instead of top first
+        #[arg(long)]
+        new: bool,
+        /// How many comments to ask for (20 to 200)
+        #[arg(short = 'n', long, default_value_t = 40)]
+        limit: usize,
+        /// Also fetch up to three replies under each comment (slower)
+        #[arg(long)]
+        replies: bool,
+        /// Print the comments as JSON
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         route: Route,
     },
@@ -300,6 +321,7 @@ fn run() -> Result<()> {
         Cmd::Search { route, .. }
         | Cmd::Play { route, .. }
         | Cmd::Feed { route, .. }
+        | Cmd::Comments { route, .. }
         | Cmd::Sub(SubCmd::Add { route, .. }) => route.clone(),
         _ => Route::default(),
     };
@@ -385,6 +407,41 @@ fn run() -> Result<()> {
                 .collect();
             browse(&server, rows, out.list)
         }
+        Cmd::Comments {
+            target,
+            new,
+            limit,
+            replies,
+            json,
+            ..
+        } => {
+            let v = ids::parse_video(&target)
+                .with_context(|| format!("{target:?} isn't a YouTube video URL or ID"))?;
+            let sort = if new {
+                comments::Sort::New
+            } else {
+                comments::Sort::Top
+            };
+            let found =
+                rt.yt
+                    .comments(&v.watch_url(), sort, limit.clamp(20, 200), replies, &|| {
+                        false
+                    })?;
+            if json {
+                return print_json(&found);
+            }
+            if found.comments.is_empty() {
+                note!("no comments, or they are turned off");
+            }
+            for c in &found.comments {
+                print_comment(c, "")?;
+                for reply in &c.replies {
+                    print_comment(reply, "  ")?;
+                }
+                outln!("");
+            }
+            Ok(())
+        }
         Cmd::Sub(cmd) => sub(&rt, paths, cmd),
         Cmd::History { clear, json } => history(&rt.cfg, paths, clear, json),
         Cmd::Resume { clear, json } => resumed(&rt.cfg, paths, clear, json),
@@ -407,6 +464,23 @@ fn serve(server: &Arc<Server>) -> Result<()> {
     let mut stdin = std::io::stdin();
     while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
     server.shutdown();
+    Ok(())
+}
+
+/// One comment: who and when on a line, then what they wrote.
+fn print_comment(c: &comments::Comment, indent: &str) -> Result<()> {
+    let mut head = vec![c.author.clone()];
+    if c.pinned {
+        head.push("pinned".into());
+    }
+    head.extend(c.time_text.clone());
+    if let Some(likes) = c.likes {
+        head.push(format!("\u{2665} {}", video::fmt_count(likes)));
+    }
+    outln!("{indent}{}", head.join("  \u{b7}  "));
+    for line in c.text.lines() {
+        outln!("{indent}{line}");
+    }
     Ok(())
 }
 
@@ -700,7 +774,8 @@ mod tests {
                 assert!(!takes(&cmd), "`qveil {path}` shows a route it doesn't use");
                 continue;
             }
-            let uses_network = ["search", "play", "feed", "sub add"].contains(&path.as_str());
+            let uses_network =
+                ["search", "play", "feed", "comments", "sub add"].contains(&path.as_str());
             assert_eq!(takes(&cmd), uses_network, "`qveil {path}`");
         }
         // They can't be given both, and the others don't take either.
@@ -716,7 +791,7 @@ mod tests {
             let says = cmd
                 .get_after_help()
                 .is_some_and(|h| h.to_string().contains("/proc"));
-            let takes_input = ["search", "play", "sub add"].contains(&path.as_str());
+            let takes_input = ["search", "play", "comments", "sub add"].contains(&path.as_str());
             assert_eq!(says, takes_input, "`qveil {path}`");
         }
     }

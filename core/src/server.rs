@@ -17,6 +17,7 @@
 //! - `relay`: the video relay, chunked and Range-forwarding.
 
 mod api;
+mod comments;
 mod http;
 mod jobs;
 mod relay;
@@ -55,6 +56,8 @@ pub struct Server {
     base: OnceLock<String>,
     sessions: Mutex<VecDeque<(String, Arc<Session>)>>,
     thumbs: thumbs::Thumbs,
+    /// The comments fetched lately (see `comments`).
+    comments: comments::Kept,
     /// The feed refresh that is running, if one is.
     jobs: jobs::Jobs,
     /// Serializes settings changes.
@@ -120,6 +123,7 @@ impl Server {
             base: OnceLock::new(),
             sessions: Mutex::new(VecDeque::new()),
             thumbs: thumbs::Thumbs::default(),
+            comments: comments::Kept::default(),
             jobs: jobs::Jobs::default(),
             settings: Mutex::new(()),
             connections: Arc::new(AtomicUsize::new(0)),
@@ -372,6 +376,7 @@ impl Server {
             }
             ("GET", ["api", "feed"]) => self.feed(&mut stream, &req),
             ("POST", ["api", "play"]) => self.play(&mut stream, &req),
+            ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),
             _ => self.json_api(&mut stream, &req, &segs),
         }
     }

@@ -6,6 +6,7 @@
 //! password would be readable by every local user in /proc/*/cmdline, so they
 //! never go on the command line: see `Call`.
 
+use crate::comments::{self, Comments, Sort};
 use crate::errors::friendly;
 use crate::ids;
 use crate::inflight::{Inflight, Run, StartError};
@@ -26,6 +27,11 @@ use std::time::{Duration, Instant};
 const QUICK: Duration = Duration::from_secs(60);
 /// Resolving a video does more (player requests, the JavaScript challenge), so it gets longer.
 const RESOLVE: Duration = Duration::from_secs(90);
+/// Comments come a page at a time, and replies a thread at a time, so a long
+/// list over a slow route takes a while.
+const COMMENTS: Duration = Duration::from_secs(120);
+/// How many replies are asked for under each comment, when they are.
+const REPLIES_EACH: usize = 3;
 /// yt-dlp's own limit for one connection. The deadlines above bound the whole
 /// call, and this keeps a single dead connection from using up all of it.
 const SOCKET_TIMEOUT: &str = "20";
@@ -351,6 +357,44 @@ impl Ytdlp {
             QUICK,
         )?;
         Ok(entries(&v))
+    }
+
+    /// The first `n` comment threads of a video, in `sort` order, and with
+    /// `replies` up to `REPLIES_EACH` replies under each. yt-dlp has no way
+    /// to ask for the next page, so more is asked for from the start.
+    /// Nothing is downloaded, and a video without formats (a stream that
+    /// hasn't started) still has comments.
+    pub fn comments(
+        &self,
+        url: &str,
+        sort: Sort,
+        n: usize,
+        replies: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Comments> {
+        // max_comments is: comments in all, threads, replies in all, replies per thread.
+        let limits = if replies {
+            format!(
+                "{},{n},{},{REPLIES_EACH}",
+                n * (REPLIES_EACH + 1),
+                n * REPLIES_EACH
+            )
+        } else {
+            format!("{n},{n},0,0")
+        };
+        let extractor = format!(
+            "{SKIP_MANIFESTS};comment_sort={};max_comments={limits}",
+            sort.as_str()
+        );
+        let args = [
+            "-J",
+            "--no-playlist",
+            "--skip-download",
+            "--ignore-no-formats-error",
+            "--write-comments",
+        ];
+        let v = self.json_with(&args, Some(&extractor), url, COMMENTS, abort)?;
+        Ok(comments::parse(&v, sort))
     }
 
     /// Picks the streams to relay. `format` must only select plain downloads
