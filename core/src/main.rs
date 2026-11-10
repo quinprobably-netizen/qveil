@@ -521,7 +521,7 @@ fn run() -> Result<()> {
         Cmd::Resume { clear, json } => resumed(&rt.cfg, paths, clear, json),
         Cmd::Config => show_config(&rt, paths),
         Cmd::Privacy { .. } => {
-            outln!("{}", privacy::text(&rt.net));
+            outln!("{}", privacy::text(&rt.net, &rt.cfg));
             Ok(())
         }
         Cmd::Wipe { yes } => wipe(paths, yes),
@@ -801,7 +801,7 @@ fn show_config(rt: &Runtime, p: &Paths) -> Result<()> {
     outln!("max height     {}p", rt.cfg.max_height);
     outln!("");
     // What the window says too, from the same place (see `privacy`).
-    outln!("{}", privacy::text(&rt.net));
+    outln!("{}", privacy::text(&rt.net, &rt.cfg));
     Ok(())
 }
 

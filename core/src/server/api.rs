@@ -217,7 +217,7 @@ impl Server {
             "configPath": self.paths.config,
             // What the window says about privacy, from the one place that
             // words it (see `privacy`).
-            "privacy": privacy::describe(&rt.net),
+            "privacy": privacy::describe(&rt.net, &rt.cfg),
         })
     }
 

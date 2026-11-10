@@ -17,7 +17,10 @@
 //! - A proxy URL with credentials of its own is "not isolated", and so is an
 //!   HTTP proxy.
 //! - A stream that is looked up again after a 403 links two circuits.
+//! - With resume on, qveil does remember unfinished videos, so history being
+//!   off is "keeps no list of what you watch", not "doesn't remember".
 
+use crate::config::Config;
 use crate::net::{Net, TOR_PROXY};
 use serde::Serialize;
 
@@ -101,7 +104,9 @@ const EVERYWHERE: &[&str] = &[
     "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits.",
     "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
     "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
-    "Subscriptions, history and the feed cache stay on this computer, in files only you can read, and qveil has no telemetry.",
+    "Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.",
+    "A lens is refreshed as one search per topic: on one address their timing links them, and even over Tor a set of related searches can be linked by content.",
+    "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.",
 ];
 
 /// What the README says besides the above: the details behind them.
@@ -134,10 +139,13 @@ const DETAILS: &[(&str, &str)] = &[
         "Tracking parameters",
         "Links are reduced to the video ID; `si=`, `pp=`, `feature=` and similar are dropped. A start time (`t=`) is kept, for the player only.",
     ),
-    ("Player state", "No resume files, no watch history in mpv."),
+    (
+        "Player state",
+        "mpv keeps no resume files or history. qveil itself remembers where you stopped in an unfinished video for a set number of days (7 unless you change it; 0 turns it off) in a file only you can read, then deletes it; a finished video is forgotten at once.",
+    ),
     (
         "Local data",
-        "Subscriptions and the feed cache live in `~/.local/share/qveil` and `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those).",
+        "Subscriptions, lenses, resume positions and the history live in `~/.local/share/qveil`, the feed cache and each lens's results in `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those).",
     ),
 ];
 
@@ -171,6 +179,10 @@ pub struct Pages {
     pub subscriptions: &'static str,
     pub history_off: &'static str,
     pub history_on: &'static str,
+    /// For the number of days that is set, so it is not a fixed text.
+    pub resume: String,
+    pub comments: &'static str,
+    pub lenses: &'static str,
 }
 
 const ROUTES: Routes = Routes {
@@ -179,15 +191,32 @@ const ROUTES: Routes = Routes {
     proxy: "A proxy you trust, such as a VPN's: YouTube sees its address, not yours. A SOCKS proxy gets fresh credentials per request (a separate circuit if it is Tor); a proxy URL with credentials of its own is not isolated.",
 };
 
-const PAGES: Pages = Pages {
-    search: "Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches.",
-    subscriptions: "Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels.",
-    history_off: "Off: qveil doesn't remember what you watch.",
-    history_on: "On: kept only on this computer, in a file only you can read, until you clear it.",
-};
+const SEARCH: &str = "Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches.";
+const SUBSCRIPTIONS: &str = "Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels.";
+const HISTORY_OFF: &str = "Off: qveil keeps no list of what you watch.";
+const HISTORY_ON: &str =
+    "On: kept only on this computer, in a file only you can read, until you clear it.";
+const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.";
+const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches; your wording, the filters and the ranking stay on this computer.";
 
-/// The text for the route `net` is.
-pub fn describe(net: &Net) -> Privacy {
+/// What is said about resume when positions are kept for `days` (0: not at all).
+fn resume(days: u32) -> String {
+    match days {
+        0 => "Off: qveil doesn't remember where you stopped.".into(),
+        _ => format!(
+            "On: qveil remembers where you stopped in an unfinished video for {}, in a file only you can read, then deletes it. A finished video is forgotten at once.",
+            if days == 1 {
+                "1 day".to_string()
+            } else {
+                format!("{days} days")
+            }
+        ),
+    }
+}
+
+/// The text for the route `net` is, and for the settings in `cfg` that
+/// change what is true.
+pub fn describe(net: &Net, cfg: &Config) -> Privacy {
     let kind = Kind::of(net);
     let points = kind
         .route_points()
@@ -199,7 +228,15 @@ pub fn describe(net: &Net) -> Privacy {
         summary: kind.summary().into(),
         points,
         routes: ROUTES,
-        pages: PAGES,
+        pages: Pages {
+            search: SEARCH,
+            subscriptions: SUBSCRIPTIONS,
+            history_off: HISTORY_OFF,
+            history_on: HISTORY_ON,
+            resume: resume(cfg.resume_days),
+            comments: COMMENTS,
+            lenses: LENSES,
+        },
     }
 }
 
@@ -250,11 +287,16 @@ pub fn markdown() -> String {
     md.push_str(&format!("\n{STILL_SEES}\n"));
 
     md.push_str("\n**On the pages**\n\n");
+    let (resume_on, resume_off) = (resume(Config::default().resume_days), resume(0));
     for (name, line) in [
-        ("Search", PAGES.search),
-        ("Subscriptions", PAGES.subscriptions),
-        ("History, off", PAGES.history_off),
-        ("History, on", PAGES.history_on),
+        ("Search", SEARCH),
+        ("Subscriptions", SUBSCRIPTIONS),
+        ("Lenses", LENSES),
+        ("Comments", COMMENTS),
+        ("History, off", HISTORY_OFF),
+        ("History, on", HISTORY_ON),
+        ("Resume, on", resume_on.as_str()),
+        ("Resume, off", resume_off.as_str()),
     ] {
         md.push_str(&format!("- **{name}.** {line}\n"));
     }
@@ -262,18 +304,20 @@ pub fn markdown() -> String {
 }
 
 /// The text for the route `net` is, for the command line.
-pub fn text(net: &Net) -> String {
-    let p = describe(net);
+pub fn text(net: &Net, cfg: &Config) -> String {
+    let p = describe(net, cfg);
     let mut out = format!("{}\n", p.summary);
     for point in &p.points {
         out.push_str(&format!("\n- {point}"));
     }
+    out.push_str(&format!("\n- Resume. {}", p.pages.resume));
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use serde_json::{Value, json};
 
     const BEGIN: &str = "<!-- privacy:begin -->";
@@ -307,7 +351,7 @@ mod tests {
     fn everything() -> Vec<String> {
         let mut all = vec![markdown()];
         for (_, n) in routes() {
-            let p = describe(&n);
+            let p = describe(&n, &Config::default());
             all.push(p.summary);
             all.extend(p.points);
         }
@@ -348,6 +392,8 @@ mod tests {
                 "cannot link",
                 "can't be linked",
                 "unlinkable",
+                // With resume on, qveil does remember some of it.
+                "doesn't remember what you watch",
             ] {
                 assert!(!text.contains(wrong), "{wrong:?} in: {text}");
             }
@@ -360,6 +406,9 @@ mod tests {
             "not isolated",
             "links the two circuits",
             "fingerprint",
+            "one more lookup of that video",
+            "one search per topic",
+            "a finished video is forgotten at once",
         ] {
             assert!(
                 md.contains(right),
@@ -371,13 +420,13 @@ mod tests {
     #[test]
     fn each_route_says_what_is_true_of_it() {
         let says = |n: &Net, words: &str| {
-            let p = describe(n);
+            let p = describe(n, &Config::default());
             p.summary.contains(words) || p.points.iter().any(|s| s.contains(words))
         };
         let direct = net(None);
         assert!(says(&direct, "your IP address"));
         // Nothing about circuits or credentials where there are none.
-        let p = describe(&direct);
+        let p = describe(&direct, &Config::default());
         assert!(
             !p.points
                 .iter()
@@ -409,7 +458,10 @@ mod tests {
     #[test]
     fn credentials_never_appear_in_what_is_said() {
         for (_, n) in routes() {
-            for text in [describe(&n).summary, describe(&n).points.join("\n")] {
+            for text in [
+                describe(&n, &Config::default()).summary,
+                describe(&n, &Config::default()).points.join("\n"),
+            ] {
                 assert!(!text.contains("pw") && !text.contains("me:"), "{text}");
             }
         }
@@ -418,7 +470,7 @@ mod tests {
     /// What the window is coded against.
     #[test]
     fn the_json_has_the_shape_the_window_expects() {
-        let v = serde_json::to_value(describe(&net(Some(TOR_PROXY)))).unwrap();
+        let v = serde_json::to_value(describe(&net(Some(TOR_PROXY)), &Config::default())).unwrap();
         let keys = |v: &Value| -> Vec<String> {
             let mut k: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
             k.sort();
@@ -428,7 +480,15 @@ mod tests {
         assert_eq!(keys(&v["routes"]), ["direct", "proxy", "tor"]);
         assert_eq!(
             keys(&v["pages"]),
-            ["history_off", "history_on", "search", "subscriptions"]
+            [
+                "comments",
+                "history_off",
+                "history_on",
+                "lenses",
+                "resume",
+                "search",
+                "subscriptions"
+            ]
         );
         assert!(v["summary"].is_string());
         let points = v["points"].as_array().unwrap();
@@ -437,9 +497,34 @@ mod tests {
         let summary = v["summary"].as_str().unwrap();
         assert_eq!(summary.matches(". ").count(), 0, "{summary}");
         assert_eq!(
-            json!(describe(&net(None)).routes)["direct"],
+            json!(describe(&net(None), &Config::default()).routes)["direct"],
             "YouTube sees your IP address."
         );
+    }
+
+    #[test]
+    fn resume_says_the_live_number_of_days() {
+        let says = |days: u32| {
+            let cfg = Config {
+                resume_days: days,
+                ..Config::default()
+            };
+            describe(&net(None), &cfg).pages.resume
+        };
+        assert!(
+            says(7).starts_with("On: ") && says(7).contains("for 7 days,"),
+            "{}",
+            says(7)
+        );
+        assert!(says(1).contains("for 1 day,"), "{}", says(1));
+        assert!(says(0).starts_with("Off: "), "{}", says(0));
+        assert!(!says(0).contains("days"));
+        // The command line says it too.
+        assert!(text(&net(None), &Config::default()).contains("for 7 days,"));
+        // The README describes both states.
+        let md = markdown();
+        assert!(md.contains("**Resume, on.**") && md.contains("**Resume, off.**"));
+        assert!(md.contains("**Comments.**") && md.contains("**Lenses.**"));
     }
 
     #[test]
