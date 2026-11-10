@@ -19,6 +19,11 @@ max_height = 1080
 # Keep a local watch history. Nothing ever leaves this machine either way.
 history = false
 
+# For how many days qveil remembers where you stopped in an unfinished video,
+# in a file only you can read. A finished video is forgotten at once. 0 turns
+# this off and deletes what was remembered.
+resume_days = 7
+
 # Show thumbnails. They are fetched through the same route as everything else.
 # With Tor isolation each one gets its own circuit, so separate requests can't
 # be linked by IP address. A refresh is still a burst of requests for exactly

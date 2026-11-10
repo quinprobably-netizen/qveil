@@ -56,6 +56,10 @@ impl Paths {
     pub fn history(&self) -> PathBuf {
         self.data.join("history.json")
     }
+    /// Where unfinished videos were stopped (see `resume`).
+    pub fn resume(&self) -> PathBuf {
+        self.data.join("resume.json")
+    }
     pub fn feed_cache(&self) -> PathBuf {
         self.cache.join("feed.json")
     }

@@ -39,6 +39,7 @@ mod player;
 mod privacy;
 mod private;
 mod proc;
+mod resume;
 mod server;
 mod signals;
 mod store;

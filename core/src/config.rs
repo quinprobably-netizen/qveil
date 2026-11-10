@@ -18,6 +18,9 @@ pub struct Config {
     pub max_height: u32,
     /// Keep a local watch history. Off by default.
     pub history: bool,
+    /// For how many days qveil remembers where an unfinished video was
+    /// stopped. 0 turns that off, and deletes what was remembered.
+    pub resume_days: u32,
     /// Show thumbnails (fetched through the same route as everything else).
     pub thumbnails: bool,
     /// How many channel feeds to fetch at once.
@@ -35,6 +38,7 @@ impl Default for Config {
             isolate_circuits: true,
             max_height: 1080,
             history: false,
+            resume_days: 7,
             thumbnails: true,
             feed_workers: 4,
             ytdlp: "yt-dlp".into(),
@@ -83,6 +87,24 @@ mod tests {
         assert!(
             toml::from_str::<Config>("histroy = true").is_err(),
             "typos must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn resume_is_seven_days_unless_the_file_says_otherwise() {
+        assert_eq!(Config::default().resume_days, 7);
+        assert_eq!(
+            toml::from_str::<Config>("resume_days = 3")
+                .unwrap()
+                .resume_days,
+            3
+        );
+        // A config written before the key existed.
+        assert_eq!(
+            toml::from_str::<Config>("history = true")
+                .unwrap()
+                .resume_days,
+            7
         );
     }
 
