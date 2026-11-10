@@ -107,7 +107,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - **Resume, on.** On: qveil remembers where you stopped in an unfinished video for 7 days, in a file only you can read. After that it is no longer offered, and it is deleted the next time qveil starts or saves a position. A finished video is forgotten at once.
 - **Resume, off.** Off: qveil doesn't remember where you stopped.
 - **Topic feeds, off.** Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.
-- **Topic feeds, on.** On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three phrases for each of up to four groups, again once a group's results are a day old. YouTube sees those searches, which say what the channels you follow are about. Videos from channels you already follow are left out of what is shown.
+- **Topic feeds, on.** On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, and none for a group whose results are less than a day old. YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted.
 <!-- privacy:end -->
 
 ## The app

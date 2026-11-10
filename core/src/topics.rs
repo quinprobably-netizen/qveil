@@ -25,16 +25,71 @@ pub const TITLES: usize = 30;
 /// How alike two channels' terms must be for them to share a group.
 const ALIKE: f64 = 0.2;
 
-/// The groups the user doesn't want to see, by id.
+/// How many searches the topic feeds may make in a day, whatever the groups
+/// are and however often they change.
+pub const BUDGET: usize = MAX_GROUPS * SEARCHES;
+
+/// What the user doesn't want to see or have searched for. A group's id
+/// changes whenever a channel joins or leaves it, so what is kept is what was
+/// refused: the channels the group was made of and the phrases it searched
+/// for. A group that has one of either is hidden.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Hidden {
+    /// Ids, from before the above was kept; still honoured.
+    #[serde(default)]
     pub ids: Vec<String>,
+    #[serde(default)]
+    pub refused: Vec<Refused>,
 }
 
-/// What each group's searches last found, by the group's id.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Refused {
+    pub channels: Vec<String>,
+    pub phrases: Vec<String>,
+}
+
+impl Hidden {
+    pub fn hides(&self, group: &Group) -> bool {
+        self.ids.contains(&group.id)
+            || self.refused.iter().any(|r| {
+                r.channels.iter().any(|c| group.channel_ids.contains(c))
+                    || r.phrases.iter().any(|p| group.searches.contains(p))
+            })
+    }
+
+    pub fn hide(&mut self, group: &Group) {
+        self.refused.push(Refused {
+            channels: group.channel_ids.clone(),
+            phrases: group.searches.clone(),
+        });
+        // The oldest go first.
+        let over = self.refused.len().saturating_sub(200);
+        self.refused.drain(..over);
+    }
+}
+
+/// What the searches last found, by what was searched for (`Group::key`),
+/// and when each search of the last day was made.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Results {
+    #[serde(default)]
     pub groups: HashMap<String, crate::lens::Cached>,
+    #[serde(default)]
+    pub searched: Vec<i64>,
+}
+
+impl Results {
+    /// Whether `n` more searches fit in the day that ends at `now`.
+    pub fn allows(&self, n: usize, now: i64) -> bool {
+        let spent = self.searched.iter().filter(|t| now - **t < STALE).count();
+        spent + n <= BUDGET
+    }
+
+    /// Notes `n` searches made at `now`, and forgets those older than a day.
+    pub fn spent(&mut self, n: usize, now: i64) {
+        self.searched.retain(|t| now - *t < STALE);
+        self.searched.extend(std::iter::repeat_n(now, n));
+    }
 }
 
 /// A channel you follow and the titles it uploaded lately.
@@ -53,8 +108,20 @@ pub struct Group {
     pub label: String,
     /// The names of its channels.
     pub channels: Vec<String>,
+    /// And their ids.
+    #[serde(rename = "channelIds", default)]
+    pub channel_ids: Vec<String>,
     /// What a refresh asks YouTube for, word for word.
     pub searches: Vec<String>,
+}
+
+impl Group {
+    /// What its results are kept under: what was searched for. A group that
+    /// gains or loses a channel but searches for the same has the same results.
+    pub fn key(&self) -> String {
+        let phrases: Vec<&str> = self.searches.iter().map(String::as_str).collect();
+        stable_id(&phrases)
+    }
 }
 
 /// Words that say nothing about a topic.
@@ -232,6 +299,7 @@ pub fn groups(channels: &[Channel]) -> Vec<Group> {
                 id: stable_id(&ids),
                 label: searches.join(", "),
                 channels: members.iter().map(|(c, _)| c.name.to_string()).collect(),
+                channel_ids: ids.iter().map(|id| (*id).to_string()).collect(),
                 searches,
             },
         ));
@@ -388,5 +456,57 @@ mod tests {
         };
         let found = groups(&[phones, bikes]);
         assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn what_was_hidden_is_hidden_by_its_channels_and_its_phrases() {
+        let found = groups(&[wood_a(), wood_b(), systems()]);
+        let (wood, sys) = (&found[0], &found[1]);
+        let mut hidden = Hidden::default();
+        assert!(!hidden.hides(wood));
+        hidden.hide(wood);
+        assert!(hidden.hides(wood));
+        assert!(!hidden.hides(sys));
+        // The same channels in another group, or the same phrase from other channels.
+        let alone = &groups(&[wood_a()])[0];
+        assert_ne!(alone.id, wood.id);
+        assert!(hidden.hides(alone));
+        let other = Group {
+            id: "0".into(),
+            label: String::new(),
+            channels: vec!["Someone Else".into()],
+            channel_ids: vec!["UCother".into()],
+            searches: vec!["hand plane".into()],
+        };
+        assert!(hidden.hides(&other));
+        // What an older version hid by id alone is still hidden.
+        let old: Hidden = serde_json::from_str(&format!(r#"{{"ids":["{}"]}}"#, sys.id)).unwrap();
+        assert!(old.hides(sys));
+    }
+
+    #[test]
+    fn results_are_kept_by_what_was_searched_not_by_who_is_in_the_group() {
+        let both = groups(&[wood_a(), wood_b()]);
+        let mut other = both[0].clone();
+        other.id = "another".into();
+        other.channel_ids.push("UCx".into());
+        assert_eq!(both[0].key(), other.key());
+        other.searches.push("workbench".into());
+        assert_ne!(both[0].key(), other.key());
+    }
+
+    #[test]
+    fn a_day_allows_twelve_searches() {
+        let now = 1_000_000;
+        let mut results = Results::default();
+        assert!(results.allows(3, now));
+        results.searched = vec![now - 10; 10];
+        assert!(results.allows(2, now));
+        assert!(!results.allows(3, now));
+        // What is older than a day no longer counts.
+        results.searched = vec![now - STALE - 1; 12];
+        assert!(results.allows(3, now));
+        results.spent(3, now);
+        assert_eq!(results.searched, vec![now; 3]);
     }
 }

@@ -299,27 +299,14 @@ pub struct Topics {
     /// Whether topic feeds are on. Off, there are no groups.
     pub enabled: bool,
     pub groups: Vec<TopicFeed>,
+    /// The groups whose searches failed this time, in words.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
-/// The topic feeds. While the setting is off this reads nothing and asks
-/// nobody. On, the groups are worked out from what is on this machine (the
-/// subscriptions and the titles in the feed cache); with `refresh`, a group
-/// whose results are missing or a day old is searched for again, one search
-/// per phrase, and videos from channels that are already followed are left
-/// out. `wanted` is asked between searches, as for a lens.
-pub fn topics(
-    rt: &Runtime,
-    paths: &Paths,
-    refresh: bool,
-    progress: &dyn Fn(usize, usize),
-    wanted: &dyn Fn() -> bool,
-) -> Result<Topics> {
-    if !rt.cfg.topic_feeds {
-        return Ok(Topics {
-            enabled: false,
-            groups: Vec::new(),
-        });
-    }
+/// The groups the followed channels fall into now, worked out from what is on
+/// this machine (the subscriptions and the titles in the feed cache).
+fn topic_groups(paths: &Paths) -> Result<(Vec<topics::Group>, HashSet<String>)> {
     let subs = load_subs(paths)?;
     let cache: FeedCache = store::load_cache(&paths.feed_cache())?;
     // Each channel's titles, newest first.
@@ -343,13 +330,45 @@ pub fn topics(
                 .collect(),
         })
         .collect();
-    let hidden: topics::Hidden = store::load(&paths.topics())?;
-    let groups: Vec<topics::Group> = topics::groups(&channels)
-        .into_iter()
-        .filter(|g| !hidden.ids.contains(&g.id))
-        .take(topics::MAX_GROUPS)
-        .collect();
+    let groups = topics::groups(&channels);
+    Ok((groups, subs.channels.into_iter().map(|c| c.id).collect()))
+}
+
+/// The topic feeds. While the setting is off this reads nothing and asks
+/// nobody. On, the groups are worked out from what is on this machine; with
+/// `refresh`, a group whose results are missing or a day old is searched for
+/// again, one search per phrase, while the day's budget of searches lasts
+/// (`topics::BUDGET`, whatever the groups are). A group whose search fails is
+/// left as it was and named in `errors`; the others are still searched for.
+/// Videos from channels that are followed are left out. `wanted` is asked
+/// before each group and between searches: once it says no (the client is
+/// gone, the route was left, or the setting was turned off), nothing more is
+/// searched for or saved.
+pub fn topics(
+    rt: &Runtime,
+    paths: &Paths,
+    refresh: bool,
+    progress: &dyn Fn(usize, usize),
+    wanted: &dyn Fn() -> bool,
+) -> Result<Topics> {
+    if !rt.cfg.topic_feeds {
+        return Ok(Topics {
+            enabled: false,
+            groups: Vec::new(),
+            errors: Vec::new(),
+        });
+    }
+    let (all, followed) = topic_groups(paths)?;
+    let shown = |hidden: &topics::Hidden| -> Vec<topics::Group> {
+        all.iter()
+            .filter(|g| !hidden.hides(g))
+            .take(topics::MAX_GROUPS)
+            .cloned()
+            .collect()
+    };
+    let groups = shown(&store::load(&paths.topics())?);
     let mut results: topics::Results = store::load_cache(&paths.topics_cache())?;
+    let mut errors = Vec::new();
     if refresh {
         let at = now();
         let due: Vec<&topics::Group> = groups
@@ -357,7 +376,7 @@ pub fn topics(
             .filter(|group| {
                 results
                     .groups
-                    .get(&group.id)
+                    .get(&group.key())
                     .is_none_or(|c| at - c.fetched_at >= topics::STALE)
             })
             .collect();
@@ -367,69 +386,120 @@ pub fn topics(
         for group in due {
             let so_far = before;
             before += group.searches.len();
+            if !wanted() {
+                bail!(crate::ytdlp::CANCELLED);
+            }
+            // It may have been hidden since this began, and the day has a budget.
+            let hidden: topics::Hidden = store::load(&paths.topics())?;
+            if hidden.hides(group) || !results.allows(group.searches.len(), now()) {
+                continue;
+            }
             let reading = Reading {
                 topics: group.searches.clone(),
                 subs: crate::lens::read::Subs::Exclude,
                 ..Reading::default()
             };
-            let videos = search_topics(
+            let found = search_topics(
                 rt,
                 paths,
                 &reading,
                 topics::PER_SEARCH,
                 &|done, _| progress(so_far + done, total),
                 wanted,
-            )?;
+            );
             if !wanted() {
                 bail!(crate::ytdlp::CANCELLED);
             }
+            // The searches were made, whatever came of them.
             let _lock = store::lock(paths)?;
             let mut kept: topics::Results = store::load_cache(&paths.topics_cache())?;
-            kept.groups.insert(
-                group.id.clone(),
-                Cached {
-                    fetched_at: at,
-                    videos,
-                },
-            );
-            // Only what there is still a group for is kept.
-            kept.groups
-                .retain(|id, _| groups.iter().any(|g| g.id == *id));
+            kept.spent(group.searches.len(), now());
+            match found {
+                Ok(videos) => {
+                    kept.groups.insert(
+                        group.key(),
+                        Cached {
+                            fetched_at: at,
+                            videos,
+                        },
+                    );
+                }
+                Err(e) => errors.push(format!("{}: {e:#}", group.label)),
+            }
+            // What there is no group for any more goes once it is a day old:
+            // a group that comes back sooner has not been searched for twice.
+            let now_at = now();
+            kept.groups.retain(|key, found| {
+                groups.iter().any(|g| g.key() == *key) || now_at - found.fetched_at < topics::STALE
+            });
             store::save_compact(&paths.topics_cache(), &kept)?;
             results = kept;
         }
     }
+    // Asked again: one may have been hidden while this ran.
+    let groups = shown(&store::load(&paths.topics())?);
     Ok(Topics {
         enabled: true,
         groups: groups
             .into_iter()
             .map(|group| {
-                let found = results.groups.remove(&group.id);
+                let found = results.groups.get(&group.key());
                 TopicFeed {
-                    fetched_at: found.as_ref().map(|c| c.fetched_at),
-                    videos: found.map(|c| c.videos).unwrap_or_default(),
+                    fetched_at: found.map(|c| c.fetched_at),
+                    // What is followed now is left out, whenever it was found.
+                    videos: found
+                        .map(|c| {
+                            c.videos
+                                .iter()
+                                .filter(|v| {
+                                    v.video
+                                        .channel_id
+                                        .as_ref()
+                                        .is_some_and(|id| !followed.contains(id))
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     group,
                 }
             })
             .collect(),
+        errors,
     })
 }
 
-/// Hides the topic feed `id`: it is not shown or searched for again.
+/// Hides the topic feed `id`, and with it what it was made of: its channels
+/// and its phrases are not shown or searched for as a topic again, in
+/// whatever group they turn up.
 pub fn hide_topic(paths: &Paths, id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 32 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("{id:?} is not a topic feed");
     }
+    let (groups, _) = topic_groups(paths)?;
     let _lock = store::lock(paths)?;
     let mut hidden: topics::Hidden = store::load(&paths.topics())?;
-    if !hidden.ids.iter().any(|h| h == id) {
-        hidden.ids.push(id.to_string());
-        // Old ones go first: a group that no longer exists needs no entry.
-        let over = hidden.ids.len().saturating_sub(200);
-        hidden.ids.drain(..over);
-        store::save(&paths.topics(), &hidden)?;
+    match groups.iter().find(|g| g.id == id) {
+        Some(group) if !hidden.hides(group) => hidden.hide(group),
+        Some(_) => return Ok(()),
+        // Not a group any more: its id is all there is to go by.
+        None if !hidden.ids.iter().any(|h| h == id) => {
+            hidden.ids.push(id.to_string());
+            let over = hidden.ids.len().saturating_sub(200);
+            hidden.ids.drain(..over);
+        }
+        None => return Ok(()),
     }
-    Ok(())
+    store::save(&paths.topics(), &hidden)
+}
+
+/// Forgets what the topic feeds found (when they are turned off).
+pub fn forget_topics(paths: &Paths) -> Result<()> {
+    let _lock = store::lock(paths)?;
+    match std::fs::remove_file(paths.topics_cache()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Serialize)]

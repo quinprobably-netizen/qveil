@@ -185,6 +185,9 @@ pub struct Pages {
     pub lenses: &'static str,
     /// For whether topic feeds are on.
     pub topics: &'static str,
+    /// Both, so that what turning them on does can be said before it is done.
+    pub topics_on: &'static str,
+    pub topics_off: &'static str,
 }
 
 const ROUTES: Routes = Routes {
@@ -200,7 +203,7 @@ const HISTORY_ON: &str =
     "On: kept only on this computer, in a file only you can read, until you clear it.";
 const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.";
 const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.";
-const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three phrases for each of up to four groups, again once a group's results are a day old. YouTube sees those searches, which say what the channels you follow are about. Videos from channels you already follow are left out of what is shown.";
+const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, and none for a group whose results are less than a day old. YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
 const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
 
@@ -248,6 +251,8 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
             } else {
                 TOPICS_OFF
             },
+            topics_on: TOPICS_ON,
+            topics_off: TOPICS_OFF,
         },
     }
 }
@@ -511,7 +516,9 @@ mod tests {
                 "resume",
                 "search",
                 "subscriptions",
-                "topics"
+                "topics",
+                "topics_off",
+                "topics_on",
             ]
         );
         assert!(v["summary"].is_string());

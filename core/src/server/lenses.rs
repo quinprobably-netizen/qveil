@@ -135,7 +135,8 @@ impl Server {
                 say(json!({ "progress": { "done": done, "total": total } }));
             }
         };
-        let wanted = || !watch.gone() && self.still_on(&rt);
+        // Also while the setting is still on: turned off, it stops at once.
+        let wanted = || !watch.gone() && self.still_on(&rt) && self.runtime().cfg.topic_feeds;
         let result = self.guarded(&rt, app::topics(&rt, &self.paths, true, &progress, &wanted));
         if watch.gone() {
             return Ok(());
@@ -290,6 +291,8 @@ whole=
 for a in "$@"; do [ "$a" = -J ] && whole=1; done
 while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" >> "$d/asked"; shift; done
 [ -f "$d/delay" ] && sleep "$(cat "$d/delay")"
+# `failfor`: a search for what it says fails.
+if [ -f "$d/failfor" ] && tail -n 1 "$d/asked" | grep -qF "$(cat "$d/failfor")"; then echo "ERROR: no" >&2; exit 1; fi
 # `nofilter`: a search through YouTube's own filter finds nothing.
 if [ -f "$d/nofilter" ] && tail -n 1 "$d/asked" | grep -q "results?"; then exit 0; fi
 n=$(wc -l < "$d/asked")
@@ -771,5 +774,157 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         let (_, v) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(v, serde_json::json!({ "enabled": false, "groups": [] }));
         assert_eq!(asked(&bin), wanted);
+    }
+
+    fn topics_on(base: &str) {
+        let (status, cfg) = json(base, "POST", "api/config", r#"{"topicFeeds":true}"#);
+        assert_eq!(status, 200, "{cfg}");
+    }
+
+    #[test]
+    fn a_topic_whose_search_fails_does_not_take_the_others_with_it() {
+        let (bin, base, d) = rig();
+        follow_some_channels(&d);
+        topics_on(&base);
+        std::fs::write(bin.0.join("failfor"), "hand plane").unwrap();
+        let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
+        assert_eq!(status, 200, "{v}");
+        let groups = v["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "{v}");
+        // The one that failed has nothing and is said to have failed...
+        assert_eq!(groups[0]["videos"], serde_json::json!([]));
+        assert!(groups[0].get("fetchedAt").is_none());
+        assert_eq!(v["errors"].as_array().unwrap().len(), 1, "{v}");
+        // ...and the other was searched for all the same.
+        assert!(!groups[1]["videos"].as_array().unwrap().is_empty(), "{v}");
+        assert!(groups[1]["fetchedAt"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn turning_topic_feeds_off_stops_a_refresh_that_is_running() {
+        let (bin, base, d) = rig();
+        follow_some_channels(&d);
+        topics_on(&base);
+        let (_, listed) = json(&base, "GET", "api/topics", "");
+        let all: usize = listed["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["searches"].as_array().unwrap().len())
+            .sum();
+        assert!(all >= 3, "{listed}");
+        std::fs::write(bin.0.join("delay"), "1").unwrap();
+        let asking = {
+            let base = base.clone();
+            std::thread::spawn(move || json(&base, "GET", "api/topics?refresh=1", ""))
+        };
+        wait_for("yt-dlp to start", Duration::from_secs(10), || {
+            !asked(&bin).is_empty()
+        });
+        json(&base, "POST", "api/config", r#"{"topicFeeds":false}"#);
+        let (status, v) = asking.join().unwrap();
+        // It stopped: the answer is not the feeds, and the rest was never searched for.
+        assert!(status != 200 || v["enabled"] == false, "{v}");
+        assert!(asked(&bin).len() < all, "{:?}", asked(&bin));
+        // Off, nothing that was worked out is left on disk either.
+        assert!(!d.paths().topics_cache().exists());
+        let (_, v) = json(&base, "GET", "api/topics", "");
+        assert_eq!(v, serde_json::json!({ "enabled": false, "groups": [] }));
+    }
+
+    #[test]
+    fn a_hidden_topic_stays_hidden_when_its_channels_change() {
+        use crate::feed::{FeedCache, Seen};
+        use crate::subs::{Sub, Subs};
+        use crate::video::Video;
+        let (bin, base, d) = rig();
+        follow_some_channels(&d);
+        topics_on(&base);
+        let (_, v) = json(&base, "GET", "api/topics", "");
+        let wood = v["groups"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(v["groups"][0]["searches"][0], "hand plane");
+        let (status, _) = json(&base, "POST", &format!("api/topics/hide?id={wood}"), "");
+        assert_eq!(status, 200);
+
+        // One more woodworking channel is followed: the group is another
+        // group now, about the same thing.
+        let paths = d.paths();
+        let mut subs: Subs = crate::store::load(&paths.subscriptions()).unwrap();
+        subs.add(Sub {
+            id: "UCwood000000000000000000c".into(),
+            name: "Shavings".into(),
+        });
+        crate::store::save(&paths.subscriptions(), &subs).unwrap();
+        let mut cache: FeedCache = crate::store::load_cache(&paths.feed_cache()).unwrap();
+        for (n, title) in [
+            "Hand plane restoration",
+            "A dovetail in ten minutes",
+            "Which hand plane first",
+            "Dovetail markers",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let video = Video {
+                id: format!("woodc0000{n:02}"),
+                title: (*title).into(),
+                channel: Some("Shavings".into()),
+                channel_id: Some("UCwood000000000000000000c".into()),
+                published: Some(1_700_000_000 - n as i64),
+                duration: None,
+                views: None,
+                short: false,
+                live: false,
+            };
+            cache.seen.insert(
+                video.id.clone(),
+                Seen {
+                    video,
+                    first_seen: 0,
+                    last_seen: 0,
+                },
+            );
+        }
+        crate::store::save_compact(&paths.feed_cache(), &cache).unwrap();
+
+        let (_, v) = json(&base, "GET", "api/topics?refresh=1", "");
+        let groups = v["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{v}");
+        assert_eq!(
+            groups[0]["channels"],
+            serde_json::json!(["Low Level Hours"])
+        );
+        for line in asked(&bin) {
+            assert!(
+                !line.contains("hand plane") && !line.contains("dovetail"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_day_has_a_budget_of_searches_whatever_the_groups_are() {
+        let (bin, base, d) = rig();
+        follow_some_channels(&d);
+        topics_on(&base);
+        // Twelve searches were already made in the last day (for groups that are gone).
+        let now = crate::app::now();
+        let spent = crate::topics::Results {
+            groups: Default::default(),
+            searched: vec![now - 60; 12],
+        };
+        crate::store::save_compact(&d.paths().topics_cache(), &spent).unwrap();
+        let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
+        assert_eq!(status, 200, "{v}");
+        assert!(asked(&bin).is_empty(), "{:?}", asked(&bin));
+        assert_eq!(v["groups"][0]["videos"], serde_json::json!([]));
+        // A day on, there is a budget again.
+        let old = crate::topics::Results {
+            groups: Default::default(),
+            searched: vec![now - 25 * 3600; 12],
+        };
+        crate::store::save_compact(&d.paths().topics_cache(), &old).unwrap();
+        json(&base, "GET", "api/topics?refresh=1", "");
+        assert!(!asked(&bin).is_empty());
     }
 }
