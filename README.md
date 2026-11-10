@@ -1,10 +1,11 @@
 # qveil
 
 A private, account-free YouTube app for Arch Linux and Omarchy. Subscribe,
-search and watch in a native window with no Google account, no stored cookies and
-no browser, and optionally route every byte through Tor.
+search, describe the feeds you want in words, and watch in a native window with
+no Google account, no stored cookies and no browser, and optionally route every
+byte through Tor.
 
-![qveil's feed, thumbnails veiled until hovered](docs/screenshot.png)
+![qveil's home page: unfinished videos on top, then the feed, thumbnails frosted until pointed at](docs/screenshot.png)
 
 > **Prototype.** It works day to day, but expect rough edges. Not affiliated
 > with YouTube or Google.
@@ -109,31 +110,57 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 
 ## The app
 
-- **Feed**: latest uploads from your subscriptions. **Search** and **channel**
-  pages, **Subscriptions**, and an optional **History**.
-- Video plays inside the window (libmpv), with fullscreen.
-- **Veiled thumbnails**: thumbnails stay blurred and muted until you hover or
-  select them, so a wall of clickbait doesn't shout at you. You can switch
-  this off, or not load thumbnails at all.
+- **Home**: the videos you left part-way, then the latest uploads from the
+  channels you follow.
+- **Lenses**: feeds you describe in words, such as "slow woodworking with hand
+  tools, no music, longer than 15 minutes". Fixed rules read the words (no
+  language model): what is left after the rules are lifted out is searched
+  for, one search per topic, and the results are filtered and ordered on your
+  machine. The page shows how a lens was read and the exact searches a refresh
+  will make, and every result says why it is there. The search box reads the
+  same rules ("talks over 30 min", "jazz -fusion"); a query without one goes
+  to YouTube exactly as typed.
+- **Watching**: the video in a page of its own, with its description, its
+  chapters cut into the seek bar, what comes next in the list you opened it
+  from, and its **comments**, which are only fetched when you open that tab.
+  Timestamps seek; links to other sites can be copied but are never opened.
+- **Resume**: a video you stop part-way starts there next time. Positions are
+  kept for 7 days unless you change that in the settings (0 turns it off).
+- **Picture in picture** (`I`): the video moves to a small window of its own
+  while you go on browsing. Omarchy floats and pins that window by its title.
+  On another Hyprland setup, add a window rule that floats and pins windows
+  titled `Picture-in-Picture` (Omarchy's own is in `default/hypr/apps/pip.lua`).
+  Anywhere else it is an ordinary small window.
+- **Frosted thumbnails**: thumbnails stay blurred and muted until you point at
+  them, so a wall of clickbait doesn't shout at you. You can show them plainly,
+  or not load thumbnails at all.
 - **Live streams aren't supported yet.** qveil relays one plain download per
   video, and a live stream (or a video offered only as HLS/DASH) is a playlist
   whose segments the player would fetch itself, around your route. qveil says
   so instead of playing it.
 - **Moving from YouTube**: drop a Google Takeout `subscriptions.csv`, or a
   NewPipe or FreeTube export, anywhere on the window. It's read offline.
-- Follows the Omarchy theme accent and window rounding, live.
+- It looks like the rest of an Omarchy desktop: the theme's colours and accent,
+  the system's typeface (`omarchy font set` changes it live) and Hyprland's
+  window rounding.
 
 | Key | Action |
 |---|---|
 | `/` | Search |
-| `1` `2` `3` | Feed, subscriptions, history |
+| `1` `2` `3` `4` `5` | Home, lenses, channels, history, settings |
 | Arrows, `Enter` | Move and play |
-| `R` | Refresh |
+| `R` | Refresh what is showing |
+| `P` | Route |
 | `Space` | Play or pause |
 | `←` `→` / `J` `L` | Back or forward 5 / 10 seconds |
+| `[` `]` | Previous or next chapter |
+| `<` `>` | Slower or faster |
 | `↑` `↓` | Volume |
 | `M` | Mute |
+| `I` | Picture in picture, and back |
+| `T` | Theatre |
 | `F` | Fullscreen |
+| `C` | Comments |
 | `Esc` | Back |
 | `?` | All shortcuts |
 | `Q` | Quit |
@@ -152,14 +179,21 @@ qveil sub import subscriptions.csv
 qveil sub export > newpipe.json
 qveil play <url>            # plays in a separate mpv window
 qveil feed --tor --list
+qveil comments <url>        # --new, --replies, -n 80, --json
+qveil read talks over 30 min, no drama   # how a search or a lens is read; asks nobody
+qveil lens add slow woodworking, no music
+qveil lens ls
+qveil lens show 1 --refresh --json
+qveil resume                # where unfinished videos were stopped; --clear forgets them
 qveil config                # where data lives, what is exposed, what veil left over
 qveil wipe
 ```
 
 `--tor` and `--proxy <url>` are given to the commands that use the network
-(`search`, `play`, `feed`, `sub add`), after the command. What you type on
-`search`, `play` and `sub add` is in the command's arguments, which other local
-users can read through `/proc` while it runs (see the privacy model above).
+(`search`, `play`, `feed`, `comments`, `sub add`, `lens show`), after the
+command. What you type on `search`, `play`, `comments`, `sub add`, `lens add`
+and `read` is in the command's arguments, which other local users can read
+through `/proc` while it runs (see the privacy model above).
 Output piped into `head` and the like ends quietly when the reader is done.
 
 ## How it's built
@@ -167,7 +201,8 @@ Output piped into `head` and the like ends quietly when the reader is done.
 ```
 core/        qveil-core, the engine (Rust)
   server.rs    loopback server: state, lifecycle, routing
-  server/      http (limits, token), api, jobs (the feed refresh), thumbs, relay
+  server/      http (limits, token), api, jobs (the feed refresh), thumbs,
+               relay, comments, lenses
   privacy.rs   every privacy claim, for the window, `qveil config` and this README
   errors.rs    plain-language errors, and the code each carries
   proc.rs      every child process: own process group, killed with the engine
@@ -175,14 +210,27 @@ core/        qveil-core, the engine (Rust)
   inflight.rs  the running yt-dlp calls, so a route switch or exit can stop them
   signals.rs   clean-up on SIGINT, SIGTERM and SIGHUP
   feed.rs      per-channel RSS with a yt-dlp fallback when RSS is down
-  ytdlp.rs     isolated yt-dlp calls: search, channels, stream resolution
+  ytdlp.rs     isolated yt-dlp calls: search, channels, stream resolution, comments
+  lens.rs      lenses: stored words and what their searches found
+  lens/        read (words into topics and rules), rank (the order, and why),
+               sp (YouTube's own filters, where one contains a rule)
+  resume.rs    where unfinished videos were stopped, with an expiry
+  comments.rs  a video's comments, as threads
   private.rs   private scratch directories, so secrets stay off command lines
   ids.rs       URL → ID, dropping tracking parameters
 src/         the window (C++ / Qt Quick)
   backend.*    starts qveil-core and talks to it over loopback
   mpvitem.*    libmpv rendered into the scene
-  *.qml        the interface
+  theme.*      the Omarchy theme's colours, the system typeface, Hyprland's rounding
+  Style.qml    the tokens everything is drawn with
+  *.qml        the parts (Act, TabWord, Field, …) and the pages built from them
+  Linkify.js   what in a description or a comment can be clicked
+tests/       Qt tests; shots/engine.py is a stand-in engine for them and for stills
 ```
+
+`bin/shot <view> <out.png>` takes a still of the built window against that
+stand-in engine, inside a headless compositor (it needs `cage`; `ffmpeg` gives
+the watch page something to play), without opening anything on the desktop.
 
 YouTube's private API, signature deciphering and PO tokens change
 constantly. qveil leaves that to yt-dlp, so a fix there is a package update
@@ -195,6 +243,7 @@ RSS fails for, the rest of that refresh doesn't ask it again.
 ```sh
 bin/build    # engine + app into build/
 bin/test     # Rust and Qt tests
+bin/shot home home.png
 ```
 
 **Releasing.** `pkgbuild/PKGBUILD` builds the tag `v<pkgver>` from GitHub

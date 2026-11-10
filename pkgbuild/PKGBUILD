@@ -2,7 +2,7 @@ pkgname=qveil
 # A release is the tag `v$pkgver` of the repository, and core/Cargo.toml in it
 # has the same version: prepare() refuses to build when they disagree, so a
 # tag and this file can't drift apart unnoticed. (README: "Releasing".)
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc='Private, account-free YouTube app: no account, no stored cookies, optional Tor for every byte'
 arch=('x86_64')
@@ -16,7 +16,7 @@ provides=('veil')
 conflicts=('veil')
 replaces=('veil')
 optdepends=('tor: hide your IP from YouTube, with a fresh circuit per request')
-makedepends=('cargo' 'gcc' 'git' 'make' 'qt6-shadertools')
+makedepends=('cargo' 'gcc' 'git' 'make')
 # makepkg's -flto makes ring's C objects LTO bitcode, which the Rust linker can't read.
 options=('!lto' '!debug')
 # A git source pinned to the tag, rather than GitHub's tag tarball: the tag
