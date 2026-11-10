@@ -1956,6 +1956,60 @@ private slots:
         QVERIFY(app.item("lens-sort") && app.item("lens-sort")->isVisible());
     }
 
+    void channelsAreTwoPanesAndThePaneAsksNobody()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QTest::keyClick(app.window, Qt::Key_3);
+        QQuickItem *list = nullptr;
+        QTRY_VERIFY((list = app.item("channel-list")) && list->hasActiveFocus());
+        QTRY_COMPARE(app.items("channel-row").size(), 5);
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        // Each channel has a picture: its latest video's, which is already here.
+        QVERIFY(App::under(app.items("channel-row").first(), "channel-picture"));
+        // Beside the list, the latest of the channel the keyboard is on.
+        QQuickItem *pane = app.item("channel-pane");
+        QVERIFY(pane && box(pane).left() >= box(list).right());
+        QCOMPARE(app.item("channel-pane-name")->property("text").toString(), QString("Low Level Hours"));
+        QTRY_COMPARE(pane->property("count").toInt(), 3);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(app.item("channel-pane-name")->property("text").toString(), QString("Northlight Woodworks"));
+        QTRY_COMPARE(pane->property("count").toInt(), 3);
+        // None of that asked for anything.
+        QCOMPARE(app.asked("GET api/channel"), 0);
+
+        // Right goes into the pane, where Enter plays; left at its edge comes back.
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_VERIFY(pane->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000002"));
+        QTRY_COMPARE(app.items("next-entry").size(), 2);
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.window->property("watching").toBool());
+        QTRY_VERIFY(pane->hasActiveFocus() || list->hasActiveFocus());
+        pane->forceActiveFocus();
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_VERIFY(list->hasActiveFocus());
+
+        // U asks once, in place, and then lets the channel go.
+        QTest::keyClick(app.window, Qt::Key_U);
+        QCOMPARE(app.asked("POST api/subs/rm"), 0);
+        QQuickItem *current = nullptr;
+        for (QQuickItem *row : app.items("channel-row"))
+            if (row->property("current").toBool())
+                current = row;
+        QVERIFY(current);
+        QCOMPARE(App::under(current, "unsubscribe")->property("text").toString(), QString("Unsubscribe?"));
+        QTest::keyClick(app.window, Qt::Key_U);
+        QTRY_COMPARE(app.asked("POST api/subs/rm"), 1);
+        QTRY_COMPARE(app.items("channel-row").size(), 4);
+        // Enter opens the channel's own page (which does ask).
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.page(), QString("channel"));
+    }
+
     // --- What the council found in the code. ---
 
     void turningTopicFeedsOffDuringARefreshKeepsThemOff()

@@ -623,7 +623,10 @@ ApplicationWindow {
                     id: subsPage
                     anchors.fill: parent
                     visible: win.page === "channels" && !win.watching
+                    thumbs: win.thumbs
+                    progress: win.watched
                     onChannelRequested: id => win.openChannel(id)
+                    onActivated: (video, list, index) => win.play(video, list, index)
                 }
 
                 HistoryPage {
