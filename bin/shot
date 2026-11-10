@@ -1,0 +1,39 @@
+#!/bin/sh
+# Takes a still of the window in one of its views:
+#
+#   bin/shot <view> <out.png>
+#
+# The app is built as it is in the tree and run against the stand-in engine
+# (tests/shots/engine.py), inside a headless compositor of its own, so it
+# renders on the GPU without opening anything on the desktop. Views: home,
+# narrow, lenses, channels, history, settings, search, watch.
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+view="${1:?usage: bin/shot <view> <out.png>}"
+out="${2:?usage: bin/shot <view> <out.png>}"
+case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+mkdir -p "$(dirname "$out")" "$ROOT/build/shot"
+
+cd "$ROOT/build/shot"
+qmake6 "$ROOT/tests/shot.pro" >/dev/null
+make -j"$(nproc)" >/dev/null
+
+# Something to play on the watch page: a test pattern, made once.
+clip="$ROOT/build/shot/clip.mkv"
+if [ ! -f "$clip" ] && command -v ffmpeg >/dev/null; then
+  ffmpeg -loglevel error -f lavfi -i testsrc2=d=60:s=1280x720:r=30 -f lavfi -i anullsrc -shortest \
+    -c:v libx264 -preset ultrafast -c:a aac "$clip" || rm -f "$clip"
+fi
+[ -f "$clip" ] && export QVEIL_STANDIN_CLIP="$clip"
+
+if [ "$view" = narrow ]; then
+  # A headless compositor has one size of screen; a narrow window is drawn
+  # without one instead (no blur, which the layout doesn't need).
+  QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software ./qveil_shot "$view" "$out" 950 520
+else
+  env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
+    WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 QT_QPA_PLATFORM=wayland \
+    cage -- ./qveil_shot "$view" "$out" 2>&1 | grep -E "saved|couldn't|qml|QML|Error" || true
+fi
+[ -f "$out" ]

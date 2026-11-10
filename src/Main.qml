@@ -3,6 +3,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
+import Qveil
 
 ApplicationWindow {
     id: win
@@ -11,28 +12,36 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 500
     visible: true
-    title: player.active && player.info.title ? player.info.title + " · qveil" : "qveil"
-    color: "#0d0d10"
+    title: player.active && player.info.title ? player.info.title + " \u00b7 qveil" : "qveil"
+    color: Style.bg
 
+    // The pages that are not redrawn yet still use Material controls.
     Material.theme: Material.Dark
     Material.accent: theme.accent
-    Material.background: "#0d0d10"
+    Material.background: Style.bg
     Material.roundedScale: theme.radius
 
-    property string page: "feed"
-    property string returnPage: "feed"
+    // The place that is showing: home, lenses, channels, channel, history,
+    // search or settings.
+    property string page: "home"
+    property string returnPage: "home"
     // Whether the first engine start has loaded the window yet.
     property bool started: false
     readonly property bool fullscreen: visibility === Window.FullScreen
+    // Whether a video has the window.
+    readonly property bool watching: player.active
     // Before the first subscription there is nothing to refresh or filter. Both
     // counts must say so, so a loading window doesn't flash the controls away.
     readonly property bool noSubs: backend.feedInfo.channels === 0 && backend.subs.length === 0
-    // Whether keys are going into a text field (the search box, the add field
-    // on the subscriptions page, the proxy field). Every Qt Quick text input
-    // has a cursor position and nothing else that takes focus does.
+    // Whether keys are going into a text field. Every Qt Quick text input
+    // has a cursor position and nothing else that takes focus does. While
+    // this is true, no letter, digit or bracket is a shortcut.
     readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
-    readonly property var pages: ({ feed: feedPage, search: searchPage, channel: channelPage,
-                                    subs: subsPage, history: historyPage })
+    readonly property var pages: ({ home: feedPage, search: searchPage, channel: channelPage,
+                                    channels: subsPage, history: historyPage,
+                                    lenses: lensesPage, settings: settingsPage })
+    // The rail marks where you are; a channel's page belongs to where you came from.
+    readonly property string place: page === "channel" || page === "search" ? returnPage : page
 
     Settings {
         id: prefs
@@ -42,18 +51,24 @@ ApplicationWindow {
     }
 
     function go(p) {
+        if (!pages[p])
+            return
         if (player.active)
             player.close()
-        if (p !== "channel")
+        if (p !== "channel" && p !== "search")
             returnPage = p
-        // What was typed in the top bar belongs to the search page only.
-        if (p !== "search")
+        // What was typed in the search field belongs to the search page only.
+        if (p !== "search") {
             search.text = ""
+            backend.read("")
+        }
         page = p
-        if (p === "subs")
+        if (p === "channels")
             backend.loadSubs()
         if (p === "history")
             backend.loadHistory()
+        if (p === "lenses")
+            backend.loadLenses()
         Qt.callLater(() => win.focusPage(p))
     }
 
@@ -71,9 +86,10 @@ ApplicationWindow {
             return
         if (player.active)
             player.close()
-        if (page !== "channel")
+        if (page !== "channel" && page !== "search")
             returnPage = page
         search.text = ""
+        backend.read("")
         page = "channel"
         backend.openChannel(id)
         Qt.callLater(() => win.focusPage("channel"))
@@ -87,13 +103,13 @@ ApplicationWindow {
             backend.openChannel(backend.channel.id)
         else if (page === "search")
             backend.search(backend.query)
-        else
+        else if (page === "home")
             backend.refreshFeed(true, prefs.showShorts)
     }
 
-    // The first run's way in: Subscriptions, with the add field ready to type in.
+    // The first run's way in: Channels, with the add field ready to type in.
     function addChannel() {
-        go("subs")
+        go("channels")
         // go() puts focus on the list on the next turn; the field comes after.
         Qt.callLater(() => subsPage.focusAdd())
     }
@@ -111,8 +127,8 @@ ApplicationWindow {
         backend.play(video.id)
     }
 
-    // Over a video the route popup hangs from the top bar, which is hidden
-    // while the controls are: bring it back first.
+    // Over a video the route popup hangs from the rail, which is hidden
+    // while the video has the window: bring the controls back first.
     function openRoute() {
         if (player.active)
             player.reveal()
@@ -144,7 +160,7 @@ ApplicationWindow {
             player.close()
         else if (typing)
             focusPage(page)
-        else if (page === "channel")
+        else if (page === "channel" || page === "search")
             go(returnPage)
     }
 
@@ -162,6 +178,8 @@ ApplicationWindow {
             // not refetch what was fetched minutes ago.
             backend.refreshFeed(true, prefs.showShorts)
             backend.loadSubs()
+            backend.loadResume()
+            backend.loadLenses()
         }
         // The engine ends the streams of the old route, so the player has
         // nothing left to play, and must not stay up as if it had.
@@ -173,41 +191,44 @@ ApplicationWindow {
         function onNotice(text) { toast.show(text) }
     }
 
-    Shortcut { sequences: ["/", "Ctrl+L"]; context: Qt.ApplicationShortcut; onActivated: { search.forceActiveFocus(); search.selectAll() } }
-    Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; onActivated: help.opened ? help.close() : help.open() }
-    Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; onActivated: Qt.quit() }
-    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; onActivated: win.goBack() }
-    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; onActivated: player.active ? player.mpv.togglePause() : win.playCurrent() }
-    Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; onActivated: win.go("feed") }
-    Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; onActivated: win.go("subs") }
-    Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; onActivated: win.go("history") }
-    Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !player.active; onActivated: win.refresh() }
-    Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; onActivated: win.toggleRoute() }
-    Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: win.toggleFullscreen() }
-    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: player.mpv.muted = !player.mpv.muted }
-    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
-    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: { player.mpv.seek(5, true); player.reveal() } }
-    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: { player.mpv.seek(-10, true); player.reveal() } }
-    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: { player.mpv.seek(10, true); player.reveal() } }
-    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
-    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: player.active; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
+    // Escape and the keys that lead to a text field work while typing; every
+    // other key is only a shortcut when it isn't going into one.
+    Shortcut { sequences: ["/", "Ctrl+L"]; context: Qt.ApplicationShortcut; enabled: !win.typing || sequence === "Ctrl+L"; onActivated: search.edit() }
+    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.goBack() }
+    Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: help.opened ? help.close() : help.open() }
+    Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: Qt.quit() }
+    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: player.active ? player.mpv.togglePause() : win.playCurrent() }
+    Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("home") }
+    Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("lenses") }
+    Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("channels") }
+    Shortcut { sequence: "4"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("history") }
+    Shortcut { sequence: "5"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("settings") }
+    Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !win.typing && !player.active; onActivated: win.refresh() }
+    Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.toggleRoute() }
+    Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: win.toggleFullscreen() }
+    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: player.mpv.muted = !player.mpv.muted }
+    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(-5, true); player.reveal() } }
+    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(5, true); player.reveal() } }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(-10, true); player.reveal() } }
+    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.seek(10, true); player.reveal() } }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && player.active; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
 
-    // Right-to-left languages mirror the window; the Translator sets the
+    // Mirrors for right-to-left languages. A top-level window ignores the
     // application's layout direction.
     Item {
         anchors.fill: parent
         LayoutMirroring.enabled: Qt.application.layoutDirection === Qt.RightToLeft
         LayoutMirroring.childrenInherit: true
 
-        // The player owns the whole window while a video is open, the top bar's
-        // strip included, so it is the bottom layer: the pages above it are
-        // hidden then, and the bar floats over the video with the controls.
+        // The player owns the whole window while a video is open, so it is
+        // the bottom layer: the rail and the pages above it are hidden then.
         PlayerView {
             id: player
             anchors.fill: parent
-            topInset: (topBar.visible ? topBar.height : 0) + (errorBar.visible ? errorBar.height : 0)
-            // The bar goes with the controls, but not while it is in use.
-            hold: barHover.hovered || win.typing || route.opened || help.opened
+            topInset: errorBar.visible ? errorBar.height : 0
+            // The controls stay while something outside the player is in use.
+            hold: win.typing || route.opened || help.opened
             savedVolume: prefs.volume
             onSavedVolumeChanged: prefs.volume = savedVolume
             onClosed: {
@@ -219,288 +240,246 @@ ApplicationWindow {
             onFullscreenToggled: win.toggleFullscreen()
         }
 
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 0
+        Rail {
+            id: rail
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            visible: !player.active
+            current: win.place
+            route: backend.config.route || "direct"
+            routeSummary: backend.privacy.summary
+            onPicked: place => win.go(place)
+            onRouteClicked: win.toggleRoute()
+        }
 
-            // The top bar: wordmark, places, search, and the route.
-            Rectangle {
-                id: topBar
-                Layout.fillWidth: true
-                Layout.preferredHeight: 60
-                visible: !win.fullscreen
-                // Over a video the bar has no fill of its own: the player's
-                // gradient sits behind it, like behind the controls.
-                color: player.active ? "transparent" : "#111115"
-                // It fades with the player's controls, and while it is hidden
-                // it must not catch clicks that belong to the video.
-                opacity: player.active && !player.chrome ? 0 : 1
-                enabled: opacity > 0
-                Behavior on opacity { NumberAnimation { duration: 220 } }
-
-                HoverHandler { id: barHover }
-                // Clicks on the bar's empty space are not clicks on the video.
-                MouseArea { anchors.fill: parent }
-
-                Rectangle {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.bottom: parent.bottom
-                    height: 1
-                    color: "#1e1e25"
-                    visible: !player.active
-                }
-
-                RowLayout {
-                    anchors.fill: parent
-                    anchors.leftMargin: 22
-                    anchors.rightMargin: 14
-                    spacing: 6
-
-                    Wordmark {
-                        text: "qveil"
-                        pixelSize: 25
-                        Layout.rightMargin: 18
-                        Layout.alignment: Qt.AlignVCenter
-                        // Over a video the dye would sit on the picture as a
-                        // muddy blotch. It keeps its place, so the tabs don't
-                        // move when a video opens.
-                        opacity: player.active ? 0 : 1
-                    }
-
-                    Repeater {
-                        model: [
-                            { key: "feed", label: qsTr("Feed") },
-                            { key: "subs", label: qsTr("Subscriptions") },
-                            { key: "history", label: qsTr("History") },
-                        ]
-                        delegate: TabButtonish {}
-                    }
-
-                    Item { Layout.fillWidth: true }
-
-                    SearchBox {
-                        id: search
-                        Layout.preferredWidth: Math.min(420, win.width * 0.32)
-                        onSubmitted: query => {
-                            win.go("search")
-                            backend.search(query)
-                        }
-                    }
-
-                    RouteChip {
-                        Layout.leftMargin: 8
-                        onClicked: win.toggleRoute()
-                        RoutePopup {
-                            id: route
-                            objectName: "routePopup"
-                            prefs: prefs
-                            y: parent.height + 8
-                            x: parent.width - width
-                        }
-                    }
-                }
+        // The route popup opens beside the foot of the rail, where the
+        // route is shown.
+        Item {
+            anchors.left: rail.right
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: Style.u * 3
+            width: 1
+            height: 1
+            RoutePopup {
+                id: route
+                objectName: "routePopup"
+                prefs: prefs
+                x: Style.u * 2
+                y: -height
             }
+        }
 
-            // Errors stay until dismissed; they say what went wrong. The bar
-            // is part of the column, so the page gets shorter instead of the
-            // bar sitting on the last row of videos or on the player's controls.
-            Rectangle {
+        Item {
+            id: content
+            anchors.left: rail.visible ? rail.right : parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+
+            // Errors stay until dismissed. Over a video they sit on its top edge.
+            ErrorBar {
                 id: errorBar
                 objectName: "errorBar"
-                Layout.fillWidth: true
-                Layout.preferredHeight: Math.max(52, errorText.implicitHeight + 24)
-                visible: backend.error !== ""
-                color: "#2b1417"
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                z: 2
+                onRouteRequested: win.openRoute()
+            }
 
-                Rectangle {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.bottom: parent.bottom
-                    height: 1
-                    color: "#6b2a31"
-                }
+            // The search field, and under it how what is typed was read.
+            Column {
+                id: top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: errorBar.visible ? errorBar.bottom : parent.top
+                anchors.leftMargin: Style.gutter
+                anchors.rightMargin: Style.gutter
+                anchors.topMargin: Style.u * 5
+                spacing: Style.u * 2
+                visible: !player.active
 
-                Label {
-                    id: errorText
-                    anchors.left: parent.left
-                    anchors.right: errorActions.left
-                    anchors.leftMargin: 28
-                    anchors.rightMargin: 12
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: backend.error
-                    wrapMode: Text.Wrap
-                    color: "#ffd9dc"
-                }
-                RowLayout {
-                    id: errorActions
-                    anchors.right: parent.right
-                    anchors.rightMargin: 14
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: 4
-
-                    // The only thing an error offers to do: for the errors another
-                    // route may get past (a bot check, a route that is down).
-                    Button {
-                        objectName: "changeRoute"
-                        visible: backend.errorOffersRoute
-                        text: qsTr("Change route")
-                        flat: true
-                        onClicked: {
-                            backend.clearError()
-                            win.openRoute()
-                        }
+                FindField {
+                    id: search
+                    objectName: "search"
+                    width: Math.min(520, parent.width)
+                    onSubmitted: query => {
+                        win.go("search")
+                        search.text = query
+                        backend.search(query)
                     }
-                    ToolButton {
-                        icon.source: "qrc:/icons/close.svg"
-                        onClicked: backend.clearError()
-                    }
+                }
+                ReadingTags {
+                    objectName: "reading-tags"
+                    width: parent.width
+                    // Only for what is in the field now, and only when there is a rule to show.
+                    visible: backend.reading.rules === true && backend.reading.text === search.text.trim()
+                    tags: backend.reading.tags || []
                 }
             }
 
             Item {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
+                id: stage
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: top.visible ? top.bottom : parent.top
+                anchors.bottom: parent.bottom
+                anchors.topMargin: top.visible ? Style.u * 2 : 0
 
-                VideoPage {
-                    id: feedPage
-                    objectName: "feedPage"
-                    anchors.fill: parent
-                    visible: win.page === "feed" && !player.active
-                    focus: visible
-                    veil: prefs.veilThumbnails
-                    // The first-run welcome sits on a cloud of the veil's dye.
-                    washEmpty: win.noSubs
-                    heading: qsTr("Feed")
-                    subheading: {
-                        // While it runs, how far the refresh is; it says more than the
-                        // channel count, which it would only repeat.
-                        if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
-                            return qsTr("Refreshing %1 of %2").arg(backend.refreshDone).arg(backend.refreshTotal)
-                        const info = backend.feedInfo
-                        if (!info.channels)
-                            return ""
-                        let s = qsTr("Latest from %n channels", "", info.channels)
-                        if (info.errors && info.errors.length > 0)
-                            s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
-                        return s
+            VideoPage {
+                id: feedPage
+                objectName: "feedPage"
+                anchors.fill: parent
+                visible: win.page === "home" && !player.active
+                focus: visible
+                veil: prefs.veilThumbnails
+                // The first-run welcome sits on a cloud of the veil's dye.
+                washEmpty: win.noSubs
+                heading: qsTr("Feed")
+                subheading: {
+                    // While it runs, how far the refresh is; it says more than the
+                    // channel count, which it would only repeat.
+                    if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
+                        return qsTr("Refreshing %1 of %2").arg(backend.refreshDone).arg(backend.refreshTotal)
+                    const info = backend.feedInfo
+                    if (!info.channels)
+                        return ""
+                    let s = qsTr("Latest from %n channels", "", info.channels)
+                    if (info.errors && info.errors.length > 0)
+                        s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
+                    return s
+                }
+                model: backend.feed
+                estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
+                loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
+                emptyText: backend.feedInfo.channels === 0
+                           ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
+                           : qsTr("Nothing here yet. Press R to refresh.")
+                emptyActions: [
+                    Button {
+                        visible: backend.feedInfo.channels === 0
+                        text: qsTr("Add a channel")
+                        highlighted: true
+                        onClicked: win.addChannel()
                     }
-                    model: backend.feed
-                    estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
-                    loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
-                    emptyText: backend.feedInfo.channels === 0
-                               ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
-                               : qsTr("Nothing here yet. Press R to refresh.")
-                    emptyActions: [
-                        Button {
-                            visible: backend.feedInfo.channels === 0
-                            text: qsTr("Add a channel")
-                            highlighted: true
-                            onClicked: win.addChannel()
+                ]
+                onActivated: video => win.play(video)
+                onChannelRequested: id => win.openChannel(id)
+                actions: [
+                    CheckBox {
+                        visible: !win.noSubs
+                        text: qsTr("Shorts")
+                        checked: prefs.showShorts
+                        onToggled: {
+                            prefs.showShorts = checked
+                            backend.refreshFeed(false, checked)
                         }
-                    ]
-                    onActivated: video => win.play(video)
-                    onChannelRequested: id => win.openChannel(id)
-                    actions: [
-                        CheckBox {
-                            visible: !win.noSubs
-                            text: qsTr("Shorts")
-                            checked: prefs.showShorts
-                            onToggled: {
-                                prefs.showShorts = checked
-                                backend.refreshFeed(false, checked)
-                            }
-                        },
-                        Button {
-                            visible: !win.noSubs
-                            text: qsTr("Refresh")
-                            flat: true
-                            icon.source: "qrc:/icons/refresh.svg"
-                            enabled: backend.busy.indexOf("feed") < 0
-                            onClicked: win.refresh()
+                    },
+                    Button {
+                        visible: !win.noSubs
+                        text: qsTr("Refresh")
+                        flat: true
+                        icon.source: "qrc:/icons/refresh.svg"
+                        enabled: backend.busy.indexOf("feed") < 0
+                        onClicked: win.refresh()
+                    }
+                ]
+            }
+
+            VideoPage {
+                id: searchPage
+                objectName: "searchPage"
+                anchors.fill: parent
+                visible: win.page === "search" && !player.active
+                veil: prefs.veilThumbnails
+                heading: backend.query ? qsTr("“%1”").arg(backend.query) : qsTr("Search")
+                subheading: backend.privacy.pages.search
+                model: backend.results
+                estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
+                loading: backend.busy.indexOf("search") >= 0
+                emptyText: backend.query ? qsTr("No results.") : ""
+                onActivated: video => win.play(video)
+                onChannelRequested: id => win.openChannel(id)
+            }
+
+            VideoPage {
+                id: channelPage
+                anchors.fill: parent
+                visible: win.page === "channel" && !player.active
+                veil: prefs.veilThumbnails
+                heading: backend.channel.name || ""
+                subheading: backend.channelVideos.count
+                            ? qsTr("%n recent videos", "", backend.channelVideos.count) : ""
+                model: backend.channelVideos
+                estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
+                loading: backend.busy.indexOf("channel") >= 0
+                emptyText: qsTr("No videos.")
+                onActivated: video => win.play(video)
+                actions: [
+                    Button {
+                        id: subscribe
+                        readonly property bool isOn: !!backend.channel.subscribed
+                        visible: !!backend.channel.name
+                        text: isOn ? qsTr("Subscribed") : qsTr("Subscribe")
+                        // Subscribe is the filled call to action. Subscribed is the same
+                        // control switched on: a check and an accent outline, not flat text.
+                        highlighted: !isOn
+                        flat: isOn
+                        checked: isOn
+                        icon.source: isOn ? "qrc:/icons/check.svg" : ""
+                        icon.width: 18
+                        icon.height: 18
+                        onClicked: isOn ? backend.unsubscribe(backend.channel.id)
+                                        : backend.subscribe(backend.channel.id)
+
+                        Rectangle {
+                            anchors.fill: subscribe.background
+                            visible: subscribe.isOn
+                            radius: subscribe.background.radius
+                            color: "transparent"
+                            border.width: 1
+                            border.color: theme.accent
                         }
-                    ]
-                }
+                    }
+                ]
+            }
 
-                VideoPage {
-                    id: searchPage
-                    objectName: "searchPage"
+            SubsPage {
+                id: subsPage
+                anchors.fill: parent
+                visible: win.page === "channels" && !player.active
+                onChannelRequested: id => win.openChannel(id)
+            }
+
+            HistoryPage {
+                id: historyPage
+                anchors.fill: parent
+                visible: win.page === "history" && !player.active
+                onPlayRequested: video => win.play(video)
+            }
+
+                // Lenses and settings are drawn by the tasks that add them.
+                Item {
+                    id: lensesPage
+                    objectName: "page-lenses"
                     anchors.fill: parent
-                    visible: win.page === "search" && !player.active
-                    veil: prefs.veilThumbnails
-                    heading: backend.query ? qsTr("“%1”").arg(backend.query) : qsTr("Search")
-                    subheading: backend.privacy.pages.search
-                    model: backend.results
-                    estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
-                    loading: backend.busy.indexOf("search") >= 0
-                    emptyText: backend.query ? qsTr("No results.") : ""
-                    onActivated: video => win.play(video)
-                    onChannelRequested: id => win.openChannel(id)
+                    visible: win.page === "lenses" && !player.active
                 }
-
-                VideoPage {
-                    id: channelPage
+                Item {
+                    id: settingsPage
+                    objectName: "page-settings"
                     anchors.fill: parent
-                    visible: win.page === "channel" && !player.active
-                    veil: prefs.veilThumbnails
-                    heading: backend.channel.name || ""
-                    subheading: backend.channelVideos.count
-                                ? qsTr("%n recent videos", "", backend.channelVideos.count) : ""
-                    model: backend.channelVideos
-                    estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
-                    loading: backend.busy.indexOf("channel") >= 0
-                    emptyText: qsTr("No videos.")
-                    onActivated: video => win.play(video)
-                    actions: [
-                        Button {
-                            id: subscribe
-                            readonly property bool isOn: !!backend.channel.subscribed
-                            visible: !!backend.channel.name
-                            text: isOn ? qsTr("Subscribed") : qsTr("Subscribe")
-                            // Subscribe is the filled call to action. Subscribed is the same
-                            // control switched on: a check and an accent outline, not flat text.
-                            highlighted: !isOn
-                            flat: isOn
-                            checked: isOn
-                            icon.source: isOn ? "qrc:/icons/check.svg" : ""
-                            icon.width: 18
-                            icon.height: 18
-                            onClicked: isOn ? backend.unsubscribe(backend.channel.id)
-                                            : backend.subscribe(backend.channel.id)
-
-                            Rectangle {
-                                anchors.fill: subscribe.background
-                                visible: subscribe.isOn
-                                radius: subscribe.background.radius
-                                color: "transparent"
-                                border.width: 1
-                                border.color: theme.accent
-                            }
-                        }
-                    ]
+                    visible: win.page === "settings" && !player.active
                 }
 
-                SubsPage {
-                    id: subsPage
-                    anchors.fill: parent
-                    visible: win.page === "subs" && !player.active
-                    onChannelRequested: id => win.openChannel(id)
-                }
-
-                HistoryPage {
-                    id: historyPage
-                    anchors.fill: parent
-                    visible: win.page === "history" && !player.active
-                    onPlayRequested: video => win.play(video)
-                }
-
-                // A thin bar along the top of the page while anything is loading.
-                // It fills as a feed refresh gets through its channels, and
-                // only then: anything else running at the same time makes it
-                // as long as that is.
-                ProgressBar {
+                // A thin line along the top of the page while anything is
+                // loading. It fills as a feed refresh gets through its
+                // channels, and only then: anything else running at the same
+                // time makes it as long as that is.
+                BusyLine {
                     objectName: "progress"
-                    readonly property var tasks: backend.busy.filter(t => t !== "play" && t !== "config")
+                    readonly property var tasks: backend.busy.filter(t => ["play", "config", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0)
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top
@@ -511,35 +490,12 @@ ApplicationWindow {
             }
         }
 
-        Rectangle {
+        Toast {
             id: toast
-            property string text
-            function show(t) {
-                text = t
-                opacity = 1
-                toastTimer.restart()
-            }
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
-            anchors.bottomMargin: 24
-            width: toastLabel.implicitWidth + 36
-            height: 40
-            radius: Math.min(20, theme.radius)
-            color: "#202027"
-            border.color: "#2e2e37"
-            opacity: 0
-            visible: opacity > 0
-            Behavior on opacity { NumberAnimation { duration: 200 } }
-            Label {
-                id: toastLabel
-                anchors.centerIn: parent
-                text: toast.text
-            }
-            Timer {
-                id: toastTimer
-                interval: 3000
-                onTriggered: toast.opacity = 0
-            }
+            anchors.bottomMargin: Style.gutter
+            z: 5
         }
 
         // Dropping an export imports it.
@@ -553,86 +509,19 @@ ApplicationWindow {
             Rectangle {
                 anchors.fill: parent
                 visible: drop.containsDrag
-                color: "#cc0d0d10"
+                color: Style.scrim
                 border.width: 2
-                border.color: theme.accent
-                Label {
+                border.color: Style.accent
+                Text {
                     anchors.centerIn: parent
                     text: qsTr("Drop to import subscriptions")
-                    font.pixelSize: 18
+                    color: Style.fg
+                    font.family: Style.font
+                    font.pixelSize: Style.head
                 }
             }
         }
     }
 
     HelpOverlay { id: help }
-
-    component TabButtonish: AbstractButton {
-        id: tab
-        required property var modelData
-        // Nothing is "current" while a video has the window.
-        readonly property bool current: !player.active && (win.page === modelData.key
-                                        || (win.page === "channel" && win.returnPage === modelData.key))
-        Layout.fillHeight: true
-        leftPadding: 12
-        rightPadding: 12
-        onClicked: win.go(modelData.key)
-        contentItem: Label {
-            text: tab.modelData.label
-            font.pixelSize: 14
-            // One weight for every tab: a bolder current tab is wider, and would
-            // push its neighbours sideways. Colour and the underline mark it.
-            color: tab.current ? "#ffffff" : tab.hovered ? "#d0d0d8" : "#8d8d98"
-            verticalAlignment: Text.AlignVCenter
-        }
-        background: Item {
-            Rectangle {
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.leftMargin: 10
-                anchors.rightMargin: 10
-                height: 2
-                color: theme.accent
-                visible: tab.current
-            }
-        }
-    }
-
-    // The route, always in view: amber while YouTube can see your IP, a
-    // steady green once it can't. Neither follows the theme accent, which
-    // tabs, rings and buttons use.
-    component RouteChip: AbstractButton {
-        id: chip
-        readonly property string route: backend.config.route || "direct"
-        readonly property color tone: route === "direct" ? "#e0a93b" : theme.protectedColor
-        Layout.preferredHeight: 34
-        leftPadding: 12
-        rightPadding: 14
-        hoverEnabled: true
-        // What the engine says about this route, as it says it.
-        ToolTip.visible: hovered && ToolTip.text !== ""
-        ToolTip.delay: 500
-        ToolTip.text: backend.privacy.summary
-        contentItem: RowLayout {
-            spacing: 8
-            Rectangle {
-                Layout.preferredWidth: 8
-                Layout.preferredHeight: 8
-                radius: 4
-                color: chip.tone
-            }
-            Label {
-                text: chip.route === "tor" ? qsTr("Tor") : chip.route === "proxy" ? qsTr("Proxy") : qsTr("Direct")
-                font.pixelSize: 13
-                font.weight: Font.DemiBold
-                color: chip.tone
-            }
-        }
-        background: Rectangle {
-            radius: Math.min(17, theme.radius)
-            color: chip.hovered ? "#1d1d24" : "transparent"
-            border.color: Qt.rgba(chip.tone.r, chip.tone.g, chip.tone.b, 0.45)
-        }
-    }
 }

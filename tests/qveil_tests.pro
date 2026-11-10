@@ -9,7 +9,7 @@ INCLUDEPATH += ../src
 DEFINES += SRCDIR=\\\"$$PWD/../src\\\"
 
 HEADERS += suite.h ../src/backend.h ../src/datadirs.h ../src/launch.h ../src/mpvitem.h ../src/theme.h ../src/translator.h ../src/videomodel.h
-SOURCES += main.cpp qveil_tests.cpp videomodel_tests.cpp engine_tests.cpp parts_tests.cpp \
+SOURCES += main.cpp qveil_tests.cpp videomodel_tests.cpp engine_tests.cpp parts_tests.cpp window_tests.cpp \
     ../src/backend.cpp ../src/datadirs.cpp ../src/mpvitem.cpp ../src/theme.cpp ../src/translator.cpp ../src/videomodel.cpp
 
 # The app's resources (icons, the veil's shader), so its QML loads as it does there.
