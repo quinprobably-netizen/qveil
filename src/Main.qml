@@ -258,7 +258,7 @@ ApplicationWindow {
     // The player opens at once, with what the card knows, while the engine
     // looks the video up. `list` and `index` say where it was opened from.
     function play(video, list, index) {
-        startingOver = ""
+        openingAs = null
         if (list && list !== playedFrom) {
             const rows = []
             for (let i = 0; i < list.count; i++)
@@ -278,13 +278,41 @@ ApplicationWindow {
         backend.play(video.id)
     }
 
-    // The video that is being started over, by its ID: it plays from its
-    // start whatever place was kept for it, and that place is forgotten once
-    // the video has begun, not before (one that doesn't open keeps it).
-    property string startingOver: ""
+    // How the video that is being opened is to begin, when that is not as the
+    // engine's answer says: { id, at, forget }. `at` is the second it starts
+    // at, and `forget` says that the place the engine kept for it is forgotten
+    // once the video has begun, not before (a video that doesn't open keeps it).
+    property var openingAs: null
     function startOver(video, list, index) {
         play(video, list, index)
-        startingOver = video.id
+        openingAs = { id: video.id, at: 0, forget: true }
+    }
+
+    // The route changed under the video that is showing, and the engine has
+    // ended the streams it had over the old one. It is looked up again and
+    // opened by the new route, at the place it had got to, where it was (in
+    // the small window too). One that had played to its end has nothing to
+    // carry on from, and is put away.
+    function reopen() {
+        const from = player
+        if (!from.active)
+            return
+        const info = from.info
+        const over = from.length > 0 && from.lastPosition >= from.length - 2
+        if (!from.pending && over) {
+            if (pip)
+                pipWindow.end()
+            else
+                watch.close()
+            return
+        }
+        // (One that was still being looked up begins as it was going to.)
+        const as = from.pending ? openingAs : { id: info.id, at: from.mpv.started ? from.lastPosition : from.startedAt, forget: false }
+        play(info, playList, playIndex)
+        openingAs = as
+        // The popup the route was chosen in keeps the keyboard.
+        if (route.opened)
+            route.forceActiveFocus()
     }
 
     // A place that was forgotten (what the engine had kept for the video) can
@@ -432,14 +460,9 @@ ApplicationWindow {
             backend.loadResume()
             backend.loadLenses()
         }
-        // The engine ends the streams of the old route, so the player has
-        // nothing left to play, and must not stay up as if it had.
-        function onRouteChanged() {
-            if (watch.active)
-                watch.close()
-            if (win.pip)
-                pipWindow.end()
-        }
+        // The engine ends the streams of the old route, so what was playing
+        // is opened again by the new one.
+        function onRouteChanged() { win.reopen() }
         function onBusyChanged() {
             if (quitting.running && backend.busy.indexOf("resume-note") < 0) {
                 quitting.stop()
@@ -448,13 +471,14 @@ ApplicationWindow {
         }
         function onPlayReady(info) {
             const surface = win.pip ? pipWindow.surface : watch.surface
-            if (info.id === win.startingOver) {
-                surface.forgetWhenStarted = true
-                surface.openAt(info, 0)
+            const as = win.openingAs && win.openingAs.id === info.id ? win.openingAs : null
+            win.openingAs = null
+            if (as) {
+                surface.forgetWhenStarted = as.forget
+                surface.openAt(info, as.at)
             } else {
                 surface.open(info)
             }
-            win.startingOver = ""
         }
         // A lens that was just added is shown, wherever it was added from.
         function onLensAdded(id) {

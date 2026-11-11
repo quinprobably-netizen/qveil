@@ -1065,6 +1065,67 @@ private slots:
         QVERIFY(!app.item("now-playing")->isVisible());
     }
 
+    void changingTheRouteMidVideoOpensItAgainWhereItWas()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
+        QQuickItem *surface = app.item("surface");
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mpv && mpv->property("started").toBool(), 15000);
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 40));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() >= 40, 10000);
+        const int opened = app.asked("POST api/play");
+
+        // The engine ends the video's streams with the old route: it is looked up
+        // and opened again by the new one, from where it had got to.
+        app.backend->setConfig({{"route", "tor"}});
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
+        QTRY_COMPARE(app.asked("POST api/play"), opened + 1);
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && !surface->property("pending").toBool(), 15000);
+        QVERIFY(app.window->property("watching").toBool());
+        QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000002"));
+        // (What the window asked of the player: the stand-in's stream can't be seeked, so how far it gets is its own.)
+        const double at = surface->property("startedAt").toDouble();
+        QVERIFY2(at >= 38 && at < 100, qPrintable(QString::number(at)));
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void changingTheRouteMidVideoKeepsPictureInPicture()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
+        QQuickItem *surface = app.item("surface");
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mpv && mpv->property("started").toBool(), 15000);
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 40));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() >= 40, 10000);
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QQuickItem *small = app.inPip("pip-surface");
+        QObject *pipMpv = small->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(pipMpv->property("started").toBool(), 15000);
+        const int opened = app.asked("POST api/play");
+
+        app.backend->setConfig({{"route", "tor"}});
+        QTRY_COMPARE(app.asked("POST api/play"), opened + 1);
+        QTRY_VERIFY_WITH_TIMEOUT(pipMpv->property("started").toBool() && !small->property("pending").toBool(), 15000);
+        // Still in the small window, and not on the page.
+        QVERIFY(app.pip()->isVisible());
+        QVERIFY(!app.window->property("watching").toBool());
+        QCOMPARE(small->property("info").toMap().value("id").toString(), QString("vid00000002"));
+        QVERIFY(small->property("startedAt").toDouble() >= 38);
+    }
+
     void settingsChangeTheEngineAndUseItsWords()
     {
         App app;

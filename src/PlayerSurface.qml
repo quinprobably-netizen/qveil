@@ -26,6 +26,9 @@ FocusScope {
     // Set when the video is played from its start in place of a kept place:
     // that place is forgotten once the first frame is up.
     property bool forgetWhenStarted: false
+    // The last second the video was known to be at while it played (which
+    // stays when the player has lost it: its streams are gone).
+    property real lastPosition: 0
     // The second it last started a video at (0 from the start), and the
     // second it was last sent to: what the window asked of the player.
     property real startedAt: 0
@@ -55,6 +58,7 @@ FocusScope {
         }
         note.shown = false
         forgetWhenStarted = false
+        lastPosition = 0
         startedAt = 0
         lastSeek = -1
         pending = true
@@ -73,6 +77,7 @@ FocusScope {
         const resumed = at === undefined && !(i.start > 0) && i.resume > 0
         startedAt = at !== undefined ? at : (i.start > 0 ? i.start : (i.resume > 0 ? i.resume : 0))
         lastSeek = -1
+        lastPosition = startedAt
         note.shown = resumed
         if (resumed)
             noteTimer.restart()
@@ -160,6 +165,7 @@ FocusScope {
         backgroundColor: "black"
         onFailed: message => backend.reportError(message)
         onVolumeChanged: surface.savedVolume = volume
+        onPositionChanged: if (started && position > 0) surface.lastPosition = position
         onPausedChanged: {
             surface.reveal()
             if (paused)
