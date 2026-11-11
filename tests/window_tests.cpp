@@ -1258,6 +1258,17 @@ private slots:
         QVERIFY(!app.window->property("pip").toBool());
     }
 
+    void theSmallWindowLetsGoOfWhatItDrewWithWhenHidden()
+    {
+        App app;
+        READY(app);
+        auto mpv = [](QQuickItem *surface) { return surface ? surface->property("mpv").value<QObject *>() : nullptr; };
+        QVERIFY(mpv(app.inPip("pip-surface")) && mpv(app.item("surface")));
+        // The small window comes and goes; the main one keeps what it draws with.
+        QVERIFY(mpv(app.inPip("pip-surface"))->property("releaseWhenHidden").toBool());
+        QVERIFY(!mpv(app.item("surface"))->property("releaseWhenHidden").toBool());
+    }
+
     void theLeadsVideoIsNotAlsoTheFirstOfLatest()
     {
         App app;

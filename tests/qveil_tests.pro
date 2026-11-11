@@ -8,7 +8,7 @@ TEMPLATE = app
 DEFINES += SRCDIR=\\\"$$PWD/../src\\\"
 
 HEADERS += suite.h
-SOURCES += main.cpp qveil_tests.cpp videomodel_tests.cpp engine_tests.cpp parts_tests.cpp window_tests.cpp linkify_tests.cpp
+SOURCES += main.cpp qveil_tests.cpp videomodel_tests.cpp engine_tests.cpp parts_tests.cpp window_tests.cpp linkify_tests.cpp player_tests.cpp
 
 # The window's code, as the app has it.
 include(../src/sources.pri)

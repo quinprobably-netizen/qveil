@@ -50,6 +50,8 @@ Window {
         objectName: "pip-surface"
         anchors.fill: parent
         compact: true
+        // Hidden, this window lets go of what it drew with (see MpvItem).
+        mpv.releaseWhenHidden: true
         thumbs: pip.thumbs
         savedVolume: pip.savedVolume
         onSavedVolumeChanged: pip.savedVolume = savedVolume
