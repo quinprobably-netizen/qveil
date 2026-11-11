@@ -1,6 +1,7 @@
 import QtQuick
 import Qveil
 import "Format.js" as Format
+import "Arrange.js" as Arrange
 
 // What you watched, when the history is on; and when it is off, what that
 // means, in the engine's words.
@@ -14,7 +15,17 @@ FocusScope {
     // Whether Clear has been pressed once, and waits for the second.
     property bool arming: false
     property string thumbs: "clear"
-    signal playRequested(var video)
+    // `list` is what the video was clicked in, and `index` where: what comes
+    // next is the rest of it.
+    signal playRequested(var video, var list, int index)
+
+    // Plays the video at `index` of what is listed (the history, or what is
+    // kept unfinished).
+    function play(rows, index) {
+        page.playRequested(rows[index], Arrange.listed(rows), index)
+    }
+    // The unfinished videos as videos: where they were stopped is no part of one.
+    readonly property var keptRows: backend.resume.map(k => ({ id: k.id, title: k.title || "", channel: k.channel || "", duration: k.dur }))
 
     onVisibleChanged: arming = false
     // Turned on or off here, the keyboard goes to the list that is now showing.
@@ -150,9 +161,7 @@ FocusScope {
             required property var modelData
             required property int index
             readonly property bool current: ListView.isCurrentItem && kept.activeFocus
-            function play() {
-                page.playRequested({ id: modelData.id, title: modelData.title || "", channel: modelData.channel || "" })
-            }
+            function play() { page.play(page.keptRows, index) }
             objectName: "history-kept"
             width: kept.width
             height: 92
@@ -275,11 +284,12 @@ FocusScope {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         model: page.on ? backend.history : []
-        Keys.onReturnPressed: if (currentItem) page.playRequested(currentItem.modelData)
+        Keys.onReturnPressed: if (currentIndex >= 0) page.play(backend.history, currentIndex)
 
         delegate: Rectangle {
             id: row
             required property var modelData
+            required property int index
             objectName: "history-row"
             width: list.width
             height: 52
@@ -333,7 +343,7 @@ FocusScope {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: page.playRequested(row.modelData)
+                onClicked: page.play(backend.history, row.index)
             }
         }
     }

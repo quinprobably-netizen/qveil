@@ -1325,6 +1325,67 @@ private slots:
         QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Glaze tests: 36 tiles, one kiln load"));
     }
 
+    void resumingPlaysWithTheUnfinishedVideosToFollow()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        app.click(app.item("lead-resume"));
+        QTRY_VERIFY(app.item("surface")->property("active").toBool());
+        // What comes next is the rest of what was left unfinished (not "nothing follows").
+        QTRY_COMPARE(app.items("next-entry").size(), 2);
+        QCOMPARE(app.items("next-entry").at(0)->property("title").toString(), QString("Crossing the Pamir on a steel bike, part 3"));
+        QCOMPARE(app.items("next-entry").at(1)->property("title").toString(), QString("Glaze tests: 36 tiles, one kiln load"));
+        // N goes on to it.
+        QTest::keyClick(app.window, Qt::Key_N);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000005"));
+        QTRY_COMPARE(app.items("next-entry").size(), 1);
+    }
+
+    void resumingTheLastUnfinishedVideoFollowsWithTheLatest()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        app.backend->forgetResume("vid00000005");
+        app.backend->forgetResume("vid00000004");
+        QTRY_COMPARE(app.backend->resume().size(), 1);
+        app.click(app.item("lead-resume"));
+        QTRY_VERIFY(app.item("surface")->property("active").toBool());
+        // The feed, newest first, without the video that is playing.
+        QTRY_VERIFY(app.items("next-entry").size() >= 2);
+        QCOMPARE(app.items("next-entry").at(0)->property("title").toString(), QString("A dovetail box with four hand tools"));
+        QCOMPARE(app.items("next-entry").at(1)->property("title").toString(), QString("The 1970s synth that refuses to stay in tune"));
+    }
+
+    void historyPlaysWithTheListItWasClickedIn()
+    {
+        {
+            // On: the history, from the video clicked.
+            App app;
+            READY(app);
+            app.backend->setConfig({{"history", true}});
+            QTRY_VERIFY(app.backend->config().value("history").toBool());
+            QTest::keyClick(app.window, Qt::Key_4);
+            QTRY_COMPARE(app.items("history-row").size(), 4);
+            app.click(app.items("history-row").at(1));
+            QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000002"));
+            QTRY_COMPARE(app.items("next-entry").size(), 2);
+            QCOMPARE(app.items("next-entry").first()->property("title").toString(), QString("The 1970s synth that refuses to stay in tune"));
+        }
+        {
+            // Off: what is kept unfinished, from the video clicked.
+            App app;
+            READY(app);
+            QTest::keyClick(app.window, Qt::Key_4);
+            QTRY_COMPARE(app.items("history-kept").size(), 3);
+            app.click(app.items("history-kept").at(1));
+            QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000005"));
+            QTRY_COMPARE(app.items("next-entry").size(), 1);
+            QCOMPARE(app.items("next-entry").first()->property("title").toString(), QString("Glaze tests: 36 tiles, one kiln load"));
+        }
+    }
+
     void aShelfOpensItsFeedInFullAndEscapeReturns()
     {
         App app(false, QSize(1280, 1600));

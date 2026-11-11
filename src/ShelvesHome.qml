@@ -88,7 +88,8 @@ FocusScope {
         return ({})
     }
     signal activated(var video, var list, int index)
-    signal resumed(var video)
+    // The lead is picked up: `list` is what comes after it.
+    signal resumed(var video, var list, int index)
     signal allRequested(string feed)
     signal channelRequested(string id)
     signal refreshRequested()
@@ -163,9 +164,7 @@ FocusScope {
         return sourceOf(key).slice(0, n)
     }
     function pick(key, video, index) {
-        if (key === "resume") {
-            page.resumed(video)
-        } else if (key === "latest" && Arrange.plain(arrangements[key])) {
+        if (key === "latest" && Arrange.plain(arrangements[key])) {
             // The shelf is the start of the feed: what comes next is the rest of
             // it, from where the video is in the feed (the lead's is left out here).
             let at = index
@@ -283,7 +282,7 @@ FocusScope {
             else if (leadAction === 2)
                 backend.forgetResume(kept.id)
             else
-                page.resumed({ id: kept.id, title: kept.title || "", channel: kept.channel || "" })
+                resume(kept)
             return
         }
         const key = keys[row]
@@ -291,10 +290,23 @@ FocusScope {
         if (column < entries.length)
             pick(key, entries[column], column)
     }
+    // What follows the lead when it is played: the other unfinished videos
+    // (the shelf under it), and when there are none, the latest from the channels.
+    function afterLead(kept) {
+        const video = { id: kept.id, title: kept.title || "", channel: kept.channel || "" }
+        let rest = sourceOf("resume").filter(v => v.id !== video.id)
+        if (rest.length === 0)
+            rest = Arrange.rows(backend.feed).filter(v => v.id !== video.id)
+        return Arrange.listed([video].concat(rest))
+    }
+    function resume(kept) {
+        const list = afterLead(kept)
+        page.resumed(list.get(0), list, 0)
+    }
     function startOver(kept) {
         // The place is forgotten first, so that the video starts at its start.
         backend.forgetResume(kept.id)
-        page.resumed({ id: kept.id, title: kept.title || "", channel: kept.channel || "" })
+        resume(kept)
     }
 
     Component.onCompleted: rekey()
@@ -391,7 +403,7 @@ FocusScope {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: page.resumed({ id: lead.kept.id, title: lead.kept.title || "", channel: lead.kept.channel || "" })
+                    onClicked: page.resume(lead.kept)
                     onPositionChanged: mouse => page.pointed(mapToItem(null, mouse.x, mouse.y))
                 }
                 Item {
@@ -501,7 +513,7 @@ FocusScope {
                         primary: !page.compact
                         quiet: page.compact
                         marked: page.leadSelected && page.leadAction === 0
-                        onClicked: page.resumed({ id: lead.kept.id, title: lead.kept.title || "", channel: lead.kept.channel || "" })
+                        onClicked: page.resume(lead.kept)
                     }
                     Act {
                         objectName: "lead-over"

@@ -606,7 +606,7 @@ ApplicationWindow {
                     onActivated: (video, index) => win.play(video, feedPage.model, index)
                     onShelfActivated: (video, list, index) => win.play(video, list, index)
                     onChannelRequested: id => win.openChannel(id)
-                    onResumed: video => win.play(video)
+                    onResumed: (video, list, index) => win.play(video, list, index)
                     onShortsToggled: shown => {
                         prefs.showShorts = shown
                         backend.refreshFeed(false, shown)
@@ -696,7 +696,7 @@ ApplicationWindow {
                     anchors.fill: parent
                     thumbs: win.thumbs
                     visible: win.page === "history" && !win.watching
-                    onPlayRequested: video => win.play(video)
+                    onPlayRequested: (video, list, index) => win.play(video, list, index)
                 }
 
                 WatchPage {
