@@ -234,9 +234,15 @@ impl Server {
             ("POST", ["api", "history", "clear"]) => {
                 app::clear_history(paths)?;
                 // They say what was watched lately, too, and the
-                // thumbnails kept on disk what was shown.
+                // thumbnails kept on disk what was shown. The history is
+                // cleared whatever becomes of those: that is said in the log,
+                // and not by an error for what is done.
                 self.lookups.clear();
-                self.thumbs.disk.forget(&paths.thumbs())?;
+                if let Err(e) = self.thumbs.disk.forget(&paths.thumbs()) {
+                    note!(
+                        "qveil: the history was cleared, but not the thumbnails kept on disk: {e:#}"
+                    );
+                }
                 json!({})
             }
             ("GET", ["api", "read"]) => self.read_json(req),
@@ -280,7 +286,10 @@ impl Server {
                     title: s.title,
                     channel: s.channel.filter(|c| !c.is_empty()),
                 };
-                json!({ "noted": resume::note(paths, rt.cfg.resume_days, position, now)? })
+                // Asked again under the store's lock, so that a position that
+                // waited behind turning resume off finds it off.
+                let days = || self.runtime().cfg.resume_days;
+                json!({ "noted": resume::note(paths, days, position, now)? })
             }
             ("POST", ["api", "resume", "rm"]) => {
                 let target = req.param("v")?;
@@ -382,15 +391,27 @@ impl Server {
         }
         // Validates the proxy before anything is saved.
         let mut next = Runtime::new(cfg, &self.paths, None, false)?;
-        next.cfg.save(&self.paths.config)?;
-        // Off means forgotten, not just no longer offered. A shorter time
-        // takes what is now too old with it.
-        if next.cfg.resume_days != rt.cfg.resume_days {
+        let resume_changed = next.cfg.resume_days != rt.cfg.resume_days;
+        let keep_thumbnails = next.cfg.keep_thumbnails;
+        let thumbnails_off = rt.cfg.keep_thumbnails && !keep_thumbnails;
+        let topics_off = rt.cfg.topic_feeds && !next.cfg.topic_feeds;
+        let prepare_off = rt.cfg.prepare_next && !next.cfg.prepare_next;
+        // What turning a setting off deletes comes first, and a failure
+        // there is the answer, with nothing saved and the old settings still
+        // in force: otherwise the file would say off while what was to be
+        // forgotten is still there. Off means forgotten, not just no longer
+        // offered, and a shorter time takes what is now too old with it.
+        // (Each is done again after the swap: see below. What the topic
+        // feeds found is only deleted then: the store can be busy with a
+        // refresh, and the setting must be off for it before that waits.)
+        if resume_changed {
             resume::purge(&self.paths, next.cfg.resume_days, app::now())?;
         }
-        let keep_thumbnails = next.cfg.keep_thumbnails;
+        if thumbnails_off {
+            self.thumbs.disk.forget(&self.paths.thumbs())?;
+        }
+        next.cfg.save(&self.paths.config)?;
         let route_changed = !next.net.same_route(&rt.net);
-        let topics_off = rt.cfg.topic_feeds && !next.cfg.topic_feeds;
         if !route_changed {
             // The same route keeps its running calls (and the registry that
             // can still stop them at exit); a new route starts with none.
@@ -424,16 +445,29 @@ impl Server {
         } else {
             drop(sessions);
         }
-        // The thumbnails kept on disk go when keeping them is off. After the
-        // swap, so that a thumbnail being kept now sees that it is off.
-        if !keep_thumbnails {
-            self.thumbs.disk.forget(&self.paths.thumbs())?;
+        // The lookup of the next video that is running was asked for while
+        // that was on.
+        if prepare_off && let Some(running) = lock(&self.preparing).as_ref() {
+            running.store(true, Ordering::Release);
         }
-        // Turned off, what the topic feeds found is not kept. Deleted after
-        // the swap: a refresh that is running sees the setting off before it
-        // can save, so nothing it found is put back afterwards.
-        if topics_off {
-            app::forget_topics(&self.paths)?;
+        // The change is made now, so what is left to do can't undo it: a
+        // failure is said in the log and not as an error. These are the same
+        // deletions as before, done again after the swap because something
+        // that was running under the old settings can have put back what the
+        // first deleted: a position noted in between, a thumbnail being kept
+        // (it sees now that keeping is off). A topic refresh that is about
+        // to save sees the setting off before it can, so that what it found
+        // is deleted after it.
+        if resume_changed
+            && let Err(e) = resume::purge(&self.paths, self.runtime().cfg.resume_days, app::now())
+        {
+            note!("qveil: couldn't tidy the remembered positions: {e:#}");
+        }
+        if !keep_thumbnails && let Err(e) = self.thumbs.disk.forget(&self.paths.thumbs()) {
+            note!("qveil: couldn't delete the thumbnails kept on disk: {e:#}");
+        }
+        if topics_off && let Err(e) = app::forget_topics(&self.paths) {
+            note!("qveil: couldn't delete what the topic feeds found: {e:#}");
         }
         Ok(())
     }
@@ -489,6 +523,7 @@ mod tests {
     use serde_json::Value;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -907,6 +942,129 @@ echo '{"entries":[]}'"#,
         assert_eq!(status, 500, "{body}");
         assert!(body.contains("The route changed; try again"), "{body}");
         assert_stopped_and_cleaned_up(&pid, &private);
+    }
+
+    #[test]
+    fn a_change_that_cannot_delete_what_it_must_is_refused_before_anything_is_saved() {
+        // Off means forgotten: if the positions can't be deleted (here the
+        // file is in the way of it), the setting must not claim they were.
+        let (s, base, _d) = server();
+        std::fs::create_dir_all(&s.paths.data).unwrap();
+        std::fs::create_dir(s.paths.resume()).unwrap();
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"resumeDays":0,"history":true}"#,
+        );
+        assert_eq!(status, 500, "{body}");
+        assert!(!s.paths.config.exists(), "a refused change was saved");
+        let (_, cfg) = http(&base, "GET", &path(&base, "api/config"), "");
+        let v: Value = serde_json::from_str(&cfg).unwrap();
+        assert_eq!(
+            (v["resumeDays"].as_u64(), v["history"].as_bool()),
+            (Some(7), Some(false))
+        );
+        // The same for the thumbnails kept on disk, and for the topic feeds' results.
+        let (s, base, _d) = server_with(Config {
+            keep_thumbnails: true,
+            ..Config::default()
+        });
+        let thumbs = s.paths.thumbs();
+        std::fs::create_dir_all(&thumbs).unwrap();
+        std::fs::write(thumbs.join("dQw4w9WgXcQ.jpg"), b"x").unwrap();
+        std::fs::set_permissions(&thumbs, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"keepThumbnails":false}"#,
+        );
+        std::fs::set_permissions(&thumbs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(status, 500, "{body}");
+        assert!(!s.paths.config.exists());
+        assert!(s.runtime().cfg.keep_thumbnails);
+        assert!(thumbs.join("dQw4w9WgXcQ.jpg").exists());
+        // Once it can be done, it is.
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"keepThumbnails":false}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(!thumbs.exists());
+        assert!(!Config::load(&s.paths.config).unwrap().keep_thumbnails);
+    }
+
+    #[test]
+    fn a_deletion_that_fails_after_the_change_is_made_does_not_undo_or_skip_the_rest() {
+        let (s, base, _d) = server_with(Config {
+            topic_feeds: true,
+            ..Config::default()
+        });
+        std::fs::create_dir_all(&s.paths.cache).unwrap();
+        // The topic feeds' results are a directory: not deletable like a file.
+        std::fs::create_dir(s.paths.topics_cache()).unwrap();
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"topicFeeds":false,"history":true}"#,
+        );
+        assert_eq!(status, 200, "the change is applied: {body}");
+        assert!(!s.runtime().cfg.topic_feeds && s.runtime().cfg.history);
+        let saved = Config::load(&s.paths.config).unwrap();
+        assert!(!saved.topic_feeds && saved.history);
+    }
+
+    #[test]
+    fn clearing_the_history_is_answered_even_when_the_thumbnails_cannot_be_deleted() {
+        let (s, base, _d) = server_with(Config {
+            history: true,
+            ..Config::default()
+        });
+        crate::store::save(
+            &s.paths.history(),
+            &app::History {
+                watched: vec![watched()],
+            },
+        )
+        .unwrap();
+        // A file where the directory should be: deleting it as one fails.
+        std::fs::create_dir_all(&s.paths.cache).unwrap();
+        std::fs::write(s.paths.thumbs(), b"x").unwrap();
+        assert_eq!(
+            http(&base, "POST", &path(&base, "api/history/clear"), "").0,
+            200,
+            "the history was cleared, whatever happened to the thumbnails"
+        );
+        assert!(!s.paths.history().exists());
+    }
+
+    #[test]
+    fn turning_getting_the_next_video_ready_off_stops_the_lookup_that_is_running() {
+        let bin = TempDir::new();
+        let (s, base, _d) = server_with(Config {
+            ytdlp: hanging_ytdlp(&bin.0),
+            prepare_next: true,
+            ..Config::default()
+        });
+        let mut prepare = post_open(&base, "api/prepare?v=dQw4w9WgXcQ");
+        let (pid, private) = hanging_running(&bin.0);
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"prepareNext":false}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_stopped_and_cleaned_up(&pid, &private);
+        assert_eq!(read_reply(&mut prepare).0, 500);
+        wait_for("the registry to be empty", Duration::from_secs(10), || {
+            s.runtime().yt.calls.running() == 0
+        });
+        assert!(lock(&s.preparing).is_none());
     }
 
     #[test]
