@@ -1078,6 +1078,33 @@ echo '{"entries":[]}'
         assert!(spied(&dir, "config").contains("'https://www.youtube.com/watch?v=dQw4w9WgXcQ'"));
     }
 
+    /// yt-dlp keeps what it works out once per version of YouTube's player
+    /// (the signature solutions) in its cache, so every call has to be
+    /// given the same one, and one that outlives it: not the call's private
+    /// directory, which is removed when it ends. (yt-dlp 2026.08 keeps
+    /// nothing else there: it fetches the player's JavaScript anew in every
+    /// call, and the lookup to play a video doesn't need it at all.)
+    #[test]
+    fn every_call_is_given_the_one_lasting_cache() {
+        let dir = TempDir::new();
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
+        let cache_of = |argv: &str| {
+            argv.lines()
+                .skip_while(|l| *l != "--cache-dir")
+                .nth(1)
+                .unwrap()
+                .to_string()
+        };
+        yt.search("x", 1).unwrap();
+        let (first, private) = (spied(&dir, "argv"), spied(&dir, "private-dir"));
+        let _ = yt.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b");
+        let second = spied(&dir, "argv");
+        assert_eq!(cache_of(&first), yt.cache_dir.display().to_string());
+        assert_eq!(cache_of(&first), cache_of(&second));
+        assert!(!cache_of(&first).starts_with(private.trim()));
+        assert!(yt.cache_dir.is_dir());
+    }
+
     #[test]
     fn a_search_skips_the_homepage_however_it_is_asked() {
         let dir = TempDir::new();

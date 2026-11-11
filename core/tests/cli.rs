@@ -535,10 +535,14 @@ fn the_privacy_text_prints_without_a_home_and_wipe_needs_no_confirmation_with_ye
     assert!(text(&out.stdout).starts_with("Direct: YouTube sees your IP address."));
     // `wipe --yes` doesn't ask.
     write(&home.data().join("qveil/subscriptions.json"), "{}");
+    // What yt-dlp keeps in its cache goes too.
+    let solved = home.cache().join("qveil/yt-dlp/youtube-sigfuncs/x.json");
+    write(&solved, "{}");
     let out = home.run(&["wipe", "--yes"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(text(&out.stdout).contains("wiped"));
     assert!(!home.data().join("qveil").exists());
+    assert!(!solved.exists() && !home.cache().join("qveil").exists());
 }
 
 #[test]
