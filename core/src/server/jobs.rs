@@ -19,6 +19,7 @@ use crate::net::Net;
 use crate::util::lock;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Condvar, Mutex};
@@ -41,6 +42,10 @@ pub(super) struct FeedJob {
     net: Net,
     /// What it fetches, which is what a request must be covered by to join.
     refresh: Refresh,
+    /// The channels that were subscribed to when it started. Its list of
+    /// what to fetch is made from them, so a channel that isn't among them
+    /// (one that was added since) is not fetched by it.
+    listed: BTreeSet<String>,
     state: Mutex<JobState>,
     changed: Condvar,
 }
@@ -57,10 +62,11 @@ struct JobState {
 }
 
 impl FeedJob {
-    fn new(net: Net, refresh: Refresh) -> Arc<Self> {
+    fn new(net: Net, refresh: Refresh, listed: BTreeSet<String>) -> Arc<Self> {
         Arc::new(FeedJob {
             net,
             refresh,
+            listed,
             state: Mutex::default(),
             changed: Condvar::new(),
         })
@@ -89,6 +95,17 @@ impl FeedJob {
 
     fn running(&self) -> bool {
         lock(&self.state).finished.is_none()
+    }
+
+    /// Whether it fetches all that `wanted` asks for, with `subscribed` the
+    /// channels that are subscribed to now. A refresh of all channels (or of
+    /// those that are due) leaves out one that was added after it started.
+    fn covers(&self, wanted: &Refresh, subscribed: &BTreeSet<String>) -> bool {
+        self.refresh.covers(wanted)
+            && match wanted {
+                Refresh::Force | Refresh::Stale => subscribed.is_subset(&self.listed),
+                Refresh::Channel(_) | Refresh::Off => true,
+            }
     }
 
     /// The state once it has changed since `seen`, or `POLL` has passed.
@@ -146,8 +163,9 @@ enum Claim {
 }
 
 impl Jobs {
-    /// The job that is running on `net`'s route and covers `refresh`, or a
-    /// new one, which `start` is given to run. The check and the start happen
+    /// The job that is running on `net`'s route and covers `refresh` (with
+    /// `subscribed` the channels subscribed to now), or a new one, which
+    /// `start` is given to run. The check and the start happen
     /// under one lock, so that two requests arriving together share one job.
     ///
     /// A running job that doesn't cover `refresh` is not joined, and nor is a
@@ -157,6 +175,7 @@ impl Jobs {
         &self,
         net: &Net,
         refresh: &Refresh,
+        subscribed: &BTreeSet<String>,
         start: impl FnOnce(Arc<FeedJob>),
     ) -> Claim {
         let mut running = lock(&self.running);
@@ -164,13 +183,13 @@ impl Jobs {
             && job.running()
             && job.net.same_route(net)
         {
-            return if job.refresh.covers(refresh) {
+            return if job.covers(refresh, subscribed) {
                 Claim::Job(Arc::clone(job))
             } else {
                 Claim::Busy(Arc::clone(job))
             };
         }
-        let job = FeedJob::new(net.clone(), refresh.clone());
+        let job = FeedJob::new(net.clone(), refresh.clone(), subscribed.clone());
         *running = Some(Arc::clone(&job));
         start(Arc::clone(&job));
         Claim::Job(job)
@@ -218,11 +237,18 @@ impl Server {
         }
         let watch = Watch::new(out);
         let job = loop {
-            // Taken again after a wait, for the route may have changed.
+            // Taken again after a wait, for the route may have changed and
+            // channels may have been added.
             let rt = self.runtime();
-            let claim = self.jobs.join_or_start(&rt.net, &refresh, |job| {
-                self.start_job(&rt, refresh.clone(), job)
-            });
+            let subscribed = match app::load_subs(&self.paths) {
+                Ok(subs) => subs.channels.into_iter().map(|s| s.id).collect(),
+                Err(e) => return reply(out, stream, Err(e)),
+            };
+            let claim = self
+                .jobs
+                .join_or_start(&rt.net, &refresh, &subscribed, |job| {
+                    self.start_job(&rt, refresh.clone(), job)
+                });
             match claim {
                 Claim::Job(job) => break job,
                 // A job that doesn't fetch what this wants: wait for it to be
@@ -529,6 +555,10 @@ mod tests {
         // While it runs: a stream and a plain request. Both want what it is
         // already fetching.
         let (second, plain) = (ask(&base, "refresh=1&stream=1"), ask(&base, "refresh=1"));
+        // They must have asked before the subscription below, or they would
+        // be asking for more than this job started with. (It runs for more
+        // than a second, and a request takes a few milliseconds to arrive.)
+        std::thread::sleep(Duration::from_millis(300));
         // A channel subscribed to meanwhile is not on the list that the job
         // went by, so the request for it can't join: it is held until the
         // job is over, and then fetches that one channel.
@@ -563,6 +593,35 @@ mod tests {
         assert_eq!(first.last(), second.last());
         let v: Value = serde_json::from_str(&plain).unwrap();
         assert_eq!(&v, &first.last().unwrap()["result"]);
+    }
+
+    #[test]
+    fn channels_imported_while_a_refresh_runs_are_fetched_by_the_one_that_follows() {
+        use crate::store::testing::listing_runs as runs;
+        let (_s, base, _d, bin) = feed_server("sleep 0.3", 3);
+        let running = ask(&base, "refresh=1&stream=1");
+        wait_for("the refresh to start", Duration::from_secs(10), || {
+            runs(&bin.0) >= 1
+        });
+        // What the window asks for after an import: the imported channels
+        // have never been fetched, so they are stale, but they are not on the
+        // list that the running refresh went by.
+        let csv = format!("UC{:022},http://x,Chan4\nUC{:022},http://x,Chan5\n", 4, 5);
+        assert_eq!(
+            http(&base, "POST", &path(&base, "api/subs/import"), &csv).0,
+            200
+        );
+        let after = ask(&base, "refresh=1&stream=1");
+        assert_eq!(running.join().unwrap().0, 200);
+        let (status, after) = after.join().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            runs(&bin.0),
+            5,
+            "three for the running one, and the two that were imported"
+        );
+        let last: Value = serde_json::from_str(after.lines().last().unwrap()).unwrap();
+        assert_eq!(last["result"]["entries"].as_array().unwrap().len(), 5);
     }
 
     #[test]
@@ -716,7 +775,7 @@ mod tests {
         let tor = Net::new(Some(TOR_PROXY.into()), true).unwrap();
         let started = std::sync::atomic::AtomicUsize::new(0);
         let join = |net: &Net| {
-            let claim = jobs.join_or_start(net, &Refresh::Stale, |_| {
+            let claim = jobs.join_or_start(net, &Refresh::Stale, &BTreeSet::new(), |_| {
                 started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             });
             let Claim::Job(job) = claim else {
@@ -748,7 +807,7 @@ mod tests {
         let channel = |n: u32| Refresh::Channel(format!("UC{n:022}"));
         let started = std::sync::atomic::AtomicUsize::new(0);
         let ask = |refresh: &Refresh| {
-            jobs.join_or_start(&net, refresh, |_| {
+            jobs.join_or_start(&net, refresh, &BTreeSet::new(), |_| {
                 started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         };
@@ -782,8 +841,57 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_of_all_channels_is_joined_only_if_it_started_with_all_that_are_subscribed_to_now()
+    {
+        let net = Net::new(None, true).unwrap();
+        let ids =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|i| i.to_string()).collect() };
+        for (running, other) in [
+            (Refresh::Stale, Refresh::Force),
+            (Refresh::Force, Refresh::Stale),
+        ] {
+            let jobs = Jobs::default();
+            let ask = |refresh: &Refresh, subscribed: &[&str]| {
+                jobs.join_or_start(&net, refresh, &ids(subscribed), |_| {})
+            };
+            let Claim::Job(job) = ask(&running, &["a", "b"]) else {
+                panic!("nothing was running")
+            };
+            let joined = |claim: Claim| matches!(claim, Claim::Job(j) if Arc::ptr_eq(&j, &job));
+            let waits = |claim: Claim| matches!(claim, Claim::Busy(j) if Arc::ptr_eq(&j, &job));
+            // The same channels, or fewer (one was unsubscribed): joins.
+            assert!(joined(ask(&running, &["a", "b"])), "{running:?}");
+            assert!(joined(ask(&running, &["a"])), "{running:?}");
+            assert!(joined(ask(&running, &[])), "{running:?}");
+            // One that came after it started: waits.
+            assert!(waits(ask(&running, &["a", "b", "c"])), "{running:?}");
+            assert!(waits(ask(&running, &["c"])), "{running:?}");
+            // What the running one covers anyway follows the same rule.
+            if running.covers(&other) {
+                assert!(joined(ask(&other, &["a", "b"])));
+                assert!(waits(ask(&other, &["a", "b", "c"])));
+            }
+            // A request for one channel doesn't go by the list.
+            assert!(waits(ask(&Refresh::Channel("a".into()), &["a", "b", "c"])));
+        }
+        // A job for one channel is the same one for that channel, whoever
+        // else has subscribed meanwhile.
+        let jobs = Jobs::default();
+        let one = Refresh::Channel("a".into());
+        let Claim::Job(job) = jobs.join_or_start(&net, &one, &ids(&["a"]), |_| {}) else {
+            panic!("nothing was running")
+        };
+        let again = jobs.join_or_start(&net, &one, &ids(&["a", "b"]), |_| {});
+        assert!(matches!(again, Claim::Job(j) if Arc::ptr_eq(&j, &job)));
+    }
+
+    #[test]
     fn waiting_for_a_job_ends_when_it_is_over_or_nobody_is_waiting() {
-        let job = FeedJob::new(Net::new(None, true).unwrap(), Refresh::Stale);
+        let job = FeedJob::new(
+            Net::new(None, true).unwrap(),
+            Refresh::Stale,
+            BTreeSet::new(),
+        );
         assert!(!job.wait_over(|| true), "hung up before it was over");
         let ender = {
             let job = Arc::clone(&job);
@@ -800,12 +908,20 @@ mod tests {
 
     #[test]
     fn a_job_whose_thread_dies_ends_with_an_error() {
-        let job = FeedJob::new(Net::new(None, true).unwrap(), Refresh::Stale);
+        let job = FeedJob::new(
+            Net::new(None, true).unwrap(),
+            Refresh::Stale,
+            BTreeSet::new(),
+        );
         drop(EndWithThread(Arc::clone(&job)));
         let state = job.wait(0);
         assert!(state.finished.unwrap().is_err());
         // What was said first stands: a result isn't replaced by a late failure.
-        let job = FeedJob::new(Net::new(None, true).unwrap(), Refresh::Stale);
+        let job = FeedJob::new(
+            Net::new(None, true).unwrap(),
+            Refresh::Stale,
+            BTreeSet::new(),
+        );
         job.finish(Ok(Refreshed {
             fallbacks: 1,
             errors: vec![],
