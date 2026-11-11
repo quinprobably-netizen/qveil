@@ -422,8 +422,9 @@ fn run() -> Result<()> {
                 .with_context(|| format!("{target:?} isn't a YouTube video URL or ID"))?;
             let info = server.open(&v)?;
             // A pasted link has no card to take the channel's name from,
-            // and the history should have it.
-            if info.channel.is_none() && rt.cfg.history {
+            // and a quick lookup (see `ytdlp::LOOKUP`) has none either:
+            // the history should have it.
+            if info.details_later && info.channel.is_none() && rt.cfg.history {
                 server.name_later(&v);
             }
             player::play(&rt.cfg, &info)

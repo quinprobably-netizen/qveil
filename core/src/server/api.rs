@@ -58,7 +58,7 @@ impl Server {
     /// has been written in full: one that never reached the window wasn't watched.
     pub(super) fn play(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let watch = Watch::new(out);
-        // A lookup without the page has no name for the channel (see
+        // A quick lookup, without the page, has no name for the channel (see
         // `ytdlp::LOOKUP`), and the window has it from the card the video
         // was clicked on. It came from this computer, so the name is taken
         // as no more than a name.
@@ -1227,7 +1227,8 @@ echo '{"entries":[]}'"#,
     }
 
     /// A yt-dlp that answers a lookup without the page as YouTube's player
-    /// does: the channel's ID, but neither its name nor the upload date.
+    /// does: the channel's ID, but neither its name nor the upload date
+    /// (what a quick lookup gets, see `ytdlp::LOOKUP`).
     fn player_only_ytdlp(dir: &std::path::Path) -> String {
         crate::store::testing::script(
             &dir.join("yt-dlp"),
@@ -1247,6 +1248,7 @@ echo '{"entries":[]}'"#,
         let (s, base, _d) = server_with(Config {
             ytdlp: player_only_ytdlp(&bin.0),
             history: true,
+            quick_lookup: true,
             ..Config::default()
         });
         // Not subscribed: no name, and the window is told it can be had.
@@ -1266,22 +1268,29 @@ echo '{"entries":[]}'"#,
 
     #[test]
     fn a_play_whose_lookup_had_the_page_has_nothing_more_to_ask() {
-        let bin = TempDir::new();
-        let (_s, base, _d) = server_with(Config {
-            ytdlp: crate::store::testing::script(
-                &bin.0.join("yt-dlp"),
-                r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+        // By default, and with the quick lookup on when it fell back to
+        // the usual one.
+        for quick_lookup in [false, true] {
+            let bin = TempDir::new();
+            let (_s, base, _d) = server_with(Config {
+                ytdlp: crate::store::testing::script(
+                    &bin.0.join("yt-dlp"),
+                    r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
 grep -q player_skip "$conf" && { echo 'ERROR: [youtube] x: Video unavailable' >&2; exit 1; }
-echo '{"title":"T","channel":"Chan","timestamp":5,"url":"https://gv.test/c?expire=99999999999","protocol":"https","vcodec":"avc1"}'"#,
-            ),
-            ..Config::default()
-        });
-        let v = play_json(&base, "v=dQw4w9WgXcQ");
-        assert_eq!(
-            (&v["channel"], &v["published"]),
-            (&json!("Chan"), &json!(5))
-        );
-        assert!(v.get("detailsLater").is_none(), "{v}");
+echo '{"title":"T","channel":"Chan","timestamp":5,"url":"https://gv.test/c?expire=99999999999","protocol":"https","vcodec":"avc1","duration":600}'"#,
+                ),
+                quick_lookup,
+                ..Config::default()
+            });
+            let v = play_json(&base, "v=dQw4w9WgXcQ");
+            assert_eq!(
+                (&v["channel"], &v["published"]),
+                (&json!("Chan"), &json!(5)),
+                "quick {quick_lookup}"
+            );
+            assert!(v.get("detailsLater").is_none(), "{v}");
+            assert!(v.get("chaptersLater").is_none(), "{v}");
+        }
     }
 
     #[test]

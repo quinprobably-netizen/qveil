@@ -107,10 +107,16 @@ const EVERYWHERE: &[&str] = &[
     "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
     "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
     "Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.",
-    "Playing a video asks YouTube for its streams and not for its watch page (unless they can't be played without it, as with a video made for kids: then they are asked for again, page and all, with the same identity). What only the page has is fetched as one more lookup of that video, and only when it is wanted: chapters that its description doesn't name when you open the Chapters tab, and the channel's name and the video's age when it was played without them (from a pasted link, say).",
+    LOOKUP_POINT,
     "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing): on one address their timing links them, and even over Tor a set of related searches can be linked by content.",
     "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.",
 ];
+
+/// How a video is looked up, as it is unless the quick lookup is on.
+const LOOKUP_POINT: &str = "Playing a video, or getting it ready, looks it up the way yt-dlp does by itself: its watch page, and then YouTube's player for its streams, with the same identity. Its chapters, its channel's name and its age come with that lookup, and cost no request of their own.";
+/// How a video is looked up with `quick_lookup` on (experimental), in
+/// place of `LOOKUP_POINT`.
+const QUICK_LOOKUP_POINT: &str = "The quick lookup is on (experimental): playing a video asks YouTube for its streams and not for its watch page (unless they can't be played without it, as with a video made for kids: then they are asked for again, page and all, with the same identity). What only the page has is fetched as one more lookup of that video, and only when it is wanted: chapters that its description doesn't name when you open the Chapters tab, and the channel's name and the video's age when it was played without them (from a pasted link, say).";
 
 /// What the README says besides the above: the details behind them.
 const DETAILS: &[(&str, &str)] = &[
@@ -254,7 +260,13 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
     let points = kind
         .route_points()
         .into_iter()
-        .chain(EVERYWHERE.iter().copied())
+        .chain(EVERYWHERE.iter().map(|&p| {
+            if p == LOOKUP_POINT && cfg.quick_lookup {
+                QUICK_LOOKUP_POINT
+            } else {
+                p
+            }
+        }))
         // What is only true while a setting is on.
         .chain(cfg.topic_feeds.then_some(TOPICS_POINT))
         .chain(cfg.prepare_next.then_some(PREPARE_POINT))
@@ -673,6 +685,28 @@ mod tests {
             on.pages.prepare_on.contains("YouTube") && on.pages.prepare_on.contains("never watch")
         );
         assert!(on.pages.prepare_on.contains("pointed at it"));
+    }
+
+    #[test]
+    fn the_lookup_is_said_as_it_is_made() {
+        let net = Net::new(None, true).unwrap();
+        let usual = describe(&net, &Config::default()).points;
+        assert!(usual.iter().any(|p| p == LOOKUP_POINT));
+        assert!(!usual.iter().any(|p| p == QUICK_LOOKUP_POINT));
+        assert!(LOOKUP_POINT.contains("its watch page"));
+        assert!(LOOKUP_POINT.contains("chapters"));
+        assert!(markdown().contains(LOOKUP_POINT));
+        let quick = describe(
+            &net,
+            &Config {
+                quick_lookup: true,
+                ..Config::default()
+            },
+        )
+        .points;
+        assert!(quick.iter().any(|p| p == QUICK_LOOKUP_POINT));
+        assert!(!quick.iter().any(|p| p == LOOKUP_POINT));
+        assert_eq!(quick.len(), usual.len());
     }
 
     #[test]

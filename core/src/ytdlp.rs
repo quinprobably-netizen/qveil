@@ -69,25 +69,31 @@ const SKIP_MANIFESTS: &str = "youtube:skip=hls,dash";
 /// channel's page, not leave one out.)
 const SEARCH_ARGS: &str = "youtubetab:approximate_date;skip=webpage";
 
-/// How a video is looked up to be played: one request, YouTube's player
-/// answer for the client whose streams are played. Left to itself, yt-dlp
-/// first fetches the watch page (a megabyte of HTML, 0.85 to 1.07 s over
-/// Tor, measured), for the `web` client's player answer and the page data
-/// in it (chapters, likes, the channel's name); but `web`'s streams need a
-/// token that yt-dlp doesn't have and are dropped anyway, and without the
-/// page it would ask the player for `web` (and fetch its JavaScript) and
-/// the page data (`next`) one request at a time instead. So the page,
-/// the clients' own configuration pages, the page data and the `web`
-/// client are all left out, and the rest of yt-dlp's default clients are
-/// asked as they would have been. What the page data had is fetched apart,
-/// when it is wanted: see `details_of`. A video these clients can't play
-/// is asked for again the usual way: see `worth_the_usual_way`.
+/// How a video is looked up to be played, by default: `SKIP_MANIFESTS`,
+/// which is yt-dlp's own way, the watch page and then YouTube's player
+/// answer. The page brings what the player answer doesn't have (chapters,
+/// the channel's name, the upload date), so a play has them at once.
+///
+/// The quick lookup, off unless `quick_lookup` is set (experimental): one
+/// request, YouTube's player answer for the client whose streams are played.
+/// Left to itself, yt-dlp first fetches the watch page (a megabyte of HTML,
+/// 0.85 to 1.07 s over Tor, measured), for the `web` client's player answer
+/// and the page data in it; but `web`'s streams need a token that yt-dlp
+/// doesn't have and are dropped anyway. So the page, the clients' own
+/// configuration pages, the page data and the `web` client are all left
+/// out, and the rest of yt-dlp's default clients are asked as they would
+/// have been. Measured over Tor it failed for an ordinary video (Big Buck
+/// Bunny: one `visionos` player request, an error-sized answer, 2.7 s, most
+/// likely for want of the page's context), and then the usual lookup ran
+/// after it (see `worth_the_usual_way`): 6.0 s in place of 3.3 s, and one
+/// more request. So it is off until that is understood. What the page data
+/// had is then fetched apart, when it is wanted: see `details_of`.
 const LOOKUP: &str =
     "youtube:skip=hls,dash;player_skip=webpage,configs,initial_data;player_client=default,-web";
-/// How a video's chapters are looked up: the page data, from YouTube's
-/// `next` answer, and the player answer that yt-dlp can't do without (it
-/// has no way to skip that), but neither the page nor the player's
-/// JavaScript, and nothing is downloaded.
+/// How a video's chapters are looked up after a quick lookup (see
+/// `LOOKUP`): the page data, from YouTube's `next` answer, and the player
+/// answer that yt-dlp can't do without (it has no way to skip that), but
+/// neither the page nor the player's JavaScript, and nothing is downloaded.
 const CHAPTERS_LOOKUP: &str =
     "youtube:skip=hls,dash;player_skip=webpage,configs,js;player_client=default,-web";
 
@@ -113,6 +119,9 @@ pub struct Ytdlp {
     /// Every call is registered here, so that a route change or the engine's
     /// exit can stop it (see `Inflight`).
     pub calls: Arc<Inflight>,
+    /// Whether a video is looked up without its watch page (see `LOOKUP`):
+    /// the `quick_lookup` setting, off by default.
+    pub quick_lookup: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -133,11 +142,12 @@ pub struct Streams {
     pub published: Option<i64>,
     pub chapters: Vec<Chapter>,
     /// Whether the video may have chapters that the lookup didn't ask for:
-    /// it left the page data out (see `LOOKUP`), and the description named
-    /// none. They are then looked up apart, when they are wanted.
+    /// it was a quick one, which leaves the page data out (see `LOOKUP`),
+    /// and the description named none. They are then looked up apart, when
+    /// they are wanted.
     pub chapters_later: bool,
-    /// Whether the lookup left the page data out, and with it the
-    /// channel's name and the upload date: see `details_of`.
+    /// Whether the lookup (a quick one) left the page data out, and with
+    /// it the channel's name and the upload date: see `details_of`.
     pub details_later: bool,
 }
 
@@ -503,16 +513,18 @@ impl Ytdlp {
         abort: &dyn Fn() -> bool,
     ) -> Result<Streams> {
         let args = ["-J", "--no-playlist", "-f", format];
-        let quick = self.json_with(&args, Some(LOOKUP), url, RESOLVE, abort);
-        match quick.and_then(|v| streams_from(&v, url)) {
-            Ok(mut s) => {
-                s.chapters_later = s.chapters.is_empty();
-                s.details_later = true;
-                return Ok(s);
+        if self.quick_lookup {
+            let quick = self.json_with(&args, Some(LOOKUP), url, RESOLVE, abort);
+            match quick.and_then(|v| streams_from(&v, url)) {
+                Ok(mut s) => {
+                    s.chapters_later = s.chapters.is_empty();
+                    s.details_later = true;
+                    return Ok(s);
+                }
+                Err(e) if !worth_the_usual_way(&e) => return Err(e),
+                // Asked the usual way, page and all, below.
+                Err(_) => {}
             }
-            Err(e) if !worth_the_usual_way(&e) => return Err(e),
-            // Asked the usual way, page and all, below.
-            Err(_) => {}
         }
         let found = self
             .json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort)
@@ -523,10 +535,11 @@ impl Ytdlp {
         }
     }
 
-    /// What the page data says of a video, which a lookup to play it leaves
-    /// out (see `LOOKUP`): its chapters (what YouTube shows as its chapters,
-    /// which may have been made by YouTube, or else those the description
-    /// names), its channel's name and when it was uploaded.
+    /// What the page data says of a video, which a quick lookup to play it
+    /// leaves out (see `LOOKUP`): its chapters (what YouTube shows as its
+    /// chapters, which may have been made by YouTube, or else those the
+    /// description names), its channel's name and when it was uploaded.
+    /// Asked the usual way, page and all, unless the quick lookup is on.
     pub fn details_of(&self, url: &str, abort: &dyn Fn() -> bool) -> Result<Details> {
         let args = [
             "-J",
@@ -534,11 +547,14 @@ impl Ytdlp {
             "--skip-download",
             "--ignore-no-formats-error",
         ];
-        let v = match self.json_with(&args, Some(CHAPTERS_LOOKUP), url, QUICK, abort) {
-            Err(e) if worth_the_usual_way(&e) => {
-                self.json_with(&args, Some(SKIP_MANIFESTS), url, QUICK, abort)?
+        let usual = || self.json_with(&args, Some(SKIP_MANIFESTS), url, QUICK, abort);
+        let v = if self.quick_lookup {
+            match self.json_with(&args, Some(CHAPTERS_LOOKUP), url, QUICK, abort) {
+                Err(e) if worth_the_usual_way(&e) => usual()?,
+                found => found?,
             }
-            found => found?,
+        } else {
+            usual()?
         };
         Ok(Details {
             chapters: chapters(&v),
@@ -1048,6 +1064,7 @@ mod tests {
             bin,
             net: Net::new(proxy.map(String::from), true).unwrap(),
             calls: Arc::default(),
+            quick_lookup: false,
         }
     }
 
@@ -1191,10 +1208,26 @@ echo '{"entries":[]}'
         }
     }
 
+    /// `ytdlp`, with the quick lookup (see `LOOKUP`) turned on.
+    fn quick(mut yt: Ytdlp) -> Ytdlp {
+        yt.quick_lookup = true;
+        yt
+    }
+
     #[test]
-    fn a_lookup_asks_for_the_player_and_not_for_the_watch_page() {
+    fn a_lookup_fetches_the_watch_page_unless_the_quick_lookup_is_on() {
         let dir = TempDir::new();
         let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
+        let _ = yt.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b");
+        let config = spied(&dir, "config");
+        assert!(
+            config.contains("--extractor-args 'youtube:skip=hls,dash'\n"),
+            "{config}"
+        );
+        assert!(!config.contains("player_skip"), "{config}");
+
+        let dir = TempDir::new();
+        let yt = quick(ytdlp(script(&dir.0.join("yt-dlp"), SPY), None));
         let _ = yt.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b");
         assert!(
             spied(&dir, "config").contains(
@@ -1203,6 +1236,43 @@ echo '{"entries":[]}'
             "{}",
             spied(&dir, "config")
         );
+    }
+
+    /// With the page in the lookup, what it has (chapters, the channel's
+    /// name, the upload date) comes with the streams, and nothing is left
+    /// to be looked up later.
+    #[test]
+    fn a_lookup_with_the_page_has_its_details_in_one_call() {
+        let dir = TempDir::new();
+        let yt = ytdlp(
+            script(
+                &dir.0.join("yt-dlp"),
+                r#"echo run >> "$(dirname "$0")/calls"
+echo '{"title":"T","channel":"Chan","upload_date":"20251109","url":"https://gv.test/c","protocol":"https","vcodec":"avc1","duration":600,"chapters":[{"start_time":0,"title":"Intro"}]}'"#,
+            ),
+            None,
+        );
+        let s = yt
+            .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
+            .unwrap();
+        assert_eq!(s.channel.as_deref(), Some("Chan"));
+        assert_eq!(s.published, Some(1762646400));
+        assert_eq!(s.chapters.len(), 1);
+        assert!(!s.chapters_later && !s.details_later);
+        assert_eq!(spied(&dir, "calls"), "run\n");
+        // Without chapters, none are looked for later either.
+        let dir = TempDir::new();
+        let yt = ytdlp(
+            script(
+                &dir.0.join("yt-dlp"),
+                r#"echo '{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1","duration":600}'"#,
+            ),
+            None,
+        );
+        let s = yt
+            .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
+            .unwrap();
+        assert!(s.chapters.is_empty() && !s.chapters_later && !s.details_later);
     }
 
     #[test]
@@ -1221,6 +1291,7 @@ echo '{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"}
             ),
             None,
         );
+        let yt = quick(yt);
         let s = yt
             .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
             .unwrap();
@@ -1235,7 +1306,7 @@ echo '{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"}
     /// page and all, answers with a playable video. Each call is logged as
     /// `quick` or `usual`.
     fn quick_then_usual(dir: &TempDir, quick: &str) -> Ytdlp {
-        ytdlp(
+        self::quick(ytdlp(
             script(
                 &dir.0.join("yt-dlp"),
                 &format!(
@@ -1249,7 +1320,7 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
                 ),
             ),
             None,
-        )
+        ))
     }
 
     /// A video made for kids, among others, is only played by the clients
@@ -1327,10 +1398,16 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
     }
 
     #[test]
-    fn chapters_are_looked_up_from_the_watch_data_without_the_page_or_the_streams() {
+    fn details_are_looked_up_with_the_page_and_without_the_streams() {
+        for quick_lookup in [false, true] {
+            details_are_looked_up(quick_lookup);
+        }
+    }
+
+    fn details_are_looked_up(quick_lookup: bool) {
         let dir = TempDir::new();
         let answer = r#"{"duration":600,"channel":"Chan","uploader":"Chan","upload_date":"20251109","chapters":[{"start_time":0,"title":"Intro"},{"start_time":90,"title":"Part"}]}"#;
-        let yt = ytdlp(
+        let mut yt = ytdlp(
             script(
                 &dir.0.join("yt-dlp"),
                 &format!(
@@ -1340,6 +1417,7 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
             ),
             None,
         );
+        yt.quick_lookup = quick_lookup;
         let found = yt
             .details_of("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &|| false)
             .unwrap();
@@ -1361,12 +1439,14 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
         assert_eq!(found.channel.as_deref(), Some("Chan"));
         assert_eq!(found.published, Some(1762646400));
         let config = spied(&dir, "config");
-        assert!(
-            config.contains(
-                "--extractor-args 'youtube:skip=hls,dash;player_skip=webpage,configs,js;player_client=default,-web'\n"
-            ),
-            "{config}"
-        );
+        // The page and all, unless the quick lookup is on: then the page
+        // data from YouTube's `next` answer, without the page.
+        let args = if quick_lookup {
+            "--extractor-args 'youtube:skip=hls,dash;player_skip=webpage,configs,js;player_client=default,-web'\n"
+        } else {
+            "--extractor-args 'youtube:skip=hls,dash'\n"
+        };
+        assert!(config.contains(args), "{config}");
         let argv = spied(&dir, "argv");
         for arg in [
             "--skip-download",
@@ -1452,9 +1532,8 @@ echo '{"is_live":true}'"#,
         assert_eq!(err.to_string(), LIVE_UNSUPPORTED);
         let calls = spied(&dir, "calls");
         let calls: Vec<_> = calls.lines().collect();
-        // The quick lookup, the usual one (which finds no format either),
-        // and the one that says why.
-        assert_eq!(calls, ["skipped", "skipped", "full"]);
+        // The lookup, which finds no format, and the one that says why.
+        assert_eq!(calls, ["skipped", "full"]);
     }
 
     #[test]
@@ -1659,6 +1738,7 @@ def main(argv=None):
             bin,
             net: Net::new(Some("http://user:SECRETPW@127.0.0.1:3128".into()), true).unwrap(),
             calls: Arc::default(),
+            quick_lookup: false,
         }
     }
 

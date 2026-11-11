@@ -1,11 +1,13 @@
 //! `GET api/chapters`: what a video's page data says, fetched when the
 //! window asks: its chapters, its channel's name and when it was uploaded.
 //!
-//! A lookup to play a video leaves out YouTube's page data (see
-//! `ytdlp::LOOKUP`), so a video whose description names no chapters may
-//! still have some (YouTube makes them for some videos), and a video played
-//! without a card to take them from (a pasted link) has no channel name or
-//! age. They cost a lookup of their own, so they are only fetched when the
+//! A lookup to play a video has them, with the watch page; but a quick one
+//! (`quick_lookup`, experimental: see `ytdlp::LOOKUP`) leaves out YouTube's
+//! page data, so a video whose description names no chapters may still have
+//! some (YouTube makes them for some videos), and a video played without a
+//! card to take them from (a pasted link) has no channel name or age. The
+//! play answer then says so (`chaptersLater`, `detailsLater`), and only then
+//! does the window ask here. They cost a lookup of their own, so they are only fetched when the
 //! window wants them (the Chapters tab is opened, or the video has no
 //! channel name or age to show), one lookup at a time, and what was fetched
 //! is kept (in memory only) so that asking again doesn't ask YouTube again.
@@ -210,8 +212,12 @@ echo '{{"duration":600,"channel":"Chan","upload_date":"20251109","chapters":[{{"
             args.contains("--skip-download") && !args.contains(ID),
             "{args}"
         );
+        // The page and all: the quick lookup is off.
         let asked = std::fs::read_to_string(bin.0.join("asked")).unwrap();
-        assert!(asked.contains("player_skip=webpage,configs,js"), "{asked}");
+        assert!(
+            asked.contains("--extractor-args 'youtube:skip=hls,dash'\n"),
+            "{asked}"
+        );
         assert!(asked.lines().last().unwrap().contains(ID), "{asked}");
         // And again later, from memory.
         assert_eq!(get(&base, &format!("v={ID}")).0, 200);

@@ -55,6 +55,13 @@ keep_thumbnails = false
 # Channel feeds fetched at once.
 feed_workers = 4
 
+# Experimental: look a video up without its watch page, asking only YouTube's
+# player for its streams, and fetch its chapters, channel name and age apart
+# when they are wanted. Measured over Tor it failed for ordinary videos and
+# then fetched the page anyway, which made a play slower and added a request,
+# so it is off.
+# quick_lookup = false
+
 ytdlp = "yt-dlp"
 mpv = "mpv"
 mpv_args = []

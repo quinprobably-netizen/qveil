@@ -56,6 +56,7 @@ impl Runtime {
             cache_dir: paths.ytdlp_cache(),
             net: net.clone(),
             calls: Arc::default(),
+            quick_lookup: cfg.quick_lookup,
         };
         Ok(Self {
             cfg,
@@ -91,6 +92,7 @@ impl Runtime {
             cache_dir: self.yt.cache_dir.clone(),
             net: self.net.pinned(),
             calls: Arc::clone(&self.yt.calls),
+            quick_lookup: self.yt.quick_lookup,
         }
     }
 
@@ -1076,8 +1078,9 @@ pub fn load_history(paths: &Paths) -> Result<History> {
 }
 
 /// Adds `w` to the history, in place of the same video's entry if it has
-/// one. A video played without its channel's name (from a pasted link: see
-/// `ytdlp::LOOKUP`) keeps the name its entry had.
+/// one. A video played without its channel's name (from a pasted link,
+/// with the quick lookup on: see `ytdlp::LOOKUP`) keeps the name its entry
+/// had.
 pub fn record_history(paths: &Paths, mut w: Watched) -> Result<()> {
     let _lock = store::lock(paths)?;
     let mut h = load_history(paths)?;

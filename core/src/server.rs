@@ -283,10 +283,10 @@ impl Server {
     /// watched. `abort` is asked while yt-dlp runs, and ends it as soon as it
     /// says yes (see `Ytdlp::resolve_until`).
     ///
-    /// A lookup without the page has no name for the channel (see
-    /// `ytdlp::LOOKUP`): it is then `channel`, the name on the card the video
-    /// was picked from, or else the name of the subscription to it, if
-    /// there is one.
+    /// The lookup names the channel. A quick one, without the page, has no
+    /// name for it (see `ytdlp::LOOKUP`): it is then `channel`, the name on
+    /// the card the video was picked from, or else the name of the
+    /// subscription to it, if there is one.
     fn open_until(
         self: &Arc<Self>,
         v: &VideoRef,

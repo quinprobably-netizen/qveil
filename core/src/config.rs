@@ -40,6 +40,9 @@ pub struct Config {
     pub prepare_next: bool,
     /// How many channel feeds to fetch at once.
     pub feed_workers: usize,
+    /// Experimental, and off: look a video up without its watch page (see
+    /// `ytdlp::LOOKUP`). Not in the window's settings.
+    pub quick_lookup: bool,
     pub ytdlp: String,
     pub mpv: String,
     /// Extra arguments passed to mpv.
@@ -64,6 +67,7 @@ impl Default for Config {
             keep_thumbnails: false,
             prepare_next: false,
             feed_workers: 4,
+            quick_lookup: false,
             ytdlp: "yt-dlp".into(),
             mpv: "mpv".into(),
             mpv_args: vec![],
