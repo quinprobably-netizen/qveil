@@ -101,6 +101,14 @@ impl Launch {
     }
 }
 
+#[cfg(test)]
+impl Launch {
+    /// The Python that runs yt-dlp, and the script (or zipapp) it runs.
+    pub fn python_and_script(&self) -> (&Path, &Path, bool) {
+        (&self.python, &self.script, self.zipped)
+    }
+}
+
 /// How `bin` (a name looked up in `PATH`, or a path) could be run as a
 /// spare, if it can.
 pub fn launch_for(bin: &str) -> Option<Launch> {

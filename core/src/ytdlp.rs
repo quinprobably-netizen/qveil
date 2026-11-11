@@ -1720,6 +1720,102 @@ wait
         let msg = direct.search("x", 1).unwrap_err().to_string();
         assert!(msg.contains("Connection refused"), "{msg}");
     }
+
+    /// What yt-dlp's own option parser makes of `--extractor-args value`,
+    /// with no network and none of the user's configuration: the parser only
+    /// reads the arguments. `None` if the installed yt-dlp isn't a Python one
+    /// that can be run that way.
+    fn parsed_extractor_args(value: &str) -> Option<Value> {
+        const PARSE: &str = r#"import json, os, sys
+script, zipped = sys.argv[1], sys.argv[2] == "1"
+sys.path.insert(0, script if zipped else os.path.dirname(os.path.realpath(script)))
+import yt_dlp
+parsed = yt_dlp.parse_options(["--ignore-config", "--extractor-args", sys.argv[3]])
+print(json.dumps(parsed.ydl_opts["extractor_args"]))
+"#;
+        let launch = spare::launch_for("yt-dlp")?;
+        let (python, script, zipped) = launch.python_and_script();
+        let out = Command::new(python)
+            .args(["-P", "-c", PARSE])
+            .arg(script)
+            .arg(if zipped { "1" } else { "0" })
+            .arg(value)
+            .env("YTDLP_NO_PLUGINS", "1")
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "yt-dlp doesn't take {value:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(serde_json::from_slice(&out.stdout).unwrap())
+    }
+
+    #[test]
+    fn yt_dlp_reads_the_extractor_arguments_the_way_they_are_meant() {
+        let Some(manifests) = parsed_extractor_args(SKIP_MANIFESTS) else {
+            eprintln!("skipped: no yt-dlp that is a Python script");
+            return;
+        };
+        assert_eq!(
+            manifests,
+            serde_json::json!({"youtube": {"skip": ["hls", "dash"]}})
+        );
+        assert_eq!(
+            parsed_extractor_args(LOOKUP).unwrap(),
+            serde_json::json!({"youtube": {
+                "skip": ["hls", "dash"],
+                "player_skip": ["webpage", "configs", "initial_data"],
+                "player_client": ["default", "-web"],
+            }})
+        );
+        assert_eq!(
+            parsed_extractor_args(CHAPTERS_LOOKUP).unwrap(),
+            serde_json::json!({"youtube": {
+                "skip": ["hls", "dash"],
+                "player_skip": ["webpage", "configs", "js"],
+                "player_client": ["default", "-web"],
+            }})
+        );
+        // A key with no value (`approximate_date`) is there with an empty one.
+        assert_eq!(
+            parsed_extractor_args(SEARCH_ARGS).unwrap(),
+            serde_json::json!({"youtubetab": {
+                "approximate_date": [""],
+                "skip": ["webpage"],
+            }})
+        );
+    }
+
+    /// Asks YouTube, through the real yt-dlp and without a proxy, to see that
+    /// what the tests above only parse still works: a search, and the
+    /// lookup of the first video it finds. Not run with the rest; run it
+    /// with `cargo test -- --ignored live_`.
+    #[test]
+    #[ignore = "asks YouTube: cargo test -- --ignored live_"]
+    fn live_a_search_and_the_lookup_of_one_video_still_work() {
+        let dir = TempDir::new();
+        let yt = Ytdlp {
+            bin: "yt-dlp".into(),
+            cache_dir: dir.0.join("cache").join("qveil"),
+            net: Net::new(None, true).unwrap(),
+            calls: Arc::default(),
+            quick_lookup: false,
+        };
+        let found = yt.search("blender open movie", 5).unwrap();
+        let video = found
+            .iter()
+            .find(|v| !v.live)
+            .expect("a search finds a video that isn't live");
+        assert!(!video.title.is_empty());
+        let url = format!("https://www.youtube.com/watch?v={}", video.id);
+        let streams = yt
+            .resolve(&url, &crate::config::Config::default().format())
+            .unwrap();
+        assert!(streams.video.starts_with("https://"), "{}", streams.video);
+        assert!(!streams.title.is_empty());
+    }
 }
 
 #[cfg(test)]
