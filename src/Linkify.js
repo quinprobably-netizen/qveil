@@ -14,6 +14,8 @@ const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/
 function isYouTube(host) {
     return host === "youtu.be" || host === "youtube.com" || host === "www.youtube.com"
         || host === "m.youtube.com" || host === "music.youtube.com"
+        // The privacy-enhanced embeds, as the engine reads them too.
+        || host === "youtube-nocookie.com" || host === "www.youtube-nocookie.com"
 }
 
 // What a link names, if it is YouTube's: { kind: "video" | "channel", id }.
