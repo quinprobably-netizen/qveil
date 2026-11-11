@@ -1340,6 +1340,43 @@ private slots:
         QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Glaze tests: 36 tiles, one kiln load"));
     }
 
+    void forgettingTheLeadCanBeUndone()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QQuickItem *toast = app.item("toast"), *undo = app.item("toast-undo");
+        QVERIFY(toast && undo);
+        QVERIFY(!undo->isVisible());
+        app.click(app.item("lead-forget"));
+        // The place is gone, and the line that says so offers it back.
+        QTRY_COMPARE(app.asked("POST api/resume/rm"), 1);
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Crossing the Pamir on a steel bike, part 3"));
+        QTRY_VERIFY(toast->isVisible() && undo->isVisible());
+        QCOMPARE(app.asked().count("POST api/resume"), 0);
+
+        app.click(undo);
+        // Noted again where it was, and it leads again.
+        QTRY_COMPARE(app.asked().count("POST api/resume"), 1);
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
+        QCOMPARE(app.backend->resume().first().toMap().value("pos").toInt(), 845);
+        QCOMPARE(app.backend->resume().first().toMap().value("dur").toInt(), 2463);
+        QTRY_VERIFY(!undo->isVisible());
+    }
+
+    void theOfferToUndoGoesWhenAnotherLineTakesTheToast()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QQuickItem *undo = app.item("toast-undo");
+        app.click(app.item("lead-forget"));
+        QTRY_VERIFY(undo->isVisible());
+        QMetaObject::invokeMethod(app.item("toast"), "show", Q_ARG(QVariant, QString("Link copied")));
+        QVERIFY(!undo->isVisible());
+        QCOMPARE(app.asked().count("POST api/resume"), 0);
+    }
+
     void startingOverForgetsThePlaceOnceTheVideoHasBegun()
     {
         QTemporaryDir dir;

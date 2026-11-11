@@ -287,6 +287,20 @@ ApplicationWindow {
         startingOver = video.id
     }
 
+    // A place that was forgotten (what the engine had kept for the video) can
+    // be had back while the line that says so is up: it is noted again as it
+    // was. The forgetting itself is done at once, so quitting leaves it done.
+    property var forgot: null
+    function forgotPlace(kept) {
+        forgot = kept
+        toast.offer(qsTr("Forgot where you stopped"), qsTr("Undo"))
+    }
+    function restorePlace() {
+        if (forgot)
+            backend.noteResume(forgot, forgot.pos, forgot.dur)
+        forgot = null
+    }
+
     // Picture in picture: the video leaves the page for a small window of
     // its own, or comes back from it. Each has a player of its own; the
     // video carries on in the other from where it was, and only one plays.
@@ -644,6 +658,7 @@ ApplicationWindow {
                     onChannelRequested: id => win.openChannel(id)
                     onResumed: (video, list, index) => win.play(video, list, index)
                     onRestarted: (video, list, index) => win.startOver(video, list, index)
+                    onForgotten: kept => win.forgotPlace(kept)
                     onShortsToggled: shown => {
                         prefs.showShorts = shown
                         backend.refreshFeed(false, shown)
@@ -827,6 +842,7 @@ ApplicationWindow {
             anchors.bottom: parent.bottom
             anchors.bottomMargin: Style.gutter
             z: 5
+            onActed: win.restorePlace()
         }
 
         ResumeNotice {

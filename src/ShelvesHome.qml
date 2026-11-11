@@ -91,6 +91,8 @@ FocusScope {
     // The lead is picked up, or played from its start: `list` is what comes after it.
     signal resumed(var video, var list, int index)
     signal restarted(var video, var list, int index)
+    // The place kept for the lead was forgotten: `kept` is what it was.
+    signal forgotten(var kept)
     signal allRequested(string feed)
     signal channelRequested(string id)
     signal refreshRequested()
@@ -281,7 +283,7 @@ FocusScope {
             if (leadAction === 1)
                 startOver(kept)
             else if (leadAction === 2)
-                backend.forgetResume(kept.id)
+                forget(kept)
             else
                 resume(kept)
             return
@@ -303,6 +305,10 @@ FocusScope {
     function resume(kept) {
         const list = afterLead(kept)
         page.resumed(list.get(0), list, 0)
+    }
+    function forget(kept) {
+        backend.forgetResume(kept.id)
+        page.forgotten(kept)
     }
     function startOver(kept) {
         // (The place is forgotten once the video has begun, not before: see Main.)
@@ -532,7 +538,7 @@ FocusScope {
                         quiet: true
                         marked: page.leadSelected && page.leadAction === 2
                         tip: qsTr("Forget where you stopped in this video")
-                        onClicked: backend.forgetResume(lead.kept.id)
+                        onClicked: page.forget(lead.kept)
                     }
                     Text {
                         objectName: "lead-kept"
