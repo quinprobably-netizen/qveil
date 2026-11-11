@@ -725,7 +725,8 @@ impl Server {
         );
         out.write_all(head.as_bytes())?;
         out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
-        ahead.drain_into(out, &s.cancelled)
+        let player = Watch::new(out);
+        ahead.drain_into(out, &s.cancelled, &player)
     }
 
     /// Resolves the session's video again on a fresh pinned identity and
@@ -998,8 +999,16 @@ impl Ahead {
     /// Writes what the fetcher delivers to the player, until the range is
     /// complete. As in `copy_body`, a failed write or a cancel ends it
     /// quietly, and a stream that broke upstream is returned as an error, so
-    /// the player is left short of the Content-Length.
-    fn drain_into(&self, out: &mut impl Write, cancelled: &AtomicBool) -> Result<()> {
+    /// the player is left short of the Content-Length. So does a player
+    /// that hangs up while nothing comes (`player` watches its socket):
+    /// otherwise that would only be found out once the next bytes came,
+    /// and the fetcher would carry on for it until then.
+    fn drain_into(
+        &self,
+        out: &mut impl Write,
+        cancelled: &AtomicBool,
+        player: &Watch,
+    ) -> Result<()> {
         loop {
             let block = {
                 let mut st = lock(&self.state);
@@ -1021,6 +1030,7 @@ impl Ahead {
                             }
                             .into());
                         }
+                        None if player.gone() => return Ok(()),
                         None => st = self.wait(st),
                     }
                 }
@@ -2258,6 +2268,42 @@ EOF
             || up.gauge.live.load(Ordering::SeqCst) == 0,
         );
         assert_eq!(settled(&up), 1, "no further chunk was asked for");
+    }
+
+    #[test]
+    fn a_player_that_hangs_up_while_nothing_comes_is_let_go_at_once() {
+        let up = Upstream::start();
+        let relay = Freezer::start(up.addr);
+        let idle = Duration::from_secs(3);
+        let (s, base, _d) = server_tuned(Config::default(), |rt| {
+            rt.net = rt.net.clone().idling_after(idle);
+            rt.yt.net = rt.net.clone();
+        });
+        let sid = add_session(&s, relay.url("/big?pace=5"));
+        let session = s.session(&sid).unwrap();
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0;
+        while got < 100 << 10 {
+            got += player.read(&mut buf).unwrap();
+        }
+        // The route stalls, the player takes all there is, and hangs up
+        // while the relay waits for more.
+        relay.freeze();
+        player
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        while player.read(&mut buf).is_ok_and(|n| n > 0) {}
+        let dropped = Instant::now();
+        drop(player);
+        wait_for("the relay to let go", idle, || {
+            lock(&session.clients).is_empty()
+        });
+        eprintln!("let go after {:?}", dropped.elapsed());
+        // And when the stalled read gives up, nothing is asked for again
+        // for a player that has gone.
+        std::thread::sleep(idle + Duration::from_secs(1));
+        assert_eq!(up.requests().len(), 1, "{:?}", up.requests());
     }
 
     #[test]
