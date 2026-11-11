@@ -38,6 +38,20 @@ pub(super) const SEEK_CHUNK: u64 = 512 << 10;
 /// What a spare connection's request reads at most: its one byte, or a
 /// short error.
 const SPARE_MAX: u64 = 64 << 10;
+/// How often a session may ask for a spare connection (see
+/// `Session::keep_spare`). Each is a `bytes=0-0` request that googlevideo
+/// sees, and a player that seeks a lot would otherwise ask for one with
+/// every chunk (18 of 43 requests in one session over Tor, measured).
+const SPARE_EVERY: Duration = Duration::from_secs(10);
+/// How long a spare connection has to be ready (connected, and its one
+/// byte in) before it is given up on. Over Tor a new connection answers in
+/// under a second (325 to 691 ms, measured), but one dialled while the
+/// circuit was busy took 11 s, and was never used.
+pub(super) const SPARE_WITHIN: Duration = Duration::from_secs(3);
+/// How long a connection back in a client's pool is taken to stay there
+/// (see `Pool`). The client keeps one 90 s, but googlevideo may close it
+/// sooner, and then a spare would be wanted.
+const POOLED_FOR: Duration = Duration::from_secs(30);
 /// How often a relay waiting on the other side of `Ahead` looks at the cancel flag.
 const AHEAD_POLL: Duration = Duration::from_millis(250);
 /// How often a session may put a new client, or a new lookup, in place of
@@ -66,8 +80,8 @@ pub(super) struct Session {
     /// The client sockets of the relays in flight, so that cancelling can
     /// wake one that is blocked writing to a player that has paused.
     clients: Mutex<Vec<(u64, TcpStream)>>,
-    /// Set while a spare connection is being made ready (see `keep_spare`).
-    sparing: AtomicBool,
+    /// The spare connection being made ready, and the last (see `keep_spare`).
+    pub(super) spare: Mutex<Spare>,
     /// When a stalled client was last replaced (see `Server::recover`).
     recovered: Mutex<Option<Instant>>,
 }
@@ -83,7 +97,7 @@ impl Session {
             cancelled: AtomicBool::new(false),
             warm: Warm::default(),
             clients: Mutex::new(Vec::new()),
-            sparing: AtomicBool::new(false),
+            spare: Mutex::default(),
             recovered: Mutex::new(None),
         }
     }
@@ -120,27 +134,47 @@ impl Session {
     /// handshake through the circuit (325 to 691 ms, measured). It is a
     /// one-byte request for the start of the stream, on the same client and
     /// so on the same circuit, read to its end so that its connection goes
-    /// back to the client's pool; where the pool had an idle connection,
-    /// that is the one it uses. Over HTTP/2 every request shares one
-    /// connection, and there is nothing to spare.
+    /// back to the client's pool.
+    ///
+    /// It is a request googlevideo sees, and a connection more, so there is
+    /// one at most: none while the pool has an idle connection already (a
+    /// spare not used yet, or a chunk read to its end), none while another
+    /// is being made ready, none within `SPARE_EVERY` of the last, and one
+    /// that isn't ready within `SPARE_WITHIN` is given up on. Over HTTP/2
+    /// every request shares one connection, and there is nothing to spare.
     fn keep_spare(self: &Arc<Self>, live: &Live, kind: &str, up: &reqwest::blocking::Response) {
         if up.version() >= reqwest::Version::HTTP_2
             || self.cancelled.load(Ordering::Acquire)
-            || self.sparing.swap(true, Ordering::AcqRel)
+            || live.pool.has_idle()
         {
             return;
         }
+        {
+            let mut spare = lock(&self.spare);
+            if spare.dialing || spare.last.is_some_and(|t| t.elapsed() < SPARE_EVERY) {
+                return;
+            }
+            *spare = Spare {
+                dialing: true,
+                last: Some(Instant::now()),
+            };
+        }
         let (s, live, kind) = (Arc::clone(self), live.clone(), kind.to_string());
         let spawned = std::thread::Builder::new().spawn(move || {
+            let range = Some("bytes=0-0");
             if let Ok(Some(mut spare)) =
-                fetch_upstream(&live, &s.route, "GET", &kind, Some("bytes=0-0"))
+                send_upstream(&live, &s.route, "GET", &kind, range, Some(SPARE_WITHIN))
             {
-                let _ = io::copy(&mut (&mut spare).take(SPARE_MAX), &mut io::sink());
+                let read = io::copy(&mut (&mut spare).take(SPARE_MAX), &mut io::sink());
+                // Read to its end, its connection is back in the pool.
+                if read.is_ok_and(|n| n < SPARE_MAX) {
+                    live.pool.put_back();
+                }
             }
-            s.sparing.store(false, Ordering::Release);
+            lock(&s.spare).dialing = false;
         });
         if spawned.is_err() {
-            self.sparing.store(false, Ordering::Release);
+            lock(&self.spare).dialing = false;
         }
     }
 
@@ -150,6 +184,15 @@ impl Session {
         lock(&self.clients).push((id, client.try_clone()?));
         Ok(Attached { session: self, id })
     }
+}
+
+/// A session's spare connection (see `Session::keep_spare`).
+#[derive(Default)]
+pub(super) struct Spare {
+    /// One is being made ready.
+    pub(super) dialing: bool,
+    /// When the last was asked for.
+    last: Option<Instant>,
 }
 
 struct Attached<'a> {
@@ -179,6 +222,42 @@ pub(super) struct Live {
     pub(super) client: Client,
     /// When `client` last brought anything: a response, or a byte of one.
     pub(super) served: Arc<Served>,
+    /// The connections idle in `client`'s pool.
+    pub(super) pool: Arc<Pool>,
+}
+
+/// The connections idle in a client's pool, as far as the relay can tell
+/// (reqwest doesn't say), for `Session::keep_spare`. Over HTTP/1.1 a
+/// connection carries one request at a time: every request takes an idle
+/// one if there is one, and a response read to its end (a chunk, or a
+/// spare's one byte) puts its connection back. One that is cut short is
+/// closed. What the warm-up reads isn't counted, so there may be more than
+/// it says, which costs a spare too many and never one too few; and one is
+/// taken to be gone after `POOLED_FOR`.
+#[derive(Default)]
+pub(super) struct Pool(Mutex<Vec<Instant>>);
+
+impl Pool {
+    /// A response was read to its end, and its connection is idle again.
+    pub(super) fn put_back(&self) {
+        lock(&self.0).push(Instant::now());
+    }
+
+    /// A request is about to go out, on an idle connection if there is one.
+    fn take(&self) {
+        let mut idle = self.fresh();
+        idle.pop();
+    }
+
+    pub(super) fn has_idle(&self) -> bool {
+        !self.fresh().is_empty()
+    }
+
+    fn fresh(&self) -> MutexGuard<'_, Vec<Instant>> {
+        let mut idle = lock(&self.0);
+        idle.retain(|t| t.elapsed() < POOLED_FOR);
+        idle
+    }
 }
 
 /// When a client last brought anything, which tells a client that is stuck
@@ -422,6 +501,7 @@ impl Server {
         }
         live.client = s.route.pinned().relay_client().ok()?;
         live.served = Arc::default();
+        live.pool = Arc::default();
         live.dial += 1;
         let fresh = live.clone();
         drop(live);
@@ -567,6 +647,7 @@ impl Server {
             headers: streams.headers,
             client: yt.net.relay_client()?,
             served: Arc::default(),
+            pool: Arc::default(),
         };
         *lock(&s.live) = fresh.clone();
         // A lookup kept for playing it again has stopped working too.
@@ -583,6 +664,19 @@ pub(super) fn fetch_upstream(
     method: &str,
     kind: &str,
     range: Option<&str>,
+) -> Result<Option<reqwest::blocking::Response>, UpError> {
+    send_upstream(live, route, method, kind, range, None)
+}
+
+/// `fetch_upstream`, given up on if its response hasn't come `within`
+/// (connecting included), where that is set.
+fn send_upstream(
+    live: &Live,
+    route: &Net,
+    method: &str,
+    kind: &str,
+    range: Option<&str>,
+    within: Option<Duration>,
 ) -> Result<Option<reqwest::blocking::Response>, UpError> {
     let url = match kind {
         "v" => live.video.as_str(),
@@ -603,6 +697,10 @@ pub(super) fn fetch_upstream(
     if let Some(r) = range {
         rb = rb.header(RANGE, r);
     }
+    if let Some(t) = within {
+        rb = rb.timeout(t);
+    }
+    live.pool.take();
     match rb.send() {
         Ok(up) => {
             live.served.mark();
@@ -904,7 +1002,10 @@ impl Fetcher {
                 return Taken::Stopped;
             }
             let n = match up.read(&mut buf) {
-                Ok(0) if self.pos > self.chunk_end => return Taken::Complete,
+                Ok(0) if self.pos > self.chunk_end => {
+                    self.live.pool.put_back();
+                    return Taken::Complete;
+                }
                 Ok(0) => return Taken::Broke("the stream ended early upstream".into()),
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1137,6 +1238,7 @@ mod tests {
                 headers: vec![],
                 client: rt.net.relay_client().unwrap(),
                 served: Arc::default(),
+                pool: Arc::default(),
             },
         )
     }
@@ -1785,6 +1887,125 @@ mod tests {
             "{asked:?}"
         );
         assert!(up.connections() >= 2);
+    }
+
+    /// Over HTTP/1.1, a session keeps one connection to spare at most, and
+    /// asks for it rarely: the one-byte request it takes is a request
+    /// googlevideo sees, and a spare dialled while the others are busy only
+    /// adds a connection.
+    #[test]
+    fn over_many_chunks_and_seeks_a_spare_is_asked_for_rarely_and_connections_stay_few() {
+        let up = KeepAlive::start(Duration::from_millis(30));
+        let (s, base, _d) = server();
+        s.sparing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let size = 40u64 << 20;
+        let sid = add_session(&s, up.url(&format!("/big?size={size}")));
+        let stream = format!("s/{sid}/v");
+        let started = Instant::now();
+        // It plays a moment from the start, and the owner seeks past what
+        // is cached: the player hangs up mid-chunk.
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0;
+        while got < 100 << 10 {
+            got += player.read(&mut buf).unwrap();
+        }
+        wait_for("the spare", Duration::from_secs(5), || {
+            up.ranges().iter().any(|r| r == "bytes=0-0")
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        drop(player);
+        // Then seeks here and there, each played through more than one
+        // chunk, and a long stretch of full chunks.
+        let mut asked: Vec<(u64, u64)> = (0..12u64)
+            .map(|i| {
+                let from = (i * (3 << 20) + 12_345) % (size - (2 << 20));
+                (from, from + (3 << 19))
+            })
+            .collect();
+        asked.push((0, (25 << 20) - 1));
+        for (from, to) in asked {
+            std::thread::sleep(Duration::from_millis(30));
+            let (status, _, body) = fetch(
+                &base,
+                "GET",
+                &stream,
+                &[("Range", &format!("bytes={from}-{to}"))],
+            );
+            assert_eq!(status, 206);
+            assert!(body == big_bytes(from, to + 1), "bytes {from}-{to}");
+        }
+        let took = started.elapsed();
+        let pings = up.ranges().iter().filter(|r| *r == "bytes=0-0").count();
+        eprintln!(
+            "{pings} pings, {} connections in {took:?}",
+            up.connections()
+        );
+        assert!(
+            pings as u64 <= 1 + took.as_secs() / 10,
+            "{pings} pings in {took:?}: {:?}",
+            up.ranges()
+        );
+        assert!(up.connections() <= 3, "{} connections", up.connections());
+    }
+
+    #[test]
+    fn no_spare_is_asked_for_over_http2() {
+        use crate::h2up::H2Upstream;
+        let up = H2Upstream::start();
+        let (s, base, _d) = server_h2c();
+        s.sparing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let sid = add_session(&s, up.url("/big"));
+        for (from, to) in [(0u64, CHUNK + 99), (5 << 20, (5 << 20) + 99)] {
+            let (status, _, _) = fetch(
+                &base,
+                "GET",
+                &format!("s/{sid}/v"),
+                &[("Range", &format!("bytes={from}-{to}"))],
+            );
+            assert_eq!(status, 206);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let ranges = up.ranges();
+        assert!(
+            !ranges.iter().any(|r| r.as_deref() == Some("bytes=0-0")),
+            "{ranges:?}"
+        );
+        assert_eq!(up.connections(), 1);
+    }
+
+    /// A spare that isn't ready within `SPARE_WITHIN` is no use for the
+    /// seek it is for (over Tor one made while the circuit was busy took
+    /// 11 s): it is given up on, and doesn't hold the next one back.
+    #[test]
+    fn a_spare_that_is_slow_to_connect_is_given_up_on() {
+        // The first connection is quick, and every one after it hangs.
+        let up = KeepAlive::start_dialling(|n| Duration::from_secs(if n == 0 { 0 } else { 20 }));
+        let (s, base, _d) = server();
+        s.sparing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let size = 40u64 << 20;
+        let sid = add_session(&s, up.url(&format!("/big?size={size}&pace=20")));
+        let session = s.session(&sid).unwrap();
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        assert!(player.read(&mut buf).unwrap() > 0);
+        wait_for("the spare to be dialled", Duration::from_secs(5), || {
+            up.connections() == 2
+        });
+        let dialled = Instant::now();
+        assert!(lock(&session.spare).dialing);
+        wait_for(
+            "the spare to be given up on",
+            Duration::from_secs(5),
+            || !lock(&session.spare).dialing,
+        );
+        let took = dialled.elapsed();
+        assert!(
+            took >= SPARE_WITHIN - Duration::from_millis(500)
+                && took < SPARE_WITHIN + Duration::from_secs(1),
+            "{took:?}"
+        );
+        drop(player);
     }
 
     #[test]

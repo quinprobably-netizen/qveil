@@ -392,6 +392,11 @@ pub struct KeepAlive {
 
 impl KeepAlive {
     pub fn start(dial: Duration) -> Self {
+        Self::start_dialling(move |_| dial)
+    }
+
+    /// `start`, where the `n`th connection (from 0) costs `dial(n)`.
+    pub fn start_dialling(dial: impl Fn(usize) -> Duration + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (seen, gauge) = (Seen::default(), Arc::new(Gauge::default()));
@@ -403,7 +408,7 @@ impl KeepAlive {
         );
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
-                count.fetch_add(1, Ordering::SeqCst);
+                let dial = dial(count.fetch_add(1, Ordering::SeqCst));
                 let (log, gauge) = (Arc::clone(&log), Arc::clone(&counted));
                 std::thread::spawn(move || {
                     std::thread::sleep(dial);

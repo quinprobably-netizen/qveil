@@ -85,7 +85,7 @@ PRIVACY = {
     "summary": "Direct: YouTube sees your IP address.",
     # As long as the engine's own, so that what holds them is tried at its real size.
     "points": ["YouTube sees your IP address with every request, which links them all.",
-               "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits.",
+               "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits, and by the one-byte request (bytes=0-0) for the start of a video that keeps a connection ready for a seek, sent at most once every 10 seconds while it plays over HTTP/1.1.",
                "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
                "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
                "Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.",

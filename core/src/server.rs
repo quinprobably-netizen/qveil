@@ -471,6 +471,7 @@ impl Server {
             headers: s.headers.clone(),
             client: yt.net.relay_client()?,
             served: Arc::default(),
+            pool: Arc::default(),
         };
         Ok((s, live))
     }
