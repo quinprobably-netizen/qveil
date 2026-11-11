@@ -733,10 +733,17 @@ private slots:
         QVERIFY(pages.value("comments").toString().contains("only when you open them"));
         QVERIFY(pages.value("lenses").toString().contains("one search per topic"));
         QCOMPARE(rig.window().config().value("resumeDays").toInt(), 7);
-        // An engine that sends none of them leaves them empty, not missing.
-        const QVariantMap none = Backend::privacyOf({}).value("pages").toMap();
-        for (const char *key : {"resume", "comments", "lenses"})
-            QVERIFY(none.contains(key) && none.value(key).toString().isEmpty());
+        // Every line the engine sends is one the window passes on: a key the
+        // engine gains fails here until privacyOf lists it, so it never goes
+        // unshown.
+        const QVariantMap sent = rig.window().config().value("privacy").toMap();
+        const QVariantMap shown = Backend::privacyOf(rig.window().config());
+        for (const char *group : {"pages", "routes"}) {
+            const QVariantMap raw = sent.value(group).toMap(), passed = shown.value(group).toMap();
+            QVERIFY2(!raw.isEmpty(), group);
+            for (auto it = raw.cbegin(); it != raw.cend(); ++it)
+                QVERIFY2(passed.contains(it.key()), qPrintable(QString("%1.%2 is sent by the engine but not passed on").arg(group, it.key())));
+        }
     }
 };
 
