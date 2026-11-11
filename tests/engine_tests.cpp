@@ -70,11 +70,6 @@ public:
         return QTest::qWaitFor([this] { return backend->ready() && backend->config().value("route") == "proxy"; }, 20000);
     }
 
-    // Whether this engine speaks the contract of the engine that sends its own
-    // privacy text, codes with its errors, and streams and joins refreshes. The
-    // tests of those things need it, and skip on an older one.
-    bool modern() const { return backend->config().contains("privacy"); }
-
     Backend &window() { return *backend; }
 
     // The engine's address, without the trailing slash.
@@ -385,8 +380,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that cancels a lookup when the window hangs up");
         Backend &window = rig.window();
         QVERIFY(rig.steer("resolve-delay", "2"));
 
@@ -414,8 +407,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that streams a refresh's progress");
         Backend &window = rig.window();
         QVERIFY(rig.steer("channel-delay", "0.3"));
 
@@ -447,8 +438,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that streams a refresh's progress");
         Backend &window = rig.window();
         window.setIdleTimeout(1000);
         QVERIFY(rig.steer("channel-delay", "0.6"));
@@ -473,8 +462,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that runs one refresh for everyone who asks");
         Backend &window = rig.window();
         QVERIFY(rig.steer("channel-delay", "0.5"));
 
@@ -497,8 +484,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that sends a code with its errors");
         Backend &window = rig.window();
 
         struct Case {
@@ -554,8 +539,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that sends a code with its errors");
         Backend &window = rig.window();
         QVERIFY(rig.steer("search-delay", "3"));
         QSignalSpy failed(&window, &Backend::taskFailed);
