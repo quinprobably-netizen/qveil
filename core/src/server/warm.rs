@@ -21,7 +21,7 @@
 //! the end of one.
 
 use super::Server;
-use super::relay::{Live, Session, content_range, fetch_upstream, is_playlist_type};
+use super::relay::{Live, Session, content_range, fetch_upstream, is_playlist_type, stalled_read};
 use crate::util::lock;
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
@@ -247,9 +247,11 @@ pub(super) fn start(server: &Arc<Server>, s: &Arc<Session>) {
             Arc::clone(&head),
         );
         let spawned = std::thread::Builder::new().spawn(move || {
-            if let Err(Stalled) = fetch_head(&session, &live, kind, &fill) {
-                // The player's own request then goes upstream, on a new client.
-                server.redial(&session, &live);
+            if let Err(Stalled(since)) = fetch_head(&session, &live, kind, &fill) {
+                // The player's own request then goes upstream, and finds a
+                // new client if this one is stuck (see `Server::recover`):
+                // not if the player has been served on it meanwhile.
+                server.recover(&session, &live, true, since);
             }
             fill.end();
         });
@@ -260,20 +262,26 @@ pub(super) fn start(server: &Arc<Server>, s: &Arc<Session>) {
     }
 }
 
-/// A warm-up request timed out, or its connection failed.
-struct Stalled;
+/// A warm-up request timed out, having last got anything at the instant
+/// it holds.
+struct Stalled(Instant);
 
 /// Fetches the head of stream `kind` into `head`, as it arrives. A response
 /// that isn't the bytes asked for leaves it without them (a 403 is left to
-/// the player's own request, which resolves the stream again).
+/// the player's own request, which resolves the stream again), and so does
+/// a connection that breaks: the player's own request goes upstream then.
 fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), Stalled> {
     let want = if kind == "v" { HEAD } else { AUDIO_HEAD };
     let range = format!("bytes=0-{}", want - 1);
-    let Some(mut up) =
-        fetch_upstream(live, &s.route, "GET", kind, Some(&range)).map_err(|_| Stalled)?
-    else {
-        return Ok(());
+    let asked = Instant::now();
+    let mut up = match fetch_upstream(live, &s.route, "GET", kind, Some(&range)) {
+        Ok(Some(up)) => up,
+        Ok(None) => return Ok(()),
+        Err(e) if e.stalled => return Err(Stalled(asked)),
+        Err(_) => return Ok(()),
     };
+    // After the response came, which counts as something served.
+    let mut since = Instant::now();
     if up.status() != StatusCode::PARTIAL_CONTENT {
         return Ok(());
     }
@@ -314,6 +322,7 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
         match up.read(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => {
+                since = live.served.mark();
                 let n = n.min(want - have);
                 let mut st = lock(&head.state);
                 if st.ended {
@@ -325,7 +334,8 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
                 head.changed.notify_all();
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return Err(Stalled),
+            Err(e) if stalled_read(&e) => return Err(Stalled(since)),
+            Err(_) => return Ok(()),
         }
     }
     Ok(())
@@ -508,6 +518,53 @@ mod tests {
         let took = started.elapsed();
         assert!(took < HEAD_WAIT + Duration::from_secs(1), "{took:?}");
         assert!(ranges(&up).contains(&"bytes=0-99".to_string()));
+    }
+
+    #[test]
+    fn a_head_that_times_out_after_the_player_was_served_leaves_the_client_alone() {
+        let up = Upstream::start();
+        // The video head gets no answer, and gives up after the player's
+        // request has gone upstream itself (after `HEAD_WAIT`) and been
+        // answered on the same client.
+        let idle = HEAD_WAIT + Duration::from_secs(1);
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(
+            &bin.0,
+            &up.url(&format!("/big?size={SIZE}&hold={}&run=", HEAD - 1)),
+        );
+        let (s, base, _d) = server_tuned(
+            Config {
+                ytdlp,
+                ..Config::default()
+            },
+            |rt| {
+                rt.net = rt.net.clone().idling_after(idle);
+                rt.yt.net = rt.net.clone();
+            },
+        );
+        s.warming.store(true, Ordering::Relaxed);
+        let info = s.open(&test_video()).unwrap();
+        let sid = rel(&base, &info.video)
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let started = Instant::now();
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            rel(&base, &info.video),
+            &[("Range", "bytes=0-99")],
+        );
+        assert_eq!((status, body), (206, big_bytes(0, 100)));
+        let session = s.session(&sid).unwrap();
+        wait_for("the head to give up", idle * 2, || {
+            session.warm.find(&session, "v", 0, 0).is_none() && started.elapsed() > idle
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        // The client that just served the player is not replaced: a new
+        // one would be a new identity, and over Tor a sure 403.
+        assert_eq!(lock(&session.live).dial, 0);
     }
 
     #[test]

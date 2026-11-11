@@ -429,6 +429,7 @@ impl Server {
             audio: s.audio.clone(),
             headers: s.headers.clone(),
             client: yt.net.relay_client()?,
+            served: Arc::default(),
         };
         Ok((s, live))
     }

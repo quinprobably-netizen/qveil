@@ -210,7 +210,7 @@ impl Net {
     /// response head and then to each separate read of the body, so a stalled
     /// upstream (a dead Tor circuit, say) ends the stream with an error
     /// instead of holding a thread and a connection forever. The relay then
-    /// replaces the client (see `Server::redial`): this one would keep its
+    /// replaces the client (see `Server::recover`): this one would keep its
     /// stalled HTTP/2 connection for every later request.
     pub fn relay_client(&self) -> Result<Client> {
         self.relay_client_idle(self.relay_idle.unwrap_or(RELAY_IDLE_TIMEOUT))

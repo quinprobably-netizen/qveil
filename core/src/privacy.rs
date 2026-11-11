@@ -16,7 +16,9 @@
 //!   fingerprint and the timing can.
 //! - A proxy URL with credentials of its own is "not isolated", and so is an
 //!   HTTP proxy.
-//! - A stream that is looked up again after a 403 links two circuits.
+//! - A stream that is looked up again after a 403, or after its circuit
+//!   stalls, links two circuits (and only two: the old URLs are never tried
+//!   on a new identity, see `Server::recover`).
 //! - With resume on, qveil does remember unfinished videos, so history being
 //!   off is "keeps no list of what you watch", not "doesn't remember".
 
@@ -71,7 +73,7 @@ impl Kind {
     /// What the route does to the address and to the requests, which is the
     /// part of the story that depends on it.
     fn route_points(self) -> Vec<&'static str> {
-        let relink = "A video that outlives its circuit is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.";
+        let relink = "A video that outlives its circuit, or whose circuit stalls (a minute without a byte), is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.";
         let isolated = "Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page, and a video played again within nine minutes is played from the same lookup on the same set.";
         match self {
             Kind::Direct => {

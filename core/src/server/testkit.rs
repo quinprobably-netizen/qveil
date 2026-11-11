@@ -810,3 +810,254 @@ fn pass_on(mut from: TcpStream, mut to: TcpStream, frozen: &AtomicBool) {
         }
     }
 }
+
+/// A stand-in for googlevideo as it is reached over Tor: a SOCKS5 proxy
+/// whose user name is the identity (Tor makes a circuit for each), in
+/// front of a server that answers `/big` (see `big`) over HTTP/1.1 with
+/// keep-alive, as googlevideo did over Tor, measured. A URL names the
+/// identity it was resolved for (`who=`, see `gate_ytdlp`), and is refused
+/// with a 403 over any other, as googlevideo refuses an address other than
+/// the one that resolved it. Its connections can be frozen (a circuit that
+/// stalls) or reset.
+/// For each request to a `Gate`: the identity it came over, the one its URL
+/// names, and its Range header.
+type GateSeen = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
+/// A `Gate`'s connections: a flag that freezes each, and its socket on the
+/// player's side.
+type GateConns = Arc<Mutex<Vec<(Arc<AtomicBool>, TcpStream)>>>;
+
+pub struct Gate {
+    pub port: u16,
+    /// For each request: the identity it came over, the one its URL names,
+    /// and its Range header.
+    seen: GateSeen,
+    /// The connections made so far, to freeze or reset.
+    conns: GateConns,
+    pub gauge: Arc<Gauge>,
+}
+
+impl Gate {
+    pub fn start() -> Self {
+        let inner = TcpListener::bind("127.0.0.1:0").unwrap();
+        let inner_addr = inner.local_addr().unwrap();
+        let seen = GateSeen::default();
+        let gauge = Arc::new(Gauge::default());
+        {
+            let (seen, gauge) = (Arc::clone(&seen), Arc::clone(&gauge));
+            std::thread::spawn(move || {
+                for conn in inner.incoming().flatten() {
+                    let (seen, gauge) = (Arc::clone(&seen), Arc::clone(&gauge));
+                    std::thread::spawn(move || gate_serve(conn, &seen, &gauge));
+                }
+            });
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = GateConns::default();
+        let held = Arc::clone(&conns);
+        std::thread::spawn(move || {
+            for mut client in listener.incoming().flatten() {
+                let Some(user) = socks_handshake(&mut client) else {
+                    continue;
+                };
+                let Ok(mut server) = TcpStream::connect(inner_addr) else {
+                    continue;
+                };
+                // The server is told the identity first.
+                if writeln!(server, "{user}").is_err() {
+                    continue;
+                }
+                let flag = Arc::new(AtomicBool::new(false));
+                held.lock()
+                    .unwrap()
+                    .push((Arc::clone(&flag), client.try_clone().unwrap()));
+                for (from, to) in [
+                    (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                    (server, client),
+                ] {
+                    let flag = Arc::clone(&flag);
+                    std::thread::spawn(move || pass_on(from, to, &flag));
+                }
+            }
+        });
+        Gate {
+            port,
+            seen,
+            conns,
+            gauge,
+        }
+    }
+
+    pub fn proxy(&self) -> String {
+        format!("socks5h://127.0.0.1:{}", self.port)
+    }
+
+    /// Freezes every connection there is now.
+    pub fn freeze(&self) {
+        for (flag, _) in self.conns.lock().unwrap().iter() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Resets every connection there is now, as a circuit that breaks does.
+    pub fn reset(&self) {
+        for (_, client) in self.conns.lock().unwrap().drain(..) {
+            reset(&client);
+        }
+    }
+
+    /// The identities that requests came over, each once, in order.
+    pub fn identities(&self) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for (who, _, _) in self.seen.lock().unwrap().iter() {
+            if !found.contains(who) {
+                found.push(who.clone());
+            }
+        }
+        found
+    }
+
+    /// How many requests came over an identity other than their URL's
+    /// (and were refused).
+    pub fn refused(&self) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(over, of, _)| over != of)
+            .count()
+    }
+
+    pub fn requests(&self) -> Vec<(String, String, Option<String>)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// Closes `conn` with a TCP reset rather than an orderly close.
+fn reset(conn: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: a valid socket, and a pointer to a linger of the right size.
+    unsafe {
+        libc::setsockopt(
+            conn.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
+    }
+    let _ = conn.shutdown(std::net::Shutdown::Both);
+}
+
+/// The server side of a SOCKS5 handshake with a user name and password,
+/// for a CONNECT to anywhere. Returns the user name.
+fn socks_handshake(c: &mut TcpStream) -> Option<String> {
+    let mut head = [0u8; 2];
+    c.read_exact(&mut head).ok()?;
+    let mut methods = vec![0u8; head[1] as usize];
+    c.read_exact(&mut methods).ok()?;
+    c.write_all(&[5, 2]).ok()?;
+    let mut len = [0u8; 2];
+    c.read_exact(&mut len).ok()?;
+    let mut user = vec![0u8; len[1] as usize];
+    c.read_exact(&mut user).ok()?;
+    let mut plen = [0u8; 1];
+    c.read_exact(&mut plen).ok()?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    c.read_exact(&mut pass).ok()?;
+    c.write_all(&[1, 0]).ok()?;
+    // Version, CONNECT, reserved, and the address type.
+    let mut req = [0u8; 4];
+    c.read_exact(&mut req).ok()?;
+    let skip = match req[3] {
+        1 => 4,
+        4 => 16,
+        _ => {
+            let mut n = [0u8; 1];
+            c.read_exact(&mut n).ok()?;
+            n[0] as usize
+        }
+    };
+    let mut rest = vec![0u8; skip + 2];
+    c.read_exact(&mut rest).ok()?;
+    c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
+    Some(String::from_utf8_lossy(&user).into_owned())
+}
+
+/// `keep_alive_serve` for the `Gate`: the first line is the identity the
+/// connection came over.
+fn gate_serve(
+    mut conn: TcpStream,
+    seen: &Mutex<Vec<(String, String, Option<String>)>>,
+    gauge: &Gauge,
+) {
+    let mut r = BufReader::new(conn.try_clone().unwrap());
+    let mut over = String::new();
+    if r.read_line(&mut over).unwrap_or(0) == 0 {
+        return;
+    }
+    let over = over.trim().to_string();
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let head_only = line.starts_with("HEAD");
+        let mut range = None;
+        loop {
+            let mut h = String::new();
+            if r.read_line(&mut h).unwrap_or(0) == 0 {
+                return;
+            }
+            if h.trim().is_empty() {
+                break;
+            }
+            if let Some(v) = h.to_ascii_lowercase().strip_prefix("range:") {
+                range = Some(v.trim().to_string());
+            }
+        }
+        let query = target.split_once('?').map_or("", |(_, q)| q);
+        let of = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("who="))
+            .unwrap_or_default()
+            .to_string();
+        seen.lock()
+            .unwrap()
+            .push((over.clone(), of.clone(), range.clone()));
+        if of != over {
+            let _ = write!(
+                conn,
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\ndenied"
+            );
+            continue;
+        }
+        if !big_to(&mut conn, query, range.as_deref(), head_only, gauge, false) {
+            return;
+        }
+    }
+}
+
+/// A yt-dlp that answers with both streams at `url` on a `Gate`, for the
+/// identity it was given (the user name of its proxy), and counts its runs.
+pub fn gate_ytdlp(dir: &std::path::Path, url: &str) -> String {
+    let script = r#"n=$(cat '@COUNT@' 2>/dev/null || echo 0)
+n=$((n + 1))
+echo $n > '@COUNT@'
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+who=$(sed -n "s|.*--proxy 'socks5h://\([^:]*\):.*|\1|p" "$conf")
+cat <<EOF
+{"title":"T","requested_formats":[
+ {"url":"@URL@&who=$who&n=$n","protocol":"https","vcodec":"avc1"},
+ {"url":"@URL@&who=$who&n=$n","protocol":"https","vcodec":"none"}]}
+EOF
+"#
+    .replace("@COUNT@", &dir.join("runs").display().to_string())
+    .replace("@URL@", url);
+    crate::store::testing::script(&dir.join("yt-dlp"), &script)
+}

@@ -17,7 +17,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A relayed body is different: mpv stops reading while a paused video's
 /// cache is full, so a short write timeout would kill a paused video.
@@ -40,6 +40,10 @@ pub(super) const SEEK_CHUNK: u64 = 512 << 10;
 const SPARE_MAX: u64 = 64 << 10;
 /// How often a relay waiting on the other side of `Ahead` looks at the cancel flag.
 const AHEAD_POLL: Duration = Duration::from_millis(250);
+/// How often a session may put a new client, or a new lookup, in place of
+/// one that stalled (see `Server::recover`). A route that keeps stalling
+/// ends its streams instead of costing an identity every time.
+const RECOVER_EVERY: Duration = Duration::from_secs(10);
 
 /// One relayed stream. What mpv fetches goes through `live`, which is
 /// replaced when the upstream URLs go stale (see `Server::refresh`).
@@ -64,6 +68,8 @@ pub(super) struct Session {
     clients: Mutex<Vec<(u64, TcpStream)>>,
     /// Set while a spare connection is being made ready (see `keep_spare`).
     sparing: AtomicBool,
+    /// When a stalled client was last replaced (see `Server::recover`).
+    recovered: Mutex<Option<Instant>>,
 }
 
 impl Session {
@@ -78,7 +84,19 @@ impl Session {
             warm: Warm::default(),
             clients: Mutex::new(Vec::new()),
             sparing: AtomicBool::new(false),
+            recovered: Mutex::new(None),
         }
+    }
+
+    /// Whether a stalled client may be replaced now, at most once every
+    /// `RECOVER_EVERY`; if so, that counts as the one.
+    fn may_recover(&self) -> bool {
+        let mut at = lock(&self.recovered);
+        if at.is_some_and(|t| t.elapsed() < RECOVER_EVERY) {
+            return false;
+        }
+        *at = Some(Instant::now());
+        true
     }
 
     /// Ends the streams of this session: no relay reads another byte from
@@ -152,13 +170,50 @@ pub(super) struct Live {
     /// Counts resolves, so a waiter can tell that someone else already refreshed.
     pub(super) generation: u32,
     /// Counts the clients put in place of a stalled one since the last
-    /// resolve (see `Server::redial`), so that requests that failed on the
+    /// resolve (see `Server::recover`), so that requests that failed on the
     /// same client make one new client between them.
     pub(super) dial: u32,
     pub(super) video: String,
     pub(super) audio: Option<String>,
     pub(super) headers: Vec<(String, String)>,
     pub(super) client: Client,
+    /// When `client` last brought anything: a response, or a byte of one.
+    pub(super) served: Arc<Served>,
+}
+
+/// When a client last brought anything, which tells a client that is stuck
+/// from one request that is.
+#[derive(Default)]
+pub(super) struct Served(Mutex<Option<Instant>>);
+
+impl Served {
+    /// Marks now, and returns it.
+    pub(super) fn mark(&self) -> Instant {
+        let now = Instant::now();
+        *lock(&self.0) = Some(now);
+        now
+    }
+
+    fn after(&self, t: Instant) -> bool {
+        lock(&self.0).is_some_and(|at| at > t)
+    }
+}
+
+/// Why an upstream request failed before its response came, in words for
+/// the player (without the URL: it is signed for this address).
+pub(super) struct UpError {
+    pub(super) text: String,
+    /// It timed out: the connection stalled, rather than broke.
+    pub(super) stalled: bool,
+}
+
+/// Whether a failed read of a body timed out, rather than its connection
+/// breaking.
+pub(super) fn stalled_read(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::TimedOut
+        || e.get_ref()
+            .and_then(|e| e.downcast_ref::<reqwest::Error>())
+            .is_some_and(|e| e.is_timeout())
 }
 
 impl Server {
@@ -198,7 +253,7 @@ impl Server {
         {
             return self.relay_kept(out, &s, kind, live, w, head, meta);
         }
-        let mut up = match self.fetch_redialling(&s, &mut live, &req.method, kind, range) {
+        let mut up = match self.fetch_recovering(&s, &mut live, &req.method, kind, range) {
             Ok(Some(up)) => up,
             Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
             Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
@@ -216,7 +271,7 @@ impl Server {
                     return respond(out, 502, "text/plain", msg.as_bytes());
                 }
             };
-            up = match self.fetch_redialling(&s, &mut live, &req.method, kind, range) {
+            up = match self.fetch_recovering(&s, &mut live, &req.method, kind, range) {
                 Ok(Some(up)) => up,
                 Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
                 Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
@@ -265,20 +320,25 @@ impl Server {
         out.write_all(head.as_bytes())?;
         if req.method != "HEAD" {
             out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
-            if let Err(e) = copy_body(&mut up, out, &s.cancelled) {
+            if let Err(e) = copy_body(&mut up, out, &s.cancelled, &live.served) {
                 // The player asks again, and that has to find a client
                 // that isn't stuck on the connection that just stalled.
-                self.redial(&s, &live);
+                if let Some(since) = e
+                    .downcast_ref::<StreamBroke>()
+                    .and_then(|b| b.stalled_since)
+                {
+                    self.recover(&s, &live, true, since);
+                }
                 return Err(e);
             }
         }
         Ok(())
     }
 
-    /// `fetch_upstream`, and once more on a new client if the request
-    /// timed out or its connection failed (see `redial`). `live` is then
-    /// the session's new upstream half.
-    fn fetch_redialling(
+    /// `fetch_upstream`, and once more if that failed: on the same client,
+    /// or on what `recover` puts in place of a stalled one. `live` is then
+    /// the session's upstream half that was used.
+    fn fetch_recovering(
         &self,
         s: &Session,
         live: &mut Live,
@@ -286,44 +346,85 @@ impl Server {
         kind: &str,
         range: Option<&str>,
     ) -> Result<Option<reqwest::blocking::Response>, String> {
+        let since = Instant::now();
         match fetch_upstream(live, &s.route, method, kind, range) {
-            Err(e) => match self.redial(s, live) {
-                Some(fresh) => {
-                    *live = fresh;
-                    fetch_upstream(live, &s.route, method, kind, range)
+            Err(e) => match self.recover(s, live, e.stalled, since) {
+                Some(next) => {
+                    *live = next;
+                    fetch_upstream(live, &s.route, method, kind, range).map_err(|e| e.text)
                 }
-                None => Err(e),
+                None => Err(e.text),
             },
-            done => done,
+            Ok(up) => Ok(up),
         }
     }
 
-    /// Puts a new relay client in place of the one `seen` has, after a
-    /// request on it timed out or its connection failed, and returns the
-    /// session's upstream half with it. HTTP/2 puts all of a session's
-    /// requests on one connection, and one that stalls without closing (a
-    /// Tor circuit that stops moving) is never given up by the client: every
-    /// later request would wait out the idle timeout on it. The new client
-    /// dials again, and over SOCKS with new credentials, so Tor builds a new
-    /// circuit; a different exit then gets a 403, which resolves the stream
-    /// again as usual. Requests that failed on the same client (video and
-    /// audio together) make one new client between them: the first to
-    /// get here makes it, and the others find it. The lookup kept for
-    /// playing the video again holds the old client, so it is dropped.
-    /// `None` when the session is over or the route has changed.
-    pub(super) fn redial(&self, s: &Session, seen: &Live) -> Option<Live> {
+    /// What a request on `seen`'s client goes on with after it failed
+    /// before its end: the session's upstream half to try it once more on,
+    /// or `None` to give up. `stalled` is whether it timed out, and `since`
+    /// when it last got anything.
+    ///
+    /// A connection that broke is tried again on the same client: over
+    /// HTTP/1.1 the client makes a new connection with the same SOCKS
+    /// credentials, so over Tor it is the same circuit and the same exit,
+    /// and the stream's URLs (which only work from the address that
+    /// resolved them) still work.
+    ///
+    /// One that stalled may be stuck on a circuit that stopped moving, and
+    /// over HTTP/2 every later request would wait out the idle timeout on
+    /// the same connection. So the client is replaced, but only if it is
+    /// still the session's (requests that stalled together, video and audio,
+    /// make one replacement between them: the first to get here makes it, and
+    /// the others find it), nothing came over it since this request last got
+    /// anything (then it is this request that is stuck, not the client), and
+    /// none was replaced in the last `RECOVER_EVERY` (a route that keeps
+    /// stalling ends its streams instead). On a route that isolates, a new
+    /// client is a new identity, and the old URLs would get a 403 from its
+    /// exit (linking a third identity to the two): so the video is looked up
+    /// again instead (see `refresh`), and the new client shares that
+    /// lookup's identity. On any other route the new client keeps the URLs.
+    /// The lookup kept for playing the video again holds the old client, so
+    /// it is dropped either way. `None` too when the session is over or the
+    /// route has changed.
+    pub(super) fn recover(
+        &self,
+        s: &Session,
+        seen: &Live,
+        stalled: bool,
+        since: Instant,
+    ) -> Option<Live> {
         if s.cancelled.load(Ordering::Acquire) || !self.runtime().net.same_route(&s.route) {
             return None;
         }
-        let fresh = {
-            let mut live = lock(&s.live);
-            if live.generation != seen.generation || live.dial != seen.dial {
-                return Some(live.clone());
-            }
-            live.client = s.route.pinned().relay_client().ok()?;
-            live.dial += 1;
-            live.clone()
-        };
+        let isolating = s.route.isolates();
+        // A lookup again is one at a time, so what the others did is looked
+        // at under its lock.
+        let _one = (stalled && isolating).then(|| lock(&s.refreshing));
+        let mut live = lock(&s.live);
+        if live.generation != seen.generation || live.dial != seen.dial {
+            return Some(live.clone());
+        }
+        if !stalled || seen.served.after(since) {
+            return Some(live.clone());
+        }
+        if !s.may_recover() {
+            return None;
+        }
+        if isolating {
+            drop(live);
+            return match self.resolve_again(s, seen.generation) {
+                Ok(fresh) => Some(fresh),
+                Err(e) => {
+                    note!("qveil: couldn't look up a stalled video again: {e:#}");
+                    None
+                }
+            };
+        }
+        live.client = s.route.pinned().relay_client().ok()?;
+        live.served = Arc::default();
+        live.dial += 1;
+        let fresh = live.clone();
+        drop(live);
         self.lookups.forget(&s.source.id);
         Some(fresh)
     }
@@ -445,6 +546,11 @@ impl Server {
                 return Ok(live.clone());
             }
         }
+        self.resolve_again(s, seen)
+    }
+
+    /// `refresh`, once its lock is held and nobody else has.
+    fn resolve_again(&self, s: &Session, seen: u32) -> Result<Live> {
         let rt = self.runtime();
         if !rt.net.same_route(&s.route) {
             // The user switched routes while this stream was playing. Resolving
@@ -460,6 +566,7 @@ impl Server {
             audio: streams.audio,
             headers: streams.headers,
             client: yt.net.relay_client()?,
+            served: Arc::default(),
         };
         *lock(&s.live) = fresh.clone();
         // A lookup kept for playing it again has stopped working too.
@@ -469,15 +576,14 @@ impl Server {
 }
 
 /// Starts the upstream request for one relayed GET or HEAD, with `range` as
-/// its Range header. `None` means there is no separate audio stream. Errors
-/// are text for the client, without the URL: it is signed for this address.
+/// its Range header. `None` means there is no separate audio stream.
 pub(super) fn fetch_upstream(
     live: &Live,
     route: &Net,
     method: &str,
     kind: &str,
     range: Option<&str>,
-) -> Result<Option<reqwest::blocking::Response>, String> {
+) -> Result<Option<reqwest::blocking::Response>, UpError> {
     let url = match kind {
         "v" => live.video.as_str(),
         _ => match &live.audio {
@@ -497,9 +603,16 @@ pub(super) fn fetch_upstream(
     if let Some(r) = range {
         rb = rb.header(RANGE, r);
     }
-    rb.send()
-        .map(Some)
-        .map_err(|e| friendly(&route.explain(&format!("{:#}", e.without_url()))))
+    match rb.send() {
+        Ok(up) => {
+            live.served.mark();
+            Ok(Some(up))
+        }
+        Err(e) => Err(UpError {
+            stalled: e.is_timeout(),
+            text: friendly(&route.explain(&format!("{:#}", e.without_url()))),
+        }),
+    }
 }
 
 /// The byte range a player asked for: `bytes=start-` or `bytes=start-end`.
@@ -624,7 +737,13 @@ impl Ahead {
                     }
                     match &st.done {
                         Some(Ok(())) => return Ok(()),
-                        Some(Err(e)) => return Err(StreamBroke(io::Error::other(e.clone())).into()),
+                        Some(Err(e)) => {
+                            return Err(StreamBroke {
+                                err: io::Error::other(e.clone()),
+                                stalled_since: None,
+                            }
+                            .into());
+                        }
                         None => st = self.wait(st),
                     }
                 }
@@ -680,8 +799,13 @@ enum Taken {
     Stopped,
     /// Upstream ended it, or sent more than it was asked for.
     Broke(String),
-    /// A read failed: it timed out, or the connection broke.
-    Failed(String),
+    /// A read failed: it timed out (`stalled`), or the connection broke.
+    /// `since` is when the last byte came.
+    Failed {
+        e: String,
+        stalled: bool,
+        since: Instant,
+    },
 }
 
 impl Fetcher {
@@ -719,9 +843,8 @@ impl Fetcher {
                 Taken::Complete if self.pos > self.end => return Ok(()),
                 Taken::Complete => {}
                 Taken::Broke(e) => once_at(self.pos, &mut failed_at, e)?,
-                Taken::Failed(e) => {
-                    self.redial();
-                    once_at(self.pos, &mut failed_at, e)?;
+                Taken::Failed { e, stalled, since } => {
+                    self.recover(stalled, since, &mut failed_at, e)?;
                 }
             }
             up = match self.next(&mut failed_at)? {
@@ -744,9 +867,8 @@ impl Fetcher {
             match self.request() {
                 Ok(next) => return Ok(Some(next)),
                 Err(_) if self.stopped() => return Ok(None),
-                Err(Failure::Connection(e)) => {
-                    self.redial();
-                    once_at(self.pos, failed_at, e)?;
+                Err(Failure::Connection { e, stalled, since }) => {
+                    self.recover(stalled, since, failed_at, e)?;
                 }
                 Err(Failure::Final(e)) => return Err(e),
             }
@@ -776,6 +898,7 @@ impl Fetcher {
     /// Reads the current chunk's body into `ahead`.
     fn take(&mut self, up: &mut reqwest::blocking::Response) -> Taken {
         let mut buf = vec![0u8; 64 << 10];
+        let mut since = Instant::now();
         loop {
             if self.stopped() {
                 return Taken::Stopped;
@@ -786,8 +909,15 @@ impl Fetcher {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) if self.stopped() => return Taken::Stopped,
-                Err(e) => return Taken::Failed(e.to_string()),
+                Err(e) => {
+                    return Taken::Failed {
+                        stalled: stalled_read(&e),
+                        e: e.to_string(),
+                        since,
+                    };
+                }
             };
+            since = self.live.served.mark();
             // The read can have taken a long time.
             if self.stopped() {
                 return Taken::Stopped;
@@ -806,12 +936,29 @@ impl Fetcher {
         }
     }
 
-    /// A new client for the next request, after the last one stalled or
-    /// failed (see `Server::redial`).
-    fn redial(&mut self) {
-        if let Some(fresh) = self.server.redial(&self.session, &self.live) {
-            self.live = fresh;
+    /// What the next request goes on with after the last one failed (see
+    /// `Server::recover`), or the error that ends the stream: the second
+    /// failure in a row at the same byte on the same client, or one that
+    /// isn't to be recovered from. A new client (or a new lookup) gets an
+    /// attempt of its own.
+    fn recover(
+        &mut self,
+        stalled: bool,
+        since: Instant,
+        failed_at: &mut Option<u64>,
+        e: String,
+    ) -> Result<(), String> {
+        let Some(next) = self
+            .server
+            .recover(&self.session, &self.live, stalled, since)
+        else {
+            return Err(e);
+        };
+        if next.generation != self.live.generation || next.dial != self.live.dial {
+            *failed_at = None;
         }
+        self.live = next;
+        once_at(self.pos, failed_at, e)
     }
 
     /// Waits until the player has used up all but `LOW_WATER` of what is
@@ -836,10 +983,17 @@ impl Fetcher {
         let last = self.end.min(self.pos + CHUNK - 1);
         let range = format!("bytes={}-{last}", self.pos);
         let route = &self.session.route;
-        let get = |live: &Live| match fetch_upstream(live, route, "GET", &self.kind, Some(&range)) {
-            Ok(Some(up)) => Ok(up),
-            Ok(None) => Err(Failure::Final("no separate audio".into())),
-            Err(e) => Err(Failure::Connection(e)),
+        let get = |live: &Live| {
+            let since = Instant::now();
+            match fetch_upstream(live, route, "GET", &self.kind, Some(&range)) {
+                Ok(Some(up)) => Ok(up),
+                Ok(None) => Err(Failure::Final("no separate audio".into())),
+                Err(e) => Err(Failure::Connection {
+                    e: e.text,
+                    stalled: e.stalled,
+                    since,
+                }),
+            }
         };
         let mut up = get(&self.live)?;
         if up.status() == StatusCode::FORBIDDEN {
@@ -872,8 +1026,13 @@ impl Fetcher {
 
 /// Why the next chunk couldn't be requested.
 enum Failure {
-    /// The connection failed; worth one more try.
-    Connection(String),
+    /// The connection failed, or timed out (`stalled`) after `since`; worth
+    /// one more try.
+    Connection {
+        e: String,
+        stalled: bool,
+        since: Instant,
+    },
     /// Upstream answered, and not with the chunk (a 403 that a fresh resolve
     /// didn't cure, say): trying again would only repeat that.
     Final(String),
@@ -895,8 +1054,15 @@ fn once_at(pos: u64, failed_at: &mut Option<u64>, e: String) -> Result<(), Strin
 /// Content-Length, which mpv reports, rather than looking like a complete body.
 /// Once `cancelled` is set (the route changed) the copy ends the same quiet
 /// way, short of the Content-Length, and bytes read since are not passed on.
-fn copy_body(up: &mut impl Read, out: &mut impl Write, cancelled: &AtomicBool) -> Result<()> {
+/// Each read that brings bytes is marked in `served`.
+fn copy_body(
+    up: &mut impl Read,
+    out: &mut impl Write,
+    cancelled: &AtomicBool,
+    served: &Served,
+) -> Result<()> {
     let mut buf = vec![0u8; 64 << 10];
+    let mut since = Instant::now();
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Ok(());
@@ -906,8 +1072,15 @@ fn copy_body(up: &mut impl Read, out: &mut impl Write, cancelled: &AtomicBool) -
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) if cancelled.load(Ordering::Acquire) => return Ok(()),
-            Err(e) => return Err(StreamBroke(e).into()),
+            Err(e) => {
+                return Err(StreamBroke {
+                    stalled_since: stalled_read(&e).then_some(since),
+                    err: e,
+                }
+                .into());
+            }
         };
+        since = served.mark();
         // The read can have taken a long time.
         if cancelled.load(Ordering::Acquire) {
             return Ok(());
@@ -926,11 +1099,15 @@ pub(super) fn is_playlist_type(content_type: &str) -> bool {
 
 /// The upstream side of a relayed stream failed part-way through the body.
 #[derive(Debug)]
-pub(super) struct StreamBroke(io::Error);
+pub(super) struct StreamBroke {
+    err: io::Error,
+    /// When it last got a byte, if it then timed out waiting for the next.
+    stalled_since: Option<Instant>,
+}
 
 impl std::fmt::Display for StreamBroke {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the stream broke upstream: {}", self.0)
+        write!(f, "the stream broke upstream: {}", self.err)
     }
 }
 
@@ -959,6 +1136,7 @@ mod tests {
                 audio: None,
                 headers: vec![],
                 client: rt.net.relay_client().unwrap(),
+                served: Arc::default(),
             },
         )
     }
@@ -1178,13 +1356,13 @@ mod tests {
             cancel: Arc::clone(&cancel),
         };
         let mut out = Vec::new();
-        copy_body(&mut up, &mut out, &cancel).unwrap();
+        copy_body(&mut up, &mut out, &cancel, &Served::default()).unwrap();
         // The second chunk arrived after the change, so it isn't passed on.
         assert_eq!((up.sent, out.as_slice()), (2, &b"data"[..]));
 
         // Already cancelled: not a single read.
         let mut out = Vec::new();
-        copy_body(&mut up, &mut out, &cancel).unwrap();
+        copy_body(&mut up, &mut out, &cancel, &Served::default()).unwrap();
         assert_eq!((up.sent, out.len()), (2, 0));
     }
 
@@ -1784,14 +1962,20 @@ mod tests {
         let relay = Freezer::start(up.addr);
         let bin = TempDir::new();
         let (s, base, _d) = behind_a_freezer(&relay, &bin, 0);
-        s.warming.store(true, std::sync::atomic::Ordering::Relaxed);
-        s.open(&test_video()).unwrap();
-        wait_for("the warm-up", Duration::from_secs(5), || {
-            up.ranges().len() >= 2
-        });
+        let first = s.open(&test_video()).unwrap();
+        let (status, _, _) = fetch(
+            &base,
+            "GET",
+            rel(&base, &first.video),
+            &[("Range", "bytes=0-99")],
+        );
+        assert_eq!(status, 206);
         // Played again from the kept lookup, on its client, whose connection
         // has stalled meanwhile: the warm-up of the new session waits it out.
+        // (Nothing else is in flight on the client: bytes that came for
+        // another request after the warm-up asked would say it isn't stuck.)
         relay.freeze();
+        s.warming.store(true, std::sync::atomic::Ordering::Relaxed);
         let rt = s.runtime();
         let info = s.open(&test_video()).unwrap();
         assert_eq!(runs(&bin.0), 1);
@@ -1818,6 +2002,123 @@ mod tests {
         assert_eq!((status, body), (206, big_bytes_h2(0, 100)));
         assert!(started.elapsed() < IDLE, "{:?}", started.elapsed());
         assert_eq!(relay.connections(), 2);
+    }
+
+    /// The size of the video behind a `Gate`.
+    const GATED: u64 = 6 << 20;
+
+    /// A server on an isolating route through `gate`, whose relay clients
+    /// give up on a connection that has said nothing for `IDLE`, and whose
+    /// yt-dlp resolves both streams to `/big` on it, paced `pace` ms per
+    /// 16 KiB, for the identity it is given.
+    fn behind_a_gate(gate: &Gate, bin: &TempDir, pace: u64) -> (Arc<Server>, String, TempDir) {
+        let ytdlp = gate_ytdlp(
+            &bin.0,
+            &format!("http://gv.test/big?size={GATED}&pace={pace}"),
+        );
+        server_tuned(
+            Config {
+                ytdlp,
+                proxy: Some(gate.proxy()),
+                isolate_circuits: true,
+                ..Config::default()
+            },
+            |rt| {
+                rt.net = rt.net.clone().idling_after(IDLE);
+                rt.yt.net = rt.net.clone();
+            },
+        )
+    }
+
+    /// Plays `want` bytes of the video from the start, on a thread.
+    fn play_from_start(base: &str, video: &str, want: u64) -> std::thread::JoinHandle<Fetched> {
+        let (base, path) = (base.to_string(), rel(base, video).to_string());
+        std::thread::spawn(move || {
+            fetch(
+                &base,
+                "GET",
+                &path,
+                &[("Range", &format!("bytes=0-{}", want - 1))],
+            )
+        })
+    }
+
+    fn sent(gate: &Gate) -> usize {
+        gate.gauge.sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_connection_reset_part_way_is_tried_again_on_the_same_identity() {
+        let gate = Gate::start();
+        let bin = TempDir::new();
+        let (s, base, _d) = behind_a_gate(&gate, &bin, 5);
+        let info = s.open(&test_video()).unwrap();
+        let want = 2u64 << 20;
+        let player = play_from_start(&base, &info.video, want);
+        wait_for("bytes to flow", Duration::from_secs(5), || {
+            sent(&gate) > 256 << 10
+        });
+        gate.reset();
+        let (status, _, body) = player.join().unwrap();
+        assert_eq!(status, 206);
+        assert!(body == big_bytes(0, want), "{} bytes", body.len());
+        // A new connection on the same client: the same identity, so the
+        // same circuit, and the URL still works. Nothing was looked up again.
+        assert_eq!(gate.identities().len(), 1, "{:?}", gate.requests());
+        assert_eq!(gate.refused(), 0, "{:?}", gate.requests());
+        assert_eq!(runs(&bin.0), 1);
+    }
+
+    #[test]
+    fn a_stall_on_an_isolating_route_looks_the_video_up_again_on_one_new_identity() {
+        let gate = Gate::start();
+        let bin = TempDir::new();
+        let (s, base, _d) = behind_a_gate(&gate, &bin, 5);
+        let info = s.open(&test_video()).unwrap();
+        let want = 2u64 << 20;
+        let player = play_from_start(&base, &info.video, want);
+        wait_for("bytes to flow", Duration::from_secs(5), || {
+            sent(&gate) > 256 << 10
+        });
+        gate.freeze();
+        let (status, _, body) = player.join().unwrap();
+        assert_eq!(status, 206);
+        assert!(body == big_bytes(0, want), "{} bytes", body.len());
+        // The old URL was never tried on a new identity (that is a sure 403
+        // and a third identity): the video was looked up again on the one
+        // the rest of it then came over.
+        assert_eq!(runs(&bin.0), 2);
+        assert_eq!(gate.identities().len(), 2, "{:?}", gate.requests());
+        assert_eq!(gate.refused(), 0, "{:?}", gate.requests());
+    }
+
+    #[test]
+    fn stalls_that_keep_coming_end_the_stream_instead_of_looking_it_up_again_and_again() {
+        let gate = Gate::start();
+        let bin = TempDir::new();
+        let (s, base, _d) = behind_a_gate(&gate, &bin, 5);
+        let info = s.open(&test_video()).unwrap();
+        let want = 5u64 << 20;
+        let player = play_from_start(&base, &info.video, want);
+        wait_for("bytes to flow", Duration::from_secs(5), || {
+            sent(&gate) > 256 << 10
+        });
+        gate.freeze();
+        wait_for("the second lookup", Duration::from_secs(5), || {
+            runs(&bin.0) == 2
+        });
+        let before = sent(&gate);
+        wait_for("bytes to flow again", Duration::from_secs(5), || {
+            sent(&gate) > before + (256 << 10)
+        });
+        gate.freeze();
+        let (status, _, body) = player.join().unwrap();
+        assert_eq!(status, 206);
+        assert!((body.len() as u64) < want, "{} bytes", body.len());
+        assert!(body == big_bytes(0, body.len() as u64), "the bytes differ");
+        assert_eq!(runs(&bin.0), 2);
+        assert_eq!(gate.identities().len(), 2, "{:?}", gate.requests());
+        assert_eq!(gate.refused(), 0, "{:?}", gate.requests());
     }
 
     #[test]
