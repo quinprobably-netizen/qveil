@@ -617,7 +617,9 @@ void Backend::subscribe(const QString &input) {
         // Only the new channel needs fetching: the others are as fresh as
         // they were, and a refresh of all of them is a burst of requests that
         // would link the whole list. A running refresh started with the old
-        // list, so this one is not held back by the guard of refreshFeed().
+        // list, so this one is not held back by the guard of refreshFeed(),
+        // and the engine doesn't let it join that refresh either: it waits
+        // for it to be over and then fetches the new channel.
         loadFeed(true, m_shorts, sub.value("id").toString());
     }, true);
 }
