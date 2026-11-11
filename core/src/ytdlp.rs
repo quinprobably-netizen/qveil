@@ -1085,10 +1085,21 @@ wait
         assert!(started.elapsed() < Duration::from_secs(5));
         for name in ["pid", "grandchild"] {
             let pid = spied(&dir, name);
-            let gone = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-                .map(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
-                .unwrap_or(true);
-            assert!(gone, "{name} {pid} was left running");
+            let gone = || {
+                std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                    .map(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+                    .unwrap_or(true)
+            };
+            // The group was sent SIGKILL, but the call returns as soon as
+            // the leader has ended, and a grandchild may take a moment longer.
+            let killed = Instant::now();
+            while !gone() {
+                assert!(
+                    killed.elapsed() < Duration::from_secs(5),
+                    "{name} {pid} was left running"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
     }
