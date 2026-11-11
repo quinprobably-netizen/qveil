@@ -2,8 +2,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// The settings file. A key this version doesn't know doesn't stop it from
+/// loading (see `Config::load`): `save` writes every setting, so a file that a
+/// newer qveil saved has keys that an older one has to get past.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Route every request (search, feeds, metadata *and* video bytes)
     /// through this proxy: `http://…`, `https://…` or `socks5h://…`.
@@ -52,10 +55,49 @@ impl Default for Config {
     }
 }
 
+/// Every key a config file can have, as `save` writes them.
+fn known_keys() -> Vec<String> {
+    // `proxy` is left out of the file while it is unset.
+    let all = Config {
+        proxy: Some(String::new()),
+        ..Config::default()
+    };
+    toml::Table::try_from(&all)
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The keys of `text` that this version has no setting for, in order.
+fn unknown_keys(text: &str) -> Vec<String> {
+    let known = known_keys();
+    let mut unknown: Vec<String> = text
+        .parse::<toml::Table>()
+        .map(|t| t.keys().filter(|k| !known.contains(*k)).cloned().collect())
+        .unwrap_or_default();
+    unknown.sort();
+    unknown
+}
+
 impl Config {
+    /// The settings in `path`, or the defaults if there is no file. Keys that
+    /// this version doesn't know are left out and said so on stderr: a typo
+    /// and a setting of a newer qveil look alike, and neither is a reason not
+    /// to start. (`save` writes only the keys it knows.)
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+            Ok(s) => {
+                let cfg =
+                    toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+                let unknown = unknown_keys(&s);
+                if !unknown.is_empty() {
+                    note!(
+                        "qveil: ignoring settings in {} that this version doesn't have: {} (from a newer qveil, or a typo)",
+                        path.display(),
+                        unknown.join(", ")
+                    );
+                }
+                Ok(cfg)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -83,15 +125,81 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::testing::TempDir;
+
+    const EXAMPLE: &str = include_str!("../config.example.toml");
 
     #[test]
     fn example_config_parses() {
-        let c: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let c: Config = toml::from_str(EXAMPLE).unwrap();
         assert!(!c.history);
-        assert!(
-            toml::from_str::<Config>("histroy = true").is_err(),
-            "typos must not be silently ignored"
+    }
+
+    /// The example is where a new key is first documented, so it is held to
+    /// what loading no longer enforces: no key it names is unknown, and every
+    /// key there is has an entry (a setting whose default is "off" and which
+    /// stays commented out, like `proxy`, counts).
+    #[test]
+    fn the_example_config_names_every_key_and_only_those() {
+        assert_eq!(unknown_keys(EXAMPLE), Vec::<String>::new());
+        let described = |key: &str| {
+            EXAMPLE.lines().any(|line| {
+                let line = line.trim_start_matches('#').trim_start();
+                line.strip_prefix(key)
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+            })
+        };
+        let missing: Vec<_> = known_keys().into_iter().filter(|k| !described(k)).collect();
+        assert!(missing.is_empty(), "config.example.toml lacks {missing:?}");
+    }
+
+    #[test]
+    fn the_known_keys_are_the_ones_the_file_is_written_with() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        Config {
+            proxy: Some("socks5h://127.0.0.1:9050".into()),
+            ..Config::default()
+        }
+        .save(&path)
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(unknown_keys(&written), Vec::<String>::new());
+        let mut keys = known_keys();
+        keys.sort();
+        let mut written: Vec<_> = written
+            .parse::<toml::Table>()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        written.sort();
+        assert_eq!(keys, written);
+        assert!(keys.contains(&"topic_feeds".to_string()), "{keys:?}");
+    }
+
+    #[test]
+    fn a_config_with_a_key_this_version_does_not_know_still_loads() {
+        // What a newer qveil wrote, or a typo: the settings that are known
+        // count, and the rest is only reported.
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        std::fs::write(
+            &path,
+            "max_height = 720\nhistory = true\nsomething_newer = \"x\"\nhistroy = true\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.max_height, 720);
+        assert!(c.history);
+        assert_eq!(c.resume_days, 7, "what the file doesn't say stays default");
+        assert_eq!(
+            unknown_keys(&std::fs::read_to_string(&path).unwrap()),
+            ["histroy", "something_newer"]
         );
+        // A key that is known but wrongly typed is still an error.
+        std::fs::write(&path, "max_height = \"tall\"\n").unwrap();
+        assert!(Config::load(&path).is_err());
     }
 
     #[test]

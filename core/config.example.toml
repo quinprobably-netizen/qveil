@@ -24,6 +24,12 @@ history = false
 # this off and deletes what was remembered.
 resume_days = 7
 
+# Topic feeds: qveil works out what the channels you follow are about from the
+# titles they uploaded lately, and searches YouTube by itself for more of the
+# same, at most twelve searches a day. That tells YouTube what your channels
+# are about, so it is off until you turn it on.
+topic_feeds = false
+
 # Show thumbnails. They are fetched through the same route as everything else.
 # With Tor isolation each one gets its own circuit, so separate requests can't
 # be linked by IP address. A refresh is still a burst of requests for exactly
