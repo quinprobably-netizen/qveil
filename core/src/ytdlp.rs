@@ -87,9 +87,6 @@ pub struct Streams {
     pub duration: Option<u64>,
     pub video: String,
     pub audio: Option<String>,
-    /// How long each stream is, when YouTube says so exactly (it usually does).
-    pub video_size: Option<u64>,
-    pub audio_size: Option<u64>,
     pub headers: Vec<(String, String)>,
     /// What the page says about the video. All of it comes with the lookup
     /// that finds the streams, so showing it costs no request.
@@ -619,11 +616,7 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
             .as_str()
             .context("format has no URL")?
             .into(),
-        audio_size: audio
-            .as_ref()
-            .and(audio_fmt.and_then(|f| f["filesize"].as_u64())),
         audio,
-        video_size: video_fmt["filesize"].as_u64(),
         headers,
         description: str_field(v, &["description"])
             .map(|d| d.chars().take(DESCRIPTION_MAX).collect()),
@@ -711,7 +704,6 @@ mod tests {
             ("https://gv.test/v", Some("https://gv.test/a"))
         );
         assert_eq!(s.headers, [("User-Agent".to_string(), "x".to_string())]);
-        assert_eq!((s.video_size, s.audio_size), (None, None));
         // A cookie yt-dlp would send is not relayed, whatever the case it is spelled in.
         let s = resolved(
             r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","http_headers":{"User-Agent":"x","Cookie":"a=b","cookie":"c=d"}}"#,
@@ -724,22 +716,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!((s.video.as_str(), s.audio), ("https://gv.test/c", None));
-    }
-
-    #[test]
-    fn exact_sizes_come_with_the_streams_and_estimates_do_not() {
-        let s = resolved(
-            r#"{"requested_formats":[
-                {"url":"https://gv.test/v","protocol":"https","vcodec":"av01","filesize":123456},
-                {"url":"https://gv.test/a","protocol":"https","vcodec":"none","filesize":789}]}"#,
-        )
-        .unwrap();
-        assert_eq!((s.video_size, s.audio_size), (Some(123456), Some(789)));
-        let s = resolved(
-            r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","filesize_approx":5}"#,
-        )
-        .unwrap();
-        assert_eq!((s.video_size, s.audio_size), (None, None));
     }
 
     #[test]

@@ -269,8 +269,6 @@ mod tests {
             duration: None,
             video: video.into(),
             audio: audio.map(String::from),
-            video_size: None,
-            audio_size: None,
             headers: vec![],
             description: None,
             views: None,

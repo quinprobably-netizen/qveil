@@ -278,7 +278,6 @@ impl Server {
             }
         };
         let has_audio = s.audio.is_some();
-        let (video_size, audio_size) = (s.video_size, s.audio_size);
         let session = Session::new(v.clone(), format.clone(), rt.net.clone(), live.clone());
         let sid = self.register(&rt, session)?;
         if fresh {
@@ -290,7 +289,7 @@ impl Server {
         if let Some(s) = &session
             && self.warming.load(Ordering::Relaxed)
         {
-            warm::start(self, s, [video_size, audio_size]);
+            warm::start(self, s);
         }
         let watched = rt.cfg.history.then(|| Watched {
             id: v.id.clone(),

@@ -3,7 +3,7 @@
 
 use super::Server;
 use super::http::{Request, respond};
-use super::warm::{Piece, Warm};
+use super::warm::{Head, Meta, Warm};
 use crate::errors::friendly;
 use crate::ids::VideoRef;
 use crate::net::Net;
@@ -152,9 +152,9 @@ impl Server {
         // What the session fetched when it was opened answers the player's
         // first requests without a round trip.
         if let Some(w) = wanted
-            && let Some(kept) = s.warm.find(&s, kind, w.start, live.generation)
+            && let Some((head, meta)) = s.warm.find(&s, kind, w.start, live.generation)
         {
-            return self.relay_kept(out, &s, kind, live, w, kept);
+            return self.relay_kept(out, &s, kind, live, w, head, meta);
         }
         let mut up = match self.fetch_redialling(&s, &mut live, &req.method, kind, range) {
             Ok(Some(up)) => up,
@@ -300,20 +300,13 @@ impl Server {
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        self.serve_ahead(
-            out,
-            s,
-            kind,
-            live,
-            Ahead::default(),
-            ctype,
-            plan,
-            Some(first),
-        )
+        self.serve_ahead(out, s, kind, live, ctype, plan, First::Response(first))
     }
 
-    /// Answers a range that starts inside `kept`: its bytes first, from
-    /// memory, while the rest is fetched upstream from where they end.
+    /// Answers a range that starts inside the head fetched at open: its
+    /// bytes first, as they arrive, and then the rest, fetched upstream from
+    /// where they end (or from where the head stopped, if it stopped short).
+    #[allow(clippy::too_many_arguments)]
     fn relay_kept(
         self: &Arc<Self>,
         out: &mut TcpStream,
@@ -321,34 +314,30 @@ impl Server {
         kind: &str,
         live: Live,
         w: Wanted,
-        kept: Piece,
+        head: Arc<Head>,
+        meta: Meta,
     ) -> Result<()> {
-        let end = w.end.map_or(kept.total - 1, |e| e.min(kept.total - 1));
+        let end = w.end.map_or(meta.total - 1, |e| e.min(meta.total - 1));
         let plan = Plan {
             start: w.start,
-            first_end: end.min(kept.last()),
+            first_end: end.min(meta.last),
             end,
-            total: kept.total,
+            total: meta.total,
         };
-        let ahead = Ahead::default();
-        {
-            let mut st = lock(&ahead.state);
-            let from = (plan.start - kept.start) as usize;
-            let to = (plan.first_end - kept.start) as usize;
-            st.blocks.push_back(kept.bytes[from..=to].to_vec());
-            st.bytes = to + 1 - from;
-            if plan.first_end == plan.end {
-                st.done = Some(Ok(()));
-            }
-        }
-        self.serve_ahead(out, s, kind, live, ahead, kept.content_type, plan, None)
+        self.serve_ahead(
+            out,
+            s,
+            kind,
+            live,
+            meta.content_type,
+            plan,
+            First::Kept(head),
+        )
     }
 
-    /// Sends the head of a 206 for `plan` and then what `ahead` gets. The
-    /// bytes after `plan.first_end` are fetched upstream by a second thread,
-    /// starting with the body of `first` if there is one (it carries
-    /// `plan.start..=plan.first_end`), or else with what follows what `ahead`
-    /// already holds.
+    /// Sends the head of a 206 for `plan` and then what a second thread
+    /// fetches: `plan.start..=plan.first_end` from `first`, and the bytes
+    /// after that upstream.
     #[allow(clippy::too_many_arguments)]
     fn serve_ahead(
         self: &Arc<Self>,
@@ -356,34 +345,27 @@ impl Server {
         s: &Arc<Session>,
         kind: &str,
         live: Live,
-        ahead: Ahead,
         ctype: Option<String>,
         plan: Plan,
-        first: Option<reqwest::blocking::Response>,
+        first: First,
     ) -> Result<()> {
-        let ahead = Arc::new(ahead);
-        if first.is_some() || plan.first_end < plan.end {
-            let fetcher = Fetcher {
-                server: Arc::clone(self),
-                session: Arc::clone(s),
-                kind: kind.to_string(),
-                live,
-                ahead: Arc::clone(&ahead),
-                pos: if first.is_some() {
-                    plan.start
-                } else {
-                    plan.first_end + 1
-                },
-                chunk_end: plan.first_end,
-                end: plan.end,
-                total: plan.total,
-            };
-            if std::thread::Builder::new()
-                .spawn(move || fetcher.run(first))
-                .is_err()
-            {
-                return respond(out, 503, "text/plain", b"too busy to relay this stream");
-            }
+        let ahead = Arc::new(Ahead::default());
+        let fetcher = Fetcher {
+            server: Arc::clone(self),
+            session: Arc::clone(s),
+            kind: kind.to_string(),
+            live,
+            ahead: Arc::clone(&ahead),
+            pos: plan.start,
+            chunk_end: plan.first_end,
+            end: plan.end,
+            total: plan.total,
+        };
+        if std::thread::Builder::new()
+            .spawn(move || fetcher.run(first))
+            .is_err()
+        {
+            return respond(out, 503, "text/plain", b"too busy to relay this stream");
         }
         // Whatever happens from here on, the fetcher stops once this returns.
         let _gone = Gone(&ahead);
@@ -634,6 +616,14 @@ struct Fetcher {
     total: u64,
 }
 
+/// Where a relayed range's first bytes come from.
+enum First {
+    /// The first chunk's response, already checked.
+    Response(reqwest::blocking::Response),
+    /// The head fetched at open (see `warm`), as far as `chunk_end`.
+    Kept(Arc<Head>),
+}
+
 /// How reading one chunk's body ended.
 enum Taken {
     Complete,
@@ -645,7 +635,7 @@ enum Taken {
 }
 
 impl Fetcher {
-    fn run(mut self, first: Option<reqwest::blocking::Response>) {
+    fn run(mut self, first: First) {
         let result = self.fetch(first);
         lock(&self.ahead.state).done = Some(result);
         self.ahead.changed.notify_all();
@@ -655,17 +645,23 @@ impl Fetcher {
         self.session.cancelled.load(Ordering::Acquire) || lock(&self.ahead.state).gone
     }
 
-    fn fetch(&mut self, first: Option<reqwest::blocking::Response>) -> Result<(), String> {
+    fn fetch(&mut self, first: First) -> Result<(), String> {
         // Where the last connection failed. A connection that drops part-way
         // is picked up again at the byte where it broke, but a second failure
         // at the same byte ends the stream.
         let mut failed_at = None;
         let mut up = match first {
-            Some(up) => up,
-            None => match self.next(&mut failed_at)? {
-                Some(up) => up,
-                None => return Ok(()),
-            },
+            First::Response(up) => up,
+            First::Kept(head) => {
+                self.take_kept(&head);
+                if self.stopped() || self.pos > self.end {
+                    return Ok(());
+                }
+                match self.next(&mut failed_at)? {
+                    Some(up) => up,
+                    None => return Ok(()),
+                }
+            }
         };
         loop {
             match self.take(&mut up) {
@@ -704,6 +700,26 @@ impl Fetcher {
                 }
                 Err(Failure::Final(e)) => return Err(e),
             }
+        }
+    }
+
+    /// Passes on what `head` has from `pos` up to `chunk_end`, as it
+    /// arrives, until it has all been passed on or the head stops short
+    /// (it failed, or stalled): the rest is then fetched upstream.
+    fn take_kept(&mut self, head: &Head) {
+        let mut block = Vec::new();
+        loop {
+            let stop = || self.stopped();
+            let n = head.read_at(self.pos, self.chunk_end, 64 << 10, &mut block, &stop);
+            if n == 0 {
+                return;
+            }
+            self.pos += n as u64;
+            let mut st = lock(&self.ahead.state);
+            st.bytes += n;
+            st.blocks.push_back(std::mem::take(&mut block));
+            drop(st);
+            self.ahead.changed.notify_all();
         }
     }
 

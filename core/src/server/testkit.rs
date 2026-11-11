@@ -272,11 +272,14 @@ pub fn big_bytes(from: u64, to: u64) -> Vec<u8> {
 }
 
 /// A long video on the fake googlevideo, answering Range requests like
-/// the real one. In the query: `size=` its length, `pace=` ms between
-/// 16 KiB writes, `gen=1` a URL that has gone stale once the first chunk
+/// the real one. In the query: `size=` its length, `ttfb=` ms before the
+/// response head (a round trip through Tor), `pace=` ms between 16 KiB
+/// writes, `gen=1` a URL that has gone stale once the first chunk
 /// is through (a retired Tor circuit), `stale=` one that is never good
 /// again after that, and `dead=1` one whose connections die at once after
-/// the first chunk. `Gauge::cuts` makes that many responses stop half-way.
+/// the first chunk. `hold=B` leaves a request for a range that ends at byte
+/// `B` unanswered for ten seconds, and `cut=B` stops one half-way. `Gauge::cuts`
+/// makes that many responses stop half-way.
 pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: bool, gauge: &Gauge) {
     let param = |k: &str| {
         query
@@ -285,6 +288,9 @@ pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: boo
     };
     let size: u64 = param("size").and_then(|s| s.parse().ok()).unwrap_or(BIG);
     let pace: u64 = param("pace").and_then(|s| s.parse().ok()).unwrap_or(0);
+    if let Some(ms) = param("ttfb").and_then(|s| s.parse().ok()) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let (a, b) = match range.and_then(|r| r.strip_prefix("bytes=")) {
         Some(r) => {
             let (a, b) = r.split_once('-').unwrap();
@@ -294,6 +300,11 @@ pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: boo
         }
         None => (0, size - 1),
     };
+    let ends_at = |k: &str| param(k).and_then(|s| s.parse::<u64>().ok()) == Some(b);
+    if ends_at("hold") {
+        std::thread::sleep(Duration::from_secs(10));
+        return;
+    }
     let past_first = a > 0;
     if past_first && (param("gen") == Some("1") || param("stale").is_some()) {
         let _ = write!(
@@ -332,7 +343,7 @@ pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: boo
         *cuts = cuts.saturating_sub(1);
         cut
     };
-    if cut {
+    if cut || ends_at("cut") {
         stop = a + (b + 1 - a) / 2;
     }
     gauge.live.fetch_add(1, Ordering::SeqCst);

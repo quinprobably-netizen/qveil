@@ -1,19 +1,24 @@
-//! The start and the end of a session's streams, fetched as soon as it is
-//! opened.
+//! The start of a session's streams, fetched as soon as it is opened.
 //!
-//! mpv opens a video with a handful of Range requests one after the other:
-//! the start of the video stream, its end (where an MP4 may keep its index),
-//! the start again, and the start of the audio. Each is a round trip through
-//! the route, which over Tor is a good part of a second. Those are the same
-//! bytes every time, so the relay asks for them itself, in parallel, while
-//! the window is still getting the answer to `play` and starting mpv, and
-//! keeps them here for the player's requests to be answered from.
+//! mpv opens a video with a handful of Range requests one after the other,
+//! and the first of each stream is for its start. Each is a round trip
+//! through the route, which over Tor is a good part of a second. So the
+//! relay asks for the start of each stream itself, while the window is
+//! still getting the answer to `play` and starting mpv, and a player's
+//! request that starts there is answered from that request: its bytes are
+//! passed on as they arrive, so the player's first byte comes one round trip
+//! after the open, not once the whole head is in.
 //!
-//! What is kept is bounded (`HEAD` and `TAIL` per stream, a few MiB a
-//! session, and there are at most `MAX_SESSIONS`), belongs to one resolve of
-//! the stream (a refresh makes it stale), and is dropped when the session is
+//! What is kept is bounded (`HEAD` of the video, `AUDIO_HEAD` of the audio,
+//! and there are at most `MAX_SESSIONS`), belongs to one resolve of the
+//! stream (a refresh makes it stale), and is dropped when the session is
 //! cancelled. A failure here costs nothing: the player's request then goes
-//! upstream as it would have anyway.
+//! upstream as it would have anyway, and so does one that finds the head
+//! stalled (no response within `HEAD_WAIT`).
+//!
+//! The end of a stream (where an MP4 may keep its index) is not fetched:
+//! YouTube's streams keep their index at the start, and mpv never asked for
+//! the end of one.
 
 use super::Server;
 use super::relay::{Live, Session, content_range, fetch_upstream, is_playlist_type};
@@ -23,66 +28,139 @@ use reqwest::header::CONTENT_TYPE;
 use std::io::{self, Read};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How much of the start of each stream is fetched.
+/// How much of the start of the video is fetched: enough for the player to
+/// start, and for what follows to be on its way before it runs out.
 pub(super) const HEAD: u64 = 1 << 20;
-/// How much of the end.
-pub(super) const TAIL: u64 = 64 << 10;
-/// How often a request waiting for a piece that is on its way looks at the
-/// cancel flag.
+/// How much of the start of the audio. Audio is a tenth of the video's
+/// bitrate, and on one circuit every byte of it is a byte the video's first
+/// frame waits for.
+pub(super) const AUDIO_HEAD: u64 = 128 << 10;
+/// How long a player's request waits for the head's response to start
+/// before it goes upstream itself, and how long it waits for the next bytes
+/// of the head before it fetches the rest itself.
+pub(super) const HEAD_WAIT: Duration = Duration::from_secs(3);
+/// How often a request waiting for the head looks at the cancel flag.
 const POLL: Duration = Duration::from_millis(250);
 
-/// Bytes `start..start + bytes.len()` of a stream `total` bytes long.
-#[derive(Clone, Debug)]
-pub(super) struct Piece {
-    pub(super) start: u64,
-    pub(super) bytes: Arc<[u8]>,
-    pub(super) total: u64,
-    pub(super) content_type: Option<String>,
-    /// The resolve it was fetched from (`Live::generation`).
+/// The start of one stream, as it arrives: bytes `0..bytes.len()` of a
+/// stream `total` bytes long, of which `0..=last` are on their way.
+pub(super) struct Head {
+    /// The resolve it is fetched from (`Live::generation`).
     generation: u32,
-}
-
-impl Piece {
-    fn holds(&self, pos: u64) -> bool {
-        pos >= self.start && pos < self.start + self.bytes.len() as u64
-    }
-
-    /// The last byte it has.
-    pub(super) fn last(&self) -> u64 {
-        self.start + self.bytes.len() as u64 - 1
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-enum Slot {
-    /// Not asked for, or it failed.
-    #[default]
-    Empty,
-    Coming,
-    Here(Piece),
+    state: Mutex<HeadState>,
+    changed: Condvar,
 }
 
 #[derive(Default)]
-struct Stream {
-    head: Slot,
-    tail: Slot,
-    /// Where the tail starts, once that is known: from the length yt-dlp
-    /// reported, or else from the head's response.
-    tail_from: Option<u64>,
+struct HeadState {
+    /// What the response said, once it has started.
+    meta: Option<Meta>,
+    bytes: Vec<u8>,
+    /// Set once nothing more will arrive: all of it did, or the fetch
+    /// failed, was stopped or was given up on.
+    ended: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Meta {
+    /// The last byte it will have.
+    pub(super) last: u64,
+    pub(super) total: u64,
+    pub(super) content_type: Option<String>,
+}
+
+impl Head {
+    fn new(generation: u32) -> Arc<Self> {
+        Arc::new(Head {
+            generation,
+            state: Mutex::default(),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn wait<'a>(&self, st: MutexGuard<'a, HeadState>) -> MutexGuard<'a, HeadState> {
+        match self.changed.wait_timeout(st, POLL) {
+            Ok((st, _)) => st,
+            Err(e) => e.into_inner().0,
+        }
+    }
+
+    /// Nothing more arrives: whoever waits for it stops waiting.
+    fn end(&self) {
+        lock(&self.state).ended = true;
+        self.changed.notify_all();
+    }
+
+    fn ended(&self) -> bool {
+        lock(&self.state).ended
+    }
+
+    /// What the response said, once it has started; `None` if it failed, or
+    /// didn't start within `HEAD_WAIT`, or `stop` said so first.
+    fn meta(&self, stop: &dyn Fn() -> bool) -> Option<Meta> {
+        let deadline = Instant::now() + HEAD_WAIT;
+        let mut st = lock(&self.state);
+        loop {
+            if let Some(m) = &st.meta {
+                return Some(m.clone());
+            }
+            if st.ended || stop() || Instant::now() >= deadline {
+                return None;
+            }
+            st = self.wait(st);
+        }
+    }
+
+    /// Appends the bytes from `pos` up to `upto` (inclusive) to `out` as
+    /// they arrive, at most `max` at a time, and returns how many; 0 once
+    /// there are no more to be had: it ended short of `pos`, `stop` said
+    /// so, or nothing came for `HEAD_WAIT`.
+    pub(super) fn read_at(
+        &self,
+        pos: u64,
+        upto: u64,
+        max: usize,
+        out: &mut Vec<u8>,
+        stop: &dyn Fn() -> bool,
+    ) -> usize {
+        let mut deadline = Instant::now() + HEAD_WAIT;
+        let mut st = lock(&self.state);
+        loop {
+            let have = st.bytes.len() as u64;
+            if pos > upto {
+                return 0;
+            }
+            if pos < have {
+                let to = have.min(upto + 1).min(pos + max as u64);
+                out.extend_from_slice(&st.bytes[pos as usize..to as usize]);
+                return (to - pos) as usize;
+            }
+            if st.ended || stop() {
+                return 0;
+            }
+            let before = st.bytes.len();
+            st = self.wait(st);
+            if st.bytes.len() != before {
+                deadline = Instant::now() + HEAD_WAIT;
+            } else if Instant::now() >= deadline {
+                return 0;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
 struct State {
-    video: Stream,
-    audio: Stream,
+    video: Option<Arc<Head>>,
+    audio: Option<Arc<Head>>,
     /// Set when the session is cancelled: nothing more is fetched or kept.
     stopped: bool,
 }
 
 impl State {
-    fn stream(&mut self, kind: &str) -> &mut Stream {
+    fn stream(&mut self, kind: &str) -> &mut Option<Arc<Head>> {
         if kind == "v" {
             &mut self.video
         } else {
@@ -94,180 +172,90 @@ impl State {
 #[derive(Default)]
 pub(super) struct Warm {
     state: Mutex<State>,
-    changed: Condvar,
 }
 
 impl Warm {
-    fn wait<'a>(&self, st: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
-        match self.changed.wait_timeout(st, POLL) {
-            Ok((st, _)) => st,
-            Err(e) => e.into_inner().0,
-        }
-    }
-
     /// Drops what is kept, and stops what is being fetched.
     pub(super) fn stop(&self) {
-        let mut st = lock(&self.state);
-        *st = State {
-            stopped: true,
-            ..State::default()
+        let gone = {
+            let mut st = lock(&self.state);
+            st.stopped = true;
+            [st.video.take(), st.audio.take()]
         };
-        self.changed.notify_all();
-    }
-
-    /// The piece of stream `kind` that holds byte `pos`, from the resolve
-    /// `generation`. A piece that is on its way and may hold it is waited
-    /// for, rather than asked for a second time.
-    pub(super) fn find(&self, s: &Session, kind: &str, pos: u64, generation: u32) -> Option<Piece> {
-        let mut st = lock(&self.state);
-        loop {
-            if st.stopped || s.cancelled.load(Ordering::Acquire) {
-                return None;
-            }
-            let (head, tail, tail_from) = {
-                let stream = st.stream(kind);
-                (stream.head.clone(), stream.tail.clone(), stream.tail_from)
-            };
-            let fits = |p: &Piece| p.holds(pos) && p.generation == generation;
-            let in_tail = tail_from.is_some_and(|from| pos >= from);
-            match head {
-                Slot::Here(p) if fits(&p) => return Some(p),
-                // It may hold `pos`, or say where the tail starts.
-                Slot::Coming if !in_tail => {
-                    st = self.wait(st);
-                    continue;
-                }
-                _ => {}
-            }
-            match tail {
-                Slot::Coming if in_tail => st = self.wait(st),
-                Slot::Here(p) if fits(&p) => return Some(p),
-                _ => return None,
-            }
+        for head in gone.into_iter().flatten() {
+            head.end();
         }
     }
 
-    /// Puts `piece` in its place, unless the session was stopped meanwhile.
-    /// With `tail_from`, the tail is marked as on its way in the same step,
-    /// so that nobody looks in between and decides not to wait for it.
-    fn put(&self, kind: &str, head: bool, piece: Option<Piece>, tail_from: Option<u64>) -> bool {
+    fn stopped(&self) -> bool {
+        lock(&self.state).stopped
+    }
+
+    /// The head of stream `kind`, from the resolve `generation`, if it holds
+    /// or will hold byte `pos`: once its response has started, which is
+    /// waited for (up to `HEAD_WAIT`) rather than asked for a second time.
+    pub(super) fn find(
+        &self,
+        s: &Session,
+        kind: &str,
+        pos: u64,
+        generation: u32,
+    ) -> Option<(Arc<Head>, Meta)> {
+        let head = lock(&self.state).stream(kind).clone()?;
+        if head.generation != generation {
+            return None;
+        }
+        let stop = || self.stopped() || s.cancelled.load(Ordering::Acquire);
+        let meta = head.meta(&stop)?;
+        (pos <= meta.last).then_some((head, meta))
+    }
+
+    /// Puts a head on its way for each of `kinds`, unless stopped.
+    fn expect(&self, kinds: &[&str], generation: u32) -> Option<Vec<Arc<Head>>> {
         let mut st = lock(&self.state);
         if st.stopped {
-            return false;
+            return None;
         }
-        let slot = match piece {
-            Some(p) => Slot::Here(p),
-            None => Slot::Empty,
-        };
-        let stream = st.stream(kind);
-        if head {
-            stream.head = slot;
-        } else {
-            stream.tail = slot;
-        }
-        if let Some(from) = tail_from {
-            stream.tail = Slot::Coming;
-            stream.tail_from = Some(from);
-        }
-        self.changed.notify_all();
-        true
-    }
-
-    /// Marks the heads of `kinds` as on their way, and the tails of those
-    /// whose start is known. False once stopped.
-    fn expect(&self, kinds: &[(&str, Option<u64>)]) -> bool {
-        let mut st = lock(&self.state);
-        if st.stopped {
-            return false;
-        }
-        for (kind, tail_from) in kinds {
-            let stream = st.stream(kind);
-            stream.head = Slot::Coming;
-            if let Some(from) = tail_from {
-                stream.tail = Slot::Coming;
-                stream.tail_from = Some(*from);
-            }
-        }
-        true
+        Some(
+            kinds
+                .iter()
+                .map(|kind| {
+                    let head = Head::new(generation);
+                    *st.stream(kind) = Some(Arc::clone(&head));
+                    head
+                })
+                .collect(),
+        )
     }
 }
 
-/// Where the tail of a stream `total` bytes long starts, if it has one that
-/// the head doesn't cover.
-fn tail_of(total: u64) -> Option<u64> {
-    Some(total.saturating_sub(TAIL)).filter(|&from| from > HEAD)
-}
-
-/// Starts fetching the head and the tail of each stream of `s`. `sizes` are
-/// the lengths of the video and the audio stream, where yt-dlp knew them:
-/// then the tail is fetched alongside the head, and otherwise once the
-/// head's response has said how long the stream is.
-pub(super) fn start(server: &Arc<Server>, s: &Arc<Session>, sizes: [Option<u64>; 2]) {
+/// Starts fetching the head of each stream of `s`.
+pub(super) fn start(server: &Arc<Server>, s: &Arc<Session>) {
     let live = lock(&s.live).clone();
-    let mut kinds = vec![("v", sizes[0].and_then(tail_of))];
+    let mut kinds = vec!["v"];
     if live.audio.is_some() {
-        kinds.push(("a", sizes[1].and_then(tail_of)));
+        kinds.push("a");
     }
-    if !s.warm.expect(&kinds) {
+    let Some(heads) = s.warm.expect(&kinds, live.generation) else {
         return;
-    }
-    let spawn = |kind: &'static str, part: Part| {
-        let (server, session, live) = (Arc::clone(server), Arc::clone(s), live.clone());
-        let spawned = std::thread::Builder::new()
-            .spawn(move || fetch_part(&server, &session, &live, kind, part));
+    };
+    for (kind, head) in kinds.into_iter().zip(heads) {
+        let (server, session, live, fill) = (
+            Arc::clone(server),
+            Arc::clone(s),
+            live.clone(),
+            Arc::clone(&head),
+        );
+        let spawned = std::thread::Builder::new().spawn(move || {
+            if let Err(Stalled) = fetch_head(&session, &live, kind, &fill) {
+                // The player's own request then goes upstream, on a new client.
+                server.redial(&session, &live);
+            }
+            fill.end();
+        });
         if spawned.is_err() {
             // Nobody would ever fill it, and a request would wait for it.
-            s.warm
-                .put(kind, matches!(part, Part::Head { .. }), None, None);
-        }
-    };
-    for (kind, tail_from) in kinds {
-        spawn(
-            kind,
-            Part::Head {
-                then_tail: tail_from.is_none(),
-            },
-        );
-        if let Some(from) = tail_from {
-            spawn(kind, Part::Tail(from));
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Part {
-    /// The head, and then the tail if `then_tail` (its start wasn't known).
-    Head { then_tail: bool },
-    /// The tail, from this byte.
-    Tail(u64),
-}
-
-fn fetch_part(server: &Server, s: &Session, live: &Live, kind: &str, part: Part) {
-    let piece = |start, last| match piece(s, live, kind, start, last) {
-        Ok(found) => found,
-        Err(Stalled) => {
-            // The player's own request then goes upstream, on a new client.
-            server.redial(s, live);
-            None
-        }
-    };
-    match part {
-        Part::Head { then_tail } => {
-            let head = piece(0, HEAD - 1);
-            let tail_from = head
-                .as_ref()
-                .filter(|_| then_tail)
-                .and_then(|h| tail_of(h.total));
-            if s.warm.put(kind, true, head, tail_from)
-                && let Some(from) = tail_from
-            {
-                let tail = piece(from, from + TAIL - 1);
-                s.warm.put(kind, false, tail, None);
-            }
-        }
-        Part::Tail(from) => {
-            let tail = piece(from, from + TAIL - 1);
-            s.warm.put(kind, false, tail, None);
+            head.end();
         }
     }
 }
@@ -275,24 +263,19 @@ fn fetch_part(server: &Server, s: &Session, live: &Live, kind: &str, part: Part)
 /// A warm-up request timed out, or its connection failed.
 struct Stalled;
 
-/// Bytes `start..=last` of stream `kind`, or `None` if they can't be had
-/// as they are (a 403 is left to the player's own request, which resolves
-/// the stream again).
-fn piece(
-    s: &Session,
-    live: &Live,
-    kind: &str,
-    start: u64,
-    last: u64,
-) -> Result<Option<Piece>, Stalled> {
-    let range = format!("bytes={start}-{last}");
+/// Fetches the head of stream `kind` into `head`, as it arrives. A response
+/// that isn't the bytes asked for leaves it without them (a 403 is left to
+/// the player's own request, which resolves the stream again).
+fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), Stalled> {
+    let want = if kind == "v" { HEAD } else { AUDIO_HEAD };
+    let range = format!("bytes=0-{}", want - 1);
     let Some(mut up) =
         fetch_upstream(live, &s.route, "GET", kind, Some(&range)).map_err(|_| Stalled)?
     else {
-        return Ok(None);
+        return Ok(());
     };
     if up.status() != StatusCode::PARTIAL_CONTENT {
-        return Ok(None);
+        return Ok(());
     }
     let content_type = up
         .headers()
@@ -300,45 +283,65 @@ fn piece(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     if content_type.as_deref().is_some_and(is_playlist_type) {
-        return Ok(None);
+        return Ok(());
     }
-    let Some((a, b, total)) = content_range(&up) else {
-        return Ok(None);
+    let Some((0, last, total)) = content_range(&up) else {
+        return Ok(());
     };
-    if a != start || b > last {
-        return Ok(None);
+    if last >= want {
+        return Ok(());
     }
-    let want = (b + 1 - a) as usize;
-    let mut bytes = Vec::with_capacity(want);
-    let mut buf = vec![0u8; 64 << 10];
-    while bytes.len() < want {
-        if s.cancelled.load(Ordering::Acquire) {
-            return Ok(None);
+    {
+        let mut st = lock(&head.state);
+        if st.ended {
+            return Ok(());
+        }
+        st.meta = Some(Meta {
+            last,
+            total,
+            content_type,
+        });
+        st.bytes.reserve_exact(last as usize + 1);
+    }
+    head.changed.notify_all();
+    let want = last as usize + 1;
+    let mut buf = vec![0u8; 16 << 10];
+    let mut have = 0;
+    while have < want {
+        if s.cancelled.load(Ordering::Acquire) || head.ended() {
+            return Ok(());
         }
         match up.read(&mut buf) {
-            Ok(0) => return Ok(None),
-            Ok(n) => bytes.extend_from_slice(&buf[..n.min(want - bytes.len())]),
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                let n = n.min(want - have);
+                let mut st = lock(&head.state);
+                if st.ended {
+                    return Ok(());
+                }
+                st.bytes.extend_from_slice(&buf[..n]);
+                have += n;
+                drop(st);
+                head.changed.notify_all();
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return Err(Stalled),
         }
     }
-    Ok(Some(Piece {
-        start,
-        bytes: bytes.into(),
-        total,
-        content_type,
-        generation: live.generation,
-    }))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::server::relay;
     use crate::server::testkit::*;
     use crate::store::testing::TempDir;
+    use std::io::Write;
+    use std::net::TcpStream;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const SIZE: u64 = 3_000_000;
 
@@ -358,6 +361,82 @@ mod tests {
         (s, base, d, bin)
     }
 
+    /// Asks the relay for `range` of `stream` and returns the response head
+    /// and the socket, with the time it took for the first byte of the
+    /// body to arrive.
+    fn first_byte(base: &str, stream: &str, range: &str) -> (String, Duration, Vec<u8>, TcpStream) {
+        let mut c = TcpStream::connect(addr(base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let started = Instant::now();
+        write!(
+            c,
+            "GET {} HTTP/1.1\r\nHost: x\r\nRange: {range}\r\n\r\n",
+            path(base, stream)
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = c.read(&mut buf).unwrap();
+            assert!(n > 0, "the relay hung up");
+            got.extend_from_slice(&buf[..n]);
+            if let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n")
+                && got.len() > at + 4
+            {
+                let head = String::from_utf8_lossy(&got[..at]).into_owned();
+                return (head, started.elapsed(), got[at + 4..].to_vec(), c);
+            }
+        }
+    }
+
+    /// Reads from `c` until `have` holds `n` bytes.
+    fn read_up_to(c: &mut TcpStream, have: &mut Vec<u8>, n: usize) {
+        let mut buf = vec![0u8; 64 << 10];
+        while have.len() < n {
+            let got = c.read(&mut buf).unwrap();
+            assert!(got > 0, "the relay hung up after {} bytes", have.len());
+            have.extend_from_slice(&buf[..got]);
+        }
+    }
+
+    #[test]
+    fn the_head_reaches_the_player_as_it_arrives_not_once_it_is_all_in() {
+        let up = Upstream::start();
+        // A round trip of 300 ms and then about 400 KB/s, as over Tor: the
+        // whole video head takes more than two seconds to come.
+        let (s, base, _d, _bin) =
+            warm_server(&up, &format!("/big?size={SIZE}&ttfb=300&pace=40&run="));
+        let info = s.open(&test_video()).unwrap();
+        let (head, took, mut body, mut c) = first_byte(&base, rel(&base, &info.video), "bytes=0-");
+        eprintln!("first byte of the video after {took:?}");
+        assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+        assert!(
+            head.contains(&format!("Content-Range: bytes 0-{}/{SIZE}", SIZE - 1)),
+            "{head}"
+        );
+        assert!(took < Duration::from_millis(900), "{took:?}");
+        read_up_to(&mut c, &mut body, 200_000);
+        assert!(body[..200_000] == big_bytes(0, 200_000), "the bytes differ");
+        let (_, took, _, _a) = first_byte(
+            &base,
+            rel(&base, info.audio.as_deref().unwrap()),
+            "bytes=0-",
+        );
+        eprintln!("first byte of the audio after {took:?}");
+        assert!(took < Duration::from_millis(900), "{took:?}");
+        // Both came from the requests made at open, and nothing else was
+        // asked for meanwhile: no second request for the start, and no tails.
+        let mut asked = ranges(&up);
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                format!("bytes=0-{}", HEAD - 1),
+                format!("bytes=0-{}", AUDIO_HEAD - 1)
+            ]
+        );
+    }
+
     #[test]
     fn mpvs_first_requests_are_answered_from_what_was_fetched_at_open() {
         let up = Upstream::start();
@@ -372,7 +451,7 @@ mod tests {
         let get = |stream: &str, range: &str| fetch(&base, "GET", stream, &[("Range", range)]);
 
         // The start, the end, the start again and the audio's start, as mpv
-        // asks for them when it opens an MP4.
+        // asks for them when it opens an MP4. Only the end goes upstream.
         let (status, headers, body) = get(video, "bytes=0-99");
         assert_eq!(
             (status, headers["content-range"].as_str()),
@@ -391,14 +470,16 @@ mod tests {
         assert_eq!(get(video, "bytes=500-999").2, big_bytes(500, 1000));
         assert_eq!(get(audio, "bytes=0-4095").2, big_bytes(0, 4096));
         settled(&up);
-        let head = format!("bytes=0-{}", HEAD - 1);
-        let tail = format!("bytes={}-{}", SIZE - TAIL, SIZE - 1);
         let mut asked = ranges(&up);
         asked.sort();
         assert_eq!(
             asked,
-            [head.clone(), head, tail.clone(), tail],
-            "the player's requests went upstream"
+            [
+                format!("bytes=0-{}", HEAD - 1),
+                format!("bytes=0-{}", AUDIO_HEAD - 1),
+                format!("bytes={tail}-{}", tail + relay::CHUNK - 1),
+            ],
+            "the player's requests for the start went upstream"
         );
 
         // Playing on from the start takes the head from memory and fetches
@@ -406,50 +487,51 @@ mod tests {
         let (status, _, body) = get(video, "bytes=0-");
         assert_eq!(status, 206);
         assert!(body == big_bytes(0, SIZE), "the bytes differ");
-        assert_eq!(ranges(&up)[4..], [format!("bytes={HEAD}-{}", SIZE - 1)]);
+        assert_eq!(ranges(&up)[3..], [format!("bytes={HEAD}-{}", SIZE - 1)]);
     }
 
     #[test]
-    fn with_the_length_known_the_tail_does_not_wait_for_the_head() {
+    fn a_head_that_does_not_start_is_not_waited_for_long() {
         let up = Upstream::start();
-        let bin = TempDir::new();
-        // At this pace the head takes over a second, and the tail a tenth of that.
-        let url = up.url(&format!("/big?size={SIZE}&pace=20"));
-        let ytdlp = crate::store::testing::script(
-            &bin.0.join("yt-dlp"),
-            &format!(
-                r#"echo '{{"title":"T","url":"{url}","protocol":"https","vcodec":"avc1","filesize":{SIZE}}}'"#
-            ),
-        );
-        let (s, base, _d) = server_with(Config {
-            ytdlp,
-            ..Config::default()
-        });
-        s.warming.store(true, Ordering::Relaxed);
+        // The request for the video head gets no answer at all.
+        let (s, base, _d, _bin) =
+            warm_server(&up, &format!("/big?size={SIZE}&hold={}&run=", HEAD - 1));
         let info = s.open(&test_video()).unwrap();
-        let started = std::time::Instant::now();
-        let tail = SIZE - 100;
+        let started = Instant::now();
         let (status, _, body) = fetch(
             &base,
             "GET",
             rel(&base, &info.video),
-            &[("Range", &format!("bytes={tail}-"))],
+            &[("Range", "bytes=0-99")],
         );
-        assert_eq!((status, body), (206, big_bytes(tail, SIZE)));
+        assert_eq!((status, body), (206, big_bytes(0, 100)));
+        let took = started.elapsed();
+        assert!(took < HEAD_WAIT + Duration::from_secs(1), "{took:?}");
+        assert!(ranges(&up).contains(&"bytes=0-99".to_string()));
+    }
+
+    #[test]
+    fn a_head_that_stops_short_is_carried_on_from_where_it_stopped() {
+        let up = Upstream::start();
+        // The video head is cut off half-way.
+        let (s, base, _d, _bin) = warm_server(
+            &up,
+            &format!("/big?size={SIZE}&pace=5&cut={}&run=", HEAD - 1),
+        );
+        let info = s.open(&test_video()).unwrap();
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            rel(&base, &info.video),
+            &[("Range", "bytes=0-1999999")],
+        );
+        assert_eq!(status, 206);
+        assert!(body == big_bytes(0, 2_000_000), "{} bytes", body.len());
+        let half = HEAD / 2;
         assert!(
-            started.elapsed() < Duration::from_millis(800),
+            ranges(&up).contains(&format!("bytes={half}-1999999")),
             "{:?}",
-            started.elapsed()
-        );
-        settled(&up);
-        let mut asked = ranges(&up);
-        asked.sort();
-        assert_eq!(
-            asked,
-            [
-                format!("bytes=0-{}", HEAD - 1),
-                format!("bytes={}-{}", SIZE - TAIL, SIZE - 1)
-            ]
+            ranges(&up)
         );
     }
 
@@ -507,7 +589,7 @@ mod tests {
         wait_for("the upstream to be let go", Duration::from_secs(5), || {
             up.gauge.live.load(Ordering::SeqCst) == 0
         });
-        assert_eq!(settled(&up), 2, "the tails were asked for after the switch");
+        assert_eq!(settled(&up), 2, "more was asked for after the switch");
         assert!(held.warm.find(&held, "v", 0, 0).is_none());
         assert!(lock(&held.warm.state).stopped);
     }
