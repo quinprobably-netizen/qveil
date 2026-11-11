@@ -772,10 +772,20 @@ fn published(v: &Value) -> Option<i64> {
         })
 }
 
+/// How long a chapter must be, in seconds, for YouTube to make chapters of
+/// a description's times.
+const CHAPTER_MIN: u64 = 10;
+/// What may stand between a chapter's time and its title: a dash, a colon, a
+/// bar or a dot, or the like. Nothing else is left off the start of a title:
+/// `(Intro)`, `#2` and `¿Por qué?` are what they say.
+const CHAPTER_SEPARATORS: &[char] = &['-', '\u{2013}', '\u{2014}', ':', '|', '\u{b7}', '\u{2022}'];
+
 /// The chapters a description names, by YouTube's rule for them: lines
 /// that start with a time and go on with a title, the first at 0:00, three
-/// or more, each later than the one before and within the video. (yt-dlp
-/// reads them the same way when it has the page data, but not without it.)
+/// or more, each later than the one before and within the video, and each
+/// at least ten seconds long, the last one included (up to the end of the
+/// video). (yt-dlp reads them the same way when it has the page data, but
+/// not without it.)
 fn description_chapters(description: &str, duration: u64) -> Vec<Chapter> {
     let found: Vec<Chapter> = description
         .lines()
@@ -783,10 +793,8 @@ fn description_chapters(description: &str, duration: u64) -> Vec<Chapter> {
             let line = line.trim();
             let (stamp, rest) = line.split_at(line.find(|c: char| c.is_whitespace())?);
             let start = clock_seconds(stamp)?;
-            // A dash or the like between the time and the title.
             let title = rest
-                .trim_start()
-                .trim_start_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace())
+                .trim_start_matches(|c: char| c.is_whitespace() || CHAPTER_SEPARATORS.contains(&c))
                 .trim();
             (!title.is_empty()).then(|| Chapter {
                 start,
@@ -795,8 +803,11 @@ fn description_chapters(description: &str, duration: u64) -> Vec<Chapter> {
         })
         .take(CHAPTERS_MAX)
         .collect();
-    let in_order = found.windows(2).all(|w| w[0].start < w[1].start);
-    let fits = found.last().is_some_and(|c| c.start < duration);
+    let long_enough = |from: u64, to: u64| from.saturating_add(CHAPTER_MIN) <= to;
+    let in_order = found
+        .windows(2)
+        .all(|w| long_enough(w[0].start, w[1].start));
+    let fits = found.last().is_some_and(|c| long_enough(c.start, duration));
     if found.len() >= 3 && found[0].start == 0 && in_order && fits {
         found
     } else {
@@ -1480,13 +1491,18 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
                 chapter(545, "The end")
             ]
         );
-        // As YouTube has them: from 0:00, three or more, in order, within the video.
+        // As YouTube has them: from 0:00, three or more, in order, within the
+        // video, and each at least ten seconds long, the last one too.
         for desc in [
             "1:00 a\n2:00 b\n3:00 c",
             "0:00 a\n2:00 b",
             "0:00 a\n3:00 b\n2:00 c",
             "0:00 a\n3:00 b\n11:00 c",
             "0:00 a\n1:00:00 b\n2:00:00 c",
+            "0:00 a\n0:05 b\n0:30 c",
+            "0:00 a\n0:30 b\n0:41 c\n9:55 d",
+            "0:00 a\n0:30 b\n10:00 c",
+            "0:00 a\n0:30 b\n9:51 c",
         ] {
             assert!(
                 resolved(&json(desc, "null")).unwrap().chapters.is_empty(),
@@ -1499,6 +1515,36 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
                 .chapters
                 .len(),
             0
+        );
+        // Ten seconds, exactly, is long enough, and the last one is up to the end.
+        let s = resolved(&json("0:00 a\n0:10 b\n9:50 c", "null")).unwrap();
+        assert_eq!(s.chapters.len(), 3);
+        // Only the separators between a time and its title are left out; what
+        // starts the title itself is part of it.
+        let desc = "0:00 (Intro)\n0:15 #2 Second\n0:30 - Third\n0:45 \u{2013} Fourth\n1:00 \u{2014} Fifth\n1:15 : Sixth\n1:30 | Seventh\n1:45 \u{b7} Eighth\n2:00 \u{2022} Ninth\n2:15 -- \u{bf}Why?\n2:30 \"Quoted\"\n2:45 $5 deal\n3:00 [Part 2]";
+        let titles: Vec<String> = resolved(&json(desc, "null"))
+            .unwrap()
+            .chapters
+            .into_iter()
+            .map(|c| c.title)
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "(Intro)",
+                "#2 Second",
+                "Third",
+                "Fourth",
+                "Fifth",
+                "Sixth",
+                "Seventh",
+                "Eighth",
+                "Ninth",
+                "\u{bf}Why?",
+                "\"Quoted\"",
+                "$5 deal",
+                "[Part 2]"
+            ]
         );
         // An hour and more is h:mm:ss.
         let long = r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","duration":7200,"description":"0:00 a\n30:00 b\n1:05:30 c"}"#;
