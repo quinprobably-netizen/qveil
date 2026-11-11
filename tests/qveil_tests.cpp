@@ -1205,6 +1205,37 @@ private slots:
         QCOMPARE(Translator::pluralCategory("ja", 1), QString("other"));
     }
 
+    void aSavedSettingOrClearedHistoryIsHeardEvenWhenReadAgainAtOnce()
+    {
+        // The writes are slow (0.3 s in the stand-in engine), and the window
+        // reads the same thing again before they answer. The read must not
+        // drop what the write's answer does.
+        QTemporaryDir dir;
+        const QString log = dir.filePath("requests");
+        Backend backend(logged(log), requestLogger(dir, "time.sleep(0.3)"));
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(backend.busy().isEmpty(), 5000);
+        auto resumeReads = [&] {
+            QFile file(log);
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()).count("GET /t/api/resume") : 0;
+        };
+        const int before = resumeReads();
+
+        QSignalSpy notices(&backend, &Backend::notice);
+        backend.setConfig({{"resumeDays", 0}});
+        backend.loadConfig();
+        QTRY_VERIFY_WITH_TIMEOUT(notices.size() == 1, 5000);
+        QCOMPARE(notices.at(0).at(0).toString(), QString("Settings saved"));
+        // Fewer days takes kept positions with them, so the list is read again.
+        QTRY_VERIFY_WITH_TIMEOUT(resumeReads() > before, 5000);
+
+        backend.clearHistory();
+        backend.loadHistory();
+        QTRY_VERIFY_WITH_TIMEOUT(notices.size() == 2, 5000);
+        QCOMPARE(notices.at(1).at(0).toString(), QString("History cleared"));
+    }
+
 private:
     // Sets environment variables for its lifetime, and puts back what was there.
     struct EnvironmentVariables {

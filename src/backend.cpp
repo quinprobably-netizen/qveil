@@ -288,8 +288,8 @@ quint64 Backend::supersede(const QString &task) {
     return id;
 }
 
-void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
-                   const QString &task, Done done, bool everyAnswer) {
+void Backend::request(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
+                      const QString &task, Done done, Answers answers) {
     if (!ready()) {
         refuse(task);
         return;
@@ -308,7 +308,7 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
     QNetworkReply *reply = m_net.sendCustomRequest(request, verb, body);
     if (newestOnly(task))
         m_replies.insert(task, reply);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, task, id, generation, done, everyAnswer] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, task, id, generation, done, answers] {
         reply->deleteLater();
         if (m_replies.value(task) == reply)
             m_replies.remove(task);
@@ -332,7 +332,7 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
                 emit taskFailed(task);
             return;
         }
-        if (!everyAnswer && m_latest.value(task) != id)
+        if (answers == Answers::Latest && m_latest.value(task) != id)
             return;
         done(doc.isArray() ? QJsonValue(doc.array()) : QJsonValue(doc.object()));
     });
@@ -363,20 +363,22 @@ void Backend::adoptConfig(const QVariantMap &next, bool routeSet) {
 }
 
 void Backend::setConfig(const QVariantMap &patch) {
-    call("POST", "api/config", {}, QJsonDocument(QJsonObject::fromVariantMap(patch)).toJson(QJsonDocument::Compact),
-         "config", [this, patch](const QJsonValue &v) {
-             const QVariantMap next = v.toObject().toVariantMap();
-             // The engine reports a saved proxy redacted, so a different
-             // string than the one it reported is a new address, even if it
-             // redacts to the same text (a changed password).
-             const bool newProxy = next.value("route").toString() == "proxy" && patch.contains("proxy")
-                                   && patch.value("proxy").toString() != m_config.value("proxy").toString();
-             adoptConfig(next, newProxy);
-             // Fewer days, or none, takes kept positions with it.
-             if (patch.contains("resumeDays"))
-                 loadResume();
-             emit notice(tr("Settings saved"));
-         });
+    // A task of its own: a read of the settings meanwhile must not drop this
+    // answer, and with it the notice and the kept positions' reload.
+    write("api/config", {}, QJsonDocument(QJsonObject::fromVariantMap(patch)).toJson(QJsonDocument::Compact),
+          "config-write", [this, patch](const QJsonValue &v) {
+              const QVariantMap next = v.toObject().toVariantMap();
+              // The engine reports a saved proxy redacted, so a different
+              // string than the one it reported is a new address, even if it
+              // redacts to the same text (a changed password).
+              const bool newProxy = next.value("route").toString() == "proxy" && patch.contains("proxy")
+                                    && patch.value("proxy").toString() != m_config.value("proxy").toString();
+              adoptConfig(next, newProxy);
+              // Fewer days, or none, takes kept positions with it.
+              if (patch.contains("resumeDays"))
+                  loadResume();
+              emit notice(tr("Settings saved"));
+          });
 }
 
 void Backend::refreshFeed(bool network, bool shorts) {
@@ -621,7 +623,7 @@ void Backend::loadSubs() {
 void Backend::subscribe(const QString &input) {
     QUrlQuery q;
     q.addQueryItem("c", input.trimmed());
-    call("POST", "api/subs/add", q, {}, "subscribe", [this](const QJsonValue &v) {
+    write("api/subs/add", q, {}, "subscribe", [this](const QJsonValue &v) {
         const QJsonObject sub = v.toObject().value("sub").toObject();
         const QString name = sub.value("name").toString();
         emit notice(v.toObject().value("added").toBool() ? tr("Subscribed to %1").arg(name)
@@ -638,13 +640,13 @@ void Backend::subscribe(const QString &input) {
         // and the engine doesn't let it join that refresh either: it waits
         // for it to be over and then fetches the new channel.
         loadFeed(true, m_shorts, sub.value("id").toString());
-    }, true);
+    });
 }
 
 void Backend::unsubscribe(const QString &id) {
     QUrlQuery q;
     q.addQueryItem("id", id);
-    call("POST", "api/subs/rm", q, {}, "unsubscribe", [this, id](const QJsonValue &v) {
+    write("api/subs/rm", q, {}, "unsubscribe", [this, id](const QJsonValue &v) {
         emit notice(tr("Unsubscribed from %1").arg(v.toObject().value("name").toString()));
         if (m_channel.value("id").toString() == id) {
             m_channel.insert("subscribed", false);
@@ -652,7 +654,7 @@ void Backend::unsubscribe(const QString &id) {
         }
         loadSubs();
         loadFeed(false, m_shorts);
-    }, true);
+    });
 }
 
 void Backend::importFile(const QUrl &file) {
@@ -665,13 +667,13 @@ void Backend::importFile(const QUrl &file) {
         setError(tr("%1 is too large to be a subscriptions export.").arg(QFileInfo(f).fileName()));
         return;
     }
-    call("POST", "api/subs/import", {}, f.readAll(), "import", [this](const QJsonValue &v) {
+    write("api/subs/import", {}, f.readAll(), "import", [this](const QJsonValue &v) {
         const int added = v.toObject().value("added").toInt();
         emit notice(tr("Imported %n new channel(s)", "", added));
         loadSubs();
         // The imported channels have never been fetched, so they count as stale.
         loadFeed(true, m_shorts);
-    }, true);
+    });
 }
 
 void Backend::loadHistory() {
@@ -682,7 +684,7 @@ void Backend::loadHistory() {
 }
 
 void Backend::clearHistory() {
-    call("POST", "api/history/clear", {}, {}, "history", [this](const QJsonValue &) {
+    write("api/history/clear", {}, {}, "history-write", [this](const QJsonValue &) {
         m_history.clear();
         emit historyChanged();
         emit notice(tr("History cleared"));
@@ -729,29 +731,28 @@ void Backend::noteResume(const QVariantMap &video, double position, double durat
                      {"title", video.value("title").toString()}};
     if (!video.value("channel").toString().isEmpty())
         body.insert("channel", video.value("channel").toString());
-    call("POST", "api/resume", {}, QJsonDocument(body).toJson(QJsonDocument::Compact), "resume-note",
-         [this, id](const QJsonValue &v) {
-             // Only what changes the list is worth reading it again for.
-             const QString noted = v.toObject().value("noted").toString();
-             bool listed = false;
-             for (const QVariant &kept : std::as_const(m_resume))
-                 listed = listed || kept.toMap().value("id").toString() == id;
-             if (noted == "kept" || listed)
-                 loadResume();
-             if (noted == "kept")
-                 emit positionKept();
-         },
-         true);
+    write("api/resume", {}, QJsonDocument(body).toJson(QJsonDocument::Compact), "resume-note",
+          [this, id](const QJsonValue &v) {
+              // Only what changes the list is worth reading it again for.
+              const QString noted = v.toObject().value("noted").toString();
+              bool listed = false;
+              for (const QVariant &kept : std::as_const(m_resume))
+                  listed = listed || kept.toMap().value("id").toString() == id;
+              if (noted == "kept" || listed)
+                  loadResume();
+              if (noted == "kept")
+                  emit positionKept();
+          });
 }
 
 void Backend::forgetResume(const QString &id) {
     QUrlQuery q;
     q.addQueryItem("v", id);
-    call("POST", "api/resume/rm", q, {}, "resume-note", [this](const QJsonValue &) { loadResume(); }, true);
+    write("api/resume/rm", q, {}, "resume-note", [this](const QJsonValue &) { loadResume(); });
 }
 
 void Backend::clearResume() {
-    call("POST", "api/resume/clear", {}, {}, "resume-note", [this](const QJsonValue &) { loadResume(); }, true);
+    write("api/resume/clear", {}, {}, "resume-note", [this](const QJsonValue &) { loadResume(); });
 }
 
 void Backend::loadComments(const QString &video, const QString &sort, int n, bool replies) {
@@ -824,15 +825,15 @@ void Backend::loadShelf(const QString &id) {
 
 void Backend::addLens(const QString &text) {
     const QByteArray body = QJsonDocument(QJsonObject{{"text", text}}).toJson(QJsonDocument::Compact);
-    call("POST", "api/lenses", {}, body, "lens-write", [this](const QJsonValue &v) {
+    write("api/lenses", {}, body, "lens-write", [this](const QJsonValue &v) {
         loadLenses();
         emit lensAdded(v.toObject().value("id").toString());
-    }, true);
+    });
 }
 
 void Backend::editLens(const QString &id, const QString &text) {
     const QByteArray body = QJsonDocument(QJsonObject{{"text", text}}).toJson(QJsonDocument::Compact);
-    call("POST", "api/lenses/" + id, {}, body, "lens-write", [this, id](const QJsonValue &) {
+    write("api/lenses/" + id, {}, body, "lens-write", [this, id](const QJsonValue &) {
         loadLenses();
         // What its shelf showed was for the old words.
         if (m_shelves.remove(id) > 0)
@@ -840,17 +841,17 @@ void Backend::editLens(const QString &id, const QString &text) {
         // Its results were for the old words; saving new ones asks for them again.
         if (m_lensInfo.value("id").toString() == id)
             openLens(id, 1);
-    }, true);
+    });
 }
 
 void Backend::removeLens(const QString &id) {
-    call("POST", "api/lenses/" + id + "/rm", {}, {}, "lens-write", [this, id](const QJsonValue &) {
+    write("api/lenses/" + id + "/rm", {}, {}, "lens-write", [this, id](const QJsonValue &) {
         if (m_shelves.remove(id) > 0)
             emit shelvesChanged();
         if (m_lensInfo.value("id").toString() == id)
             closeLens();
         loadLenses();
-    }, true);
+    });
 }
 
 void Backend::loadTopics() {
@@ -897,11 +898,11 @@ void Backend::hideTopic(const QString &id) {
     supersede("topics");
     QUrlQuery q;
     q.addQueryItem("id", id);
-    call("POST", "api/topics/hide", q, {}, "topics-hide", [this](const QJsonValue &) {
+    write("api/topics/hide", q, {}, "topics-hide", [this](const QJsonValue &) {
         // Whatever takes its place has not been searched for yet.
         if (m_config.value("topicFeeds").toBool())
             refreshTopics();
-    }, true);
+    });
 }
 
 void Backend::dropTopics() {

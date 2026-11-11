@@ -245,13 +245,24 @@ signals:
 private:
     using Done = std::function<void(const QJsonValue &)>;
     using Batch = std::function<void(const QVariantList &)>;
-    // One request to the engine. `task` drives the busy state. Reads deliver
-    // only the newest answer per task, so a slow old search can't overwrite a
-    // newer one; a write (`everyAnswer`) delivers each answer, because every
-    // one of them changed something the window must hear about. When the
+    // Which answers of a task are delivered: only the newest (a read, so a
+    // slow old search can't overwrite a newer one), or every one (a write,
+    // because every one of them changed something the window must hear
+    // about). A write has a task of its own, never a read's.
+    enum class Answers { Latest, Every };
+    // One request to the engine. `task` drives the busy state. When the
     // engine isn't there, the request fails at once (see refuse()).
+    void request(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
+                 const QString &task, Done done, Answers answers);
+    // A read: only the newest answer of `task` is delivered.
     void call(const QByteArray &verb, const QString &path, const QUrlQuery &query, const QByteArray &body,
-              const QString &task, Done done, bool everyAnswer = false);
+              const QString &task, Done done) {
+        request(verb, path, query, body, task, std::move(done), Answers::Latest);
+    }
+    // A write: every answer is delivered.
+    void write(const QString &path, const QUrlQuery &query, const QByteArray &body, const QString &task, Done done) {
+        request("POST", path, query, body, task, std::move(done), Answers::Every);
+    }
     // A GET whose answer is one JSON object per line, sent as they are ready
     // (see qveil-core's streamed search). `batch` gets them a few at a time.
     // `ended` runs once the request is over, whatever became of it.
