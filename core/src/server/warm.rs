@@ -97,8 +97,18 @@ impl Head {
         lock(&self.state).ended
     }
 
+    /// Gives up on it, with the lock held: nothing more is taken from it,
+    /// so a later request doesn't wait for it again, and its fetch stops at
+    /// its next look (see `fetch_head`).
+    fn give_up(&self, mut st: MutexGuard<'_, HeadState>) {
+        st.ended = true;
+        drop(st);
+        self.changed.notify_all();
+    }
+
     /// What the response said, once it has started; `None` if it failed, or
-    /// didn't start within `HEAD_WAIT`, or `stop` said so first.
+    /// didn't start within `HEAD_WAIT` (then it is given up on), or `stop`
+    /// said so first.
     fn meta(&self, stop: &dyn Fn() -> bool) -> Option<Meta> {
         let deadline = Instant::now() + HEAD_WAIT;
         let mut st = lock(&self.state);
@@ -106,7 +116,11 @@ impl Head {
             if let Some(m) = &st.meta {
                 return Some(m.clone());
             }
-            if st.ended || stop() || Instant::now() >= deadline {
+            if st.ended || stop() {
+                return None;
+            }
+            if Instant::now() >= deadline {
+                self.give_up(st);
                 return None;
             }
             st = self.wait(st);
@@ -116,7 +130,7 @@ impl Head {
     /// Appends the bytes from `pos` up to `upto` (inclusive) to `out` as
     /// they arrive, at most `max` at a time, and returns how many; 0 once
     /// there are no more to be had: it ended short of `pos`, `stop` said
-    /// so, or nothing came for `HEAD_WAIT`.
+    /// so, or nothing came for `HEAD_WAIT` (then it is given up on).
     pub(super) fn read_at(
         &self,
         pos: u64,
@@ -145,6 +159,7 @@ impl Head {
             if st.bytes.len() != before {
                 deadline = Instant::now() + HEAD_WAIT;
             } else if Instant::now() >= deadline {
+                self.give_up(st);
                 return 0;
             }
         }
@@ -517,6 +532,29 @@ mod tests {
         let took = started.elapsed();
         assert!(took < HEAD_WAIT + Duration::from_secs(1), "{took:?}");
         assert!(ranges(&up).contains(&"bytes=0-99".to_string()));
+    }
+
+    #[test]
+    fn a_head_that_did_not_start_in_time_is_given_up_on_for_good() {
+        let up = Upstream::start();
+        // The request for the video head gets no answer for ten seconds.
+        let (s, base, _d, _bin) =
+            warm_server(&up, &format!("/big?size={SIZE}&hold={}&run=", HEAD - 1));
+        let info = s.open(&test_video()).unwrap();
+        let video = rel(&base, &info.video);
+        let get = |range: &str| fetch(&base, "GET", video, &[("Range", range)]);
+        let (status, _, body) = get("bytes=0-99");
+        assert_eq!((status, body), (206, big_bytes(0, 100)));
+        // The first request waited `HEAD_WAIT` for it, and that ended it: the
+        // next one doesn't wait again, and its fetch stops when it answers.
+        let session = s.session(video.split('/').nth(1).unwrap()).unwrap();
+        let head = lock(&session.warm.state).video.clone().unwrap();
+        assert!(head.ended());
+        let started = Instant::now();
+        let (status, _, body) = get("bytes=100-199");
+        assert_eq!((status, body), (206, big_bytes(100, 200)));
+        let took = started.elapsed();
+        assert!(took < HEAD_WAIT, "{took:?}");
     }
 
     #[test]
