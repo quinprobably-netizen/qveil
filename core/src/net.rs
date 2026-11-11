@@ -4,15 +4,21 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use std::time::Duration;
 
-/// The one browser identity qveil presents. The engine's own requests (feeds,
-/// thumbnails) send it, and every yt-dlp call is told to send it too, so the
-/// video bytes carry it as well (yt-dlp's player lookups still name the
-/// YouTube client it is pretending to be): otherwise the engine would say
-/// Firefox while yt-dlp, which picks a random Chrome version for each call,
-/// said Chrome, and one circuit would show two browsers. It has the shape of yt-dlp's own
-/// default, with a Chrome major version inside the range yt-dlp currently
-/// picks from (145 to 151), so it is no more conspicuous than yt-dlp's
-/// traffic is anyway. Bump it when yt-dlp's range moves on.
+/// The User-Agent qveil's requests send. The engine's own requests (feeds,
+/// thumbnails, the relayed video bytes) send it, and every yt-dlp call is
+/// told to send it too: otherwise the engine would say Firefox while
+/// yt-dlp, which picks a random Chrome version for each call, said Chrome.
+/// It has the shape of yt-dlp's own default, with a Chrome major version
+/// inside the range yt-dlp currently picks from (145 to 151), so it is no
+/// more conspicuous than yt-dlp's traffic is anyway. Bump it when yt-dlp's
+/// range moves on.
+///
+/// It is a header, not an identity. The TLS and HTTP/2 handshakes are
+/// rustls's and hyper's, not Chrome's, and yt-dlp's are Python's; and
+/// yt-dlp's player lookups send the User-Agent of the YouTube client they
+/// pretend to be. A circuit that carries a lookup and its video can show
+/// more than one client, and the fingerprints don't match the browser the
+/// header names.
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
 pub const TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
