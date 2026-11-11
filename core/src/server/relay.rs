@@ -1276,6 +1276,44 @@ mod tests {
     }
 
     #[test]
+    fn a_player_that_seeks_mid_chunk_costs_no_new_connection_over_http2() {
+        use crate::h2up::{H2Upstream, big_bytes_h2};
+        let up = H2Upstream::start();
+        let (s, base, _d) = server_h2c();
+        let sid = add_session(&s, up.url("/big?pace=5"));
+        // mpv reads the start of the video and hangs up to seek elsewhere,
+        // with most of the first chunk still to come.
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0;
+        while got < 100 << 10 {
+            got += player.read(&mut buf).unwrap();
+        }
+        drop(player);
+        wait_for("the stream to be cancelled", Duration::from_secs(5), || {
+            up.resets() == 1
+        });
+        // The seek is served over the connection that is already open.
+        let from = CHUNK + 3;
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            &format!("s/{sid}/v"),
+            &[("Range", &format!("bytes={from}-{}", from + 99))],
+        );
+        assert_eq!(status, 206);
+        assert_eq!(body, big_bytes_h2(from, from + 100));
+        assert_eq!(up.connections(), 1);
+        assert_eq!(
+            up.ranges(),
+            [
+                Some(format!("bytes=0-{}", CHUNK - 1)),
+                Some(format!("bytes={from}-{}", from + 99)),
+            ]
+        );
+    }
+
+    #[test]
     fn a_session_that_falls_out_of_the_queue_is_ended_not_just_forgotten() {
         let up = Upstream::start();
         let (s, base, _d) = server();

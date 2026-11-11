@@ -32,6 +32,8 @@ mod comments;
 mod config;
 mod errors;
 mod feed;
+#[cfg(test)]
+mod h2up;
 mod ids;
 mod inflight;
 mod lens;

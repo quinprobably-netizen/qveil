@@ -42,6 +42,14 @@ pub fn server_tuned(
     (s, base, dir)
 }
 
+/// A server whose clients speak HTTP/2 to a local upstream (see `h2up`).
+pub fn server_h2c() -> (Arc<Server>, String, TempDir) {
+    server_tuned(Config::default(), |rt| {
+        rt.net = rt.net.clone().speaking_h2c();
+        rt.yt.net = rt.net.clone();
+    })
+}
+
 pub fn addr(base: &str) -> &str {
     base.trim_start_matches("http://")
         .split('/')

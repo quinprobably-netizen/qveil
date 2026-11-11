@@ -24,6 +24,14 @@ pub const PROXY_MARK: &str = "[proxy ";
 /// How long a relayed stream may go without receiving a single byte.
 pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// HTTP/2 flow control: how far one stream, and one connection, may run
+/// ahead of what has been read. A stream can carry no more than this per
+/// round trip, and a round trip over Tor is half a second or more, so the
+/// HTTP/2 default of 64 KiB (or hyper's 2 MiB) would hold a video back.
+/// These are the values Chrome announces, so they say nothing new about us.
+const STREAM_WINDOW: u32 = 6 << 20;
+const CONNECTION_WINDOW: u32 = 15 << 20;
+
 #[derive(Clone, Debug, Default)]
 pub struct Net {
     proxy: Option<String>,
@@ -32,6 +40,10 @@ pub struct Net {
     /// production, so nothing leaves the machine unencrypted through the exit
     /// node or proxy; only tests, which talk to a local server, turn it on.
     allow_http: bool,
+    /// Whether plain-http requests speak HTTP/2 without asking first, the
+    /// way a local stand-in for googlevideo expects. Only tests set it; over
+    /// TLS, HTTP/2 is agreed on in the handshake.
+    h2c: bool,
 }
 
 impl Net {
@@ -67,6 +79,7 @@ impl Net {
             proxy,
             isolate,
             allow_http: false,
+            h2c: false,
         })
     }
 
@@ -74,6 +87,14 @@ impl Net {
     #[cfg(test)]
     pub fn allowing_http(mut self) -> Self {
         self.allow_http = true;
+        self
+    }
+
+    /// The same route, speaking HTTP/2 in clear text to a local upstream.
+    #[cfg(test)]
+    pub fn speaking_h2c(mut self) -> Self {
+        self.allow_http = true;
+        self.h2c = true;
         self
     }
 
@@ -186,6 +207,13 @@ impl Net {
         self.build(Some(idle))
     }
 
+    /// HTTP/2 where the server offers it, as googlevideo and YouTube do: the
+    /// requests of one client then share one connection as streams, and a
+    /// stream given up on part-way (the relay does that whenever the player
+    /// seeks) is cancelled on its own while the connection stays open for
+    /// the next request. Over HTTP/1.1 the connection would have to be
+    /// closed, and over Tor a new one costs a TCP and a TLS handshake
+    /// through the circuit, most of a second.
     fn build(&self, timeout: Option<Duration>) -> Result<Client> {
         let mut b = Client::builder()
             .user_agent(USER_AGENT)
@@ -193,10 +221,15 @@ impl Net {
             .https_only(!self.allow_http)
             .connect_timeout(Duration::from_secs(20))
             .timeout(timeout)
+            .http2_initial_stream_window_size(STREAM_WINDOW)
+            .http2_initial_connection_window_size(CONNECTION_WINDOW)
             // The route is the one chosen in qveil, never HTTP_PROXY or
             // ALL_PROXY from the environment: on Direct, the app tells you
             // YouTube sees your IP, and that has to be true.
             .no_proxy();
+        if self.h2c {
+            b = b.http2_prior_knowledge();
+        }
         if let Some(p) = self.proxy_url() {
             b = b.proxy(reqwest::Proxy::all(&p).context("invalid proxy URL")?);
         }
@@ -524,6 +557,83 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_stream_given_up_on_is_cancelled_and_its_connection_kept() {
+        use crate::h2up::{BIG, big_bytes_h2};
+        use std::io::Read;
+        let up = H2Upstream::start();
+        let client = Net::new(None, true)
+            .unwrap()
+            .speaking_h2c()
+            .relay_client()
+            .unwrap();
+        let url = up.url("/big?pace=5");
+        // Reads the start of a long range and gives up on the rest, as the
+        // relay does when the player seeks or hangs up.
+        let mut first = client.get(&url).header("range", "bytes=0-").send().unwrap();
+        let mut buf = vec![0u8; 100 << 10];
+        first.read_exact(&mut buf).unwrap();
+        drop(first);
+        let started = std::time::Instant::now();
+        while up.resets() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the stream was not cancelled"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The next request goes over the same connection.
+        let mut body = Vec::new();
+        client
+            .get(up.url("/big"))
+            .header("range", format!("bytes={}-", BIG - 1000))
+            .send()
+            .unwrap()
+            .read_to_end(&mut body)
+            .unwrap();
+        assert!(body == big_bytes_h2(BIG - 1000, BIG), "the bytes differ");
+        assert_eq!(
+            up.connections(),
+            1,
+            "a new connection for the second request"
+        );
+    }
+
+    use crate::h2up::H2Upstream;
+
+    #[test]
+    fn a_stream_may_run_ahead_of_its_reader_by_a_generous_window() {
+        let up = H2Upstream::start();
+        let client = Net::new(None, true)
+            .unwrap()
+            .speaking_h2c()
+            .relay_client()
+            .unwrap();
+        // Nothing of the body is read, so what arrives is what flow control
+        // lets through: over Tor's long round trips, a small window would
+        // hold the stream back.
+        let _held = client
+            .get(up.url(&format!("/big?size={}", 8 << 20)))
+            .header("range", "bytes=0-")
+            .send()
+            .unwrap();
+        let mut last = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let now = up.sent();
+            if now == last {
+                break;
+            }
+            last = now;
+        }
+        assert_eq!(
+            last,
+            STREAM_WINDOW as usize,
+            "{} KiB let through",
+            last >> 10
         );
     }
 
