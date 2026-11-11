@@ -1126,6 +1126,36 @@ private slots:
         QVERIFY(small->property("startedAt").toDouble() >= 38);
     }
 
+    void theLastWordOfALinesActionsStandsAtTheEdgeOfWhatIsUnderIt()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        // A button's word is `pad` inside its edge; the row of them is pulled out by as much.
+        const qreal pad = 10;
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        // Home: the shelf's last action ends `pad` past the lead above it.
+        QQuickItem *refresh = nullptr;
+        QTRY_VERIFY((refresh = app.item("shelf-refresh")) && refresh->isVisible());
+        QCOMPARE(box(refresh).right(), box(app.item("lead")).right() + pad);
+
+        // A search: "Keep as a lens" ends `pad` past the rule under the heading.
+        QMetaObject::invokeMethod(app.item("search"), "edit");
+        app.type("rust");
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.page(), QString("search"));
+        QQuickItem *keep = app.item("keep-lens");
+        QTRY_VERIFY(keep && keep->isVisible());
+        QTRY_COMPARE(box(keep).right(), qreal(1280 - 24) + pad);
+
+        // Lenses: Delete, the last of the lens's actions.
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.page(), QString("lenses"));
+        QQuickItem *del = nullptr;
+        QTRY_VERIFY((del = app.item("lens-delete")) && del->isVisible());
+        QCOMPARE(box(del).right(), qreal(1280 - 24) + pad);
+    }
+
     void settingsChangeTheEngineAndUseItsWords()
     {
         App app;

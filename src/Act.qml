@@ -22,7 +22,7 @@ Rectangle {
     readonly property bool hot: enabled && (area.containsMouse || activeFocus)
     signal clicked()
 
-    implicitWidth: row.implicitWidth + Style.u * 5
+    implicitWidth: row.implicitWidth + Style.actPad * 2
     implicitHeight: Style.control
     radius: Style.radius
     color: primary ? (hot ? Qt.lighter(Style.accent, 1.12) : Style.accent) : hot ? Style.hover : filled ? Style.rest : "transparent"

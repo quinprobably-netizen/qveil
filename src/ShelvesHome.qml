@@ -659,6 +659,7 @@ FocusScope {
                 onClicked: page.addChannelRequested()
             }
             Act {
+                objectName: "shelf-refresh"
                 visible: shelf.modelData === "latest" && !page.noChannels
                 text: qsTr("Refresh")
                 glyph: "qrc:/icons/refresh.svg"

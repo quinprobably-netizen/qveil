@@ -46,6 +46,10 @@ QtObject {
     readonly property int bar: 56
     readonly property int gutter: 24
     readonly property int control: 28
+    // How far a button's word is from its edge, to either side (see Act). A
+    // row of them at the end of a line is pulled out by this much, so that
+    // the last word stands at the edge of what is under it.
+    readonly property real actPad: u * 5 / 2
     // Whether things move at all: the desktop's own setting.
     readonly property bool motion: theme.animations
     // How long a fill or a veil takes to change, and how long something

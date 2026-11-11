@@ -56,6 +56,8 @@ FocusScope {
             Row {
                 id: acts
                 anchors.right: parent.right
+                // The last word stands at the edge, not its button's padding inside it.
+                anchors.rightMargin: -Style.actPad
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.u
                 visible: page.on
