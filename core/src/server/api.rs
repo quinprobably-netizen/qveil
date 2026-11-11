@@ -319,6 +319,10 @@ impl Server {
             // try again. Closed after the swap, so what starts from now on
             // belongs to the new route.
             rt.yt.calls.close(Why::RouteChanged);
+            // The spare went with them; the new route gets one of its own.
+            if rt.yt.calls.spare_wanted().is_some() {
+                self.runtime().yt.keep_spare();
+            }
         } else {
             drop(sessions);
         }

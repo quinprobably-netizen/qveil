@@ -15,7 +15,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 /// A child process and the group it leads.
@@ -71,6 +71,10 @@ impl Group {
 
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
     }
 
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
