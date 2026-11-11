@@ -78,10 +78,14 @@ QByteArray interopFor(const QByteArray &hwdec) {
     return {};
 }
 
+// Runs on the GUI thread, so it never asks mpv and waits: what mpv said of
+// its decoder, as it said it, is enough.
 void learnHardware(MpvCore &core) {
-    char *current = mpv_get_property_string(core.handle, "hwdec-current");
-    const QByteArray hwdec = current ? QByteArray(current) : QByteArray();
-    mpv_free(current);
+    QByteArray hwdec;
+    {
+        QMutexLocker lock(&core.mutex);
+        hwdec = core.hwdecCurrent;
+    }
     const QByteArray found = interopFor(hwdec);
     if (found.isEmpty())
         return;
@@ -134,9 +138,10 @@ void switchVideo(MpvCore &core, bool on, quint64 tag) {
 }
 
 // Frees a player's render context on the render thread of the window it
-// was made in, once its video output is off (see MpvItem::takeOver). If the
-// window isn't showing, the job is deleted without running, and the item
-// that has the player hears so.
+// was made in, once its video output is off (see MpvItem::takeOver). It runs
+// as that window synchronizes its next frame. If the window goes before it
+// draws one, the job is deleted without running, and the item that has the
+// player hears so.
 class ReleaseJob : public QRunnable {
 public:
     ReleaseJob(std::shared_ptr<MpvCore> core, quint64 handover, const void *owner)
@@ -146,6 +151,9 @@ public:
             m_core->post("releaseLost", m_handover);
     }
     void run() override {
+        // Run as the window synchronizes, on its render thread with its
+        // context current, as freeing a render context needs.
+        Q_ASSERT(QQuickWindow::graphicsApi() != QSGRendererInterface::OpenGL || QOpenGLContext::currentContext());
         m_ran = true;
         // A later handover asks for its own.
         if (m_core->handover == m_handover)
@@ -374,9 +382,16 @@ bool MpvCore::freeRender(const void *expected) {
     return true;
 }
 
+namespace {
+std::atomic<int> livePlayers{0};
+}
+
+int MpvCore::players() { return livePlayers; }
+
 MpvCore::MpvCore() : handle(mpv_create()) {
     if (!handle)
         qFatal("libmpv: couldn't create a player");
+    ++livePlayers;
     const std::pair<const char *, const char *> options[] = {
         {"vo", "libmpv"},
         // Nothing from the user's mpv setup: no config, no scripts (ytdl_hook
@@ -422,6 +437,10 @@ MpvCore::MpvCore() : handle(mpv_create()) {
     };
     for (const auto &[name, value] : options)
         mpv_set_option_string(handle, name, value);
+    // For the tests only: their players play to no sound device ("null").
+    // Nothing else sets it, and the app never does.
+    if (qEnvironmentVariableIsSet("QVEIL_MPV_AO"))
+        mpv_set_option_string(handle, "ao", qgetenv("QVEIL_MPV_AO").constData());
     {
         // As what was learnt of this machine says (see learnHardware).
         QMutexLocker lock(&hardware);
@@ -440,6 +459,7 @@ MpvCore::MpvCore() : handle(mpv_create()) {
         {"paused-for-cache", MPV_FORMAT_FLAG}, {"seeking", MPV_FORMAT_FLAG},
         {"eof-reached", MPV_FORMAT_FLAG},      {"volume", MPV_FORMAT_DOUBLE},
         {"mute", MPV_FORMAT_FLAG},             {"speed", MPV_FORMAT_DOUBLE},
+        {"hwdec-current", MPV_FORMAT_STRING},
     };
     for (const auto &[name, format] : observed)
         mpv_observe_property(handle, 0, name, format);
@@ -457,6 +477,7 @@ MpvCore::~MpvCore() {
         return;
     }
     mpv_terminate_destroy(handle);
+    --livePlayers;
 }
 
 MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_link(std::make_shared<MpvLink>()) {
@@ -505,9 +526,45 @@ MpvItem::~MpvItem() {
 }
 
 QQuickFramebufferObject::Renderer *MpvItem::createRenderer() const {
-    window()->setPersistentGraphics(true);
-    window()->setPersistentSceneGraph(true);
+    keepScene(window());
     return new MpvRenderer(m_link);
+}
+
+void MpvItem::keepScene(QQuickWindow *window) const {
+    if (!window)
+        return;
+    window->setPersistentGraphics(!m_releaseWhenHidden);
+    window->setPersistentSceneGraph(!m_releaseWhenHidden);
+}
+
+void MpvItem::setReleaseWhenHidden(bool release) {
+    if (m_releaseWhenHidden == release)
+        return;
+    m_releaseWhenHidden = release;
+    keepScene(window());
+    emit releaseWhenHiddenChanged();
+}
+
+void MpvItem::itemChange(ItemChange change, const ItemChangeData &data) {
+    QQuickFramebufferObject::itemChange(change, data);
+    if (change != ItemSceneChange)
+        return;
+    disconnect(m_hidden);
+    QQuickWindow *window = data.window;
+    if (!window)
+        return;
+    keepScene(window);
+    // Hidden, the window draws nothing, so its renderer would hold on to
+    // every render context it made (and their players) until it is shown
+    // again: a handover it was in would never get its context freed. Let go
+    // of the scene instead (the threaded render loop does so by itself for a
+    // scene that isn't persistent; this asks every loop to). The scene graph
+    // deletes the renderer on its render thread with the GL context current,
+    // and the renderer frees them there (see ~MpvRenderer).
+    m_hidden = connect(window, &QWindow::visibleChanged, this, [this, window](bool visible) {
+        if (!visible && m_releaseWhenHidden)
+            window->releaseResources();
+    });
 }
 
 void MpvItem::ensureCore() {
@@ -874,6 +931,11 @@ void MpvItem::onProperty(const mpv_event_property *p) {
         update(m_muted, flag, &MpvItem::mutedChanged, this);
     else if (name == "speed" && has)
         update(m_speed, number, &MpvItem::speedChanged, this);
+    else if (name == "hwdec-current" && m_core) {
+        const QByteArray current = has && p->format == MPV_FORMAT_STRING ? QByteArray(*static_cast<char **>(p->data)) : QByteArray();
+        QMutexLocker lock(&m_core->mutex);
+        m_core->hwdecCurrent = current;
+    }
 }
 
 void MpvItem::handleEvents() {
@@ -935,10 +997,15 @@ void MpvItem::handleEvents() {
             }
             if (!drawn) {
                 update();
-            } else if (owner && window) {
-                window->scheduleRenderJob(new ReleaseJob(m_core, m_core->handover, owner), QQuickWindow::NoStage);
+            } else if (owner && window && window->isExposed()) {
+                // As the window synchronizes, when its render thread is
+                // sure to have the GL context current; the update makes it.
+                window->scheduleRenderJob(new ReleaseJob(m_core, m_core->handover, owner),
+                                          QQuickWindow::BeforeSynchronizingStage);
                 window->update();
             } else {
+                // A window that isn't showing draws nothing, so it would
+                // never get to it.
                 abandon();
                 return;
             }

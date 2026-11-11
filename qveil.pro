@@ -14,22 +14,7 @@ QVEIL_VERSION = $$section(CARGO_VERSION_LINE, \", 1, 1)
 isEmpty(QVEIL_VERSION): error("Couldn't read the version from core/Cargo.toml")
 DEFINES += QVEIL_VERSION=\\\"$$QVEIL_VERSION\\\"
 
-HEADERS += \
-    src/backend.h \
-    src/datadirs.h \
-    src/launch.h \
-    src/mpvitem.h \
-    src/theme.h \
-    src/translator.h \
-    src/videomodel.h
+SOURCES += src/main.cpp
 
-SOURCES += \
-    src/main.cpp \
-    src/backend.cpp \
-    src/datadirs.cpp \
-    src/mpvitem.cpp \
-    src/theme.cpp \
-    src/translator.cpp \
-    src/videomodel.cpp
-
+include(src/sources.pri)
 include(src/resources.pri)

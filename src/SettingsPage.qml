@@ -12,6 +12,8 @@ FocusScope {
     // are in the feed: the window's own settings, which it keeps.
     property string thumbs: "clear"
     property bool shorts: false
+    // Whether the window's title names the video that is playing.
+    property bool videoInTitle: false
     readonly property var config: backend.config
     readonly property var pages: backend.privacy.pages
     // Which category is showing.
@@ -26,12 +28,13 @@ FocusScope {
     readonly property Item content: cats
     signal thumbsPicked(string mode)
     signal shortsPicked(bool shown)
+    signal videoInTitlePicked(bool shown)
 
     // Whether the keyboard is in the rows of the category that is showing,
     // and on which of them.
     property bool inRows: false
     property int rowAt: 0
-    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume], playback: [qualityRow, aheadRow], home: [pictures, keptRow, topicsRow, shortsRow], about: [] })
+    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume, titleRow], playback: [qualityRow, aheadRow], home: [pictures, keptRow, topicsRow, shortsRow], about: [] })
     onCategoryChanged: {
         const had = pane.activeFocus
         inRows = false
@@ -248,6 +251,19 @@ FocusScope {
                             current: true
                             patch: ({ resumeDays: resume.days })
                         }
+                    }
+                }
+                SettingRow {
+                    id: titleRow
+                    objectName: "set-title"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === titleRow
+                    width: parent.width
+                    name: qsTr("Show the video in the window title")
+                    note: qsTr("The window title is visible to other apps, bar widgets and screen shares.")
+                    noteName: "set-title-note"
+                    Choices {
+                        TabWord { objectName: "title-off"; text: qsTr("Off"); current: !page.videoInTitle; onClicked: page.videoInTitlePicked(false) }
+                        TabWord { objectName: "title-on"; text: qsTr("On"); current: page.videoInTitle; onClicked: page.videoInTitlePicked(true) }
                     }
                 }
             }

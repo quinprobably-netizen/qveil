@@ -1264,6 +1264,66 @@ private slots:
         QVERIFY(!app.window->property("pip").toBool());
     }
 
+    void theWindowTitleNamesTheVideoOnlyWhenThatIsAskedFor()
+    {
+        App app;
+        READY(app);
+        const QVariantMap video{{"id", "vid00000001"}, {"title", "Why the borrow checker says no"}};
+        // Off unless turned on: a playing video is not named.
+        app.play(video);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("title").toString(), video.value("title").toString());
+        QTRY_VERIFY(app.item("watch")->isVisible());
+        QCOMPARE(app.window->title(), QString("qveil"));
+
+        // The setting is in Privacy, and says who can read the title.
+        QTest::keyClick(app.window, Qt::Key_5);
+        QTRY_COMPARE(app.page(), QString("settings"));
+        QQuickItem *row = app.item("set-title");
+        QVERIFY(row && row->isVisible());
+        QCOMPARE(app.item("settings")->property("category").toString(), QString("privacy"));
+        QVERIFY(app.item("title-off")->property("current").toBool());
+        const QString note = app.item("set-title-note")->property("text").toString();
+        QVERIFY2(note.contains("other apps") && note.contains("bar widgets") && note.contains("screen shares"), qPrintable(note));
+
+        app.click(app.item("title-on"));
+        QTRY_VERIFY(app.item("title-on")->property("current").toBool());
+        // Kept with the window's own settings.
+        QTRY_VERIFY(QSettings().value("videoInTitle").toBool());
+        // The video went on in the small window, whose title never names it.
+        if (app.pip()->isVisible()) {
+            QCOMPARE(app.pip()->title(), QString("Picture-in-Picture"));
+            QMetaObject::invokeMethod(app.pip(), "end");
+            QTRY_VERIFY(!app.pip()->isVisible());
+        }
+        app.play(video);
+        QTRY_COMPARE(app.window->title(), QString("Why the borrow checker says no · qveil"));
+
+        // And off again.
+        QTest::keyClick(app.window, Qt::Key_5);
+        QTRY_COMPARE(app.page(), QString("settings"));
+        app.click(app.item("title-off"));
+        QTRY_VERIFY(!QSettings().value("videoInTitle").toBool());
+        if (app.pip()->isVisible()) {
+            QMetaObject::invokeMethod(app.pip(), "end");
+            QTRY_VERIFY(!app.pip()->isVisible());
+        }
+        app.play(video);
+        QTRY_VERIFY(app.item("watch")->isVisible());
+        QTRY_COMPARE(app.item("surface")->property("active").toBool(), true);
+        QCOMPARE(app.window->title(), QString("qveil"));
+    }
+
+    void theSmallWindowLetsGoOfWhatItDrewWithWhenHidden()
+    {
+        App app;
+        READY(app);
+        auto mpv = [](QQuickItem *surface) { return surface ? surface->property("mpv").value<QObject *>() : nullptr; };
+        QVERIFY(mpv(app.inPip("pip-surface")) && mpv(app.item("surface")));
+        // The small window comes and goes; the main one keeps what it draws with.
+        QVERIFY(mpv(app.inPip("pip-surface"))->property("releaseWhenHidden").toBool());
+        QVERIFY(!mpv(app.item("surface"))->property("releaseWhenHidden").toBool());
+    }
+
     void theLeadsVideoIsNotAlsoTheFirstOfLatest()
     {
         App app;

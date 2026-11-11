@@ -80,6 +80,15 @@ private slots:
         QCOMPARE(part("Slides: https://example.com/slides.", "link").property("url").toString(), QString("https://example.com/slides"));
     }
 
+    void aPrivacyEnhancedEmbedIsAYouTubeLinkToo()
+    {
+        for (const char *url : {"https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?rel=0", "https://youtube-nocookie.com/embed/dQw4w9WgXcQ",
+                                "https://WWW.YouTube-NoCookie.com/embed/dQw4w9WgXcQ"})
+            QCOMPARE(part(url, "video").property("id").toString(), QString("dQw4w9WgXcQ"));
+        // A lookalike host is another site.
+        QCOMPARE(kinds("https://youtube-nocookie.com.evil.example/embed/dQw4w9WgXcQ"), QStringList({"link"}));
+    }
+
     void markupIsShownNotRun()
     {
         const QString html = call("html", {"<script>alert(1)</script> <a href='javascript:x'>y</a> & 5 < 6", "#ffffff"}).toString();

@@ -10,7 +10,9 @@ ApplicationWindow {
     minimumWidth: 760
     minimumHeight: 500
     visible: true
-    title: watch.active && watch.info.title ? watch.info.title + " \u00b7 qveil" : "qveil"
+    // The video's title only when that is asked for: other apps, bar
+    // widgets and screen shares can all read a window's title.
+    title: prefs.videoInTitle && watch.active && watch.info.title ? watch.info.title + " \u00b7 qveil" : "qveil"
     color: Style.bg
 
     // The place that is showing: home, lenses, channels, channel, history,
@@ -97,6 +99,8 @@ ApplicationWindow {
         // "frosted" (veiled until looked at) or "clear".
         property string thumbnails: "clear"
         property bool showShorts: false
+        // Whether the window's title names the video that is playing.
+        property bool videoInTitle: false
         property real volume: 80
         // Whether it has been said that positions are kept.
         property bool resumeTold: false
@@ -869,6 +873,8 @@ ApplicationWindow {
                     visible: win.page === "settings" && !win.watching
                     thumbs: win.thumbs
                     shorts: prefs.showShorts
+                    videoInTitle: prefs.videoInTitle
+                    onVideoInTitlePicked: shown => prefs.videoInTitle = shown
                     onThumbsPicked: mode => win.thumbs = mode
                     onShortsPicked: shown => {
                         prefs.showShorts = shown
@@ -882,7 +888,7 @@ ApplicationWindow {
                 // time makes it as long as that is.
                 BusyLine {
                     objectName: "progress"
-                    readonly property var tasks: backend.busy.filter(t => ["play", "prepare", "config", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0 && t !== "topics-list" && t !== "history")
+                    readonly property var tasks: backend.busy.filter(t => ["play", "prepare", "config", "config-write", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0 && t !== "topics-list" && t !== "history" && t !== "history-write")
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top

@@ -54,8 +54,10 @@ struct MpvCore {
     // next render context switches it on.
     std::atomic<bool> videoOff{false};
     // What its "hwdec" and "gpu-hwdec-interop" are set to (see
-    // switchVideo, learnHardware). Under the mutex.
-    QByteArray hwdec, interop;
+    // switchVideo, learnHardware), and the decoder mpv says is in use (its
+    // "hwdec-current", as observed, so it is never asked for and waited on).
+    // Under the mutex.
+    QByteArray hwdec, interop, hwdecCurrent;
     // When the handover under way began (ms, see handoverLog), and whether
     // its video output is back on, so the first frame after it is told of.
     std::atomic<qint64> handoverAt{0};
@@ -70,6 +72,9 @@ struct MpvCore {
     // Posts to the item that has it.
     void post(const char *method);
     void post(const char *method, quint64 argument);
+
+    // How many players there are that mpv has not destroyed: for the tests.
+    static int players();
 };
 
 // libmpv rendered into the Qt Quick scene. mpv runs without any user config
@@ -100,6 +105,11 @@ class MpvItem : public QQuickFramebufferObject {
     // True while a player this item handed on is still drawn here: its
     // window has to stay up until then (see takeOver).
     Q_PROPERTY(bool handingOver READ handingOver NOTIFY handingOverChanged)
+    // Whether the window lets go of its scene, and with it every render
+    // context this item drew with, when it is hidden. For a window that comes
+    // and goes (the small window): whatever it drew is freed then, with no
+    // need to draw it again, and a handover it was still in finishes.
+    Q_PROPERTY(bool releaseWhenHidden READ releaseWhenHidden WRITE setReleaseWhenHidden NOTIFY releaseWhenHiddenChanged)
 
 public:
     explicit MpvItem(QQuickItem *parent = nullptr);
@@ -134,6 +144,8 @@ public:
     QColor backgroundColor() const { return m_background; }
     void setBackgroundColor(const QColor &color);
     bool handingOver() const { return m_handingOver; }
+    bool releaseWhenHidden() const { return m_releaseWhenHidden; }
+    void setReleaseWhenHidden(bool release);
 
     // The player this item shows (the renderer reads it while the GUI thread waits).
     std::shared_ptr<MpvCore> core() const { return m_core; }
@@ -153,6 +165,7 @@ signals:
     void renderScaleChanged();
     void backgroundColorChanged();
     void handingOverChanged();
+    void releaseWhenHiddenChanged();
     void failed(const QString &message);
     // A handover (takeOver) couldn't move the picture here, and the player
     // was let go of: what it played has to be opened again.
@@ -170,7 +183,13 @@ private slots:
     // The window that had to free the render context couldn't.
     void releaseLost(qulonglong handover);
 
+protected:
+    void itemChange(ItemChange change, const ItemChangeData &data) override;
+
 private:
+    // The window's scene and graphics outlive its being hidden unless this
+    // item is to let go of them then (see releaseWhenHidden).
+    void keepScene(QQuickWindow *window) const;
     void ensureCore();
     // Lets go of `core`: it stops, and its render context is freed where it was made.
     static void retire(const std::shared_ptr<MpvCore> &core);
@@ -196,5 +215,7 @@ private:
     double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100, m_speed = 1, m_renderScale = 1;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false, m_started = false, m_handingOver = false;
+    bool m_releaseWhenHidden = false;
+    QMetaObject::Connection m_hidden;
     QColor m_background = Qt::black;
 };

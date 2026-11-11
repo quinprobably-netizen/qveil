@@ -1205,6 +1205,147 @@ private slots:
         QCOMPARE(Translator::pluralCategory("ja", 1), QString("other"));
     }
 
+    void aSavedSettingOrClearedHistoryIsHeardEvenWhenReadAgainAtOnce()
+    {
+        // The writes are slow (0.3 s in the stand-in engine), and the window
+        // reads the same thing again before they answer. The read must not
+        // drop what the write's answer does.
+        QTemporaryDir dir;
+        const QString log = dir.filePath("requests");
+        Backend backend(logged(log), requestLogger(dir, "time.sleep(0.3)"));
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(backend.busy().isEmpty(), 5000);
+        auto resumeReads = [&] {
+            QFile file(log);
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()).count("GET /t/api/resume") : 0;
+        };
+        const int before = resumeReads();
+
+        QSignalSpy notices(&backend, &Backend::notice);
+        backend.setConfig({{"resumeDays", 0}});
+        backend.loadConfig();
+        QTRY_VERIFY_WITH_TIMEOUT(notices.size() == 1, 5000);
+        QCOMPARE(notices.at(0).at(0).toString(), QString("Settings saved"));
+        // Fewer days takes kept positions with them, so the list is read again.
+        QTRY_VERIFY_WITH_TIMEOUT(resumeReads() > before, 5000);
+
+        backend.clearHistory();
+        backend.loadHistory();
+        QTRY_VERIFY_WITH_TIMEOUT(notices.size() == 2, 5000);
+        QCOMPARE(notices.at(1).at(0).toString(), QString("History cleared"));
+    }
+
+    void theLastSettingSavedIsTheOneShownWhateverOrderTheAnswersComeIn()
+    {
+        // The first of two quick saves is slow to answer (0.6 s), so its
+        // answer comes last. What the window shows is what was saved last,
+        // and each save still says so.
+        QTemporaryDir dir;
+        const QString fake = engine(dir, R"PY(import http.server,json,time
+state={'route':'direct','maxHeight':1080}
+class H(http.server.BaseHTTPRequestHandler):
+  protocol_version='HTTP/1.0'
+  def send(s,body):
+    b=json.dumps(body).encode()
+    s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)
+  def do_GET(s):
+    path=s.path.split('?')[0]
+    if path.endswith('/api/config'): s.send(state)
+    elif path.endswith('/api/feed'): s.send({'channels':0,'entries':[]})
+    elif path.endswith('/api/subs') or path.endswith('/api/history') or path.endswith('/api/resume'): s.send([])
+    else: s.send({})
+  def do_POST(s):
+    patch=json.loads(s.rfile.read(int(s.headers.get('Content-Length') or 0)) or b'{}')
+    state.update(patch);now=dict(state)
+    if patch.get('maxHeight')==720: time.sleep(0.6)
+    s.send(now)
+  def log_message(s,*a): pass
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)
+print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)
+srv.serve_forever()
+)PY");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready() && !backend.config().isEmpty(), 5000);
+        QSignalSpy notices(&backend, &Backend::notice);
+        backend.setConfig({{"maxHeight", 720}});
+        QTest::qWait(100);
+        backend.setConfig({{"maxHeight", 1440}});
+        QTRY_COMPARE_WITH_TIMEOUT(notices.size(), 2, 5000);
+        QCOMPARE(backend.config().value("maxHeight").toInt(), 1440);
+    }
+
+    void anEditedLensShowsNoneOfWhatItsOldWordsFound()
+    {
+        // The lens's refresh takes 1.5 s; what it found for its old words
+        // goes as soon as the new ones are saved, not when the refresh lands.
+        QTemporaryDir dir;
+        const QString fake = engine(dir, R"PY(import http.server,json,time,urllib.parse
+state={'text':'old words'}
+def lens(): return {'id':'lens1','text':state['text'],'tags':[state['text']],'searches':[state['text']],'count':2}
+class H(http.server.BaseHTTPRequestHandler):
+  protocol_version='HTTP/1.0'
+  def send(s,body):
+    b=json.dumps(body).encode()
+    s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)
+  def do_GET(s):
+    u=urllib.parse.urlparse(s.path);q=urllib.parse.parse_qs(u.query);path=u.path.split('/t/',1)[-1]
+    if path=='api/config': s.send({'route':'direct','thumbnails':False})
+    elif path=='api/lenses': s.send([lens()])
+    elif path=='api/lens':
+      s.send_response(200);s.send_header('Content-Type','application/x-ndjson');s.end_headers()
+      if q.get('refresh')==['1']: time.sleep(1.5)
+      word=state['text'].split()[0]
+      videos=[{'id':'%s%07d'%(word[:4],i),'title':word+' %d'%i} for i in range(2)]
+      s.wfile.write((json.dumps({'result':{'lens':lens(),'videos':videos,'tags':[state['text']],'searches':[state['text']],'fetchedAt':1}})+'\n').encode())
+    elif path in ('api/subs','api/history','api/resume'): s.send([])
+    elif path=='api/feed': s.send({'channels':0,'entries':[]})
+    else: s.send({})
+  def do_POST(s):
+    u=urllib.parse.urlparse(s.path);path=u.path.split('/t/',1)[-1]
+    body=json.loads(s.rfile.read(int(s.headers.get('Content-Length') or 0)) or b'{}')
+    if path=='api/lenses/lens1': state['text']=body['text'];s.send(lens())
+    else: s.send({})
+  def log_message(s,*a): pass
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)
+print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)
+srv.serve_forever()
+)PY");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        backend.loadLenses();
+        QTRY_COMPARE_WITH_TIMEOUT(backend.lenses().size(), 1, 5000);
+        backend.openLens("lens1", 0);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.lensVideos()->count(), 2, 5000);
+        QCOMPARE(backend.lensInfo().value("text").toString(), QString("old words"));
+
+        QElapsedTimer clock;
+        clock.start();
+        backend.editLens("lens1", "new words");
+        QTRY_VERIFY_WITH_TIMEOUT(backend.lensInfo().value("text").toString() == "new words", 5000);
+        QVERIFY2(clock.elapsed() < 1200, "the new words waited for the refresh");
+        QCOMPARE(backend.lensVideos()->count(), 0);
+        QCOMPARE(backend.lensInfo().value("tags").toStringList(), QStringList({"new words"}));
+        QVERIFY(!backend.lensInfo().contains("fetchedAt"));
+        // And then what the new words found.
+        QTRY_COMPARE_WITH_TIMEOUT(backend.lensVideos()->count(), 2, 5000);
+        QCOMPARE(backend.lensVideos()->get(0).value("title").toString(), QString("new 0"));
+    }
+
+    void aNewPlayerHearsEverythingMpvSaysFromTheStart()
+    {
+        // mpv wakes the window once for events that wait, and not again
+        // until they are read. A wakeup that came before the item had the
+        // player was lost, and with it every event after: here, a pause.
+        for (int i = 0; i < 40; ++i) {
+            MpvItem item;
+            item.togglePause();
+            QTRY_VERIFY2_WITH_TIMEOUT(item.paused(), qPrintable(QString("player %1 never said it paused").arg(i)), 3000);
+        }
+    }
+
 private:
     // Sets environment variables for its lifetime, and puts back what was there.
     struct EnvironmentVariables {
