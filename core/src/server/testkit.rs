@@ -115,6 +115,9 @@ pub struct Gauge {
     pub hold: AtomicBool,
     /// How many thumbnail requests are waiting on `hold`.
     pub waiting: AtomicUsize,
+    /// While set, a `/big?gated=1` response stops after its first 16 KiB and
+    /// sends the rest once it is cleared (or after 30 s).
+    pub gate: AtomicBool,
 }
 
 /// A tiny stand-in for googlevideo on a local port. It records every
@@ -240,18 +243,49 @@ pub fn upstream_serve(
             }
             None => send("200 OK", "Content-Type: video/mp4\r\n", &body, 100),
         },
-        "/hls" => send(
-            "200 OK",
-            "Content-Type: application/vnd.apple.mpegurl\r\n",
-            b"#EXTM3U\nhttps://rr1.googlevideo.com/seg1.ts\n",
-            43,
-        ),
-        "/dash" => send(
-            "200 OK",
-            "Content-Type: application/dash+xml\r\n",
-            b"<MPD><BaseURL>https://rr1.googlevideo.com/</BaseURL></MPD>",
-            57,
-        ),
+        // A manifest, as its own type unless `type=` says another, after
+        // a byte order mark and some white space with `pad=1`, and after an
+        // XML declaration with `xml=1`. A Range from the start gets a 206.
+        "/hls" | "/dash" => {
+            let param = |k: &str| {
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+            };
+            let (own, text) = if path == "/hls" {
+                (
+                    "application/vnd.apple.mpegurl",
+                    "#EXTM3U\nhttps://rr1.googlevideo.com/seg1.ts\n",
+                )
+            } else {
+                (
+                    "application/dash+xml",
+                    "<MPD><BaseURL>https://rr1.googlevideo.com/</BaseURL></MPD>",
+                )
+            };
+            let mut doc = Vec::new();
+            if param("pad").is_some() {
+                doc.extend_from_slice(b"\xEF\xBB\xBF \r\n\t");
+            }
+            if param("xml").is_some() {
+                doc.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+            }
+            doc.extend_from_slice(text.as_bytes());
+            let ctype = param("type").unwrap_or(own);
+            let len = doc.len();
+            match range.as_deref() {
+                Some(r) if r.starts_with("bytes=0-") => send(
+                    "206 Partial Content",
+                    &format!(
+                        "Content-Type: {ctype}\r\nContent-Range: bytes 0-{}/{len}\r\n",
+                        len - 1
+                    ),
+                    &doc,
+                    len,
+                ),
+                _ => send("200 OK", &format!("Content-Type: {ctype}\r\n"), &doc, len),
+            }
+        }
         // Promises 100 bytes, sends 10 and hangs up.
         "/cut" => send("200 OK", "Content-Type: video/mp4\r\n", &body[..10], 100),
         _ => send("404 Not Found", "", b"", 0),
@@ -280,7 +314,8 @@ pub fn big_bytes(from: u64, to: u64) -> Vec<u8> {
 /// again after that, and `dead=1` one whose connections die at once after
 /// the first chunk. `hold=B` leaves a request for a range that ends at byte
 /// `B` unanswered for ten seconds, and `cut=B` stops one half-way. `Gauge::cuts`
-/// makes that many responses stop half-way.
+/// makes that many responses stop half-way, and `gated=1` holds what follows
+/// the first 16 KiB of a response behind `Gauge::gate`.
 pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: bool, gauge: &Gauge) {
     big_to(&mut conn, query, range, head_only, gauge, true);
 }
@@ -372,6 +407,12 @@ fn big_to(
         }
         gauge.sent.fetch_add(block.len(), Ordering::SeqCst);
         at += n;
+        if at == a + n && param("gated").is_some() {
+            let started = Instant::now();
+            while gauge.gate.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         if pace > 0 {
             std::thread::sleep(Duration::from_millis(pace));
         }
@@ -388,7 +429,12 @@ pub struct KeepAlive {
     pub addr: std::net::SocketAddr,
     seen: Seen,
     connections: Arc<AtomicUsize>,
+    /// The Range header of each request, with the number of the connection
+    /// (from 0) it came on.
+    on: OnConnection,
 }
+
+type OnConnection = Arc<Mutex<Vec<(usize, Option<String>)>>>;
 
 impl KeepAlive {
     pub fn start(dial: Duration) -> Self {
@@ -401,18 +447,24 @@ impl KeepAlive {
         let addr = listener.local_addr().unwrap();
         let (seen, gauge) = (Seen::default(), Arc::new(Gauge::default()));
         let connections = Arc::new(AtomicUsize::new(0));
-        let (log, counted, count) = (
+        let on = OnConnection::default();
+        let (log, counted, count, on_log) = (
             Arc::clone(&seen),
             Arc::clone(&gauge),
             Arc::clone(&connections),
+            Arc::clone(&on),
         );
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
-                let dial = dial(count.fetch_add(1, Ordering::SeqCst));
-                let (log, gauge) = (Arc::clone(&log), Arc::clone(&counted));
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let dial = dial(n);
+                let (log, gauge, on) =
+                    (Arc::clone(&log), Arc::clone(&counted), Arc::clone(&on_log));
                 std::thread::spawn(move || {
                     std::thread::sleep(dial);
-                    keep_alive_serve(conn, &log, &gauge);
+                    keep_alive_serve(conn, &log, &gauge, |range| {
+                        on.lock().unwrap().push((n, range));
+                    });
                 });
             }
         });
@@ -420,7 +472,14 @@ impl KeepAlive {
             addr,
             seen,
             connections,
+            on,
         }
+    }
+
+    /// The Range header of each request, in order, with the number of the
+    /// connection it came on (from 0, in the order they were made).
+    pub fn ranges_on(&self) -> Vec<(usize, Option<String>)> {
+        self.on.lock().unwrap().clone()
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -446,6 +505,7 @@ fn keep_alive_serve(
     mut conn: TcpStream,
     log: &Mutex<Vec<(String, Option<String>)>>,
     gauge: &Gauge,
+    on: impl Fn(Option<String>),
 ) {
     let mut r = BufReader::new(conn.try_clone().unwrap());
     loop {
@@ -469,6 +529,7 @@ fn keep_alive_serve(
             }
         }
         log.lock().unwrap().push((target.clone(), range.clone()));
+        on(range.clone());
         let query = target.split_once('?').map_or("", |(_, q)| q);
         if !big_to(&mut conn, query, range.as_deref(), head_only, gauge, false) {
             return;

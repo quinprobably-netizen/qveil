@@ -11,7 +11,7 @@
 //!
 //! What is kept is bounded (`HEAD` of the video, `AUDIO_HEAD` of the audio,
 //! and there are at most `MAX_SESSIONS`), belongs to one resolve of the
-//! stream (a refresh makes it stale), and is dropped when the session is
+//! stream (a refresh drops it), and is dropped when the session is
 //! cancelled. A failure here costs nothing: the player's request then goes
 //! upstream as it would have anyway, and so does one that finds the head
 //! stalled (no response within `HEAD_WAIT`).
@@ -21,10 +21,12 @@
 //! the end of one.
 
 use super::Server;
-use super::relay::{Live, Session, content_range, fetch_upstream, is_playlist_type, stalled_read};
+use super::relay::{
+    Live, Session, content_range, fetch_upstream, is_manifest, is_media_type, sniff, stalled_read,
+    up_type,
+};
 use crate::util::lock;
 use reqwest::StatusCode;
-use reqwest::header::CONTENT_TYPE;
 use std::io::{self, Read};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -97,8 +99,18 @@ impl Head {
         lock(&self.state).ended
     }
 
+    /// Gives up on it, with the lock held: nothing more is taken from it,
+    /// so a later request doesn't wait for it again, and its fetch stops at
+    /// its next look (see `fetch_head`).
+    fn give_up(&self, mut st: MutexGuard<'_, HeadState>) {
+        st.ended = true;
+        drop(st);
+        self.changed.notify_all();
+    }
+
     /// What the response said, once it has started; `None` if it failed, or
-    /// didn't start within `HEAD_WAIT`, or `stop` said so first.
+    /// didn't start within `HEAD_WAIT` (then it is given up on), or `stop`
+    /// said so first.
     fn meta(&self, stop: &dyn Fn() -> bool) -> Option<Meta> {
         let deadline = Instant::now() + HEAD_WAIT;
         let mut st = lock(&self.state);
@@ -106,7 +118,11 @@ impl Head {
             if let Some(m) = &st.meta {
                 return Some(m.clone());
             }
-            if st.ended || stop() || Instant::now() >= deadline {
+            if st.ended || stop() {
+                return None;
+            }
+            if Instant::now() >= deadline {
+                self.give_up(st);
                 return None;
             }
             st = self.wait(st);
@@ -116,7 +132,7 @@ impl Head {
     /// Appends the bytes from `pos` up to `upto` (inclusive) to `out` as
     /// they arrive, at most `max` at a time, and returns how many; 0 once
     /// there are no more to be had: it ended short of `pos`, `stop` said
-    /// so, or nothing came for `HEAD_WAIT`.
+    /// so, or nothing came for `HEAD_WAIT` (then it is given up on).
     pub(super) fn read_at(
         &self,
         pos: u64,
@@ -145,6 +161,7 @@ impl Head {
             if st.bytes.len() != before {
                 deadline = Instant::now() + HEAD_WAIT;
             } else if Instant::now() >= deadline {
+                self.give_up(st);
                 return 0;
             }
         }
@@ -189,6 +206,20 @@ impl Warm {
 
     fn stopped(&self) -> bool {
         lock(&self.state).stopped
+    }
+
+    /// Drops what is kept from a resolve other than `generation`, and stops
+    /// fetching it: once the stream is resolved again, the old head would
+    /// only take up memory until the session ends.
+    pub(super) fn forget_older(&self, generation: u32) {
+        let gone = {
+            let mut st = lock(&self.state);
+            let old = |head: &mut Option<Arc<Head>>| head.take_if(|h| h.generation != generation);
+            [old(&mut st.video), old(&mut st.audio)]
+        };
+        for head in gone.into_iter().flatten() {
+            head.end();
+        }
     }
 
     /// The head of stream `kind`, from the resolve `generation`, if it holds
@@ -285,12 +316,8 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
     if up.status() != StatusCode::PARTIAL_CONTENT {
         return Ok(());
     }
-    let content_type = up
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    if content_type.as_deref().is_some_and(is_playlist_type) {
+    let content_type = up_type(&up).map(String::from);
+    if !content_type.as_deref().is_none_or(is_media_type) {
         return Ok(());
     }
     let Some((0, last, total)) = content_range(&up) else {
@@ -299,6 +326,20 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
     if last >= want {
         return Ok(());
     }
+    // What it is sent as isn't the last word (see `relay`).
+    let start = match sniff(&mut up) {
+        Ok(start) => start,
+        Err(e) if stalled_read(&e) => return Err(Stalled(since)),
+        Err(_) => return Ok(()),
+    };
+    if is_manifest(&start) {
+        return Ok(());
+    }
+    if !start.is_empty() {
+        since = live.served.mark();
+    }
+    let want = last as usize + 1;
+    let have = start.len().min(want);
     {
         let mut st = lock(&head.state);
         if st.ended {
@@ -309,12 +350,12 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
             total,
             content_type,
         });
-        st.bytes.reserve_exact(last as usize + 1);
+        st.bytes.reserve_exact(want);
+        st.bytes.extend_from_slice(&start[..have]);
     }
     head.changed.notify_all();
-    let want = last as usize + 1;
     let mut buf = vec![0u8; 16 << 10];
-    let mut have = 0;
+    let mut have = have;
     while have < want {
         if s.cancelled.load(Ordering::Acquire) || head.ended() {
             return Ok(());
@@ -372,33 +413,32 @@ mod tests {
     #[test]
     fn the_head_reaches_the_player_as_it_arrives_not_once_it_is_all_in() {
         let up = Upstream::start();
-        // A round trip of 300 ms and then about 160 KB/s, as over a slow Tor
-        // circuit: the whole video head takes more than six seconds to come,
-        // and the audio's more than a second.
-        let (s, base, _d, _bin) =
-            warm_server(&up, &format!("/big?size={SIZE}&ttfb=300&pace=100&run="));
+        // Each head sends its first 16 KiB, and the rest only once the gate
+        // opens: the player's first bytes must come while it is still shut.
+        up.gauge.gate.store(true, Ordering::SeqCst);
+        let (s, base, _d, _bin) = warm_server(&up, &format!("/big?size={SIZE}&gated=1&run="));
         let info = s.open(&test_video()).unwrap();
-        // mpv opens the audio while the video is opening, so each is timed
-        // from its own request, made right after the open.
+        // mpv opens the audio while the video is opening.
         let audio = {
             let (base, audio) = (base.clone(), info.audio.clone().unwrap());
             std::thread::spawn(move || {
-                let (head, took, _, a) = first_byte(&base, rel(&base, &audio), "bytes=0-");
-                (head, took, a)
+                let (head, _, _, a) = first_byte(&base, rel(&base, &audio), "bytes=0-");
+                (head, a)
             })
         };
-        let (head, took, mut body, mut c) = first_byte(&base, rel(&base, &info.video), "bytes=0-");
-        eprintln!("first byte of the video after {took:?}");
+        let (head, _, mut body, mut c) = first_byte(&base, rel(&base, &info.video), "bytes=0-");
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
         assert!(
             head.contains(&format!("Content-Range: bytes 0-{}/{SIZE}", SIZE - 1)),
             "{head}"
         );
-        assert!(took < Duration::from_millis(900), "{took:?}");
-        let (head, took, _a) = audio.join().unwrap();
-        eprintln!("first byte of the audio after {took:?}");
+        let (head, _a) = audio.join().unwrap();
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
-        assert!(took < Duration::from_millis(900), "{took:?}");
+        assert!(
+            up.gauge.gate.load(Ordering::SeqCst),
+            "the gate opened on its own"
+        );
+        up.gauge.gate.store(false, Ordering::SeqCst);
         read_up_to(&mut c, &mut body, 200_000);
         assert!(body[..200_000] == big_bytes(0, 200_000), "the bytes differ");
         // Both came from the requests made at open: the start was asked for
@@ -521,6 +561,29 @@ mod tests {
     }
 
     #[test]
+    fn a_head_that_did_not_start_in_time_is_given_up_on_for_good() {
+        let up = Upstream::start();
+        // The request for the video head gets no answer for ten seconds.
+        let (s, base, _d, _bin) =
+            warm_server(&up, &format!("/big?size={SIZE}&hold={}&run=", HEAD - 1));
+        let info = s.open(&test_video()).unwrap();
+        let video = rel(&base, &info.video);
+        let get = |range: &str| fetch(&base, "GET", video, &[("Range", range)]);
+        let (status, _, body) = get("bytes=0-99");
+        assert_eq!((status, body), (206, big_bytes(0, 100)));
+        // The first request waited `HEAD_WAIT` for it, and that ended it: the
+        // next one doesn't wait again, and its fetch stops when it answers.
+        let session = s.session(video.split('/').nth(1).unwrap()).unwrap();
+        let head = lock(&session.warm.state).video.clone().unwrap();
+        assert!(head.ended());
+        let started = Instant::now();
+        let (status, _, body) = get("bytes=100-199");
+        assert_eq!((status, body), (206, big_bytes(100, 200)));
+        let took = started.elapsed();
+        assert!(took < HEAD_WAIT, "{took:?}");
+    }
+
+    #[test]
     fn a_head_that_times_out_after_the_player_was_served_leaves_the_client_alone() {
         let up = Upstream::start();
         // The video head gets no answer, and gives up after the player's
@@ -568,6 +631,31 @@ mod tests {
     }
 
     #[test]
+    fn a_head_that_is_a_manifest_is_not_kept() {
+        let up = Upstream::start();
+        // Sent as a video, but its first bytes say what it is.
+        let (s, base, _d, _bin) = warm_server(&up, "/hls?type=video/mp4&n=");
+        let info = s.open(&test_video()).unwrap();
+        let session = s
+            .session(rel(&base, &info.video).split('/').nth(1).unwrap())
+            .unwrap();
+        let head = lock(&session.warm.state).video.clone().unwrap();
+        wait_for("the warm-up to end", Duration::from_secs(5), || {
+            head.ended()
+        });
+        assert!(lock(&head.state).meta.is_none());
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            rel(&base, &info.video),
+            &[("Range", "bytes=0-")],
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 502, "{text}");
+        assert!(text.contains("can't relay"), "{text}");
+    }
+
+    #[test]
     fn a_head_that_stops_short_is_carried_on_from_where_it_stopped() {
         let up = Upstream::start();
         // The video head is cut off half-way.
@@ -610,6 +698,12 @@ mod tests {
             big_bytes(2_000_000, 2_000_100)
         );
         assert_eq!(runs(&bin.0), 2);
+        // What the old resolve fetched is no use now, and isn't kept.
+        let session = s.session(video.split('/').nth(1).unwrap()).unwrap();
+        let st = lock(&session.warm.state);
+        assert!(st.video.is_none() && st.audio.is_none());
+        assert!(!st.stopped, "a new head can still be fetched");
+        drop(st);
         // The head now comes from the new resolve, not from memory.
         assert_eq!(get("bytes=0-99").2, big_bytes(0, 100));
         let after: Vec<_> = up.requests()[before..]
