@@ -678,7 +678,7 @@ pub struct FeedResult {
 }
 
 /// What a feed request fetches before it answers from the cache.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Refresh {
     /// Nothing: show what is cached.
     Off,
@@ -688,6 +688,25 @@ pub enum Refresh {
     Force,
     /// Just this one, whatever its age.
     Channel(String),
+}
+
+impl Refresh {
+    /// Whether a running refresh of this kind fetches all that `wanted` asks
+    /// for, so that `wanted` can wait for its result instead of starting its
+    /// own. Forcing covers what is stale; both cover asking for nothing.
+    ///
+    /// A refresh makes its list of channels when it starts, so one asked for
+    /// by name, which may have been subscribed to since, is covered only by a
+    /// refresh of that very channel, and not by one of all of them.
+    pub fn covers(&self, wanted: &Refresh) -> bool {
+        match (self, wanted) {
+            (_, Refresh::Off) => true,
+            (Refresh::Force, Refresh::Force | Refresh::Stale) => true,
+            (Refresh::Stale, Refresh::Stale) => true,
+            (Refresh::Channel(running), Refresh::Channel(wanted)) => running == wanted,
+            _ => false,
+        }
+    }
 }
 
 /// What a refresh found out besides the videos, which are in the cache.
@@ -1089,6 +1108,37 @@ mod tests {
             ..Config::default()
         };
         Runtime::new(cfg, paths, Some("http://127.0.0.1:1".into()), false).unwrap()
+    }
+
+    #[test]
+    fn a_running_refresh_covers_only_what_it_fetches() {
+        let one = || Refresh::Channel(format!("UC{:022}", 1));
+        let other = || Refresh::Channel(format!("UC{:022}", 2));
+        // (running, wanted, covered)
+        let table = [
+            (Refresh::Force, Refresh::Force, true),
+            (Refresh::Force, Refresh::Stale, true),
+            (Refresh::Force, Refresh::Off, true),
+            (Refresh::Stale, Refresh::Stale, true),
+            (Refresh::Stale, Refresh::Off, true),
+            (Refresh::Stale, Refresh::Force, false),
+            (Refresh::Stale, one(), false),
+            // Not even forcing: its list was made before this channel may have
+            // been subscribed to.
+            (Refresh::Force, one(), false),
+            (one(), one(), true),
+            (one(), other(), false),
+            (one(), Refresh::Stale, false),
+            (one(), Refresh::Force, false),
+            (one(), Refresh::Off, true),
+        ];
+        for (running, wanted, covered) in table {
+            assert_eq!(
+                running.covers(&wanted),
+                covered,
+                "{running:?} running, {wanted:?} wanted"
+            );
+        }
     }
 
     #[test]
