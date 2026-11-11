@@ -412,7 +412,8 @@ fn charge_topic_search(paths: &Paths) -> Result<bool> {
 /// (`topics::BUDGET`, whatever the groups are). Each search is counted before
 /// it is sent, so one that is cut off or fails counts too; a group the budget
 /// has no room for is not begun. A group whose search fails is left as it was
-/// and named in `errors`; the others are still searched for. Videos from
+/// and named in `errors`, and the refresh stops there (offline, every group's
+/// first search would fail, and count). Videos from
 /// channels that are followed are left out. `wanted` is asked before each
 /// group, between searches and once more before saving, under the lock: once
 /// it says no (the client is gone, the route was left, or the setting was
@@ -528,7 +529,7 @@ pub fn topics(
                 bail!(crate::ytdlp::CANCELLED);
             }
             let mut kept: topics::Results = store::load_cache(&paths.topics_cache())?;
-            match found {
+            let failed = match found {
                 Ok(videos) => {
                     kept.groups.insert(
                         group.key(),
@@ -537,9 +538,13 @@ pub fn topics(
                             videos,
                         },
                     );
+                    false
                 }
-                Err(e) => errors.push(format!("{}: {e:#}", group.label)),
-            }
+                Err(e) => {
+                    errors.push(format!("{}: {e:#}", group.label));
+                    true
+                }
+            };
             // What there is no group for any more goes once it is due again:
             // a group that comes back sooner has not been searched for twice.
             let now_at = now();
@@ -547,6 +552,12 @@ pub fn topics(
                 groups.iter().any(|g| g.key() == *key) || !topics::due(Some(found), now_at)
             });
             store::save_compact(&paths.topics_cache(), &kept)?;
+            // A search that failed most likely failed for want of a
+            // connection, which the next group's would too, and each would
+            // count: the refresh stops here.
+            if failed {
+                break;
+            }
         }
         errors.extend(held_back);
         results = store::load_cache(&paths.topics_cache())?;

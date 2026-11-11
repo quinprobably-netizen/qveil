@@ -783,7 +783,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
     }
 
     #[test]
-    fn a_topic_whose_search_fails_does_not_take_the_others_with_it() {
+    fn a_topic_whose_search_fails_stops_the_refresh() {
         let (bin, base, d) = rig();
         follow_some_channels(&d);
         topics_on(&base);
@@ -796,9 +796,10 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         assert_eq!(groups[0]["videos"], serde_json::json!([]));
         assert!(groups[0].get("fetchedAt").is_none());
         assert_eq!(v["errors"].as_array().unwrap().len(), 1, "{v}");
-        // ...and the other was searched for all the same.
-        assert!(!groups[1]["videos"].as_array().unwrap().is_empty(), "{v}");
-        assert!(groups[1]["fetchedAt"].as_i64().unwrap() > 0);
+        // ...and nothing more was searched for: offline, every search would
+        // fail, and each would count.
+        assert_eq!(asked(&bin), ["'ytsearch20:hand plane'"]);
+        assert!(groups[1].get("fetchedAt").is_none(), "{v}");
     }
 
     #[test]
@@ -1037,16 +1038,19 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
     }
 
     #[test]
-    fn a_refresh_with_no_connection_counts_only_the_searches_it_tried() {
+    fn a_refresh_with_no_connection_counts_one_search() {
         let (bin, d) = (TempDir::new(), TempDir::new());
         let rt = topics_at(&bin, &d);
-        // Every search fails: a group stops at its first.
+        // Every search fails: the refresh stops at its first.
         std::fs::write(bin.0.join("failfor"), "ytsearch").unwrap();
         for n in 1..=5 {
             let r = app::topics(&rt, &d.paths(), true, &|_, _| {}, &|| true).unwrap();
-            assert_eq!(r.errors.len(), 2, "{:?} {:?}", r.errors, asked(&bin));
-            assert_eq!(asked(&bin).len(), 2 * n, "{:?}", asked(&bin));
+            assert_eq!(r.errors.len(), 1, "{:?} {:?}", r.errors, asked(&bin));
+            assert_eq!(asked(&bin).len(), n, "{:?}", asked(&bin));
         }
+        let counted: crate::topics::Searched =
+            crate::store::load(&d.paths().topic_searches()).unwrap();
+        assert_eq!(counted.at.len(), 5);
     }
 
     #[test]

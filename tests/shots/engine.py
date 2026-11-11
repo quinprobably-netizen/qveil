@@ -358,8 +358,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # (A refresh that was running when the setting was turned off
                 # still says what it found: the window must not show it.)
                 result = topics() if not refresh else {"enabled": True, "groups": topic_groups()}
-                # As the engine does when one group's search fails: the others are
-                # there, that one has nothing new, and it is named in `errors`.
+                # As the engine does when one group's search fails: that one has
+                # nothing new and is named in `errors`, and the refresh stops there
+                # (the groups after it keep what they had).
                 if refresh and os.environ.get("QVEIL_STANDIN_TOPICS_FAIL") == "group":
                     result["groups"][1]["videos"] = []
                     result["groups"][1].pop("fetchedAt", None)
