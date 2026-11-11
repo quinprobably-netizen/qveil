@@ -33,6 +33,16 @@ pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_WINDOW: u32 = 6 << 20;
 const CONNECTION_WINDOW: u32 = 15 << 20;
 
+/// How many idle connections to one host a client keeps for later
+/// requests. A session's relay rarely has more than its video's, its
+/// audio's and a spare open at once, and over Tor every one kept is a
+/// connection the exit sees held open.
+pub const POOLED_PER_HOST: usize = 4;
+/// How long a client keeps an idle connection. googlevideo may close one
+/// sooner; the relay counts the idle connections (`relay::Pool`) by the
+/// same two numbers.
+pub const POOLED_FOR: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, Default)]
 pub struct Net {
     proxy: Option<String>,
@@ -239,6 +249,8 @@ impl Net {
             .timeout(timeout)
             .http2_initial_stream_window_size(STREAM_WINDOW)
             .http2_initial_connection_window_size(CONNECTION_WINDOW)
+            .pool_max_idle_per_host(POOLED_PER_HOST)
+            .pool_idle_timeout(POOLED_FOR)
             // The route is the one chosen in qveil, never HTTP_PROXY or
             // ALL_PROXY from the environment: on Direct, the app tells you
             // YouTube sees your IP, and that has to be true.
@@ -672,6 +684,72 @@ mod tests {
             "{} KiB let through",
             up.sent() >> 10
         );
+    }
+
+    #[test]
+    fn a_client_keeps_no_more_than_a_few_idle_connections() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{Arc, Barrier};
+        const AT_ONCE: usize = POOLED_PER_HOST + 2;
+        // Answers each request only once `AT_ONCE` of them are waiting, so
+        // every round needs that many connections at the same time. Counts
+        // the requests each connection served.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let served = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let barrier = Arc::new(Barrier::new(AT_ONCE));
+        let (log, gate) = (Arc::clone(&served), Arc::clone(&barrier));
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let (log, gate) = (Arc::clone(&log), Arc::clone(&gate));
+                std::thread::spawn(move || {
+                    let mut out = conn.try_clone().unwrap();
+                    let mut r = BufReader::new(conn);
+                    let me = {
+                        let mut log = log.lock().unwrap();
+                        log.push(0);
+                        log.len() - 1
+                    };
+                    loop {
+                        let mut line = String::new();
+                        while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                            line.clear();
+                        }
+                        if line.is_empty() {
+                            return;
+                        }
+                        log.lock().unwrap()[me] += 1;
+                        gate.wait();
+                        let _ = write!(out, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+                    }
+                });
+            }
+        });
+        let client = Net::new(None, true)
+            .unwrap()
+            .allowing_http()
+            .relay_client()
+            .unwrap();
+        let round = || {
+            std::thread::scope(|s| {
+                for _ in 0..AT_ONCE {
+                    s.spawn(|| {
+                        let body = client.get(&url).send().unwrap().text().unwrap();
+                        assert_eq!(body, "hi");
+                    });
+                }
+            })
+        };
+        round();
+        assert_eq!(served.lock().unwrap().len(), AT_ONCE);
+        // Time for the connections to go back to the pool.
+        std::thread::sleep(Duration::from_millis(300));
+        round();
+        // Of the connections the first round opened, only the few the
+        // client kept were used again. (Fewer, if the client hadn't put them
+        // back yet; never more.)
+        let reused = served.lock().unwrap().iter().filter(|&&n| n > 1).count();
+        assert!(reused <= POOLED_PER_HOST, "{reused} reused");
     }
 
     #[test]
