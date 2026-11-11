@@ -53,6 +53,10 @@ int main(int argc, char *argv[]) {
         {"pip", "play(backend.feed.get(0), backend.feed, 0); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: win.togglePip() }', win)"},
         {"help", "help.open()"},
+        {"route", "route.open()"},
+        {"theatre", "play(backend.feed.get(0), backend.feed, 0); watch.theatre = true"},
+        {"history-on", "backend.setConfig({ history: true }); backend.loadHistory(); go('history')"},
+        {"lens-edit", "go('lenses'); lensesPage.editLens()"},
         {"sort", "feedPage.openSort()"},
         {"watch-comments", "play(backend.feed.get(0)); watch.enterSheet('comments')"},
     };

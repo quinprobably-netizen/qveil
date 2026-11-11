@@ -38,6 +38,8 @@ FocusScope {
         writing = true
         Qt.callLater(() => editor.edit())
     }
+    // Puts the open lens's words into editing (for stills and keys).
+    function editLens() { editor.edit() }
     // The lens before or after the one that is open, along the strip.
     function step(by) {
         const ids = backend.lenses.map(l => l.id)
