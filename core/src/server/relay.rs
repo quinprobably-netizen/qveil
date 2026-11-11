@@ -1943,6 +1943,36 @@ EOF
     }
 
     #[test]
+    fn a_resolve_again_is_stopped_when_the_route_changes() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        let ytdlp = ytdlp_then(&bin.0, &up.url("/video?gen="), HANG);
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        let player = {
+            let (base, url) = (base.clone(), info.video.clone());
+            std::thread::spawn(move || {
+                let mut c = TcpStream::connect(addr(&base)).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let target = path(&base, rel(&base, &url));
+                write!(c, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+                let mut got = Vec::new();
+                let _ = c.read_to_end(&mut got);
+                got
+            })
+        };
+        let pid = hung_pid(&bin.0);
+        switch_to_tor(&base);
+        gone(&pid);
+        let got = player.join().unwrap();
+        assert!(!got.starts_with(b"HTTP/1.1 2"), "{got:?}");
+        assert_eq!(runs(&bin.0), 2);
+    }
+
+    #[test]
     fn a_resolve_again_is_stopped_when_the_session_ends() {
         let up = Upstream::start();
         let bin = TempDir::new();

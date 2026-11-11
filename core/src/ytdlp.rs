@@ -499,7 +499,8 @@ impl Ytdlp {
     /// Picks the streams to relay. `format` must only select plain downloads
     /// (see `Config::format`), and the result is checked again here because a
     /// manifest slipping through would make mpv fetch segments directly,
-    /// around the route.
+    /// around the route. (What plays always has an `abort`: tests only.)
+    #[cfg(test)]
     pub fn resolve(&self, url: &str, format: &str) -> Result<Streams> {
         self.resolve_until(url, format, &|| false)
     }
