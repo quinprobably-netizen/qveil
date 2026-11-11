@@ -79,6 +79,9 @@ pub struct Server {
     warming: AtomicBool,
     /// The lookups of the videos played lately (see `lookups`).
     lookups: lookups::Lookups,
+    /// What tells the lookup of the next video that is running, if one is,
+    /// to stop (see `prepare_next`).
+    preparing: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 #[derive(Serialize)]
@@ -150,6 +153,7 @@ impl Server {
             unverified: Arc::new(Unverified::default()),
             warming: AtomicBool::new(true),
             lookups: lookups::Lookups::default(),
+            preparing: Mutex::new(None),
         })
     }
 
@@ -235,15 +239,7 @@ impl Server {
         let (s, live, fresh) = match self.lookups.get(&v.id, &format, &rt.net) {
             Some((s, live)) => (s, live, false),
             None => {
-                let yt = rt.pinned_ytdlp();
-                let s = yt.resolve_until(&v.watch_url(), &format, abort)?;
-                let live = Live {
-                    generation: 0,
-                    video: s.video.clone(),
-                    audio: s.audio.clone(),
-                    headers: s.headers.clone(),
-                    client: yt.net.relay_client()?,
-                };
+                let (s, live) = self.look_up(&rt, v, &format, abort)?;
                 (s, live, true)
             }
         };
@@ -340,6 +336,27 @@ impl Server {
             }
         }
         Ok(sid)
+    }
+
+    /// Resolves `v` through one pinned identity of `rt`'s route, with the
+    /// relay client of that identity.
+    fn look_up(
+        &self,
+        rt: &Runtime,
+        v: &VideoRef,
+        format: &str,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<(Streams, Live)> {
+        let yt = rt.pinned_ytdlp();
+        let s = yt.resolve_until(&v.watch_url(), format, abort)?;
+        let live = Live {
+            generation: 0,
+            video: s.video.clone(),
+            audio: s.audio.clone(),
+            headers: s.headers.clone(),
+            client: yt.net.relay_client()?,
+        };
+        Ok((s, live))
     }
 
     /// Keeps a lookup made on `rt`'s route for playing the video again,
@@ -441,6 +458,7 @@ impl Server {
             }
             ("GET", ["api", "feed"]) => self.feed(&mut stream, &req),
             ("POST", ["api", "play"]) => self.play(&mut stream, &req),
+            ("POST", ["api", "prepare"]) => self.prepare_next(&mut stream, &req),
             ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),
             _ => self.json_api(&mut stream, &req, &segs),
         }

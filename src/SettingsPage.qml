@@ -31,7 +31,7 @@ FocusScope {
     // and on which of them.
     property bool inRows: false
     property int rowAt: 0
-    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume], playback: [qualityRow], home: [pictures, topicsRow, shortsRow], about: [] })
+    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume], playback: [qualityRow, aheadRow], home: [pictures, topicsRow, shortsRow], about: [] })
     onCategoryChanged: {
         const had = pane.activeFocus
         inRows = false
@@ -275,6 +275,21 @@ FocusScope {
                                 patch: ({ maxHeight: modelData })
                             }
                         }
+                    }
+                }
+                SettingRow {
+                    id: aheadRow
+                    objectName: "set-prepare"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === aheadRow
+                    width: parent.width
+                    name: qsTr("Get the next video ready")
+                    note: (page.config.prepareNext ? page.pages.prepare_on : page.pages.prepare_off) || ""
+                    noteName: "set-prepare-note"
+                    would: page.config.prepareNext ? "" : (page.pages.prepare_on || "")
+                    wouldName: "set-prepare-would"
+                    Choices {
+                        Choice { objectName: "prepare-off"; text: qsTr("Off"); current: !page.config.prepareNext; patch: ({ prepareNext: false }) }
+                        Choice { objectName: "prepare-on"; text: qsTr("On"); current: !!page.config.prepareNext; patch: ({ prepareNext: true }) }
                     }
                 }
             }

@@ -111,6 +111,7 @@ state = {
     "config": {"route": "direct", "proxy": None, "describe": "direct", "isolated": False, "torRunning": True,
                "history": False, "thumbnails": True, "maxHeight": 1080, "resumeDays": 7,
                "topicFeeds": bool(os.environ.get("QVEIL_STANDIN_TOPICS")),
+               "prepareNext": False,
                "configPath": "/dev/null", "privacy": PRIVACY},
     "subs": [{"id": c, "name": n} for c, n in CHANNELS],
     "resume": [
@@ -137,6 +138,10 @@ TOPICS_ON = "On: qveil groups the channels you follow by the words that keep com
 PRIVACY["pages"]["topics_on"] = TOPICS_ON
 LENSES_SHORT = "A refresh sends each topic to YouTube as a search of its own, sometimes twice."
 PRIVACY["pages"]["lenses_short"] = LENSES_SHORT
+PREPARE_OFF = "Off: a video is looked up when you play it, and not before."
+PREPARE_ON = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it."
+PRIVACY["pages"]["prepare_off"] = PREPARE_OFF
+PRIVACY["pages"]["prepare_on"] = PREPARE_ON
 # QVEIL_STANDIN_TOPICS=fetched: they were searched for on an earlier day.
 state["topics"] = {"fetched": os.environ.get("QVEIL_STANDIN_TOPICS") == "fetched", "hidden": [], "new": set()}
 
@@ -448,7 +453,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os._exit(3)
         if path == "api/config":
             cfg = state["config"]
-            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds"):
+            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds", "prepareNext"):
                 if key in body:
                     cfg[key] = body[key]
             cfg["resumeDays"] = max(0, min(365, int(cfg["resumeDays"])))
@@ -463,6 +468,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                          "tor": "Through Tor: YouTube sees an exit node's address, not your IP.",
                                          "proxy": "Through your proxy: YouTube sees its address, not your IP."}[cfg["route"]]
             self.send(200, cfg)
+        elif path == "api/prepare":
+            # Getting the next video ready: only while that is on, as the engine does.
+            if state["config"]["prepareNext"]:
+                self.send(200, {"lookedUp": True})
+            else:
+                self.send(403, {"error": "getting the next video ready is off", "code": "other"})
         elif path == "api/play":
             v = q.get("v", "")
             if v in ("bot_check", "tor_down", "proxy_refused", "rate_limited", "age_restricted", "route_changed"):

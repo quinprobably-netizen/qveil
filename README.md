@@ -109,6 +109,8 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - **Resume, off.** Off: qveil doesn't remember where you stopped.
 - **Topic feeds, off.** Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.
 - **Topic feeds, on.** On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.
+- **Getting the next video ready, off.** Off: a video is looked up when you play it, and not before.
+- **Getting the next video ready, on.** On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it.
 <!-- privacy:end -->
 
 ## The app

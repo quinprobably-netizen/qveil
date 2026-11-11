@@ -191,6 +191,9 @@ pub struct Pages {
     /// Both, so that what turning them on does can be said before it is done.
     pub topics_on: &'static str,
     pub topics_off: &'static str,
+    /// Getting the next video ready, on and off.
+    pub prepare_on: &'static str,
+    pub prepare_off: &'static str,
 }
 
 const ROUTES: Routes = Routes {
@@ -208,6 +211,9 @@ const COMMENTS: &str = "Fetched only when you open them, as one more lookup of t
 const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.";
 const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
+const PREPARE_OFF: &str = "Off: a video is looked up when you play it, and not before.";
+const PREPARE_ON: &str = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it.";
+const PREPARE_POINT: &str = "Getting the next video ready is on: near the end of a video, the next one in its list is looked up before you play it, so YouTube sees a lookup of a video you may not watch.";
 const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
 const LENSES_SHORT: &str =
     "A refresh sends each topic to YouTube as a search of its own, sometimes twice.";
@@ -237,6 +243,7 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
         .chain(EVERYWHERE.iter().copied())
         // What is only true while a setting is on.
         .chain(cfg.topic_feeds.then_some(TOPICS_POINT))
+        .chain(cfg.prepare_next.then_some(PREPARE_POINT))
         .map(String::from)
         .collect();
     Privacy {
@@ -259,6 +266,8 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
             },
             topics_on: TOPICS_ON,
             topics_off: TOPICS_OFF,
+            prepare_on: PREPARE_ON,
+            prepare_off: PREPARE_OFF,
         },
     }
 }
@@ -323,6 +332,8 @@ pub fn markdown() -> String {
         ("Resume, off", resume_off.as_str()),
         ("Topic feeds, off", TOPICS_OFF),
         ("Topic feeds, on", TOPICS_ON),
+        ("Getting the next video ready, off", PREPARE_OFF),
+        ("Getting the next video ready, on", PREPARE_ON),
     ] {
         md.push_str(&format!("- **{name}.** {line}\n"));
     }
@@ -521,6 +532,8 @@ mod tests {
                 "history_on",
                 "lenses",
                 "lenses_short",
+                "prepare_off",
+                "prepare_on",
                 "resume",
                 "search",
                 "subscriptions",
@@ -604,6 +617,27 @@ mod tests {
         assert!(markdown().contains("when recent topic searches were made live in"));
     }
 
+    #[test]
+    fn getting_the_next_video_ready_is_said_while_it_is_on() {
+        let net = Net::new(None, true).unwrap();
+        let off = describe(&net, &Config::default());
+        assert!(!off.points.iter().any(|p| p == PREPARE_POINT));
+        assert!(off.pages.prepare_off.starts_with("Off"));
+        let on = describe(
+            &net,
+            &Config {
+                prepare_next: true,
+                ..Config::default()
+            },
+        );
+        assert!(on.points.iter().any(|p| p == PREPARE_POINT));
+        // What it costs: a lookup YouTube sees, of a video that may not be watched.
+        assert!(
+            on.pages.prepare_on.contains("YouTube") && on.pages.prepare_on.contains("never watch")
+        );
+        assert!(on.pages.prepare_on.contains("pointed at it"));
+    }
+
     /// The window's tests run against a stand-in engine, which has to say
     /// what this one says where the window shows it word for word.
     #[test]
@@ -617,6 +651,8 @@ mod tests {
             ("TOPICS_ON", TOPICS_ON),
             ("TOPICS_OFF", TOPICS_OFF),
             ("LENSES_SHORT", LENSES_SHORT),
+            ("PREPARE_OFF", PREPARE_OFF),
+            ("PREPARE_ON", PREPARE_ON),
         ] {
             assert!(
                 standin.contains(&format!("{name} = \"{text}\"")),

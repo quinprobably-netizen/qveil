@@ -30,6 +30,12 @@ resume_days = 7
 # are about, so it is off until you turn it on.
 topic_feeds = false
 
+# Get the next video ready: in the last 30 seconds of a video played from a
+# list, look up the next one in it, so that it starts at once. YouTube sees
+# that lookup even if you never watch the video, so it is off until you turn
+# it on.
+prepare_next = false
+
 # Show thumbnails. They are fetched through the same route as everything else.
 # With Tor isolation each one gets its own circuit, so separate requests can't
 # be linked by IP address. A refresh is still a burst of requests for exactly

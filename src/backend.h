@@ -148,6 +148,11 @@ public:
     // Drops the answer of a video still being looked up, and hangs up on the
     // engine, which can then stop looking: the player it was for has been closed.
     Q_INVOKABLE void cancelPlay();
+    // With "Get the next video ready" on: has the engine look up a video
+    // that is likely to be played next, so that it starts at once. Quiet:
+    // nothing is shown while it runs, nor when it fails.
+    Q_INVOKABLE void prepare(const QString &video);
+    Q_INVOKABLE void cancelPrepare();
     Q_INVOKABLE void loadResume();
     // Tells the engine where `video` (id, title, channel) is. Says nothing
     // until the player knows how long the video is.
