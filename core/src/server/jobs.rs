@@ -23,17 +23,59 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a client waits for news before it looks whether the other end has
 /// hung up. A hung-up client is noticed within this, and a job that is slow
 /// to report doesn't leave a thread waiting for a client that left.
 const POLL: Duration = Duration::from_millis(250);
 
-/// The refresh that is running, if there is one.
-#[derive(Default)]
+/// How long a request waits behind a refresh that doesn't cover it before
+/// it gives up, and answers with what is cached.
+const WAIT_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// The refresh that is running, if there is one, and the one that goes next.
 pub(super) struct Jobs {
     running: Mutex<Option<Arc<FeedJob>>>,
+    /// What the requests waiting behind the running job want, which starts
+    /// once that is over, before anything that asks after them. Locked
+    /// after `running`, and only with it.
+    next_up: Mutex<Option<NextUp>>,
+    /// How many `NextUp`s there have been, which names each.
+    made: std::sync::atomic::AtomicU64,
+    /// `WAIT_MAX`, in milliseconds; only tests change it.
+    wait_max: std::sync::atomic::AtomicU64,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Jobs {
+            running: Mutex::default(),
+            next_up: Mutex::default(),
+            made: Default::default(),
+            wait_max: (WAIT_MAX.as_millis() as u64).into(),
+        }
+    }
+}
+
+/// The refresh that goes next, and how many requests wait for it.
+struct NextUp {
+    id: u64,
+    refresh: Refresh,
+    waiters: usize,
+}
+
+/// The `NextUp` that a request waits for, if it is counted among its waiters.
+#[derive(Default)]
+pub(super) struct Place(Option<u64>);
+
+impl NextUp {
+    /// Takes `place` out of its waiters, if it is among them.
+    fn without(&mut self, place: &mut Place) {
+        if place.0.take() == Some(self.id) {
+            self.waiters -= 1;
+        }
+    }
 }
 
 pub(super) struct FeedJob {
@@ -48,6 +90,9 @@ pub(super) struct FeedJob {
     listed: BTreeSet<String>,
     state: Mutex<JobState>,
     changed: Condvar,
+    /// How many requests joined it after it started, for the tests.
+    #[cfg(test)]
+    joined: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Default)]
@@ -69,7 +114,14 @@ impl FeedJob {
             listed,
             state: Mutex::default(),
             changed: Condvar::new(),
+            #[cfg(test)]
+            joined: Default::default(),
         })
+    }
+
+    #[cfg(test)]
+    fn joined(&self) -> usize {
+        self.joined.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn update(&self, change: impl FnOnce(&mut JobState)) {
@@ -123,18 +175,33 @@ impl FeedJob {
 }
 
 impl FeedJob {
-    /// Waits until the job is over, or until `gone` says nobody is waiting any
-    /// more. Whether it is over.
-    fn wait_over(&self, gone: impl Fn() -> bool) -> bool {
-        let mut seen = 0;
+    /// Waits until the job is over, until `until`, or until `gone` says
+    /// nobody is waiting any more. `got_further` hears how far the job is
+    /// each time that changes, and stops the wait by saying false.
+    fn wait_over(
+        &self,
+        until: Instant,
+        gone: &dyn Fn() -> bool,
+        got_further: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Waited {
+        let (mut seen, mut told) = (0, None);
         loop {
             let state = self.wait(seen);
             seen = state.version;
             if state.finished.is_some() {
-                return true;
+                return Waited::Over;
+            }
+            if let Some((done, total)) = state.progress.filter(|p| Some(*p) != told) {
+                told = Some((done, total));
+                if !got_further(done, total) {
+                    return Waited::Gone;
+                }
             }
             if gone() {
-                return false;
+                return Waited::Gone;
+            }
+            if Instant::now() >= until {
+                return Waited::TooLong;
             }
         }
     }
@@ -169,30 +236,94 @@ impl Jobs {
     /// under one lock, so that two requests arriving together share one job.
     ///
     /// A running job that doesn't cover `refresh` is not joined, and nor is a
-    /// second one started beside it: that is `Claim::Busy`. (A job on another
-    /// route is being cut off, and doesn't count.)
+    /// second one started beside it: that is `Claim::Busy`, and `refresh` is
+    /// what goes next (see `wait_for_next`), with `place` saying whether the
+    /// request is counted as waiting for it. (A job on another route is
+    /// being cut off, and doesn't count.) With nothing running, the refresh
+    /// that requests have waited for starts, whoever asks: one that comes
+    /// later can't go ahead of them.
     fn join_or_start(
         &self,
         net: &Net,
         refresh: &Refresh,
         subscribed: &BTreeSet<String>,
+        place: &mut Place,
         start: impl FnOnce(Arc<FeedJob>),
     ) -> Claim {
         let mut running = lock(&self.running);
+        let mut next_up = lock(&self.next_up);
+        // Asked again: it is no longer waiting, whatever comes of this.
+        match next_up.as_mut() {
+            Some(next) => next.without(place),
+            None => place.0 = None,
+        }
         if let Some(job) = running.as_ref()
             && job.running()
             && job.net.same_route(net)
         {
             return if job.covers(refresh, subscribed) {
+                #[cfg(test)]
+                job.joined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if next_up.as_ref().is_some_and(|n| n.waiters == 0) {
+                    *next_up = None;
+                }
                 Claim::Job(Arc::clone(job))
             } else {
+                self.wait_for_next(&mut next_up, refresh, place);
                 Claim::Busy(Arc::clone(job))
             };
         }
-        let job = FeedJob::new(net.clone(), refresh.clone(), subscribed.clone());
+        let what = next_up
+            .take()
+            .map_or_else(|| refresh.clone(), |n| n.refresh);
+        let job = FeedJob::new(net.clone(), what, subscribed.clone());
         *running = Some(Arc::clone(&job));
         start(Arc::clone(&job));
-        Claim::Job(job)
+        if job.covers(refresh, subscribed) {
+            Claim::Job(job)
+        } else {
+            self.wait_for_next(&mut next_up, refresh, place);
+            Claim::Busy(job)
+        }
+    }
+
+    /// A request that waited stops waiting (its client hung up, or it waited
+    /// too long). A refresh that nobody waits for any more doesn't go next.
+    fn leave(&self, place: &mut Place) {
+        let _running = lock(&self.running);
+        let mut next_up = lock(&self.next_up);
+        match next_up.as_mut() {
+            Some(next) => {
+                next.without(place);
+                if next.waiters == 0 {
+                    *next_up = None;
+                }
+            }
+            None => place.0 = None,
+        }
+    }
+
+    fn wait_max(&self) -> Duration {
+        Duration::from_millis(self.wait_max.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Makes `refresh` what goes next, or part of it: the first request to
+    /// wait says what that is, and those after it wait for it if it covers
+    /// them. A forced one makes a refresh of what is due a forced one, which
+    /// still covers that. Anything else waits a turn more, unplaced.
+    fn wait_for_next(&self, next_up: &mut Option<NextUp>, refresh: &Refresh, place: &mut Place) {
+        let next = next_up.get_or_insert_with(|| NextUp {
+            id: self.made.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            refresh: refresh.clone(),
+            waiters: 0,
+        });
+        if *refresh == Refresh::Force && next.refresh == Refresh::Stale {
+            next.refresh = Refresh::Force;
+        }
+        if next.refresh.covers(refresh) {
+            next.waiters += 1;
+            place.0 = Some(next.id);
+        }
     }
 }
 
@@ -206,10 +337,13 @@ struct Shape {
 impl Server {
     /// `GET api/feed`: the feed, and with `refresh=1` first a refresh of the
     /// channels that are due (`&force=1` all of them, `&channel=UC…` one),
-    /// which waits its turn if a refresh of something else is running.
-    /// With `&stream=1` the reply is a stream of lines: `{"progress":
-    /// {"done":N,"total":M}}` as channels finish, and last `{"result": …}`
-    /// (the feed, as it is without `stream`) or `{"error": …, "code": …}`.
+    /// which waits its turn if a refresh of something else is running
+    /// (ahead of any request that comes after it, and for `WAIT_MAX` at
+    /// most). With `&stream=1` the reply is a stream of lines:
+    /// `{"waiting":{"done":N,"total":M}}` as the refresh it waits for goes
+    /// on, `{"progress":{"done":N,"total":M}}` as its own channels finish,
+    /// and last `{"result": …}` (the feed, as it is without `stream`) or
+    /// `{"error": …, "code": …}`.
     pub(super) fn feed(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let refresh = match req.query.get("channel").filter(|c| !c.is_empty()) {
             _ if !req.flag("refresh") => Refresh::Off,
@@ -233,42 +367,66 @@ impl Server {
                 shape.limit,
                 &|| true,
             );
-            return reply(out, stream, feed.map(|f| json!(f)));
+            return reply(out, stream, false, feed.map(|f| json!(f)));
         }
         let watch = Watch::new(out);
+        // Whether the stream's head is out: a request that waits sends it
+        // at once, and says how the refresh it waits for is going.
+        let mut head = false;
+        let mut place = Place::default();
+        let until = Instant::now() + self.jobs.wait_max();
         let job = loop {
             // Taken again after a wait, for the route may have changed and
             // channels may have been added.
             let rt = self.runtime();
             let subscribed = match app::load_subs(&self.paths) {
                 Ok(subs) => subs.channels.into_iter().map(|s| s.id).collect(),
-                Err(e) => return reply(out, stream, Err(e)),
+                Err(e) => {
+                    self.jobs.leave(&mut place);
+                    return reply(out, stream, head, Err(e));
+                }
             };
-            let claim = self
-                .jobs
-                .join_or_start(&rt.net, &refresh, &subscribed, |job| {
-                    self.start_job(&rt, refresh.clone(), job)
-                });
+            let claim =
+                self.jobs
+                    .join_or_start(&rt.net, &refresh, &subscribed, &mut place, |job| {
+                        self.start_job(&rt, job)
+                    });
             match claim {
                 Claim::Job(job) => break job,
                 // A job that doesn't fetch what this wants: wait for it to be
                 // over, unless the client hangs up first.
                 Claim::Busy(busy) => {
-                    if !busy.wait_over(|| watch.gone()) {
-                        return Ok(());
+                    match wait_behind(out, &busy, stream, &mut head, &watch, until) {
+                        Waited::Over => {}
+                        Waited::Gone => {
+                            self.jobs.leave(&mut place);
+                            return Ok(());
+                        }
+                        Waited::TooLong => {
+                            self.jobs.leave(&mut place);
+                            let left = Refreshed {
+                                fallbacks: 0,
+                                errors: vec![TOO_LONG.into()],
+                                fresh: 0,
+                            };
+                            let feed =
+                                app::feed_result(&self.paths, shape.no_shorts, shape.limit, &left);
+                            return reply(out, stream, head, feed.map(|f| json!(f)));
+                        }
                     }
                 }
             }
         };
         if stream {
-            self.stream_job(out, &job, shape)
+            self.stream_job(out, &job, shape, head)
         } else {
             self.wait_for_job(out, &job, shape)
         }
     }
 
-    fn start_job(self: &Arc<Self>, rt: &Arc<Runtime>, refresh: Refresh, job: Arc<FeedJob>) {
+    fn start_job(self: &Arc<Self>, rt: &Arc<Runtime>, job: Arc<FeedJob>) {
         let (server, rt) = (Arc::clone(self), Arc::clone(rt));
+        let refresh = job.refresh.clone();
         let thread_job = Arc::clone(&job);
         let spawned = std::thread::Builder::new()
             .name("feed-refresh".into())
@@ -307,7 +465,7 @@ impl Server {
             let state = job.wait(seen);
             seen = state.version;
             if let Some(finished) = state.finished {
-                return reply(out, false, self.job_result(finished, shape));
+                return reply(out, false, false, self.job_result(finished, shape));
             }
             if watch.gone() {
                 return Ok(());
@@ -315,9 +473,16 @@ impl Server {
         }
     }
 
-    /// Streams the job's progress, then its result.
-    fn stream_job(&self, out: &mut TcpStream, job: &FeedJob, shape: Shape) -> Result<()> {
-        if out.write_all(NDJSON_HEAD.as_bytes()).is_err() {
+    /// Streams the job's progress, then its result. `head` says whether the
+    /// stream's head is out already.
+    fn stream_job(
+        &self,
+        out: &mut TcpStream,
+        job: &FeedJob,
+        shape: Shape,
+        head: bool,
+    ) -> Result<()> {
+        if !head && out.write_all(NDJSON_HEAD.as_bytes()).is_err() {
             return Ok(());
         }
         let watch = Watch::new(out);
@@ -351,9 +516,43 @@ fn write_line(out: &mut TcpStream, line: &Value) -> std::io::Result<()> {
     out.write_all(format!("{line}\n").as_bytes())
 }
 
+/// What a request says when it has waited `WAIT_MAX` behind another refresh.
+const TOO_LONG: &str = "Another refresh was still running after 10 minutes, so this one wasn't made; this is what was already fetched.";
+
+/// How waiting behind another job ended.
+enum Waited {
+    Over,
+    Gone,
+    TooLong,
+}
+
+/// Waits for `busy` to be over, until `until`, or until the client hangs up.
+/// With `stream`, the head goes out at once (`head` says it has), and a
+/// `{"waiting":{"done":N,"total":M}}` line each time the other job gets
+/// further, so that a client that waits a long time hears something.
+fn wait_behind(
+    out: &mut TcpStream,
+    busy: &FeedJob,
+    stream: bool,
+    head: &mut bool,
+    watch: &Watch,
+    until: Instant,
+) -> Waited {
+    if stream && !*head {
+        if out.write_all(NDJSON_HEAD.as_bytes()).is_err() {
+            return Waited::Gone;
+        }
+        *head = true;
+    }
+    busy.wait_over(until, &|| watch.gone(), &mut |done, total| {
+        let line = json!({ "waiting": { "done": done, "total": total } });
+        !stream || write_line(out, &line).is_ok()
+    })
+}
+
 /// Answers with a feed that is ready, or says why it isn't: as the whole
-/// reply, or as the one line of a stream.
-fn reply(out: &mut TcpStream, stream: bool, feed: Result<Value>) -> Result<()> {
+/// reply, or as the one line of a stream (whose head is out if `head`).
+fn reply(out: &mut TcpStream, stream: bool, head: bool, feed: Result<Value>) -> Result<()> {
     match (stream, feed) {
         (false, Ok(feed)) => respond(out, 200, "application/json", feed.to_string().as_bytes()),
         (false, Err(e)) => {
@@ -365,7 +564,9 @@ fn reply(out: &mut TcpStream, stream: bool, feed: Result<Value>) -> Result<()> {
                 Ok(feed) => json!({ "result": feed }),
                 Err(e) => errors::body(&format!("{e:#}")),
             };
-            out.write_all(NDJSON_HEAD.as_bytes())?;
+            if !head {
+                out.write_all(NDJSON_HEAD.as_bytes())?;
+            }
             write_line(out, &line)?;
             Ok(())
         }
@@ -547,7 +748,7 @@ mod tests {
     #[test]
     fn a_refresh_while_one_is_running_joins_it_and_never_starts_a_second_burst() {
         use crate::store::testing::listing_runs as runs;
-        let (_s, base, _d, bin) = feed_server("sleep 0.4", 4);
+        let (s, base, _d, bin) = feed_server("sleep 0.4", 4);
         let first = ask(&base, "refresh=1&stream=1");
         wait_for("the refresh to start", Duration::from_secs(10), || {
             runs(&bin.0) >= 1
@@ -555,10 +756,13 @@ mod tests {
         // While it runs: a stream and a plain request. Both want what it is
         // already fetching.
         let (second, plain) = (ask(&base, "refresh=1&stream=1"), ask(&base, "refresh=1"));
-        // They must have asked before the subscription below, or they would
-        // be asking for more than this job started with. (It runs for more
-        // than a second, and a request takes a few milliseconds to arrive.)
-        std::thread::sleep(Duration::from_millis(300));
+        // They must have joined before the subscription below, or they would
+        // be asking for more than this job started with.
+        wait_for("both to join it", Duration::from_secs(10), || {
+            lock(&s.jobs.running)
+                .as_ref()
+                .is_some_and(|job| job.joined() == 2)
+        });
         // A channel subscribed to meanwhile is not on the list that the job
         // went by, so the request for it can't join: it is held until the
         // job is over, and then fetches that one channel.
@@ -775,9 +979,15 @@ mod tests {
         let tor = Net::new(Some(TOR_PROXY.into()), true).unwrap();
         let started = std::sync::atomic::AtomicUsize::new(0);
         let join = |net: &Net| {
-            let claim = jobs.join_or_start(net, &Refresh::Stale, &BTreeSet::new(), |_| {
-                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            });
+            let claim = jobs.join_or_start(
+                net,
+                &Refresh::Stale,
+                &BTreeSet::new(),
+                &mut Place::default(),
+                |_| {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            );
             let Claim::Job(job) = claim else {
                 panic!("a job that covers the request was in the way")
             };
@@ -807,9 +1017,15 @@ mod tests {
         let channel = |n: u32| Refresh::Channel(format!("UC{n:022}"));
         let started = std::sync::atomic::AtomicUsize::new(0);
         let ask = |refresh: &Refresh| {
-            jobs.join_or_start(&net, refresh, &BTreeSet::new(), |_| {
-                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            })
+            jobs.join_or_start(
+                &net,
+                refresh,
+                &BTreeSet::new(),
+                &mut Place::default(),
+                |_| {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
         };
         let Claim::Job(one) = ask(&channel(1)) else {
             panic!("nothing was running")
@@ -824,20 +1040,174 @@ mod tests {
             );
         }
         assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
-        // Once it is over, the next request has a job of its own, which
-        // covers what the ones after it ask for.
-        one.finish(Ok(Refreshed {
-            fallbacks: 0,
-            errors: vec![],
-            fresh: 0,
-        }));
+        // Once it is over, what the first of them asked for goes first,
+        // whoever asks next.
+        let done = || {
+            Ok(Refreshed {
+                fallbacks: 0,
+                errors: vec![],
+                fresh: 0,
+            })
+        };
+        one.finish(done());
+        let Claim::Busy(two) = ask(&Refresh::Force) else {
+            panic!("the one that waited was passed over")
+        };
+        assert_eq!(two.refresh, channel(2));
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Then the next request has a job of its own, which covers what the
+        // ones after it ask for.
+        two.finish(done());
         let Claim::Job(all) = ask(&Refresh::Force) else {
             panic!("nothing was running any more")
         };
         assert!(!Arc::ptr_eq(&all, &one));
         assert!(matches!(ask(&Refresh::Stale), Claim::Job(j) if Arc::ptr_eq(&j, &all)));
         assert!(matches!(ask(&channel(1)), Claim::Busy(_)));
-        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    fn over() -> Result<Refreshed> {
+        Ok(Refreshed {
+            fallbacks: 0,
+            errors: vec![],
+            fresh: 0,
+        })
+    }
+
+    #[test]
+    fn a_request_that_comes_after_those_waiting_does_not_go_ahead_of_them() {
+        let jobs = Jobs::default();
+        let net = Net::new(None, true).unwrap();
+        let ask = |refresh: &Refresh, place: &mut Place| {
+            jobs.join_or_start(&net, refresh, &BTreeSet::new(), place, |_| {})
+        };
+        let Claim::Job(stale) = ask(&Refresh::Stale, &mut Place::default()) else {
+            panic!("nothing was running")
+        };
+        let mut forced = Place::default();
+        assert!(matches!(ask(&Refresh::Force, &mut forced), Claim::Busy(_)));
+        stale.finish(over());
+        // Another request for what is due, before the forced one has looked
+        // again: it gets the forced refresh, which covers it.
+        let Claim::Job(next) = ask(&Refresh::Stale, &mut Place::default()) else {
+            panic!("a forced refresh covers it")
+        };
+        assert_eq!(next.refresh, Refresh::Force);
+        assert!(
+            matches!(ask(&Refresh::Force, &mut forced), Claim::Job(j) if Arc::ptr_eq(&j, &next))
+        );
+        assert!(lock(&jobs.next_up).is_none());
+    }
+
+    #[test]
+    fn a_forced_request_that_waits_makes_the_next_refresh_a_forced_one() {
+        let jobs = Jobs::default();
+        let net = Net::new(None, true).unwrap();
+        let ask = |refresh: &Refresh, place: &mut Place| {
+            jobs.join_or_start(&net, refresh, &BTreeSet::new(), place, |_| {})
+        };
+        let one = Refresh::Channel(format!("UC{:022}", 1));
+        let Claim::Job(running) = ask(&one, &mut Place::default()) else {
+            panic!("nothing was running")
+        };
+        let (mut stale, mut forced) = (Place::default(), Place::default());
+        assert!(matches!(ask(&Refresh::Stale, &mut stale), Claim::Busy(_)));
+        assert!(matches!(ask(&Refresh::Force, &mut forced), Claim::Busy(_)));
+        running.finish(over());
+        let Claim::Job(next) = ask(&Refresh::Stale, &mut stale) else {
+            panic!("the next one covers it")
+        };
+        assert_eq!(next.refresh, Refresh::Force);
+        assert!(
+            matches!(ask(&Refresh::Force, &mut forced), Claim::Job(j) if Arc::ptr_eq(&j, &next))
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_nobody_waits_for_any_more_does_not_go_next() {
+        let jobs = Jobs::default();
+        let net = Net::new(None, true).unwrap();
+        let ask = |refresh: &Refresh, place: &mut Place| {
+            jobs.join_or_start(&net, refresh, &BTreeSet::new(), place, |_| {})
+        };
+        let Claim::Job(stale) = ask(&Refresh::Stale, &mut Place::default()) else {
+            panic!("nothing was running")
+        };
+        let (mut first, mut second) = (Place::default(), Place::default());
+        assert!(matches!(ask(&Refresh::Force, &mut first), Claim::Busy(_)));
+        assert!(matches!(ask(&Refresh::Force, &mut second), Claim::Busy(_)));
+        // One hangs up: the other still waits for it.
+        jobs.leave(&mut first);
+        assert!(lock(&jobs.next_up).is_some());
+        jobs.leave(&mut second);
+        assert!(lock(&jobs.next_up).is_none());
+        stale.finish(over());
+        let Claim::Job(next) = ask(&Refresh::Stale, &mut Place::default()) else {
+            panic!("nothing was running")
+        };
+        assert_eq!(next.refresh, Refresh::Stale);
+    }
+
+    #[test]
+    fn a_forced_refresh_that_waits_hears_how_the_other_one_goes_and_then_runs() {
+        use crate::store::testing::listing_runs as runs;
+        let (s, base, _d, bin) = feed_server("sleep 0.3", 3);
+        let stale = ask(&base, "refresh=1");
+        wait_for("the refresh to start", Duration::from_secs(10), || {
+            runs(&bin.0) >= 1
+        });
+        let forced = {
+            let base = base.clone();
+            std::thread::spawn(move || lines(&base, "refresh=1&force=1&stream=1").1)
+        };
+        wait_for("it to wait", Duration::from_secs(10), || {
+            lock(&s.jobs.next_up).is_some()
+        });
+        // One for what is due, which comes after it: it goes no further ahead
+        // than the running one, and joins it, or the forced one after.
+        let later = ask(&base, "refresh=1");
+        assert_eq!(stale.join().unwrap().0, 200);
+        let forced = forced.join().unwrap();
+        assert_eq!(later.join().unwrap().0, 200);
+        assert_eq!(
+            runs(&bin.0),
+            6,
+            "three for each, and none for the later one"
+        );
+        let waiting: Vec<&Value> = forced
+            .iter()
+            .filter(|l| l.get("waiting").is_some())
+            .collect();
+        assert!(!waiting.is_empty(), "{forced:?}");
+        assert_eq!(waiting[0]["waiting"]["total"], 3);
+        // Then its own refresh, of every channel, and the feed.
+        assert_eq!(progress(&forced).last(), Some(&(3, 3)));
+        assert!(forced.last().unwrap().get("result").is_some(), "{forced:?}");
+    }
+
+    #[test]
+    fn a_request_that_waits_too_long_gets_what_is_cached_and_why() {
+        use crate::store::testing::listing_runs as runs;
+        let (s, base, _d, bin) = feed_server("sleep 0.5", 3);
+        s.jobs
+            .wait_max
+            .store(300, std::sync::atomic::Ordering::Relaxed);
+        let stale = ask(&base, "refresh=1");
+        wait_for("the refresh to start", Duration::from_secs(10), || {
+            runs(&bin.0) >= 1
+        });
+        let (_, lines) = lines(&base, &format!("refresh=1&channel=UC{:022}&stream=1", 1));
+        let last = lines.last().unwrap();
+        assert_eq!(
+            last["result"]["errors"],
+            serde_json::json!([TOO_LONG]),
+            "{lines:?}"
+        );
+        assert_eq!(last["result"]["channels"], 3);
+        assert!(lock(&s.jobs.next_up).is_none(), "it doesn't go next");
+        assert_eq!(stale.join().unwrap().0, 200);
+        assert_eq!(runs(&bin.0), 3);
     }
 
     #[test]
@@ -852,7 +1222,13 @@ mod tests {
         ] {
             let jobs = Jobs::default();
             let ask = |refresh: &Refresh, subscribed: &[&str]| {
-                jobs.join_or_start(&net, refresh, &ids(subscribed), |_| {})
+                jobs.join_or_start(
+                    &net,
+                    refresh,
+                    &ids(subscribed),
+                    &mut Place::default(),
+                    |_| {},
+                )
             };
             let Claim::Job(job) = ask(&running, &["a", "b"]) else {
                 panic!("nothing was running")
@@ -878,10 +1254,13 @@ mod tests {
         // else has subscribed meanwhile.
         let jobs = Jobs::default();
         let one = Refresh::Channel("a".into());
-        let Claim::Job(job) = jobs.join_or_start(&net, &one, &ids(&["a"]), |_| {}) else {
+        let Claim::Job(job) =
+            jobs.join_or_start(&net, &one, &ids(&["a"]), &mut Place::default(), |_| {})
+        else {
             panic!("nothing was running")
         };
-        let again = jobs.join_or_start(&net, &one, &ids(&["a", "b"]), |_| {});
+        let again =
+            jobs.join_or_start(&net, &one, &ids(&["a", "b"]), &mut Place::default(), |_| {});
         assert!(matches!(again, Claim::Job(j) if Arc::ptr_eq(&j, &job)));
     }
 
@@ -892,18 +1271,43 @@ mod tests {
             Refresh::Stale,
             BTreeSet::new(),
         );
-        assert!(!job.wait_over(|| true), "hung up before it was over");
+        let far = Instant::now() + Duration::from_secs(60);
+        let wait = |gone: bool, said: &mut Vec<(usize, usize)>| {
+            job.wait_over(far, &|| gone, &mut |done, total| {
+                said.push((done, total));
+                true
+            })
+        };
+        let mut said = Vec::new();
+        assert!(
+            matches!(wait(true, &mut said), Waited::Gone),
+            "hung up before it was over"
+        );
         let ender = {
             let job = Arc::clone(&job);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(100));
+                job.progress(1, 2);
+                std::thread::sleep(Duration::from_millis(100));
                 job.finish(Err(anyhow!("over")));
             })
         };
-        assert!(job.wait_over(|| false));
+        assert!(matches!(wait(false, &mut said), Waited::Over));
         ender.join().unwrap();
+        assert_eq!(said, [(1, 2)], "it was told how far the job got");
         // Over already: no need to look whether anybody is there.
-        assert!(job.wait_over(|| true));
+        assert!(matches!(wait(true, &mut said), Waited::Over));
+        // A wait that is not over in time ends too.
+        let other = FeedJob::new(
+            Net::new(None, true).unwrap(),
+            Refresh::Stale,
+            BTreeSet::new(),
+        );
+        let now = Instant::now();
+        assert!(matches!(
+            other.wait_over(now, &|| false, &mut |_, _| true),
+            Waited::TooLong
+        ));
     }
 
     #[test]

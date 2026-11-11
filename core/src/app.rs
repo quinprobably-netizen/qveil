@@ -15,6 +15,7 @@ use crate::util::lock;
 use crate::video::Video;
 use crate::ytdlp::Ytdlp;
 use anyhow::{Context, Result, bail};
+use rand::seq::SliceRandom;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -28,6 +29,16 @@ use std::time::{Duration, Instant};
 /// killed mid-refresh loses at most this much of it.
 const SAVE_EVERY: Duration = Duration::from_secs(2);
 
+/// How long a lens or topic refresh waits before each of its searches after
+/// the first, at random between these: searches that go out back to back,
+/// and in the same order each time, are easier to tell from a person's.
+pub const SEARCH_PAUSE: (Duration, Duration) = (Duration::from_secs(2), Duration::from_secs(8));
+
+/// What a refresh does before each of its searches after the first: waits
+/// (see `SEARCH_PAUSE`), and ends early once what it is given says the
+/// answer is no longer wanted. It must not hold a lock while it waits.
+pub type Pause = Arc<dyn Fn(&dyn Fn() -> bool) + Send + Sync>;
+
 pub struct Runtime {
     pub cfg: Config,
     pub net: Net,
@@ -40,6 +51,9 @@ pub struct Runtime {
     pub thumb_base: String,
     /// How often a refresh saves (`SAVE_EVERY`); only tests change it.
     pub save_every: Duration,
+    /// The wait between a refresh's searches (`SEARCH_PAUSE`); only tests
+    /// change it.
+    pub pause: Pause,
 }
 
 impl Runtime {
@@ -66,6 +80,7 @@ impl Runtime {
             feed_base: "https://www.youtube.com".into(),
             thumb_base: "https://i.ytimg.com".into(),
             save_every: SAVE_EVERY,
+            pause: search_pause(),
         })
     }
 
@@ -102,6 +117,68 @@ impl Runtime {
     pub fn keeping_calls_of(mut self, from: &Runtime) -> Self {
         self.yt.calls = Arc::clone(&from.yt.calls);
         self
+    }
+}
+
+/// The pause between a refresh's searches: `SEARCH_PAUSE`, except in tests.
+/// The window's tests run the engine itself, and ask for none with
+/// `QVEIL_TEST_NO_SEARCH_PAUSE=1`.
+fn search_pause() -> Pause {
+    if cfg!(test) || std::env::var_os("QVEIL_TEST_NO_SEARCH_PAUSE").is_some_and(|v| v == "1") {
+        return Arc::new(|_| {});
+    }
+    Arc::new(|wanted| {
+        use rand::Rng;
+        let (low, high) = SEARCH_PAUSE;
+        wait_while_wanted(rand::rng().random_range(low..=high), wanted)
+    })
+}
+
+/// Waits `long`, or until `wanted` says no, which it asks every tenth of a
+/// second: a client that hangs up, a route that is left or a setting turned
+/// off ends the wait as soon as it would end a search.
+fn wait_while_wanted(long: Duration, wanted: &dyn Fn() -> bool) {
+    let until = Instant::now() + long;
+    while wanted() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// Spaces out the searches of one refresh: each one after the first waits
+/// for `Runtime::pause`. A search typed in waits for nothing.
+struct Pacing<'a> {
+    pause: Option<&'a Pause>,
+    sent: std::cell::Cell<bool>,
+}
+
+impl<'a> Pacing<'a> {
+    fn of(rt: &'a Runtime) -> Self {
+        Pacing {
+            pause: Some(&rt.pause),
+            sent: Default::default(),
+        }
+    }
+
+    fn none() -> Self {
+        Pacing {
+            pause: None,
+            sent: Default::default(),
+        }
+    }
+
+    /// Before a search: waits, unless it is the first. Whether the search
+    /// is still wanted.
+    fn before_search(&self, wanted: &dyn Fn() -> bool) -> bool {
+        if self.sent.replace(true)
+            && let Some(pause) = self.pause
+        {
+            pause(wanted);
+        }
+        wanted()
     }
 }
 
@@ -172,9 +249,7 @@ pub fn lens(
     let stored = lens::cached(paths, id)?;
     let due = match refresh {
         LensRefresh::Off => false,
-        LensRefresh::Stale => stored
-            .as_ref()
-            .is_none_or(|c| at - c.fetched_at >= lens::STALE),
+        LensRefresh::Stale => lens::due(stored.as_ref(), at, lens::STALE),
         LensRefresh::Force => true,
     };
     let stored = if due {
@@ -186,6 +261,7 @@ pub fn lens(
             progress,
             &|| Ok(()),
             wanted,
+            &Pacing::of(rt),
         )?;
         let fresh = Cached {
             fetched_at: at,
@@ -224,13 +300,36 @@ pub fn smart_search(
     limit: usize,
     wanted: &dyn Fn() -> bool,
 ) -> Result<Vec<Ranked>> {
-    search_topics(rt, paths, reading, limit, &|_, _| {}, &|| Ok(()), wanted)
+    search_topics(
+        rt,
+        paths,
+        reading,
+        limit,
+        &|_, _| {},
+        &|| Ok(()),
+        wanted,
+        &Pacing::none(),
+    )
 }
 
-/// One search per topic, one after the other, then the ranking. The searches
-/// are all that leaves the machine: the rules and the order are applied here.
-/// `charge` is called before each search is sent, and an error from it stops
-/// the searching there.
+/// How many searches `search_topics` may send for `reading` at `now`: one
+/// per topic, and where YouTube's own filter is used, a second one for a
+/// topic that it finds nothing for.
+fn searches_needed(reading: &Reading, now: i64) -> usize {
+    let per_topic = if lens::sp::sp(reading, now).is_some() {
+        2
+    } else {
+        1
+    };
+    reading.topics.len() * per_topic
+}
+
+/// One search per topic, one after the other in random order (the ranking
+/// doesn't depend on it), then the ranking. The searches are all that leaves
+/// the machine: the rules and the order are applied here. `pacing` spaces
+/// them out. `charge` is called before each search is sent, and an error
+/// from it stops the searching there.
+#[allow(clippy::too_many_arguments)]
 fn search_topics(
     rt: &Runtime,
     paths: &Paths,
@@ -239,16 +338,40 @@ fn search_topics(
     progress: &dyn Fn(usize, usize),
     charge: &dyn Fn() -> Result<()>,
     wanted: &dyn Fn() -> bool,
+    pacing: &Pacing,
 ) -> Result<Vec<Ranked>> {
     reading.check()?;
+    // What the ranking needs from this machine is read first: if it can't
+    // be, the searches would be sent for nothing.
+    let subscribed: HashSet<String> = load_subs(paths)?
+        .channels
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    // What was watched is only known when the history is kept.
+    let watched: HashSet<String> = if rt.cfg.history {
+        load_history(paths)?
+            .watched
+            .into_iter()
+            .map(|w| w.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let total = reading.topics.len();
     progress(0, total);
     // Where YouTube has a filter that contains a rule, it does the first
     // pass; the rules are applied here afterwards either way.
     let filter = lens::sp::sp(reading, now());
     let mut found = Vec::new();
-    for (topic, query) in reading.topics.iter().enumerate() {
+    let mut order: Vec<usize> = (0..total).collect();
+    order.shuffle(&mut rand::rng());
+    for (done, topic) in order.into_iter().enumerate() {
+        let query = &reading.topics[topic];
         let mut search = |sp: Option<&str>| {
+            if !pacing.before_search(wanted) {
+                bail!(crate::ytdlp::CANCELLED);
+            }
             charge()?;
             // Counting it may have waited for the lock, while the answer
             // stopped being wanted: then it stays counted, and isn't sent.
@@ -274,23 +397,8 @@ fn search_topics(
         if !wanted() {
             bail!(crate::ytdlp::CANCELLED);
         }
-        progress(topic + 1, total);
+        progress(done + 1, total);
     }
-    let subscribed: HashSet<String> = load_subs(paths)?
-        .channels
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
-    // What was watched is only known when the history is kept.
-    let watched: HashSet<String> = if rt.cfg.history {
-        load_history(paths)?
-            .watched
-            .into_iter()
-            .map(|w| w.id)
-            .collect()
-    } else {
-        HashSet::new()
-    };
     Ok(rank::rank(
         reading,
         found,
@@ -484,10 +592,13 @@ pub fn topics(
         // What a refresh that this one waited for found.
         results = store::load_cache(&paths.topics_cache())?;
         let at = now();
-        let due: Vec<&topics::Group> = groups
+        let mut due: Vec<&topics::Group> = groups
             .iter()
             .filter(|group| topics::due(results.groups.get(&group.key()), at))
             .collect();
+        due.shuffle(&mut rand::rng());
+        // One refresh's searches are spaced out across its groups too.
+        let pacing = Pacing::of(rt);
         // How far it is, counted in searches, over all the groups that are due.
         let total: usize = due.iter().map(|g| g.searches.len()).sum();
         let mut before = 0;
@@ -509,22 +620,24 @@ pub fn topics(
                     continue;
                 }
             }
-            match topic_searches_left(paths) {
-                Err(e) => {
-                    held_back = Some(topics_uncounted(&e));
-                    break;
-                }
-                Ok(left) if left < group.searches.len() => {
-                    held_back.get_or_insert_with(|| TOPICS_SPENT.into());
-                    continue;
-                }
-                Ok(_) => {}
-            }
             let reading = Reading {
                 topics: group.searches.clone(),
                 subs: crate::lens::read::Subs::Exclude,
                 ..Reading::default()
             };
+            // Room for every search the group may send, so that the budget
+            // doesn't cut it off half-way.
+            match topic_searches_left(paths) {
+                Err(e) => {
+                    held_back = Some(topics_uncounted(&e));
+                    break;
+                }
+                Ok(left) if left < searches_needed(&reading, now()) => {
+                    held_back.get_or_insert_with(|| TOPICS_SPENT.into());
+                    continue;
+                }
+                Ok(_) => {}
+            }
             // Each search is counted before it is sent, so what is sent is
             // counted, however this ends.
             let refused: std::cell::RefCell<Option<String>> = Default::default();
@@ -545,6 +658,7 @@ pub fn topics(
                 &|done, _| progress(so_far + done, total),
                 &charge,
                 wanted,
+                &pacing,
             );
             if !wanted() {
                 bail!(crate::ytdlp::CANCELLED);
@@ -797,15 +911,28 @@ pub fn refresh(
         fetch
     });
     done.fallbacks = fetch.fallbacks;
-    done.errors = fetch.errors;
+    done.errors = not_fetched(&fetch);
+    done.errors.splice(0..0, fetch.errors);
+    saver.finish()?;
+    Ok(done)
+}
+
+/// Why the channels that a refresh didn't get to were left out, in words.
+fn not_fetched(fetch: &feed::Fetch) -> Vec<String> {
+    let mut said = Vec::new();
     if fetch.skipped > 0 {
-        done.errors.push(format!(
+        said.push(format!(
             "The route changed during the refresh; {} channel(s) were not fetched.",
             fetch.skipped
         ));
     }
-    saver.finish()?;
-    Ok(done)
+    if fetch.unsaved > 0 {
+        said.push(format!(
+            "{} channel(s) were not fetched, because what was fetched couldn't be saved.",
+            fetch.unsaved
+        ));
+    }
+    said
 }
 
 /// The feed as the cache has it now, for a refresh that is over (or none).
@@ -1144,6 +1271,170 @@ mod tests {
             ..Config::default()
         };
         Runtime::new(cfg, paths, Some("http://127.0.0.1:1".into()), false).unwrap()
+    }
+
+    /// A yt-dlp that finds nothing through YouTube's own filter, and one
+    /// video for any other search; each search's target is added to `asked`.
+    fn unfiltered_ytdlp(dir: &std::path::Path) -> String {
+        crate::store::testing::script(
+            &dir.join("yt-dlp"),
+            r#"d=$(dirname "$0")
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" >> "$d/asked"; shift; done
+tail -n 1 "$d/asked" | grep -q "results?" && exit 0
+n=$(wc -l < "$d/asked")
+id=$(printf 'v%010d' "$n")
+channel=$(printf 'UC%022d' "$n")
+echo "{\"id\":\"$id\",\"title\":\"t\",\"channel\":\"C\",\"channel_id\":\"$channel\",\"duration\":2000.0}"
+"#,
+        )
+    }
+
+    fn asked(dir: &TempDir) -> Vec<String> {
+        fs::read_to_string(dir.0.join("asked"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_topic_searched_again_without_its_filter_counts_twice_and_room_is_made_for_that() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let rt = Runtime::new(rt_cfg(&unfiltered_ytdlp(&dir.0)), &paths, None, false).unwrap();
+        // YouTube has a filter for the length, which finds nothing here.
+        let reading = read("bread, sourdough over 30 min", now());
+        assert!(lens::sp::sp(&reading, now()).is_some());
+        let charged = std::cell::Cell::new(0);
+        let found = search_topics(
+            &rt,
+            &paths,
+            &reading,
+            5,
+            &|_, _| {},
+            &|| {
+                charged.set(charged.get() + 1);
+                Ok(())
+            },
+            &|| true,
+            &Pacing::none(),
+        )
+        .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(asked(&dir).len(), 4, "{:?}", asked(&dir));
+        assert_eq!(charged.get(), 4, "every search that was sent is counted");
+        // So a refresh needs room for both of each topic's searches before it
+        // begins, or the budget would cut it off half-way.
+        assert_eq!(searches_needed(&reading, now()), 4);
+        assert_eq!(searches_needed(&read("bread, sourdough", now()), now()), 2);
+    }
+
+    /// A runtime whose pause between searches waits for nothing, and says
+    /// each time whether the store was free to lock meanwhile.
+    fn pausing(paths: &Paths, ytdlp: &str) -> (Runtime, Arc<Mutex<Vec<bool>>>) {
+        let paused: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let mut rt = Runtime::new(rt_cfg(ytdlp), paths, None, false).unwrap();
+        let (seen, lock_file) = (Arc::clone(&paused), paths.lock_file());
+        rt.pause = Arc::new(move |_| {
+            let free = fs::File::create(&lock_file).unwrap().try_lock().is_ok();
+            lock(&seen).push(free);
+        });
+        (rt, paused)
+    }
+
+    #[test]
+    fn a_lens_refresh_pauses_between_its_searches_with_nothing_locked() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (rt, paused) = pausing(&paths, &unfiltered_ytdlp(&dir.0));
+        let id = lens::add(&paths, "bread, sourdough, rye", now())
+            .unwrap()
+            .id;
+        let found = lens(&rt, &paths, &id, LensRefresh::Force, &|_, _| {}, &|| true).unwrap();
+        assert_eq!(found.videos.len(), 3);
+        assert_eq!(asked(&dir).len(), 3);
+        // Before the second and the third, not before the first.
+        assert_eq!(*lock(&paused), [true, true]);
+    }
+
+    #[test]
+    fn a_refresh_that_stops_being_wanted_while_it_pauses_sends_nothing_more() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let ytdlp = unfiltered_ytdlp(&dir.0);
+        let mut rt = Runtime::new(rt_cfg(&ytdlp), &paths, None, false).unwrap();
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hang_up = Arc::clone(&gone);
+        // The window goes away during the first pause.
+        rt.pause = Arc::new(move |wanted| {
+            hang_up.store(true, Ordering::SeqCst);
+            assert!(!wanted());
+        });
+        let id = lens::add(&paths, "bread, sourdough, rye", now())
+            .unwrap()
+            .id;
+        let wanted = || !gone.load(Ordering::SeqCst);
+        let r = lens(&rt, &paths, &id, LensRefresh::Force, &|_, _| {}, &wanted);
+        assert_eq!(r.err().unwrap().to_string(), crate::ytdlp::CANCELLED);
+        assert_eq!(asked(&dir).len(), 1);
+        assert!(!paths.lens_cache(&id).exists());
+    }
+
+    #[test]
+    fn a_search_typed_in_does_not_pause() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (rt, paused) = pausing(&paths, &unfiltered_ytdlp(&dir.0));
+        let reading = crate::lens::read::read_search("bread, sourdough over 10 min", now());
+        smart_search(&rt, &paths, &reading, 5, &|| true).unwrap();
+        assert!(asked(&dir).len() >= 2);
+        assert!(lock(&paused).is_empty());
+    }
+
+    #[test]
+    fn the_pause_ends_as_soon_as_it_is_not_wanted() {
+        let started = Instant::now();
+        wait_while_wanted(Duration::from_secs(60), &|| false);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        let asked = std::cell::Cell::new(0);
+        wait_while_wanted(Duration::from_secs(60), &|| {
+            asked.set(asked.get() + 1);
+            asked.get() < 3
+        });
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // And otherwise lasts as long as it was meant to.
+        let started = Instant::now();
+        wait_while_wanted(Duration::from_millis(50), &|| true);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        // The real one is a few seconds, which no two refreshes share.
+        let (low, high) = SEARCH_PAUSE;
+        assert!(Duration::from_secs(2) <= low && low < high && high <= Duration::from_secs(8));
+    }
+
+    #[test]
+    fn the_topics_are_searched_in_a_new_order_each_time_and_ranked_the_same() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let rt = Runtime::new(rt_cfg(&unfiltered_ytdlp(&dir.0)), &paths, None, false).unwrap();
+        let reading = read("bread, sourdough, rye", now());
+        let mut orders = HashSet::new();
+        for round in 0..20 {
+            let found = search_topics(
+                &rt,
+                &paths,
+                &reading,
+                5,
+                &|_, _| {},
+                &|| Ok(()),
+                &|| true,
+                &Pacing::none(),
+            )
+            .unwrap();
+            let why: Vec<&str> = found.iter().map(|r| r.why[0].as_str()).collect();
+            assert_eq!(why, ["bread", "sourdough", "rye"]);
+            orders.insert(asked(&dir)[round * 3..].to_vec());
+        }
+        assert!(orders.len() > 1, "always {orders:?}");
     }
 
     #[test]
@@ -1519,6 +1810,30 @@ mod tests {
         );
         let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
         assert!(cache.fetched_at.is_empty(), "all of them are still due");
+    }
+
+    #[test]
+    fn channels_left_out_because_saving_failed_are_not_blamed_on_the_route() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=3 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let ytdlp = listing_ytdlp(&dir.0, "");
+        let rt = offline(&paths, &ytdlp);
+        let subs = load_subs(&paths).unwrap().channels;
+        // The disk is full: the first channel can't be kept, which stops the refresh.
+        let fetch = feed::fetch_all(&rt, &subs, 1, &|| true, &|_| bail!("disk full"), &|_, _| {});
+        assert_eq!((fetch.fetched, fetch.skipped, fetch.unsaved), (0, 0, 2));
+        let said = not_fetched(&fetch);
+        assert_eq!(
+            said,
+            ["2 channel(s) were not fetched, because what was fetched couldn't be saved."]
+        );
+        assert!(!said.iter().any(|s| s.contains("route")));
+        // The one that was fetched says why it wasn't kept.
+        assert_eq!(fetch.errors.len(), 1);
+        assert!(fetch.errors[0].contains("disk full"), "{:?}", fetch.errors);
     }
 
     fn rt_cfg(ytdlp: &str) -> Config {

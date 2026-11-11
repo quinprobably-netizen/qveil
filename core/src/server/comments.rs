@@ -5,12 +5,13 @@
 //! a tab doesn't ask YouTube again.
 
 use super::Server;
+use super::flights::Flights;
 use super::http::{Request, Watch, respond};
 use crate::comments::{Comments, Sort};
 use crate::errors;
 use crate::ids;
 use crate::util::lock;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::net::TcpStream;
@@ -30,18 +31,22 @@ type Asked = (String, Sort, usize, bool);
 /// what other people wrote under a video the user opened, which is not
 /// something to leave on disk.
 #[derive(Default)]
-pub(super) struct Kept(Mutex<VecDeque<(Asked, Arc<Comments>)>>);
+pub(super) struct Kept {
+    answers: Mutex<VecDeque<(Asked, Arc<Comments>)>>,
+    /// The lookups running, so that the same one isn't run twice at once.
+    flights: Flights<Asked>,
+}
 
 impl Kept {
     fn get(&self, asked: &Asked) -> Option<Arc<Comments>> {
-        lock(&self.0)
+        lock(&self.answers)
             .iter()
             .find(|(a, _)| a == asked)
             .map(|(_, c)| Arc::clone(c))
     }
 
     fn put(&self, asked: Asked, comments: Arc<Comments>) {
-        let mut kept = lock(&self.0);
+        let mut kept = lock(&self.answers);
         kept.retain(|(a, _)| *a != asked);
         kept.push_back((asked, comments));
         while kept.len() > KEPT {
@@ -83,6 +88,15 @@ impl Server {
         if let Some(found) = self.comments.get(&asked) {
             return Ok(found);
         }
+        // The same lookup may be running for another request: this one waits
+        // for it, and then finds its answer kept. If it ended without one,
+        // this one asks for itself.
+        let Some(_turn) = self.comments.flights.take(&asked, abort) else {
+            bail!(crate::ytdlp::CANCELLED);
+        };
+        if let Some(found) = self.comments.get(&asked) {
+            return Ok(found);
+        }
         let rt = self.runtime();
         let found = rt.yt.comments(&video.watch_url(), sort, n, asked.3, abort);
         // Not kept if the route changed meanwhile: what came over a route
@@ -113,7 +127,7 @@ mod tests {
             &format!(
                 r#"d=$(dirname "$0")
 n=$(cat "$d/runs" 2>/dev/null || echo 0)
-echo $((n + 1)) > "$d/runs"
+echo $((n + 1)) > "$d/runs.new" && mv "$d/runs.new" "$d/runs"
 echo "$*" > "$d/args"
 while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && cp "$2" "$d/asked"; shift; done
 sleep {delay}
@@ -190,6 +204,51 @@ JSON
         get(&base, &format!("v={ID}&n=1"));
         let asked = std::fs::read_to_string(bin.0.join("asked")).unwrap();
         assert!(asked.contains("max_comments=20,20,0,0'"), "{asked}");
+    }
+
+    #[test]
+    fn the_same_comments_asked_for_twice_at_once_are_looked_up_once() {
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: commenting_ytdlp(&bin.0, "2"),
+            ..Config::default()
+        });
+        let ask = || {
+            let base = base.clone();
+            std::thread::spawn(move || get(&base, &format!("v={ID}")))
+        };
+        let first = ask();
+        wait_for("the lookup to start", Duration::from_secs(10), || {
+            runs(&bin.0) >= 1
+        });
+        let second = ask();
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        assert_eq!(first.0, 200, "{}", first.1);
+        assert_eq!(second, first);
+        assert_eq!(runs(&bin.0), 1);
+    }
+
+    #[test]
+    fn a_request_that_waited_for_one_whose_client_hung_up_looks_up_for_itself() {
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: commenting_ytdlp(&bin.0, "1"),
+            ..Config::default()
+        });
+        let mut c = TcpStream::connect(addr(&base)).unwrap();
+        let target = path(&base, &format!("api/comments?v={ID}"));
+        write!(c, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        wait_for("the lookup to start", Duration::from_secs(10), || {
+            runs(&bin.0) >= 1
+        });
+        let second = {
+            let base = base.clone();
+            std::thread::spawn(move || get(&base, &format!("v={ID}")))
+        };
+        drop(c);
+        let (status, body) = second.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(runs(&bin.0), 2);
     }
 
     #[test]

@@ -59,6 +59,8 @@ public:
         environment.insert("XDG_DATA_HOME", root.filePath("data"));
         environment.insert("XDG_CACHE_HOME", root.filePath("cache"));
         environment.insert("XDG_RUNTIME_DIR", root.filePath("run"));
+        // A lens refresh waits a few seconds between its searches; not here.
+        environment.insert("QVEIL_TEST_NO_SEARCH_PAUSE", "1");
     }
 
     // Starts the engine and waits until the window knows its settings.

@@ -106,17 +106,33 @@ const EVERYWHERE: &[&str] = &[
     "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits, and by the one-byte request (bytes=0-0) for the start of a video that keeps a connection ready for a seek, sent at most once every 10 seconds while it plays over HTTP/1.1.",
     "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
     "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
-    "Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.",
+    "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.",
     LOOKUP_POINT,
-    "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing): on one address their timing links them, and even over Tor a set of related searches can be linked by content.",
+    "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.",
     "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.",
 ];
 
+/// Who yt-dlp says it is when it asks YouTube's player for a video's
+/// streams, which is not qveil's `net::USER_AGENT`: said with either lookup.
+macro_rules! player_client {
+    () => {
+        "yt-dlp asks the player as one of YouTube's own clients, with that client's User-Agent (with current yt-dlp, Safari's, from its visionOS client) and not qveil's Chrome one, which the video's bytes carry: a lookup and its stream show two browser identities."
+    };
+}
+#[cfg(test)]
+const PLAYER_CLIENT: &str = player_client!();
 /// How a video is looked up, as it is unless the quick lookup is on.
-const LOOKUP_POINT: &str = "Playing a video, or getting it ready, looks it up the way yt-dlp does by itself: its watch page, and then YouTube's player for its streams, with the same identity. Its chapters, its channel's name and its age come with that lookup, and cost no request of their own.";
+const LOOKUP_POINT: &str = concat!(
+    "Playing a video, or getting it ready, looks it up the way yt-dlp does by itself: its watch page, and then YouTube's player for its streams, with the same identity. Its chapters, its channel's name and its age come with that lookup, and cost no request of their own. ",
+    player_client!()
+);
 /// How a video is looked up with `quick_lookup` on (experimental), in
 /// place of `LOOKUP_POINT`.
-const QUICK_LOOKUP_POINT: &str = "The quick lookup is on (experimental): playing a video asks YouTube for its streams and not for its watch page (unless they can't be played without it, as with a video made for kids: then they are asked for again, page and all, with the same identity). What only the page has is fetched as one more lookup of that video, and only when it is wanted: chapters that its description doesn't name when you open the Chapters tab, and the channel's name and the video's age when it was played without them (from a pasted link, say).";
+const QUICK_LOOKUP_POINT: &str = concat!(
+    "The quick lookup is on (experimental): playing a video asks YouTube for its streams and not for its watch page (unless they can't be played without it, as with a video made for kids: then they are asked for again, page and all, with the same identity). ",
+    player_client!(),
+    " What only the page has is fetched as one more lookup of that video, and only when it is wanted: chapters that its description doesn't name when you open the Chapters tab, and the channel's name and the video's age when it was played without them (from a pasted link, say)."
+);
 
 /// What the README says besides the above: the details behind them.
 const DETAILS: &[(&str, &str)] = &[
@@ -126,7 +142,7 @@ const DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Route",
-        "*Direct*, *Tor*, or your own *Proxy*, always shown at the foot of the window, in a colour of its own once YouTube can't see your IP. *Direct* means direct: qveil ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment. qveil can't tell Tor from another SOCKS proxy by its address (it may be `localhost`, Tor Browser's port 9150 or a tunnel), so every SOCKS proxy gets fresh credentials per request, and `isolate_circuits = false` is refused. Seeking still works over any route, because the engine relays Range requests. `socks5://` is refused (it leaks DNS); use `socks5h://`. Thumbnails are fetched a page at a time: all the thumbnails of one page of the window share one identity, and the next page gets another.",
+        "*Direct*, *Tor*, or your own *Proxy*, shown at the foot of the window (hidden while a video is fullscreen), in a colour of its own once YouTube can't see your IP. *Direct* means direct: qveil ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment. qveil can't tell Tor from another SOCKS proxy by its address (it may be `localhost`, Tor Browser's port 9150 or a tunnel), so every SOCKS proxy gets fresh credentials per request, and `isolate_circuits = false` is refused. Seeking still works over any route, because the engine relays Range requests. `socks5://` is refused (it leaks DNS); use `socks5h://`. Thumbnails are fetched a page at a time: all the thumbnails of one page of the window share one identity, and the next page gets another.",
     ),
     (
         "Switching routes",
@@ -222,10 +238,10 @@ const SUBSCRIPTIONS: &str = "Kept only on this computer. Each channel is fetched
 const HISTORY_OFF: &str = "Off: qveil keeps no history. Where you stopped in unfinished videos is remembered separately, while resume is on.";
 const HISTORY_ON: &str =
     "On: kept only on this computer, in a file only you can read, until you clear it.";
-const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.";
+const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing. Commenters' pictures are never fetched.";
 const COMMENTS_SHORT: &str = "Loaded on demand, one extra request.";
 const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.";
-const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.";
+const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups, in a new random order each time and 2 to 8 seconds apart: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
 const PREPARE_OFF: &str = "Off: a video is looked up when you play it, and not before.";
 const PREPARE_ON: &str = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it.";
@@ -234,7 +250,7 @@ const KEEP_THUMBS_OFF: &str =
     "Off: thumbnails are kept in memory while qveil runs, and not on disk.";
 const KEEP_THUMBS_ON: &str = "On: the thumbnails you were shown are kept on disk, in ~/.cache/qveil/thumbs, in files only you can read (at most 64 MiB, the least recently shown going first), so that they aren't fetched again. They are a record, on this computer, of the pictures you were shown. Turning this off, clearing the history or qveil wipe deletes them.";
 const KEEP_THUMBS_POINT: &str = "Thumbnails are kept on disk: ~/.cache/qveil/thumbs is a record, on this computer, of the pictures you were shown, until you turn that off or clear the history.";
-const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
+const LENSES: &str = "A refresh sends one search per topic, each a request of its own, in a new random order each time and 2 to 8 seconds apart. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
 const LENSES_SHORT: &str =
     "A refresh sends each topic to YouTube as a search of its own, sometimes twice.";
 
@@ -665,6 +681,54 @@ mod tests {
         }
         // Where that is kept is said with the rest of what is kept.
         assert!(markdown().contains("when recent topic searches were made live in"));
+    }
+
+    #[test]
+    fn the_order_and_spacing_of_lens_and_topic_searches_are_said_as_they_are() {
+        let (low, high) = crate::app::SEARCH_PAUSE;
+        let said = format!(
+            "in a new random order each time and {} to {} seconds apart",
+            low.as_secs(),
+            high.as_secs()
+        );
+        let lens_point = EVERYWHERE
+            .iter()
+            .find(|p| p.starts_with("A lens is refreshed"))
+            .unwrap();
+        for text in [TOPICS_ON, LENSES, lens_point] {
+            assert!(text.contains(&said), "{said:?} is missing from: {text}");
+        }
+    }
+
+    #[test]
+    fn the_players_own_client_identity_is_said_however_a_video_is_looked_up() {
+        for point in [LOOKUP_POINT, QUICK_LOOKUP_POINT] {
+            assert!(point.contains(PLAYER_CLIENT), "{point}");
+        }
+        assert!(
+            PLAYER_CLIENT.contains("visionOS") && PLAYER_CLIENT.contains("two browser identities")
+        );
+    }
+
+    #[test]
+    fn comments_say_that_their_lookup_can_be_tied_to_the_video() {
+        let tied = "on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing";
+        assert!(COMMENTS.contains(tied), "{COMMENTS}");
+        assert!(
+            EVERYWHERE
+                .iter()
+                .any(|p| p.starts_with("Comments are") && p.contains(tied))
+        );
+    }
+
+    #[test]
+    fn the_route_is_not_said_to_be_always_on_screen() {
+        let route = DETAILS.iter().find(|(name, _)| *name == "Route").unwrap().1;
+        assert!(!route.contains("always shown"), "{route}");
+        assert!(
+            route.contains("(hidden while a video is fullscreen)"),
+            "{route}"
+        );
     }
 
     #[test]
