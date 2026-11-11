@@ -549,24 +549,33 @@ mod tests {
         assert_eq!(raw(&base, fine.as_bytes()), 200);
     }
 
-    /// Connects `n` clients that never say a word.
-    fn idle_clients(base: &str, n: usize) -> Vec<TcpStream> {
-        (0..n)
-            .map(|_| TcpStream::connect(addr(base)).unwrap())
-            .collect()
-    }
-
     #[test]
     fn clients_without_the_token_cannot_lock_the_app_out() {
         let (_s, base, _d) = server();
-        // More silent connections than the server has places for.
-        let idle = idle_clients(&base, MAX_UNVERIFIED + MAX_CONNECTIONS + 16);
+        // More silent connections than the server has places for, and when
+        // each was made.
+        let idle: Vec<(TcpStream, Instant)> = (0..MAX_UNVERIFIED + MAX_CONNECTIONS + 16)
+            .map(|_| (TcpStream::connect(addr(&base)).unwrap(), Instant::now()))
+            .collect();
         // The app, which has the token, is served all the same, and at once:
         // before a single stranger has been told it was too slow, so it
         // didn't have to wait for their places to run out.
+        let asked = Instant::now();
         let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
+        let served = Instant::now();
         assert_eq!(status, 200, "{body}");
-        for c in &idle {
+        assert!(
+            served - asked < REQUEST_LINE_TIMEOUT,
+            "the app waited {:?} to be served",
+            served - asked
+        );
+        // A stranger may have been told it was too slow only if it had been
+        // waiting that long: on a busy machine, making the connections alone
+        // can take longer than that.
+        for (c, made) in &idle {
+            if served - *made >= REQUEST_LINE_TIMEOUT {
+                continue;
+            }
             c.set_nonblocking(true).unwrap();
             let mut head = [0u8; 12];
             let n = c.peek(&mut head).unwrap_or(0);
@@ -576,6 +585,7 @@ mod tests {
             );
             c.set_nonblocking(false).unwrap();
         }
+        let idle: Vec<TcpStream> = idle.into_iter().map(|(c, _)| c).collect();
 
         // And the silent ones don't linger: each is closed, within the short
         // deadline for a request line, not left for the full 15 s.
