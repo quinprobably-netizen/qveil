@@ -518,6 +518,12 @@ void MpvItem::ensureCore() {
         QMutexLocker lock(&m_core->mutex);
         m_core->item = this;
     }
+    // mpv calls its wakeup once, when events arrive with none waiting, and not
+    // again until they have been read. What came in before the item was set
+    // (the first values of what is observed) found nobody to post to, so
+    // without this the player would be deaf: a pause toggled soon after would
+    // never be heard of.
+    QMetaObject::invokeMethod(this, "handleEvents", Qt::QueuedConnection);
     // A new player is as this item was told to be.
     double volume = m_volume, speed = m_speed;
     int mute = m_muted;
