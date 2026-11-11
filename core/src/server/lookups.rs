@@ -111,7 +111,7 @@ impl Running {
         self.changed.notify_all();
     }
 
-    /// The plays waiting on it.
+    /// The plays waiting on it (see `Lookups::waiting`).
     #[cfg(test)]
     pub(super) fn waiting(&self) -> usize {
         lock(&self.state).waiting
@@ -324,10 +324,7 @@ impl Lookups {
     /// How many plays are waiting on a lookup ahead now, for a test to wait
     /// until they do before it asserts that something hasn't happened.
     pub(super) fn waiting(&self) -> usize {
-        lock(&self.running)
-            .iter()
-            .map(|r| lock(&r.state).waiting)
-            .sum()
+        lock(&self.running).iter().map(|r| r.waiting()).sum()
     }
 }
 
@@ -621,7 +618,7 @@ EOF
         });
         let played = play(&base);
         wait_for("the play to wait on it", Duration::from_secs(10), || {
-            lock(&s.lookups.running).iter().any(|r| r.waiting() == 1)
+            s.lookups.waiting() == 1
         });
         touch(&bin.0, "go1");
         let (status, body) = played.join().unwrap();
