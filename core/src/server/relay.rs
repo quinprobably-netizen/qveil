@@ -3,6 +3,7 @@
 
 use super::Server;
 use super::http::{Request, respond};
+use super::warm::{Piece, Warm};
 use crate::errors::friendly;
 use crate::ids::VideoRef;
 use crate::net::Net;
@@ -42,14 +43,16 @@ pub(super) struct Session {
     format: String,
     /// The route it was opened on, not one pinned identity of it: a fresh
     /// identity is derived from it each time the stream is resolved again.
-    route: Net,
-    live: Mutex<Live>,
+    pub(super) route: Net,
+    pub(super) live: Mutex<Live>,
     /// Held while resolving again, so simultaneous failures share one resolve.
     refreshing: Mutex<()>,
     /// Set when the route changes. A relay that is already copying bytes
     /// would otherwise keep pulling the rest of the video over the route the
     /// user just left (mpv holds one open-ended Range request).
-    cancelled: AtomicBool,
+    pub(super) cancelled: AtomicBool,
+    /// The start and end of its streams, fetched when it was opened (see `warm`).
+    pub(super) warm: Warm,
     /// The client sockets of the relays in flight, so that cancelling can
     /// wake one that is blocked writing to a player that has paused.
     clients: Mutex<Vec<(u64, TcpStream)>>,
@@ -64,6 +67,7 @@ impl Session {
             live: Mutex::new(live),
             refreshing: Mutex::new(()),
             cancelled: AtomicBool::new(false),
+            warm: Warm::default(),
             clients: Mutex::new(Vec::new()),
         }
     }
@@ -72,6 +76,7 @@ impl Session {
     /// upstream, and the players' connections are closed.
     pub(super) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.warm.stop();
         for (_, client) in lock(&self.clients).drain(..) {
             // Wakes a relay blocked in a write, and makes the player's
             // reads end, so it doesn't wait on a stream that is gone.
@@ -140,6 +145,13 @@ impl Server {
         };
         let range = range.as_deref();
         let mut live = lock(&s.live).clone();
+        // What the session fetched when it was opened answers the player's
+        // first requests without a round trip.
+        if let Some(w) = wanted
+            && let Some(kept) = s.warm.find(&s, kind, w.start, live.generation)
+        {
+            return self.relay_kept(out, &s, kind, live, w, kept);
+        }
         let mut up = match fetch_upstream(&live, &s.route, &req.method, kind, range) {
             Ok(Some(up)) => up,
             Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
@@ -226,23 +238,90 @@ impl Server {
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        let ahead = Arc::new(Ahead::default());
-        let fetcher = Fetcher {
-            server: Arc::clone(self),
-            session: Arc::clone(s),
-            kind: kind.to_string(),
+        self.serve_ahead(
+            out,
+            s,
+            kind,
             live,
-            ahead: Arc::clone(&ahead),
-            pos: plan.start,
-            chunk_end: plan.first_end,
-            end: plan.end,
-            total: plan.total,
+            Ahead::default(),
+            ctype,
+            plan,
+            Some(first),
+        )
+    }
+
+    /// Answers a range that starts inside `kept`: its bytes first, from
+    /// memory, while the rest is fetched upstream from where they end.
+    fn relay_kept(
+        self: &Arc<Self>,
+        out: &mut TcpStream,
+        s: &Arc<Session>,
+        kind: &str,
+        live: Live,
+        w: Wanted,
+        kept: Piece,
+    ) -> Result<()> {
+        let end = w.end.map_or(kept.total - 1, |e| e.min(kept.total - 1));
+        let plan = Plan {
+            start: w.start,
+            first_end: end.min(kept.last()),
+            end,
+            total: kept.total,
         };
-        if std::thread::Builder::new()
-            .spawn(move || fetcher.run(first))
-            .is_err()
+        let ahead = Ahead::default();
         {
-            return respond(out, 503, "text/plain", b"too busy to relay this stream");
+            let mut st = lock(&ahead.state);
+            let from = (plan.start - kept.start) as usize;
+            let to = (plan.first_end - kept.start) as usize;
+            st.blocks.push_back(kept.bytes[from..=to].to_vec());
+            st.bytes = to + 1 - from;
+            if plan.first_end == plan.end {
+                st.done = Some(Ok(()));
+            }
+        }
+        self.serve_ahead(out, s, kind, live, ahead, kept.content_type, plan, None)
+    }
+
+    /// Sends the head of a 206 for `plan` and then what `ahead` gets. The
+    /// bytes after `plan.first_end` are fetched upstream by a second thread,
+    /// starting with the body of `first` if there is one (it carries
+    /// `plan.start..=plan.first_end`), or else with what follows what `ahead`
+    /// already holds.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_ahead(
+        self: &Arc<Self>,
+        out: &mut TcpStream,
+        s: &Arc<Session>,
+        kind: &str,
+        live: Live,
+        ahead: Ahead,
+        ctype: Option<String>,
+        plan: Plan,
+        first: Option<reqwest::blocking::Response>,
+    ) -> Result<()> {
+        let ahead = Arc::new(ahead);
+        if first.is_some() || plan.first_end < plan.end {
+            let fetcher = Fetcher {
+                server: Arc::clone(self),
+                session: Arc::clone(s),
+                kind: kind.to_string(),
+                live,
+                ahead: Arc::clone(&ahead),
+                pos: if first.is_some() {
+                    plan.start
+                } else {
+                    plan.first_end + 1
+                },
+                chunk_end: plan.first_end,
+                end: plan.end,
+                total: plan.total,
+            };
+            if std::thread::Builder::new()
+                .spawn(move || fetcher.run(first))
+                .is_err()
+            {
+                return respond(out, 503, "text/plain", b"too busy to relay this stream");
+            }
         }
         // Whatever happens from here on, the fetcher stops once this returns.
         let _gone = Gone(&ahead);
@@ -300,7 +379,7 @@ impl Server {
 /// Starts the upstream request for one relayed GET or HEAD, with `range` as
 /// its Range header. `None` means there is no separate audio stream. Errors
 /// are text for the client, without the URL: it is signed for this address.
-fn fetch_upstream(
+pub(super) fn fetch_upstream(
     live: &Live,
     route: &Net,
     method: &str,
@@ -393,7 +472,7 @@ struct Plan {
 }
 
 /// `Content-Range: bytes a-b/total`, with a known total.
-fn content_range(up: &reqwest::blocking::Response) -> Option<(u64, u64, u64)> {
+pub(super) fn content_range(up: &reqwest::blocking::Response) -> Option<(u64, u64, u64)> {
     let v = up.headers().get(CONTENT_RANGE)?.to_str().ok()?;
     let (span, total) = v.trim().strip_prefix("bytes ")?.split_once('/')?;
     let (a, b) = span.split_once('-')?;
@@ -498,7 +577,7 @@ enum Taken {
 }
 
 impl Fetcher {
-    fn run(mut self, first: reqwest::blocking::Response) {
+    fn run(mut self, first: Option<reqwest::blocking::Response>) {
         let result = self.fetch(first);
         lock(&self.ahead.state).done = Some(result);
         self.ahead.changed.notify_all();
@@ -508,12 +587,18 @@ impl Fetcher {
         self.session.cancelled.load(Ordering::Acquire) || lock(&self.ahead.state).gone
     }
 
-    fn fetch(&mut self, first: reqwest::blocking::Response) -> Result<(), String> {
-        let mut up = first;
+    fn fetch(&mut self, first: Option<reqwest::blocking::Response>) -> Result<(), String> {
         // Where the last connection failed. A connection that drops part-way
         // is picked up again at the byte where it broke, but a second failure
         // at the same byte ends the stream.
         let mut failed_at = None;
+        let mut up = match first {
+            Some(up) => up,
+            None => match self.next(&mut failed_at)? {
+                Some(up) => up,
+                None => return Ok(()),
+            },
+        };
         loop {
             match self.take(&mut up) {
                 Taken::Stopped => return Ok(()),
@@ -521,17 +606,29 @@ impl Fetcher {
                 Taken::Complete => {}
                 Taken::Broke(e) => once_at(self.pos, &mut failed_at, e)?,
             }
-            up = loop {
-                if !self.wait_for_room() {
-                    return Ok(());
-                }
-                match self.request() {
-                    Ok(next) => break next,
-                    Err(_) if self.stopped() => return Ok(()),
-                    Err(Failure::Connection(e)) => once_at(self.pos, &mut failed_at, e)?,
-                    Err(Failure::Final(e)) => return Err(e),
-                }
+            up = match self.next(&mut failed_at)? {
+                Some(up) => up,
+                None => return Ok(()),
             };
+        }
+    }
+
+    /// The response for the next chunk, once there is room for it. `None`
+    /// if the player went away or the route changed meanwhile.
+    fn next(
+        &mut self,
+        failed_at: &mut Option<u64>,
+    ) -> Result<Option<reqwest::blocking::Response>, String> {
+        loop {
+            if !self.wait_for_room() {
+                return Ok(None);
+            }
+            match self.request() {
+                Ok(next) => return Ok(Some(next)),
+                Err(_) if self.stopped() => return Ok(None),
+                Err(Failure::Connection(e)) => once_at(self.pos, failed_at, e)?,
+                Err(Failure::Final(e)) => return Err(e),
+            }
         }
     }
 
@@ -670,7 +767,7 @@ fn copy_body(up: &mut impl Read, out: &mut impl Write, cancelled: &AtomicBool) -
 }
 
 /// HLS and DASH manifests, however the server spells the type.
-fn is_playlist_type(content_type: &str) -> bool {
+pub(super) fn is_playlist_type(content_type: &str) -> bool {
     let t = content_type.to_ascii_lowercase();
     t.contains("mpegurl") || t.contains("dash+xml")
 }

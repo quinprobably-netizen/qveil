@@ -181,7 +181,7 @@ private slots:
         QCOMPARE(audio.captured(2), QString("a"));
         QCOMPARE(video.captured(1), audio.captured(1));
         QVERIFY(info.value("video").toString().startsWith(rig.base()));
-        QVERIFY(!info.value("video").toString().contains("upstream.invalid"));
+        QVERIFY(!info.value("video").toString().contains("127.0.0.1:1/"));
         QCOMPARE(info.value("title").toString(), QString("Canned video"));
         QCOMPARE(info.value("id").toString(), QString("AAAAAAAAAA1"));
         QCOMPARE(info.value("duration").toInt(), 61);

@@ -86,6 +86,9 @@ comments)
   echo "{\"comment_count\":1204,\"comments\":[{\"id\":\"c1\",\"parent\":\"root\",\"author\":\"@alpha\",\"text\":\"Correction at 0:10\",\"like_count\":640,\"_time_text\":\"9 hours ago\",\"is_pinned\":true,\"author_is_uploader\":true},{\"id\":\"c2\",\"parent\":\"root\",\"author\":\"@beta\",\"text\":\"Nice\",\"like_count\":12,\"_time_text\":\"6 hours ago\"}$reply,{\"id\":\"c3\",\"parent\":\"root\",\"author\":\"@delta\",\"text\":\"See https://example.com/x\",\"_time_text\":\"1 hour ago\"}]}"
   ;;
 resolve)
-  echo '{"title":"Canned video","channel":"Alpha","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","duration":61,"description":"About this video.\\n0:00 Intro","view_count":59000,"timestamp":1762700000,"chapters":[{"start_time":0,"title":"Intro"},{"start_time":60,"title":"Middle"}],"requested_formats":[{"url":"https://upstream.invalid/video","protocol":"https","vcodec":"avc1"},{"url":"https://upstream.invalid/audio","protocol":"https","vcodec":"none"}]}'
+  # The streams are on a port where nothing listens: the engine fetches
+  # their start as soon as a video is opened, and that must fail at once,
+  # without even a DNS lookup.
+  echo '{"title":"Canned video","channel":"Alpha","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","duration":61,"description":"About this video.\\n0:00 Intro","view_count":59000,"timestamp":1762700000,"chapters":[{"start_time":0,"title":"Intro"},{"start_time":60,"title":"Middle"}],"requested_formats":[{"url":"https://127.0.0.1:1/video","protocol":"https","vcodec":"avc1"},{"url":"https://127.0.0.1:1/audio","protocol":"https","vcodec":"none"}]}'
   ;;
 esac

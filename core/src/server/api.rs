@@ -63,7 +63,14 @@ impl Server {
         match opened {
             Ok(opened) => {
                 let body = json!(opened.info).to_string();
-                respond(out, 200, "application/json", body.as_bytes())?;
+                if let Err(e) = respond(out, 200, "application/json", body.as_bytes()) {
+                    // Nobody will play it, so what is being fetched for
+                    // the player is not wanted either.
+                    if let Some(s) = &opened.session {
+                        s.warm.stop();
+                    }
+                    return Err(e);
+                }
                 self.remember(&opened);
                 Ok(())
             }

@@ -15,6 +15,7 @@
 //! - `jobs`: the feed refresh, one at a time, that requests can join.
 //! - `thumbs`: thumbnails, fetched a page at a time.
 //! - `relay`: the video relay, chunked and Range-forwarding.
+//! - `warm`: the start and end of a video's streams, fetched when it is opened.
 
 mod api;
 mod comments;
@@ -25,6 +26,7 @@ mod relay;
 #[cfg(test)]
 mod testkit;
 mod thumbs;
+mod warm;
 
 use crate::app::{self, Runtime, Watched};
 use crate::ids::VideoRef;
@@ -44,7 +46,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -68,6 +70,10 @@ pub struct Server {
     connections: Arc<AtomicUsize>,
     /// Connections that haven't shown the token yet.
     unverified: Arc<Unverified>,
+    /// Whether a session starts fetching the start and end of its streams
+    /// when it is opened (see `warm`). Always on, except in the tests that
+    /// count every request the upstream gets.
+    warming: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -109,6 +115,8 @@ pub struct Opened {
     pub info: PlayInfo,
     /// What to add to the history, if it is on. Not added yet: see `Server::remember`.
     watched: Option<Watched>,
+    /// The session it was registered as.
+    session: Option<Arc<Session>>,
 }
 
 impl Server {
@@ -135,6 +143,7 @@ impl Server {
             settings: Mutex::new(()),
             connections: Arc::new(AtomicUsize::new(0)),
             unverified: Arc::new(Unverified::default()),
+            warming: AtomicBool::new(true),
         })
     }
 
@@ -219,6 +228,7 @@ impl Server {
         let format = rt.cfg.format();
         let s = yt.resolve_until(&v.watch_url(), &format, abort)?;
         let has_audio = s.audio.is_some();
+        let (video_size, audio_size) = (s.video_size, s.audio_size);
         let session = Session::new(
             v.clone(),
             format,
@@ -232,6 +242,14 @@ impl Server {
             },
         );
         let sid = self.register(&rt, session)?;
+        // What mpv will ask for first is fetched while the answer travels
+        // and mpv starts.
+        let session = self.session(&sid);
+        if let Some(s) = &session
+            && self.warming.load(Ordering::Relaxed)
+        {
+            warm::start(s, [video_size, audio_size]);
+        }
         let watched = rt.cfg.history.then(|| Watched {
             id: v.id.clone(),
             title: s.title.clone(),
@@ -256,6 +274,7 @@ impl Server {
                 chapters: s.chapters,
             },
             watched,
+            session,
         })
     }
 

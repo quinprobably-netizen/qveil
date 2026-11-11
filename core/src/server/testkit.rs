@@ -38,6 +38,9 @@ pub fn server_tuned(
     rt.yt.net = rt.net.clone();
     tune(&mut rt);
     let s = Server::new(rt, paths);
+    // Most tests count what the upstream is asked; the ones about warming
+    // turn it back on.
+    s.warming.store(false, Ordering::Relaxed);
     let base = s.listen().unwrap();
     (s, base, dir)
 }
