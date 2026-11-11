@@ -680,3 +680,27 @@ echo '{"id":"bbbbbbbbbbb","title":"Brief","channel":"c","duration":100.0}'
     let out = home.run(&["search", "talks", "over", "10", "min", "--json"], "");
     assert!(text(&out.stdout).contains(r#""over 10:00""#));
 }
+
+#[test]
+fn a_misspelt_setting_stops_the_engine_and_a_newer_one_does_not() {
+    let home = Home::new();
+    let config = home.config().join("qveil").join("config.toml");
+    // Someone who typed Tor in by hand, with a slip: on Direct, YouTube
+    // would see their IP, so the engine doesn't start at all.
+    write(&config, "prxoy = \"socks5h://127.0.0.1:9050\"\n");
+    let out = home.run(&["config"], "");
+    assert!(!out.status.success(), "{}", text(&out.stdout));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("`prxoy`") && err.contains("did you mean `proxy`"),
+        "{err}"
+    );
+    assert!(!text(&out.stdout).contains("YouTube sees your real IP"));
+    // A key no setting is close to is a newer qveil's: it is said on stderr,
+    // and the rest of the file counts.
+    write(&config, "history = true\nchapters_on_the_bar = true\n");
+    let out = home.run(&["config"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("chapters_on_the_bar"));
+    assert!(text(&out.stdout).contains("on (local only)"));
+}

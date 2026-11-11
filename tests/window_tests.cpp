@@ -862,6 +862,32 @@ private slots:
         QVERIFY(sheet->mapToScene(QPointF(sheet->width(), 0)).x() <= 630);
     }
 
+    void keysOfTheSettingsFileThatWereLeftOutAreSaidOnce()
+    {
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_IGNORED", "chapters_on_the_bar,something_newer"}});
+        READY(app);
+        // The window says so as it starts, once, on the line that says what happened.
+        QQuickItem *toast = app.item("toast");
+        QTRY_VERIFY(toast->isVisible());
+        QCOMPARE(toast->property("text").toString(),
+                 QString("Left out of the settings file, as this version has no such settings: chapters_on_the_bar, something_newer"));
+        QTRY_VERIFY_WITH_TIMEOUT(!toast->isVisible(), 6000);
+        app.backend->loadConfig();
+        QTest::qWait(500);
+        QVERIFY(!toast->isVisible());
+        // And under the file's path in Settings, for as long as it is so.
+        QTest::keyClick(app.window, Qt::Key_5);
+        QTRY_COMPARE(app.page(), QString("settings"));
+        QQuickItem *page = app.item("settings");
+        app.click(App::under(page, "settings-cat-about"));
+        QQuickItem *left = App::under(page, "set-file-ignored");
+        QTRY_VERIFY(left->isVisible());
+        QCOMPARE(left->property("text").toString(), QString("Left out, as this version has no such settings: chapters_on_the_bar, something_newer"));
+        // A change rewrites the file with the settings this version has.
+        app.backend->setConfig({{"history", true}});
+        QTRY_VERIFY(!left->isVisible());
+    }
+
     void aLinkInADescriptionLeadsBackIntoTheAppOrIsOnlyCopied()
     {
         App app;

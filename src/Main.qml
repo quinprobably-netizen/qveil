@@ -19,6 +19,7 @@ ApplicationWindow {
     property string returnPage: "home"
     // Whether the first engine start has loaded the window yet.
     property bool started: false
+    property bool toldLeftOut: false
     readonly property bool fullscreen: visibility === Window.FullScreen
     // Whether a video has the window.
     readonly property bool watching: watch.active
@@ -477,6 +478,16 @@ ApplicationWindow {
             backend.loadSubs()
             backend.loadResume()
             backend.loadLenses()
+        }
+        // Keys of the settings file that the engine left out (a newer
+        // qveil's settings) are said once, as the window starts; Settings
+        // keeps saying so under the file's path.
+        function onConfigChanged() {
+            const left = backend.config.ignoredKeys || []
+            if (win.toldLeftOut || left.length === 0)
+                return
+            win.toldLeftOut = true
+            toast.show(qsTr("Left out of the settings file, as this version has no such settings: %1").arg(left.join(", ")))
         }
         // The engine ends the streams of the old route, so what was playing
         // is opened again by the new one.

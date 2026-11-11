@@ -425,9 +425,12 @@ FocusScope {
                     }
                 }
                 SettingRow {
+                    readonly property var leftOut: page.config.ignoredKeys || []
                     width: parent.width
                     name: qsTr("Settings file")
                     note: page.config.configPath || ""
+                    would: leftOut.length > 0 ? qsTr("Left out, as this version has no such settings: %1").arg(leftOut.join(", ")) : ""
+                    wouldName: "set-file-ignored"
                 }
             }
         }

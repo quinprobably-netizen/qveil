@@ -133,6 +133,29 @@ private slots:
         QNetworkProxy::setApplicationProxy(QNetworkProxy::NoProxy);
     }
 
+    void aMisspeltSettingStopsTheEngineAndTheWindowSaysWhich() {
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        {
+            // Tor typed in by hand, with a slip: without the refusal the
+            // engine would go out on Direct, with the real IP.
+            Rig rig("prxoy = \"socks5h://127.0.0.1:9050\"\n");
+            QVERIFY(rig.ok);
+            rig.backend = std::make_unique<Backend>(rig.environment, Rig::core());
+            rig.backend->start();
+            Backend &window = rig.window();
+            WAIT_FOR(!window.error().isEmpty(), 10000);
+            QVERIFY2(window.error().contains("`prxoy`") && window.error().contains("did you mean `proxy`"),
+                     qPrintable(window.error()));
+            QVERIFY(!window.ready());
+        }
+        // A key no setting is close to, from a newer qveil, is only left out,
+        // and the window is told which.
+        Rig rig("chapters_on_the_bar = true\n");
+        QVERIFY2(rig.start(), "the engine didn't start");
+        QCOMPARE(rig.window().config().value("ignoredKeys").toStringList(), QStringList({"chapters_on_the_bar"}));
+    }
+
     void theWindowAndTheEngineUnderstandEachOther() {
         Rig rig;
         if (Rig::core().isEmpty())

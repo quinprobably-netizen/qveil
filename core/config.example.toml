@@ -1,5 +1,8 @@
 # qveil config: copy to ~/.config/qveil/config.toml
 # Every key is optional; these are the defaults unless noted.
+# A key this version doesn't have (a newer qveil's setting) is left out, and
+# the window says which. One a letter or two off a setting, like `prxoy`, is
+# taken for a typo: qveil doesn't start until it is corrected.
 
 # Route ALL traffic (search, feeds, metadata and the video bytes) through a proxy.
 # http://, https:// or socks5h:// (plain socks5:// is refused because it leaks DNS).

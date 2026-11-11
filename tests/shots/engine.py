@@ -114,7 +114,9 @@ state = {
                "topicFeeds": bool(os.environ.get("QVEIL_STANDIN_TOPICS")),
                "prepareNext": False,
                "keepThumbnails": False,
-               "configPath": "/dev/null", "privacy": PRIVACY},
+               "configPath": "/dev/null", "privacy": PRIVACY,
+               # QVEIL_STANDIN_IGNORED: keys of the settings file that were left out.
+               "ignoredKeys": [k for k in os.environ.get("QVEIL_STANDIN_IGNORED", "").split(",") if k]},
     "subs": [{"id": c, "name": n} for c, n in CHANNELS],
     "resume": [
         {"id": "vid00000001", "pos": 845, "dur": 2463, "at": NOW - HOUR, "title": FEED[0]["title"],
@@ -464,6 +466,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds", "prepareNext", "keepThumbnails"):
                 if key in body:
                     cfg[key] = body[key]
+            # The file is saved with only the keys the engine knows.
+            cfg["ignoredKeys"] = []
             cfg["resumeDays"] = max(0, min(365, int(cfg["resumeDays"])))
             if cfg["resumeDays"] == 0:
                 state["resume"] = []

@@ -292,6 +292,9 @@ impl Server {
             "prepareNext": rt.cfg.prepare_next,
             "keepThumbnails": rt.cfg.keep_thumbnails,
             "configPath": self.paths.config,
+            // The keys of the file that were left out: a newer qveil's
+            // settings, or a typo too far from any setting to be refused.
+            "ignoredKeys": rt.cfg.ignored,
             // What the window says about privacy, from the one place that
             // words it (see `privacy`).
             "privacy": privacy::describe(&rt.net, &rt.cfg),
@@ -1132,6 +1135,30 @@ echo '{"entries":[]}'"#,
             "a video that was never answered"
         );
         assert!(lock(&s.sessions).is_empty());
+    }
+
+    #[test]
+    fn the_settings_say_which_keys_of_the_file_were_left_out() {
+        let (_s, base, _d) = server_with(Config {
+            ignored: vec!["something_newer".into()],
+            ..Config::default()
+        });
+        let get = || {
+            let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        assert_eq!(get()["ignoredKeys"], json!(["something_newer"]));
+        // A change saves the file with only the keys this version knows, so
+        // after it nothing is being left out any more.
+        let (status, _) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"history":true}"#,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(get()["ignoredKeys"], json!([]));
     }
 
     #[test]

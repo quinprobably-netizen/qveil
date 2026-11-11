@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// The settings file. A key this version doesn't know doesn't stop it from
 /// loading (see `Config::load`): `save` writes every setting, so a file that a
-/// newer qveil saved has keys that an older one has to get past.
+/// newer qveil saved has keys that an older one has to get past. One that is
+/// a letter or two off a setting does stop it: that is a typo.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -43,6 +44,11 @@ pub struct Config {
     pub mpv: String,
     /// Extra arguments passed to mpv.
     pub mpv_args: Vec<String>,
+    /// The keys of the file that this version has no setting for, and left
+    /// out (see `load`). Not a setting: never written, and only ever filled
+    /// in by `load`.
+    #[serde(skip)]
+    pub ignored: Vec<String>,
 }
 
 impl Default for Config {
@@ -61,6 +67,7 @@ impl Default for Config {
             ytdlp: "yt-dlp".into(),
             mpv: "mpv".into(),
             mpv_args: vec![],
+            ignored: vec![],
         }
     }
 }
@@ -88,24 +95,80 @@ fn unknown_keys(text: &str) -> Vec<String> {
     unknown
 }
 
+/// How far apart two keys are: the edits (a letter added, removed, changed,
+/// or two neighbours swapped) that turn one into the other.
+fn distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    // d[i][j]: the distance between the first i letters of a and the first j of b.
+    let mut d = vec![vec![0; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let change = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + change);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+/// How many edits apart an unknown key may be from a setting to be taken
+/// for a typo of it.
+const TYPO: usize = 2;
+
+/// The setting that `key` (which isn't one) looks like a typo of, if any.
+/// Case and `-` for `_` don't count as different.
+fn meant(key: &str, known: &[String]) -> Option<String> {
+    let typed = key.to_lowercase().replace('-', "_");
+    known
+        .iter()
+        .map(|k| (distance(&typed, k), k))
+        .filter(|(d, _)| *d <= TYPO)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k.clone())
+}
+
 impl Config {
-    /// The settings in `path`, or the defaults if there is no file. Keys that
-    /// this version doesn't know are left out and said so on stderr: a typo
-    /// and a setting of a newer qveil look alike, and neither is a reason not
-    /// to start. (`save` writes only the keys it knows.)
+    /// The settings in `path`, or the defaults if there is no file. A key
+    /// that this version doesn't know is left out, said so on stderr and
+    /// kept in `ignored` for the window to show: it may be a setting of a
+    /// newer qveil, and that is no reason not to start. One that is within
+    /// `TYPO` edits of a setting is refused instead: that is a typo, and a
+    /// setting left out because of one can matter (`prxoy` would mean no
+    /// proxy, and the real IP). (`save` writes only the keys it knows.)
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let cfg =
+                let mut cfg: Config =
                     toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
                 let unknown = unknown_keys(&s);
+                let known = known_keys();
+                for key in &unknown {
+                    if let Some(setting) = meant(key, &known) {
+                        bail!(
+                            "{}: `{key}` isn't a setting; did you mean `{setting}`? Correct it or remove it. qveil doesn't start with a setting that may be misspelt, because it would be left out (a misspelt `proxy` would mean no proxy)",
+                            path.display()
+                        );
+                    }
+                }
                 if !unknown.is_empty() {
                     note!(
-                        "qveil: ignoring settings in {} that this version doesn't have: {} (from a newer qveil, or a typo)",
+                        "qveil: ignoring settings in {} that this version doesn't have: {} (from a newer qveil?)",
                         path.display(),
                         unknown.join(", ")
                     );
                 }
+                cfg.ignored = unknown;
                 Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -196,7 +259,7 @@ mod tests {
         let path = dir.0.join("config.toml");
         std::fs::write(
             &path,
-            "max_height = 720\nhistory = true\nsomething_newer = \"x\"\nhistroy = true\n",
+            "max_height = 720\nhistory = true\nsomething_newer = \"x\"\nchapters_on_the_bar = true\n",
         )
         .unwrap();
         let c = Config::load(&path).unwrap();
@@ -205,11 +268,54 @@ mod tests {
         assert_eq!(c.resume_days, 7, "what the file doesn't say stays default");
         assert_eq!(
             unknown_keys(&std::fs::read_to_string(&path).unwrap()),
-            ["histroy", "something_newer"]
+            ["chapters_on_the_bar", "something_newer"]
         );
+        // And the window is told which, through `ignored`.
+        assert_eq!(c.ignored, ["chapters_on_the_bar", "something_newer"]);
+        assert!(Config::default().ignored.is_empty());
         // A key that is known but wrongly typed is still an error.
         std::fs::write(&path, "max_height = \"tall\"\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_key_a_letter_or_two_off_a_setting_stops_it_from_loading() {
+        // `proxy` misspelt would otherwise be left out, and the engine would
+        // start on Direct: the real IP, for someone who set up Tor by hand.
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        for (typo, meant) in [
+            ("prxoy", "proxy"),
+            ("Proxy", "proxy"),
+            ("proxi", "proxy"),
+            ("PROXY", "proxy"),
+            ("histroy", "history"),
+            ("max-height", "max_height"),
+            ("isolate_circuit", "isolate_circuits"),
+        ] {
+            std::fs::write(&path, format!("{typo} = \"socks5h://127.0.0.1:9050\"\n")).unwrap();
+            let err = format!("{:#}", Config::load(&path).unwrap_err());
+            assert!(err.contains(&format!("`{typo}`")), "{typo}: {err}");
+            assert!(err.contains(&format!("`{meant}`")), "{typo}: {err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+        // One that is far from every setting is a newer qveil's, and passes.
+        std::fs::write(&path, "proxy_rotation_minutes = 5\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().ignored,
+            ["proxy_rotation_minutes"]
+        );
+    }
+
+    #[test]
+    fn the_distance_counts_edits_and_swaps() {
+        assert_eq!(distance("proxy", "proxy"), 0);
+        assert_eq!(distance("prxoy", "proxy"), 1);
+        assert_eq!(distance("proxi", "proxy"), 1);
+        assert_eq!(distance("prox", "proxy"), 1);
+        assert_eq!(distance("pproxyy", "proxy"), 2);
+        assert_eq!(distance("mpv", "proxy"), 5);
+        assert_eq!(distance("", "abc"), 3);
     }
 
     #[test]
