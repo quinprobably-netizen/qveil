@@ -2096,7 +2096,8 @@ mod tests {
     fn stalls_that_keep_coming_end_the_stream_instead_of_looking_it_up_again_and_again() {
         let gate = Gate::start();
         let bin = TempDir::new();
-        let (s, base, _d) = behind_a_gate(&gate, &bin, 5);
+        // Slow enough that the second stall comes well before the end, under load too.
+        let (s, base, _d) = behind_a_gate(&gate, &bin, 20);
         let info = s.open(&test_video()).unwrap();
         let want = 5u64 << 20;
         let player = play_from_start(&base, &info.video, want);
