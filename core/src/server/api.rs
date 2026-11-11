@@ -977,7 +977,7 @@ echo '{"entries":[]}'"#,
             (v["resumeDays"].as_u64(), v["history"].as_bool()),
             (Some(7), Some(false))
         );
-        // The same for the thumbnails kept on disk, and for the topic feeds' results.
+        // The same for the thumbnails kept on disk.
         let (s, base, _d) = server_with(Config {
             keep_thumbnails: true,
             ..Config::default()
