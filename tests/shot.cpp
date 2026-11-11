@@ -49,7 +49,7 @@ int main(int argc, char *argv[]) {
         {"settings-home", "go('settings'); settingsPage.category = 'home'"},
         {"search", "go('search'); backend.search('talks over 30 min')"},
         {"watch", "play(backend.feed.get(0), backend.feed, 0)"},
-        {"feed", "feedPage.showAll('latest')"},
+        {"feed", "feedPage.showAll()"},
         // The video, moved to its small window once it plays there.
         {"pip", "play(backend.feed.get(0), backend.feed, 0); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: win.togglePip() }', win)"},

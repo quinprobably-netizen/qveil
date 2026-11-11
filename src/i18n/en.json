@@ -23,10 +23,6 @@
     "one": "%n channel",
     "other": "%n channels"
   },
-  "Latest from %n channels": {
-    "one": "Latest from %n channel",
-    "other": "Latest from %n channels"
-  },
   "%n couldn't be fetched": {
     "one": "%n couldn't be fetched",
     "other": "%n couldn't be fetched"

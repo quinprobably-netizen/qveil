@@ -32,7 +32,7 @@
         <file alias="BusyLine.qml">BusyLine.qml</file>
         <file alias="Frost.qml">Frost.qml</file>
         <file alias="HomePage.qml">HomePage.qml</file>
-        <file alias="FeedTabs.qml">FeedTabs.qml</file>
+        <file alias="FeedHead.qml">FeedHead.qml</file>
         <file alias="Linkify.js">Linkify.js</file>
         <file alias="PlayerSurface.qml">PlayerSurface.qml</file>
         <file alias="SeekBar.qml">SeekBar.qml</file>

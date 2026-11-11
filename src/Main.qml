@@ -83,8 +83,6 @@ ApplicationWindow {
             watch.sheet.turn(by)
         else if (!watching && page === "lenses")
             lensesPage.step(by)
-        else if (!watching && page === "home")
-            feedPage.tabStep(by)
     }
     readonly property var pages: ({ home: feedPage, search: searchPage, channel: channelPage,
                                     channels: subsPage, history: historyPage,
@@ -231,14 +229,18 @@ ApplicationWindow {
             backend.search(backend.query)
         else if (page === "lenses")
             lensesPage.refresh()
-        else if (page === "home" && feedPage.onLens && !feedPage.overview)
-            backend.openLens(feedPage.feed, 2)
         else if (page === "home")
             backend.refreshFeed(true, prefs.showShorts)
     }
 
     // The first run's way in: Channels, with the add field ready to type in.
     function addChannel() {
+    // The Lenses page, with the lens `id` open.
+    function openLens(id) {
+        lensesPage.show(id)
+        go("lenses")
+    }
+
         go("channels")
         // go() puts focus on the list on the next turn; the field comes after.
         Qt.callLater(() => subsPage.focusAdd())
@@ -700,6 +702,7 @@ ApplicationWindow {
                     objectName: "searchPage"
                     anchors.fill: parent
                     visible: win.page === "search" && !win.watching
+                    onLensRequested: id => win.openLens(id)
                     thumbs: win.thumbs
                     progress: win.watched
                     heading: backend.query ? qsTr("\u201c%1\u201d").arg(backend.query) : qsTr("Search")

@@ -163,10 +163,10 @@ struct App {
             QTest::keyClick(window, *c);
     }
     QString page() const { return window->property("page").toString(); }
-    // Home's feed in full (the grid with its tabs), as a shelf's "See all" opens it.
-    void seeAll(const char *feed = "latest") const
+    // Home's latest in full (the grid under its heading), as the shelf's "See all" opens it.
+    void seeAll() const
     {
-        QMetaObject::invokeMethod(item("feedPage"), "showAll", Q_ARG(QVariant, QString(feed)));
+        QMetaObject::invokeMethod(item("feedPage"), "showAll");
     }
 
     // The small window of picture in picture, and something in it.
@@ -420,32 +420,94 @@ private slots:
         QVERIFY(!none.item("lead")->isVisible());
     }
 
-    void aLensTabShowsThatLensInTheGrid()
+    void theFeedInFullIsNamedAndHasNoLensTabs()
     {
         App app;
         READY(app);
         app.seeAll();
-        QQuickItem *tabs = app.item("feed-tabs");
+        QQuickItem *head = app.item("feed-head");
         QQuickItem *grid = app.item("home-grid");
-        QVERIFY(tabs && grid);
-        QTRY_VERIFY(app.item("feed-tab-aaaa0002"));
-        QVERIFY(app.item("feed-tab-latest") && app.item("feed-tab-aaaa0001") && app.item("feed-tab-new"));
-        QVERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QVERIFY(head && grid);
         QTRY_COMPARE(grid->property("count").toInt(), 12);
+        // A way back and its name, where the tabs were; the lenses are not here.
+        QCOMPARE(app.item("feed-title")->property("text").toString(), QString("Latest from your channels"));
+        QVERIFY(app.item("feed-back") && app.item("feed-back")->isVisible());
+        QVERIFY(app.item("feed-back")->mapToScene(QPointF(0, 0)).x() < app.item("feed-title")->mapToScene(QPointF(0, 0)).x());
+        for (const char *gone : {"feed-tab-latest", "feed-tab-aaaa0001", "feed-tab-aaaa0002", "feed-tab-new"})
+            QVERIFY2(!app.item(gone), gone);
+        QStringList said;
+        App::texts(head, said);
+        QVERIFY2(!said.contains("New lens") && !said.contains("Latest"), qPrintable(said.join("|")));
+        // Sort, Shorts and Refresh stay, at the far end.
+        QVERIFY(app.item("feed-sort")->isVisible());
+        QVERIFY2(said.contains("Shorts: off") && said.contains("Refresh"), qPrintable(said.join("|")));
         QVERIFY(app.items("card-why").isEmpty());
+        // The way back is the shelves.
+        app.click(app.item("feed-back"));
+        QTRY_VERIFY(app.item("shelves")->isVisible());
+        QVERIFY(!grid->isVisible());
+    }
 
-        app.click(app.item("feed-tab-aaaa0002"));
+    void aLensShelfsSeeAllOpensTheLensesPageOnThatLens()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelf-aaaa0002"));
+        // Nothing is asked for by seeing a lens's shelf; opening it reads what the engine has.
+        app.click(App::under(app.item("shelf-aaaa0002"), "shelf-all"));
+        QTRY_COMPARE(app.page(), QString("lenses"));
         QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
-        QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
+        // It is the open one, in the strip, and its videos are the page's.
+        QTRY_COMPARE(app.items("lens-row").size(), 2);
+        QTRY_VERIFY(!app.items("lens-row").at(0)->property("current").toBool());
+        QVERIFY(app.items("lens-row").at(1)->property("current").toBool());
+        QQuickItem *grid = app.item("lens-grid");
         QTRY_COMPARE(grid->property("count").toInt(), 6);
         // Each of a lens's videos says why it is there.
         QTRY_VERIFY(!app.items("card-why").isEmpty());
         QVERIFY(app.items("card-why").first()->property("text").toString().contains("over 30:00"));
         // It was fetched two hours ago: opening it asks for nothing new.
         QCOMPARE(app.asked("GET api/lens?id=aaaa0002&stream=1&refresh=1"), 1);
+        QCOMPARE(app.asked("GET api/lens?id=aaaa0001&stream=1&refresh=1"), 0);
+        QCOMPARE(app.asked("GET api/search"), 0);
+        // The other lens is a tab away, and Home's own latest is still its own page.
+        app.click(app.items("lens-row").first());
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0001"));
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTRY_VERIFY(app.item("shelves")->isVisible());
+        QVERIFY(!app.item("home-grid")->isVisible());
 
-        app.click(app.item("feed-tab-latest"));
-        QTRY_COMPARE(grid->property("count").toInt(), 12);
+        // O on a lens's shelf does the same.
+        QTRY_VERIFY(app.item("shelf-aaaa0002"));
+        QCOMPARE(app.item("shelves-home")->property("keys").toStringList().indexOf("aaaa0002"), 3);
+        QVERIFY(app.item("shelves-home")->setProperty("row", 3));
+        QTest::keyClick(app.window, Qt::Key_O);
+        QTRY_COMPARE(app.page(), QString("lenses"));
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
+    }
+
+    void everyWayIntoALensStillWorks()
+    {
+        App app;
+        READY(app);
+        // The Lenses page: its strip.
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.items("lens-row").size(), 2);
+        app.click(app.items("lens-row").at(1));
+        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
+        QTRY_VERIFY(app.items("lens-row").at(1)->property("current").toBool());
+        // ...and New lens, there and on Home's foot.
+        app.click(app.item("lens-new"));
+        QTRY_VERIFY(app.item("lens-text")->property("editing").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTRY_VERIFY(app.item("shelves")->isVisible());
+        QMetaObject::invokeMethod(app.item("shelves"), "positionViewAtEnd");
+        app.click(app.item("home-new-lens"));
+        QCOMPARE(app.page(), QString("lenses"));
+        QTRY_VERIFY(app.item("lens-text")->property("editing").toBool());
     }
 
     void aCardClearsUnderThePointerAndUnderTheKeyboard()
@@ -497,7 +559,7 @@ private slots:
             // Nothing reaches past the window's edge.
             for (QQuickItem *card : app.items("card"))
                 QVERIFY(card->mapToScene(QPointF(card->width(), 0)).x() <= width);
-            for (const char *name : {"feed-tabs", "search"})
+            for (const char *name : {"feed-head", "search"})
                 QVERIFY2(app.item(name)->mapToScene(QPointF(app.item(name)->width(), 0)).x() <= width, name);
         }
     }
@@ -847,29 +909,6 @@ private slots:
         app.click(del);
         QCOMPARE(del->property("text").toString(), QString("Delete?"));
         QCOMPARE(app.items("lens-row").size(), 2);
-
-        // The order is two plain words, and the note is on their line, at the far end.
-        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
-        QQuickItem *top = app.item("comments-top"), *newest = app.item("comments-new"), *note = app.item("comments-note");
-        QVERIFY(top->isVisible() && newest->isVisible() && note->isVisible());
-        for (QQuickItem *word : {top, newest})
-            QVERIFY(word->property("plain").toBool());
-        QVERIFY(top->property("current").toBool());
-        // (No fill under the current one, as the other text tabs have none.)
-        QCOMPARE(top->property("color").value<QColor>().alpha(), 0);
-        QVERIFY2(qAbs(box(note).center().y() - box(top).center().y()) <= 2, "the note is on the words' line");
-        QVERIFY(box(note).left() >= box(newest).right());
-        QQuickItem *sheet = app.item("sheet");
-        QVERIFY(box(note).right() <= box(sheet).right());
-        QVERIFY(box(note).center().x() > box(sheet).center().x());
-
-        // Pressing it shows the engine's whole sentence under, and again hides it.
-        app.click(note);
-        QTRY_VERIFY(app.item("comments-note-all")->isVisible());
-        QCOMPARE(app.item("comments-note-all")->property("text").toString(), pages.value("comments").toString());
-        QVERIFY(box(app.item("comments-note-all")).top() >= box(note).bottom() - 1);
-        app.click(note);
-        QTRY_VERIFY(!app.item("comments-note-all")->isVisible());
         QTRY_VERIFY(app.item("lens-cancel")->isVisible());
         app.click(app.item("lens-cancel"));
         QTRY_COMPARE(del->property("text").toString(), QString("Delete"));
@@ -910,13 +949,6 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_1);
         QMetaObject::invokeMethod(app.item("shelves"), "positionViewAtEnd");
         app.click(app.item("home-new-lens"));
-        QCOMPARE(app.page(), QString("lenses"));
-        QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString());
-        // So does the feed's own tab row.
-        QTest::keyClick(app.window, Qt::Key_Escape);
-        QTest::keyClick(app.window, Qt::Key_1);
-        app.seeAll();
-        app.click(app.item("feed-tab-new"));
         QCOMPARE(app.page(), QString("lenses"));
         QTRY_COMPARE(app.item("lens-text")->property("text").toString(), QString());
         QTRY_VERIFY(app.item("lens-text")->property("editing").toBool());
@@ -1672,19 +1704,18 @@ private slots:
         QTRY_VERIFY(grid->isVisible());
         QVERIFY(!shelves->isVisible());
         QTRY_COMPARE(grid->property("count").toInt(), 12);
-        QVERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QCOMPARE(app.item("feed-title")->property("text").toString(), QString("Latest from your channels"));
         QTRY_VERIFY(grid->hasActiveFocus());
         QTest::keyClick(app.window, Qt::Key_Escape);
         QTRY_VERIFY(shelves->isVisible());
         QVERIFY(!grid->isVisible());
         QCOMPARE(app.page(), QString("home"));
 
-        // A lens's shelf opens that lens.
+        // A lens's shelf leads to that lens, on the Lenses page.
         app.click(App::under(app.item("shelf-aaaa0002"), "shelf-title"));
-        QTRY_VERIFY(grid->isVisible());
+        QTRY_COMPARE(app.page(), QString("lenses"));
         QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
-        QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
-        QTRY_COMPARE(grid->property("count").toInt(), 6);
+        QVERIFY(!grid->isVisible());
         // Home, by its key or the bar, is the shelves again.
         QTest::keyClick(app.window, Qt::Key_1);
         QTRY_VERIFY(shelves->isVisible());
@@ -1808,6 +1839,17 @@ private slots:
             for (const auto &[other, otherRow, unused] : rows)
                 QCOMPARE(App::under(page, otherRow)->isVisible(), other == category);
         }
+        // The categories are as wide as the channels' rail, which stands at the same edge,
+        // and the rows start a gutter beyond them.
+        QCOMPARE(box(App::under(page, "settings-cat-privacy")).width(), qreal(260));
+        QCOMPARE(box(App::under(page, "settings-cat-privacy")).left(), qreal(24));
+        QCOMPARE(left, box(App::under(page, "settings-cat-privacy")).right() + 24);
+        QTest::keyClick(app.window, Qt::Key_3);
+        QTRY_COMPARE(app.page(), QString("channels"));
+        QCOMPARE(box(app.item("channel-list")).width(), box(App::under(page, "settings-cat-privacy")).width());
+        QCOMPARE(box(app.item("channel-list")).left(), box(App::under(page, "settings-cat-privacy")).left());
+        QTest::keyClick(app.window, Qt::Key_5);
+        QTRY_COMPARE(app.page(), QString("settings"));
         // The route's row says what the engine says of the route chosen.
         app.click(App::under(page, "settings-cat-privacy"));
         QCOMPARE(App::under(App::under(page, "set-route"), "route-note")->property("text").toString(),
@@ -1897,6 +1939,10 @@ private slots:
             QVERIFY2(box(act).left() >= box(app.item("lead-meta")).right() - 1, name);
             QVERIFY2(box(act).right() <= box(app.item("lead-picture")).left() + 1, name);
         }
+        // Resume is still the one filled button, at the strip's own height (32).
+        QVERIFY(app.item("lead-resume")->property("primary").toBool());
+        QVERIFY(!app.item("lead-resume")->property("quiet").toBool());
+        QCOMPARE(app.item("lead-resume")->height(), qreal(32));
         // Left and right go along them, and Enter does what is marked; the next
         // video to lead starts on Resume again.
         QTRY_VERIFY(app.item("shelves-home")->property("leadSelected").toBool());
@@ -1923,6 +1969,8 @@ private slots:
         QTRY_VERIFY(tall.item("lead")->isVisible());
         QTRY_VERIFY(box(tall.item("lead")).height() >= 200);
         QVERIFY(tall.item("lead-over")->isVisible());
+        QVERIFY(tall.item("lead-resume")->property("primary").toBool());
+        QCOMPARE(tall.item("lead-resume")->height(), qreal(36));
     }
 
     void aNarrowColumnFoldsTheSearchFieldIntoItsKey()
@@ -2020,17 +2068,6 @@ private slots:
         QVERIFY(row && next && prev);
         // The arrows are there when the shelf is pointed at, and only where there is more.
         QVERIFY(!next->isVisible() && !prev->isVisible());
-        // The categories are as wide as the channels' rail, which stands at the same edge,
-        // and the rows start a gutter beyond them.
-        QCOMPARE(box(App::under(page, "settings-cat-privacy")).width(), qreal(260));
-        QCOMPARE(box(App::under(page, "settings-cat-privacy")).left(), qreal(24));
-        QCOMPARE(left, box(App::under(page, "settings-cat-privacy")).right() + 24);
-        QTest::keyClick(app.window, Qt::Key_3);
-        QTRY_COMPARE(app.page(), QString("channels"));
-        QCOMPARE(box(app.item("channel-list")).width(), box(App::under(page, "settings-cat-privacy")).width());
-        QCOMPARE(box(app.item("channel-list")).left(), box(App::under(page, "settings-cat-privacy")).left());
-        QTest::keyClick(app.window, Qt::Key_5);
-        QTRY_COMPARE(app.page(), QString("settings"));
         app.hover(row);
         QTRY_VERIFY(next->isVisible());
         QVERIFY(!prev->isVisible());
@@ -2131,10 +2168,6 @@ private slots:
             return best ? best->property("videoId").toString() : QString();
         };
         QCOMPARE(first(shelf), QString("vid00000002"));
-        // Resume is still the one filled button, at the strip's own height (32).
-        QVERIFY(app.item("lead-resume")->property("primary").toBool());
-        QVERIFY(!app.item("lead-resume")->property("quiet").toBool());
-        QCOMPARE(app.item("lead-resume")->height(), qreal(32));
         QQuickItem *sort = App::under(shelf, "shelf-sort");
         QVERIFY(sort);
         QCOMPARE(sort->property("text").toString(), QString("Newest"));
@@ -2161,8 +2194,6 @@ private slots:
             QVERIFY(card->property("seconds").toInt() > 1800);
             QVERIFY(!QStringList({"vid00000001", "vid00000005", "vid00000004"}).contains(card->property("videoId").toString()));
         }
-        QVERIFY(tall.item("lead-resume")->property("primary").toBool());
-        QCOMPARE(tall.item("lead-resume")->height(), qreal(36));
         // The longest, and the shortest of the long.
         app.click(app.item("sort-longest"));
         QTRY_COMPARE(first(shelf), QString("vid00000006"));
@@ -2565,7 +2596,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_1);
         app.seeAll();
         QStringList said;
-        App::texts(app.item("feed-tabs"), said);
+        App::texts(app.item("feed-head"), said);
         QVERIFY2(said.contains("Shorts: off"), qPrintable(said.join("|")));
         QTest::keyClick(app.window, Qt::Key_5);
         QQuickItem *forget = app.item("forget-positions"), *note = app.item("set-resume-note");
@@ -2608,7 +2639,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_O);
         QQuickItem *grid = app.item("home-grid");
         QTRY_VERIFY(grid->isVisible());
-        QVERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QCOMPARE(app.item("feed-title")->property("text").toString(), QString("Latest from your channels"));
         QTest::keyClick(app.window, Qt::Key_S);
         QTRY_VERIFY(app.item("feed-sort")->property("opened").toBool());
         QTest::keyClick(app.window, Qt::Key_Escape);
@@ -2846,14 +2877,14 @@ private slots:
         QTRY_VERIFY(app.items("lens-row").at(1)->property("current").toBool());
         QTest::keyClick(app.window, Qt::Key_BracketLeft);
         QTRY_VERIFY(app.items("lens-row").at(0)->property("current").toBool());
-        // The full feed: along its tabs.
+        // The full feed has no tabs: the brackets change nothing there.
         QTest::keyClick(app.window, Qt::Key_1);
         app.seeAll();
-        QTRY_VERIFY(app.item("feed-tab-latest")->property("current").toBool());
         QTest::keyClick(app.window, Qt::Key_BracketRight);
-        QTRY_VERIFY(!app.item("feed-tab-latest")->property("current").toBool());
         QTest::keyClick(app.window, Qt::Key_BracketLeft);
-        QTRY_VERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QCOMPARE(app.page(), QString("home"));
+        QVERIFY(app.item("home-grid")->isVisible());
+        QCOMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0001"));
 
         // Under the help, the page keys do nothing; under a menu, Space picks.
         QTest::keyClick(app.window, '?');
@@ -3329,30 +3360,6 @@ private slots:
     }
 
     // --- What the review of the window found. ---
-
-    void homeShowsTheLensItsTabNames()
-    {
-        App app;
-        READY(app);
-        app.seeAll();
-        QTRY_VERIFY(app.item("feed-tab-aaaa0002"));
-        app.click(app.item("feed-tab-aaaa0002"));
-        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
-        // Another lens is opened on the lenses page...
-        QTest::keyClick(app.window, Qt::Key_2);
-        QTRY_COMPARE(app.items("lens-row").size(), 2);
-        app.click(app.items("lens-row").first());
-        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0001"));
-        // ...and home still shows the one its tab says.
-        QTest::keyClick(app.window, Qt::Key_1);
-        app.seeAll("aaaa0002");
-        QVERIFY(app.item("feed-tab-aaaa0002")->property("current").toBool());
-        QTRY_COMPARE(app.backend->lensInfo().value("id").toString(), QString("aaaa0002"));
-        QTRY_VERIFY(!app.items("card-why").isEmpty());
-        QVERIFY(app.items("card-why").first()->property("text").toString().contains("over 30:00"));
-        // Putting that right is no reason to search again.
-        QCOMPARE(app.asked("GET api/lens?id=aaaa0002&stream=1&refresh=2"), 0);
-    }
 
     void arrowsMoveThroughTheGridWhileAVideoIsInTheSmallWindow()
     {

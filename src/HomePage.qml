@@ -1,15 +1,12 @@
 import QtQuick
 import Qveil
 
-// Home. It opens on the shelves (see ShelvesHome); a shelf's heading opens
-// its feed in full: the grid, with a tab for the latest from the channels
-// you follow and one for each of your lenses.
+// Home. It opens on the shelves (see ShelvesHome); the latest shelf's heading
+// opens that feed in full: the grid. A lens's shelf leads to the Lenses page.
 FocusScope {
     id: page
 
-    // Which feed is showing: "latest", or a lens's id.
-    property string feed: "latest"
-    // Whether the shelves are showing, and not one feed in full.
+    // Whether the shelves are showing, and not the latest in full.
     property bool overview: true
     property string thumbs: "frosted"
     property bool shorts: false
@@ -25,34 +22,14 @@ FocusScope {
     property var arrangements: ({})
     property var watched: ({})
     signal arranged(string key, var setting)
-    readonly property bool onLens: feed !== "latest"
     readonly property bool noChannels: backend.feedInfo.channels === 0 && backend.subs.length === 0
-    readonly property bool loading: onLens ? backend.busy.indexOf("lens") >= 0
-        : (backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready)
-    // What is loading, or what is there.
-    readonly property string subheading: {
-        if (onLens) {
-            if (backend.lensTotal > 0 && backend.busy.indexOf("lens") >= 0)
-                return qsTr("Refreshing %1 of %2").arg(backend.lensDone).arg(backend.lensTotal)
-            return ""
-        }
-        // While it runs, how far the refresh is; it says more than the
-        // channel count, which it would only repeat.
+    readonly property bool loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
+    // What is loading, or what is there, in few words: the heading, over the
+    // shelf and over the feed in full, already says what it is.
+    readonly property string brief: {
+        // While it runs, how far the refresh is.
         if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
             return qsTr("Refreshing %1 of %2").arg(backend.refreshDone).arg(backend.refreshTotal)
-        const info = backend.feedInfo
-        if (!info.channels)
-            return ""
-        let s = qsTr("Latest from %n channels", "", info.channels)
-        if (info.errors && info.errors.length > 0)
-            s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
-        return s
-    }
-
-    // The same in few words, for the shelf, whose heading already says what it is.
-    readonly property string brief: {
-        if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
-            return subheading
         const info = backend.feedInfo
         if (!info.channels)
             return ""
@@ -73,10 +50,11 @@ FocusScope {
     signal refreshRequested()
     signal newLensRequested()
     signal addChannelRequested()
+    // A lens's shelf is opened in full: the Lenses page has it.
+    signal lensRequested(string id)
 
-    // One feed in full: "latest", or a lens's id.
-    function showAll(which) {
-        feed = which
+    // The latest from the channels, in full.
+    function showAll() {
         overview = false
         grid.forceActiveFocus()
     }
@@ -84,34 +62,10 @@ FocusScope {
         overview = true
         shelves.forceActiveFocus()
     }
-    // The tab before or after, in the full feed: Latest, then each lens.
-    function tabStep(by) {
-        if (overview)
-            return
-        const ids = ["latest"].concat(backend.lenses.map(l => l.id))
-        const at = Math.max(0, ids.indexOf(feed))
-        feed = ids[Math.max(0, Math.min(ids.length - 1, at + by))]
-    }
     function openSort() { overview ? shelves.openSort() : feedSort.open() }
     function openCurrent() { if (overview) shelves.openCurrent() }
     // Plays what the keyboard is on, on the shelves.
     function pickCurrent() { shelves.pickCurrent() }
-
-    // A lens that was removed is not a feed any more.
-    Connections {
-        target: backend
-        function onLensesChanged() {
-            if (page.onLens && !backend.lenses.some(l => l.id === page.feed))
-                page.feed = "latest"
-        }
-    }
-    // (`onLens` may not have caught up with `feed` yet when this runs.)
-    onFeedChanged: if (feed !== "latest") backend.openLens(feed, 1)
-    // There is one open lens, and the lenses page may have opened another
-    // meanwhile: coming back, the one this page's tab names is opened again
-    // (from what the engine has; that is no reason to search).
-    readonly property bool showing: visible && !overview
-    onShowingChanged: if (showing && feed !== "latest" && backend.lensInfo.id !== feed) backend.openLens(feed, 0)
 
     ShelvesHome {
         id: shelves
@@ -130,7 +84,7 @@ FocusScope {
         onResumed: (video, list, index) => page.resumed(video, list, index)
         onRestarted: (video, list, index) => page.restarted(video, list, index)
         onForgotten: kept => page.forgotten(kept)
-        onAllRequested: which => page.showAll(which)
+        onAllRequested: which => which === "latest" ? page.showAll() : page.lensRequested(which)
         onChannelRequested: id => page.channelRequested(id)
         onRefreshRequested: page.refreshRequested()
         onAddChannelRequested: page.addChannelRequested()
@@ -151,33 +105,30 @@ FocusScope {
         Column {
             width: parent.width
             spacing: Style.u
-            FeedTabs {
-                id: tabs
-                objectName: "feed-tabs"
+            FeedHead {
+                id: head
+                objectName: "feed-head"
                 width: parent.width
-                lenses: backend.lenses
-                current: page.feed
-                status: page.subheading
+                title: qsTr("Latest from your channels")
+                status: page.brief
                 onBack: page.showShelves()
-                onPicked: which => page.feed = which
-                onNewLens: page.newLensRequested()
 
                 SortMenu {
                     id: feedSort
                     objectName: "feed-sort"
-                    setting: page.arrangements[page.feed] || ({})
-                    sourceLabel: page.onLens ? qsTr("Best match") : qsTr("Newest")
-                    onChanged: setting => page.arranged(page.feed, setting)
+                    setting: page.arrangements.latest || ({})
+                    sourceLabel: qsTr("Newest")
+                    onChanged: setting => page.arranged("latest", setting)
                 }
                 Act {
-                    visible: !page.onLens && !page.noChannels
+                    visible: !page.noChannels
                     text: page.shorts ? qsTr("Shorts: on") : qsTr("Shorts: off")
                     quiet: true
                     tip: qsTr("Show or hide Shorts in the feed")
                     onClicked: page.shortsToggled(!page.shorts)
                 }
                 Act {
-                    visible: page.onLens || !page.noChannels
+                    visible: !page.noChannels
                     text: qsTr("Refresh")
                     glyph: "qrc:/icons/refresh.svg"
                     enabled: !page.loading
@@ -198,13 +149,12 @@ FocusScope {
         anchors.topMargin: Style.u * 2
         visible: !page.overview
         focus: !page.overview
-        source: page.onLens ? backend.lensVideos : backend.feed
-        arrange: page.arrangements[page.feed] || ({})
+        source: backend.feed
+        arrange: page.arrangements.latest || ({})
         watched: page.watched
         thumbs: page.thumbs
         progress: page.progress
-        estimateNote: page.onLens ? qsTr("Approximate: YouTube's search only says how long ago")
-                                  : qsTr("Approximate: YouTube's feed for this channel was unavailable")
+        estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
         onActivated: (video, index) => page.activated(video, index)
         onChannelRequested: id => page.channelRequested(id)
     }
@@ -212,11 +162,10 @@ FocusScope {
     EmptyState {
         anchors.fill: grid
         visible: !page.overview && !page.loading && grid.count === 0
-        text: page.onLens ? qsTr("Nothing fetched for this lens yet. Refresh runs its searches.")
-            : page.noChannels ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
+        text: page.noChannels ? qsTr("Add a channel, or drop a Google Takeout subscriptions.csv anywhere on this window.")
             : qsTr("Nothing here yet. Press R to refresh.")
         Act {
-            visible: !page.onLens && page.noChannels
+            visible: page.noChannels
             text: qsTr("Add a channel")
             filled: true
             onClicked: page.addChannelRequested()

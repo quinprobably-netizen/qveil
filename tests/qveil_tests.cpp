@@ -715,12 +715,12 @@ private slots:
         QVERIFY(!errorBar->property("visible").toBool());
 
         // Startup refreshes the feed, which the engine streams: how far it
-        // is shows in the subheading and in the bar, which then fills.
-        QTRY_VERIFY_WITH_TIMEOUT(feedPage->property("subheading").toString().startsWith("Refreshing "), 5000);
+        // is shows over the feed and in the bar, which then fills.
+        QTRY_VERIFY_WITH_TIMEOUT(feedPage->property("brief").toString().startsWith("Refreshing "), 5000);
         QVERIFY(progress->property("visible").toBool());
         QVERIFY(!progress->property("indeterminate").toBool());
         QTRY_VERIFY_WITH_TIMEOUT(progress->property("value").toDouble() > 0.4, 5000);
-        QTRY_COMPARE_WITH_TIMEOUT(feedPage->property("subheading").toString(), QString("Latest from 4 channels"), 8000);
+        QTRY_COMPARE_WITH_TIMEOUT(feedPage->property("brief").toString(), QString("4 channels"), 8000);
         QTRY_VERIFY_WITH_TIMEOUT(!progress->property("visible").toBool(), 5000);
 
         // The search page's line is the engine's, as sent.
