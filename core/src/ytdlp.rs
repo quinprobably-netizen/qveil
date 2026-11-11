@@ -45,6 +45,10 @@ const LIVE_UNSUPPORTED: &str =
     "Live streams aren't supported yet: they can't be relayed through your route.";
 const MANIFEST_ONLY: &str = "This video is only offered as an HLS/DASH stream, which can't be relayed through your route yet.";
 
+/// What an answer without a format to play ends with.
+const NOTHING_PLAYABLE: &str = "no playable format";
+const NO_URL: &str = "format has no URL";
+
 /// What a lookup that its caller gave up on (the window hung up) ends with.
 /// Nobody is left to read it; it is only the end of the call.
 pub const CANCELLED: &str = "The request was cancelled";
@@ -76,7 +80,8 @@ const SEARCH_ARGS: &str = "youtubetab:approximate_date;skip=webpage";
 /// the clients' own configuration pages, the page data and the `web`
 /// client are all left out, and the rest of yt-dlp's default clients are
 /// asked as they would have been. What the page data had is fetched apart,
-/// when it is wanted: see `chapters_of`.
+/// when it is wanted: see `chapters_of`. A video these clients can't play
+/// is asked for again the usual way: see `worth_the_usual_way`.
 const LOOKUP: &str =
     "youtube:skip=hls,dash;player_skip=webpage,configs,initial_data;player_client=default,-web";
 /// How a video's chapters are looked up: the page data, from YouTube's
@@ -485,23 +490,22 @@ impl Ytdlp {
         abort: &dyn Fn() -> bool,
     ) -> Result<Streams> {
         let args = ["-J", "--no-playlist", "-f", format];
-        let (found, quick) = match self.json_with(&args, Some(LOOKUP), url, RESOLVE, abort) {
-            // A yt-dlp whose only default client is `web` has nothing left to
-            // ask: then it is asked the usual way, page and all.
-            Err(e) if is_no_client(&e) => (
-                self.json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort),
-                false,
-            ),
-            found => (found, true),
-        };
-        match found {
-            Ok(v) => {
-                let mut s = streams_from(&v, url)?;
-                s.chapters_later = quick && s.chapters.is_empty();
-                Ok(s)
+        let quick = self.json_with(&args, Some(LOOKUP), url, RESOLVE, abort);
+        match quick.and_then(|v| streams_from(&v, url)) {
+            Ok(mut s) => {
+                s.chapters_later = s.chapters.is_empty();
+                return Ok(s);
             }
+            Err(e) if !worth_the_usual_way(&e) => return Err(e),
+            // Asked the usual way, page and all, below.
+            Err(_) => {}
+        }
+        let found = self
+            .json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort)
+            .and_then(|v| streams_from(&v, url));
+        match found {
             Err(e) if is_no_format(&e) => Err(self.explain_no_format(url, e, abort)),
-            Err(e) => Err(e),
+            found => found,
         }
     }
 
@@ -515,7 +519,12 @@ impl Ytdlp {
             "--skip-download",
             "--ignore-no-formats-error",
         ];
-        let v = self.json_with(&args, Some(CHAPTERS_LOOKUP), url, QUICK, abort)?;
+        let v = match self.json_with(&args, Some(CHAPTERS_LOOKUP), url, QUICK, abort) {
+            Err(e) if worth_the_usual_way(&e) => {
+                self.json_with(&args, Some(SKIP_MANIFESTS), url, QUICK, abort)?
+            }
+            found => found?,
+        };
         Ok(chapters(&v))
     }
 
@@ -605,9 +614,26 @@ fn is_no_format(e: &anyhow::Error) -> bool {
     })
 }
 
-fn is_no_client(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<Failed>()
-        .is_some_and(|f| f.raw.contains("No player clients have been requested"))
+/// Whether a quick lookup (see `LOOKUP`) that ended with `e` is worth
+/// asking again the usual way, page and all. yt-dlp asks more of YouTube
+/// when it has the page: a yt-dlp whose only default client is `web` has
+/// nothing left to ask without it, and a video made for kids is played by
+/// clients that yt-dlp only adds when the page says what it is (and those
+/// that the quick lookup asks can't play it). So whatever yt-dlp failed
+/// with, or a result with nothing playable in it, is asked again; but not a
+/// lookup that was given up on, or stopped, or ran out of time, or a route
+/// that is down, which the usual way would only wait for again, nor a live
+/// stream, which neither can play.
+fn worth_the_usual_way(e: &anyhow::Error) -> bool {
+    if let Some(f) = e.downcast_ref::<Failed>() {
+        return !matches!(
+            crate::errors::explain(&f.raw).code,
+            crate::errors::Code::TorDown | crate::errors::Code::ProxyRefused
+        );
+    }
+    // What `streams_from` found in an answer.
+    let said = e.to_string();
+    said == NOTHING_PLAYABLE || said == NO_URL
 }
 
 fn is_live(v: &Value) -> bool {
@@ -652,7 +678,7 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
         .copied()
         .find(is_video)
         .or(formats.first().copied())
-        .context("no playable format")?;
+        .context(NOTHING_PLAYABLE)?;
     let audio_fmt = formats.iter().find(|f| !is_video(f));
     let audio = audio_fmt.and_then(|f| f["url"].as_str()).map(String::from);
     // yt-dlp attaches the cookies of its in-memory jar that match the URL.
@@ -681,10 +707,7 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
         channel: str_field(v, &["channel", "uploader"]),
         channel_id: str_field(v, &["channel_id"]).filter(|c| ids::is_channel_id(c)),
         duration,
-        video: video_fmt["url"]
-            .as_str()
-            .context("format has no URL")?
-            .into(),
+        video: video_fmt["url"].as_str().context(NO_URL)?.into(),
         audio,
         headers,
         description,
@@ -1164,6 +1187,102 @@ echo '{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"}
         assert_eq!(spied(&dir, "calls"), "quick\nusual\n");
     }
 
+    /// A yt-dlp whose quick lookup (the player answer only, see `LOOKUP`)
+    /// ends with `quick`, a line of shell, and whose lookup the usual way,
+    /// page and all, answers with a playable video. Each call is logged as
+    /// `quick` or `usual`.
+    fn quick_then_usual(dir: &TempDir, quick: &str) -> Ytdlp {
+        ytdlp(
+            script(
+                &dir.0.join("yt-dlp"),
+                &format!(
+                    r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+if grep -q "player_skip=webpage" "$conf"; then
+  echo quick >> "$(dirname "$0")/calls"
+  {quick}
+fi
+echo usual >> "$(dirname "$0")/calls"
+echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1","duration":600,"chapters":[{{"start_time":0,"title":"Intro"}}]}}'"#
+                ),
+            ),
+            None,
+        )
+    }
+
+    /// A video made for kids, among others, is only played by the clients
+    /// that yt-dlp adds when the watch page says so, and the quick lookup
+    /// has no page: whatever it fails with (but being given up on), the
+    /// video is looked up again the usual way.
+    #[test]
+    fn a_video_the_quick_lookup_cannot_play_is_looked_up_the_usual_way() {
+        for quick in [
+            // What visionos says of a video made for kids, more or less.
+            "echo 'ERROR: [youtube] x: Video unavailable. This video is not available' >&2; exit 1",
+            "echo 'ERROR: [youtube] x: Sign in to confirm your age. This video may be inappropriate for some users.' >&2; exit 1",
+            // Nothing playable left once the unplayable clients are dropped.
+            "echo 'ERROR: [youtube] x: Requested format is not available. Use --list-formats for a list of available formats' >&2; exit 1",
+            "echo 'ERROR: [youtube] x: No video formats found!' >&2; exit 1",
+            // An answer without a playable format in it.
+            r#"echo '{"title":"T","requested_formats":[]}'; exit 0"#,
+        ] {
+            let dir = TempDir::new();
+            let yt = quick_then_usual(&dir, quick);
+            let s = yt
+                .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
+                .unwrap_or_else(|e| panic!("{quick}: {e:#}"));
+            assert_eq!(s.video, "https://gv.test/c", "{quick}");
+            // The page was in it, chapters and all.
+            assert!(!s.chapters_later, "{quick}");
+            assert_eq!(spied(&dir, "calls"), "quick\nusual\n", "{quick}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_given_up_on_or_a_route_that_is_down_is_not_looked_up_again() {
+        let dir = TempDir::new();
+        let yt = quick_then_usual(&dir, "sleep 30");
+        let started = Instant::now();
+        let err = yt
+            .resolve_until("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b", &|| {
+                started.elapsed() > Duration::from_millis(300)
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), CANCELLED);
+        assert_eq!(spied(&dir, "calls"), "quick\n");
+
+        let dir = TempDir::new();
+        let mut yt = quick_then_usual(
+            &dir,
+            "echo 'ERROR: [youtube] x: Unable to download API page: [Errno 111] Connection refused' >&2; exit 1",
+        );
+        yt.net = Net::new(Some(TOR_PROXY.into()), true).unwrap();
+        let err = yt
+            .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
+            .unwrap_err();
+        assert!(err.to_string().contains("Tor"), "{err}");
+        assert_eq!(spied(&dir, "calls"), "quick\n");
+    }
+
+    #[test]
+    fn chapters_the_quick_lookup_cannot_have_are_looked_up_the_usual_way() {
+        let dir = TempDir::new();
+        let yt = quick_then_usual(
+            &dir,
+            "echo 'ERROR: [youtube] x: Video unavailable. This video is not available' >&2; exit 1",
+        );
+        let found = yt
+            .chapters_of("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &|| false)
+            .unwrap();
+        assert_eq!(
+            found,
+            [Chapter {
+                start: 0,
+                title: "Intro".into()
+            }]
+        );
+        assert_eq!(spied(&dir, "calls"), "quick\nusual\n");
+    }
+
     #[test]
     fn chapters_are_looked_up_from_the_watch_data_without_the_page_or_the_streams() {
         let dir = TempDir::new();
@@ -1286,7 +1405,9 @@ echo '{"is_live":true}'"#,
         assert_eq!(err.to_string(), LIVE_UNSUPPORTED);
         let calls = spied(&dir, "calls");
         let calls: Vec<_> = calls.lines().collect();
-        assert_eq!(calls, ["skipped", "full"]);
+        // The quick lookup, the usual one (which finds no format either),
+        // and the one that says why.
+        assert_eq!(calls, ["skipped", "skipped", "full"]);
     }
 
     #[test]

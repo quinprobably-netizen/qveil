@@ -76,7 +76,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.
 - You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.
 - Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.
-- Playing a video asks YouTube for its streams and not for its watch page, so chapters that its description doesn't name are fetched only when you open the Chapters tab, as one more lookup of that video.
+- Playing a video asks YouTube for its streams and not for its watch page (unless they can't be played without it, as with a video made for kids: then they are asked for again, page and all, with the same identity), so chapters that its description doesn't name are fetched only when you open the Chapters tab, as one more lookup of that video.
 - A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing): on one address their timing links them, and even over Tor a set of related searches can be linked by content.
 - Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.
 
