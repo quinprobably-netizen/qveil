@@ -1176,6 +1176,31 @@ private slots:
         }
     }
 
+    void aLensTabIsCutByTheRoomThereIsAndNotBeforeThat()
+    {
+        {
+            // Plenty of room: the whole sentence, whatever its length.
+            App app;
+            READY(app);
+            QTest::keyClick(app.window, Qt::Key_2);
+            QTRY_COMPARE(app.items("lens-row").size(), 2);
+            for (QQuickItem *tab : app.items("lens-row"))
+                QVERIFY2(!tab->property("cut").toBool(), qPrintable(tab->property("text").toString()));
+            QCOMPARE(app.items("lens-row").first()->property("text").toString(), QString("slow woodworking with hand tools, no music"));
+            QVERIFY(app.items("lens-row").first()->width() > 300);
+        }
+        {
+            // Twelve of them: each is cut to share what there is, and the row scrolls from there.
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LENSES", "12"}});
+            READY(app);
+            QTest::keyClick(app.window, Qt::Key_2);
+            QTRY_COMPARE(app.items("lens-row").size(), 12);
+            QVERIFY(app.items("lens-row").last()->property("cut").toBool());
+            for (QQuickItem *tab : app.items("lens-row"))
+                QVERIFY2(tab->width() <= 141, qPrintable(QString::number(tab->width())));
+        }
+    }
+
     void settingsChangeTheEngineAndUseItsWords()
     {
         App app;

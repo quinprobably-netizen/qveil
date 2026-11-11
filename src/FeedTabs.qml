@@ -1,5 +1,6 @@
 import QtQuick
 import Qveil
+import "Format.js" as Format
 
 // What the home page shows: the latest from the channels you follow, or one
 // of your lenses. At the far end, the things that act on it.
@@ -19,6 +20,18 @@ Item {
     signal newLens()
 
     implicitHeight: Style.control
+
+    // How wide a lens's tab may be: the words of the lenses, cut by the room
+    // there is for them between the other tabs and the actions.
+    FontMetrics {
+        id: tabFont
+        font.family: Style.font
+        font.pixelSize: Style.body
+        font.weight: Style.strong
+    }
+    readonly property real tabLimit: Format.tabLimit(
+        tabs.lenses.map(l => Math.ceil(tabFont.advanceWidth(l.text)) + 14 + Style.u * 2 + Style.u * 6),
+        tabs.width - home.width - latest.width - fresh.width - tail.width - note.width - Style.u * 8, 140)
 
     // Latest, then the lenses (which scroll sideways when there are more
     // than fit), then the way to a new one, which is never pushed out of reach.
@@ -62,8 +75,9 @@ Item {
                     delegate: TabWord {
                         required property var modelData
                         objectName: "feed-tab-" + modelData.id
-                        // A lens can be a long sentence; its tab is the start of it.
-                        text: modelData.text.length > 26 ? modelData.text.slice(0, 25) + "\u2026" : modelData.text
+                        // A lens can be a long sentence; its tab is the start of it, as much as there is room for.
+                        text: modelData.text
+                        limit: tabs.tabLimit
                         glyph: "qrc:/icons/lens.svg"
                         underlined: true
                         current: tabs.current === modelData.id

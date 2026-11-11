@@ -9,6 +9,24 @@ function clock(seconds) {
     return h > 0 ? h + ":" + pad(m) + ":" + pad(r) : m + ":" + pad(r)
 }
 
+// How wide a row of tabs may let each be, so that they all fit in `room`: the
+// short ones keep the width they need, and the long ones share what is left,
+// all cut to one width, though never to less than `least`. (Infinity when they
+// all fit.) `wanted` is the width each needs.
+function tabLimit(wanted, room, least) {
+    if (wanted.reduce((sum, w) => sum + w, 0) <= room)
+        return Infinity
+    const sorted = wanted.slice().sort((a, b) => a - b)
+    let left = room
+    for (let i = 0; i < sorted.length; i++) {
+        const share = left / (sorted.length - i)
+        if (sorted[i] > share)
+            return Math.max(least, Math.floor(share))
+        left -= sorted[i]
+    }
+    return Infinity
+}
+
 // "3 days ago". Whether a date is only approximate is said where it is shown
 // (a tooltip), not in the text: a "~" in front reads as noise.
 function age(timestamp) {

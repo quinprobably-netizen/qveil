@@ -1,5 +1,6 @@
 import QtQuick
 import Qveil
+import "Format.js" as Format
 
 // Lenses: feeds described in words. They are a strip along the top; under it
 // the one that is open: its words, how they read, what a refresh asks for,
@@ -91,6 +92,17 @@ FocusScope {
         anchors.topMargin: Style.u * 2
         height: Style.control + Style.u
 
+        // How wide a tab may be: the words of the lenses, cut by the room there is for them.
+        FontMetrics {
+            id: tabFont
+            font.family: Style.font
+            font.pixelSize: Style.body
+            font.weight: Style.strong
+        }
+        readonly property real tabLimit: Format.tabLimit(
+            backend.lenses.map(l => Math.ceil(tabFont.advanceWidth(l.text)) + Style.u * 6),
+            width - fresh.width - Style.u * 3, 140)
+
         Flickable {
             id: strip
             objectName: "lens-list"
@@ -112,8 +124,9 @@ FocusScope {
                         objectName: "lens-row"
                         underlined: true
                         activeFocusOnTab: false
-                        // A lens can be a long sentence; its tab is the start of it.
-                        text: modelData.text.length > 34 ? modelData.text.slice(0, 33) + "\u2026" : modelData.text
+                        // A lens can be a long sentence; its tab is the start of it, as much as there is room for.
+                        text: modelData.text
+                        limit: head.tabLimit
                         current: page.current === modelData.id
                         onClicked: page.show(modelData.id)
                         // The open one is kept in view.
