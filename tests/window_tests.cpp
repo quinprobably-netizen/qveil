@@ -1483,7 +1483,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && !surface->property("pending").toBool(), 15000);
         QVERIFY(app.window->property("watching").toBool());
         QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000002"));
-        // (What the window asked of the player: the stand-in's stream can't be seeked, so how far it gets is its own.)
+        // (What the window asked of the player: it starts from where the video was, give or take what the player's seek lands on.)
         const double at = surface->property("startedAt").toDouble();
         QVERIFY2(at >= 38 && at < 100, qPrintable(QString::number(at)));
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
@@ -1532,11 +1532,12 @@ private slots:
         QQuickItem *main = app.item("surface");
         QObject *mainMpv = main->property("mpv").value<QObject *>();
         QTRY_VERIFY_WITH_TIMEOUT(mainMpv && mainMpv->property("started").toBool(), 15000);
+        const int notedBeforeSeek = app.asked("POST api/resume");
         QMetaObject::invokeMethod(main, "seekTo", Q_ARG(QVariant, 40));
         QTRY_VERIFY_WITH_TIMEOUT(mainMpv->property("position").toDouble() >= 40, 10000);
         QTRY_VERIFY(!mainMpv->property("buffering").toBool());
-        // (Where a seek got to is told once it has rested.)
-        QTest::qWait(1000);
+        // (Where a seek got to is told once it has rested: wait for that note, so none is left to come in under the checks below.)
+        QTRY_VERIFY_WITH_TIMEOUT(app.asked("POST api/resume") > notedBeforeSeek, 10000);
         // What opening the video asks of the engine: a lookup, and its stream.
         const int looked = app.asked("POST api/play"), streamed = app.asked("GET s/");
         QVERIFY(streamed >= 1);
