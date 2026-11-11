@@ -1303,7 +1303,7 @@ private slots:
         const auto playing = [](App &app) { return app.item("surface")->property("info").toMap().value("id").toString(); };
         {
             // From a list: Replay beside a primary Next, with its key, and nothing is started.
-            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_NO_RANGES", "1"}});
             READY(app);
             QMetaObject::invokeMethod(app.window, "playListed", Q_ARG(QVariant, QString("Latest from your channels")),
                                       Q_ARG(QVariant, app.backend->feed()->get(0)), Q_ARG(QVariant, QVariant::fromValue<QObject *>(app.backend->feed())),
@@ -1337,7 +1337,7 @@ private slots:
         }
         {
             // With no list, or at the end of it: Replay alone, filled, as it was.
-            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_NO_RANGES", "1"}});
             READY(app);
             app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
             playToTheEnd(app);
