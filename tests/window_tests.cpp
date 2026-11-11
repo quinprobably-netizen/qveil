@@ -1156,6 +1156,26 @@ private slots:
         QCOMPARE(box(del).right(), qreal(1280 - 24) + pad);
     }
 
+    void theChannelsPaneHeadingStandsOverItsFirstPicture()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        for (const QSize size : {QSize(1280, 720), QSize(1920, 1080)}) {
+            App app(false, size);
+            READY(app);
+            QTRY_COMPARE(app.backend->feed()->count(), 12);
+            QTest::keyClick(app.window, Qt::Key_3);
+            QTRY_COMPARE(app.page(), QString("channels"));
+            QQuickItem *pane = nullptr;
+            QTRY_VERIFY((pane = app.item("channel-pane")) && pane->property("count").toInt() == 3);
+            QQuickItem *name = app.item("channel-pane-name");
+            QTRY_VERIFY(App::under(pane, "frost"));
+            QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+            const qreal picture = box(App::under(pane, "frost")).left();
+            // (The heading's own text has no side bearing to speak of; a pixel is allowed for it.)
+            QVERIFY2(qAbs(box(name).left() - picture) <= 1, qPrintable(QString("%1 vs %2 at %3").arg(box(name).left()).arg(picture).arg(size.width())));
+        }
+    }
+
     void settingsChangeTheEngineAndUseItsWords()
     {
         App app;

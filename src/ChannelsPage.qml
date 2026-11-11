@@ -269,7 +269,8 @@ FocusScope {
             id: paneHead
             anchors.left: parent.left
             anchors.right: parent.right
-            anchors.leftMargin: Style.u * 2
+            // Where the first picture starts: the grid's margin, and its cards' own.
+            anchors.leftMargin: pane.leftMargin + Style.u * 2
             anchors.rightMargin: Style.gutter
             height: Style.control + Style.u
             Text {
