@@ -204,9 +204,19 @@ FocusScope {
                 Act {
                     id: leave
                     objectName: "unsubscribe"
+                    // Under the pointer the row is hovered until this shows,
+                    // and then this is: what it is shown for changes as it is
+                    // shown, so it is shown a moment after, not in a loop.
+                    readonly property bool wanted: area.containsMouse || hot || row.arming
+                    onWantedChanged: showing.restart()
+                    Timer {
+                        id: showing
+                        interval: 0
+                        onTriggered: leave.visible = leave.wanted
+                    }
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    visible: area.containsMouse || hot || row.arming
+                    visible: false
                     text: row.arming ? qsTr("Unsubscribe?") : qsTr("Unsubscribe")
                     quiet: !row.arming
                     onClicked: {
