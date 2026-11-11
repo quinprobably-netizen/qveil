@@ -171,13 +171,14 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 | `/` | Search |
 | `1` `2` `3` `4` `5` | Home, lenses, channels, history, settings |
 | Arrows or `h` `j` `k` `l`, `Enter` | Move and play |
-| `S` | Sort and filter what the keyboard is on |
+| `Enter` | Play or open what is marked |
+| `S` | Sort and filter what the keyboard is on (`Space` or `Enter` picks) |
 | `O` | Open the shelf in full |
 | `R` | Refresh what is showing |
 | `P` | Route |
-| `Space` | Play or pause |
+| `Space` / `K` | Play or pause (`K` while the video has the keyboard) |
 | `←` `→` / `J` `L` | Back or forward 5 / 10 seconds |
-| `[` `]` | Previous or next chapter |
+| `[` `]` | Previous or next chapter; while browsing, the tab before or after (lenses, the full feed, the side sheet) |
 | `<` `>` | Slower or faster |
 | `↑` `↓` | Volume |
 | `M` | Mute |

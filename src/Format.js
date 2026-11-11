@@ -42,12 +42,13 @@ function views(n) {
     return qsTr("%1 views").arg(n)
 }
 
-function meta(video, date) {
+// `brief`: the count of views without the word, for where the word won't fit.
+function meta(video, date, brief) {
     const parts = []
     const when = age(date)
     if (when)
         parts.push(when)
-    const v = views(video.views)
+    const v = brief ? views(video.views).replace(/\s*\S+$/, "") : views(video.views)
     if (v)
         parts.push(v)
     return parts.join("  ·  ")

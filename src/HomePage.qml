@@ -82,6 +82,14 @@ FocusScope {
         overview = true
         shelves.forceActiveFocus()
     }
+    // The tab before or after, in the full feed: Latest, then each lens.
+    function tabStep(by) {
+        if (overview)
+            return
+        const ids = ["latest"].concat(backend.lenses.map(l => l.id))
+        const at = Math.max(0, ids.indexOf(feed))
+        feed = ids[Math.max(0, Math.min(ids.length - 1, at + by))]
+    }
     function openSort() { overview ? shelves.openSort() : feedSort.open() }
     function openCurrent() { if (overview) shelves.openCurrent() }
     // Plays what the keyboard is on, on the shelves.

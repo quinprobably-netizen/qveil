@@ -15,31 +15,31 @@ Popup {
             keys: [
                 [["/", "Ctrl+L"], qsTr("Search")],
                 [["1", "2", "3", "4", "5"], qsTr("Home, lenses, channels, history, settings")],
-                [["H", "J", "K", "L"], qsTr("Move, like the arrows (while browsing)")],
-                [["S"], qsTr("Sort and filter what the keyboard is on")],
+                [["H", "J", "K", "L"], qsTr("Move, like the arrows")],
+                [["Enter"], qsTr("Play or open what is marked")],
+                [["[", "]"], qsTr("Tab before or after")],
+                [["S"], qsTr("Sort and filter")],
                 [["O"], qsTr("Open the shelf in full")],
-                [["U"], qsTr("Unsubscribe (on the channels page; asked twice)")],
-                [["R"], qsTr("Refresh what is showing")],
+                [["U"], qsTr("Unsubscribe, on Channels (twice)")],
+                [["R"], qsTr("Refresh")],
                 [["P"], qsTr("Route")],
                 [["Esc"], qsTr("Back")],
-                [["?"], qsTr("This help")],
-                [["Q"], qsTr("Quit")],
+                [["?", "Q"], qsTr("This help; quit")],
             ]
         },
         {
             title: qsTr("Playing"),
             keys: [
-                [["Space"], qsTr("Play or pause (browsing: play the selected video)")],
-                [["Left", "Right"], qsTr("Back or forward 5 seconds")],
-                [["J", "L"], qsTr("Back or forward 10 seconds")],
-                [["[", "]"], qsTr("Previous or next chapter")],
+                [["Space", "K"], qsTr("Play or pause")],
+                [["Left", "Right"], qsTr("5 seconds back or on")],
+                [["J", "L"], qsTr("10 seconds back or on")],
+                [["[", "]"], qsTr("Chapter before or after")],
                 [["<", ">"], qsTr("Slower or faster")],
                 [["Up", "Down"], qsTr("Volume")],
                 [["M"], qsTr("Mute")],
                 [["I"], qsTr("Picture in picture, and back")],
-                [["T"], qsTr("Theatre")],
-                [["F"], qsTr("Fullscreen")],
-                [["C"], qsTr("Comments, with the keyboard in the sheet (Esc gives it back)")],
+                [["T", "F"], qsTr("Theatre; fullscreen")],
+                [["C"], qsTr("Comments (Esc gives the keys back)")],
                 [["N"], qsTr("Next video")],
             ]
         },
@@ -123,7 +123,7 @@ Popup {
                             delegate: Item {
                                 required property var modelData
                                 width: group.width
-                                height: Style.control - 6
+                                height: Math.max(Style.control - 6, said.implicitHeight + 4)
                                 Text {
                                     width: 96
                                     anchors.verticalCenter: parent.verticalCenter
@@ -134,12 +134,15 @@ Popup {
                                     font.pixelSize: Style.small
                                 }
                                 Text {
+                                    id: said
+                                    objectName: "help-said"
                                     x: 104
                                     width: parent.width - 104
                                     anchors.verticalCenter: parent.verticalCenter
                                     text: modelData[1]
                                     textFormat: Text.PlainText
-                                    elide: Text.ElideRight
+                                    // (Wrapped, never cut: a key nobody can read the use of is no use.)
+                                    wrapMode: Text.Wrap
                                     color: Style.fg
                                     font.family: Style.font
                                     font.pixelSize: Style.small

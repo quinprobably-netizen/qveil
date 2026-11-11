@@ -327,14 +327,17 @@ FocusScope {
                 width: parent.width
                 height: Style.control + Style.u
                 Row {
+                    id: leftControls
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.u * 2
                     Act {
+                        id: playAct
                         glyph: mpv.paused || mpv.ended ? "qrc:/icons/play.svg" : "qrc:/icons/pause.svg"
                         onClicked: mpv.togglePause()
                     }
                     Text {
+                        id: timeText
                         anchors.verticalCenter: parent.verticalCenter
                         text: bar.time
                         textFormat: Text.PlainText
@@ -344,8 +347,13 @@ FocusScope {
                     }
                     Text {
                         objectName: "seek-chapter"
+                        // What is left beside the controls at the right; too little, and it steps aside.
+                        readonly property real room: leftControls.parent.width - rightControls.width - playAct.width
+                            - timeText.width - 2 * leftControls.spacing - Style.u * 4
                         anchors.verticalCenter: parent.verticalCenter
-                        visible: text !== "" && !surface.compact
+                        width: Math.max(0, Math.min(implicitWidth, room))
+                        elide: Text.ElideRight
+                        visible: text !== "" && !surface.compact && room >= 80
                         text: bar.chapterText
                         textFormat: Text.PlainText
                         color: Style.dim
@@ -354,10 +362,12 @@ FocusScope {
                     }
                 }
                 Row {
+                    id: rightControls
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.u
                     Act {
+                        objectName: "seek-speed"
                         visible: !surface.compact
                         text: (Math.round(mpv.speed * 100) / 100) + "x"
                         tip: qsTr("Speed (< >)")

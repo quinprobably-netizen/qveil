@@ -2410,6 +2410,101 @@ private slots:
         QCOMPARE(channels(), before);
     }
 
+    void bracketsChangeTheTabAndNothingActsUnderAMenu()
+    {
+        App app;
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        // Lenses: ] and [ go along the strip of lenses.
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.items("lens-row").size(), 2);
+        QTRY_VERIFY(app.items("lens-row").at(0)->property("current").toBool());
+        QTest::keyClick(app.window, Qt::Key_BracketRight);
+        QTRY_VERIFY(app.items("lens-row").at(1)->property("current").toBool());
+        QTest::keyClick(app.window, Qt::Key_BracketLeft);
+        QTRY_VERIFY(app.items("lens-row").at(0)->property("current").toBool());
+        // The full feed: along its tabs.
+        QTest::keyClick(app.window, Qt::Key_1);
+        app.seeAll();
+        QTRY_VERIFY(app.item("feed-tab-latest")->property("current").toBool());
+        QTest::keyClick(app.window, Qt::Key_BracketRight);
+        QTRY_VERIFY(!app.item("feed-tab-latest")->property("current").toBool());
+        QTest::keyClick(app.window, Qt::Key_BracketLeft);
+        QTRY_VERIFY(app.item("feed-tab-latest")->property("current").toBool());
+
+        // Under the help, the page keys do nothing; under a menu, Space picks.
+        QTest::keyClick(app.window, '?');
+        QObject *help = app.object("help");
+        QTRY_VERIFY(help->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_2);
+        QCOMPARE(app.page(), QString("home"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!help->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_S);
+        QQuickItem *sort = app.item("feed-sort");
+        QTRY_VERIFY(sort->property("opened").toBool());
+        // (To the top first: the menu opens on the order that holds.)
+        for (int i = 0; i < 5; ++i)
+            QTest::keyClick(app.window, Qt::Key_K);
+        // (Down to Most viewed: an option the list's own order makes the same as another isn't shown.)
+        for (int i = 0; i < 5 && !app.item("sort-views")->property("marked").toBool(); ++i)
+            QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_VERIFY(app.item("sort-views")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_Space);
+        QTRY_VERIFY(sort->property("text").toString().contains("Most viewed"));
+        QVERIFY(!app.window->property("watching").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!sort->property("opened").toBool());
+
+        // Watching, with the keyboard in the sheet: [ and ] change its tab.
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::keyClick(app.window, Qt::Key_C);
+        QQuickItem *sheet = app.item("sheet");
+        QTRY_COMPARE(sheet->property("current").toString(), QString("comments"));
+        QTest::keyClick(app.window, Qt::Key_BracketLeft);
+        QTRY_COMPARE(sheet->property("current").toString(), QString("next"));
+    }
+
+    void nothingIsCutOrOverlappedInTheQuarterTile()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        // The help: every line whole, and it fits.
+        QTest::keyClick(app.window, '?');
+        QObject *help = app.object("help");
+        QTRY_VERIFY(help->property("opened").toBool());
+        QTest::qWait(250);
+        for (QQuickItem *said : app.items("help-said"))
+            QVERIFY2(!said->property("truncated").toBool() && said->property("lineCount").toInt() <= 2,
+                     qPrintable(said->property("text").toString()));
+        const QRectF sheet = box(help->property("background").value<QQuickItem *>());
+        QVERIFY2(sheet.bottom() <= 508 && sheet.top() >= 0, qPrintable(QString::number(sheet.height())));
+        const QStringList listed = help->property("listed").toStringList();
+        for (const char *key : {"Enter", "[", "]", "K", "S", "O", "U", "N", "C"})
+            QVERIFY2(listed.contains(key), key);
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!help->property("opened").toBool());
+
+        // Watching: the chapter's name stops before the speed; Up next's lines are whole.
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QQuickItem *surface = app.item("surface");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        QQuickItem *chapter = App::under(surface, "seek-chapter"), *speed = App::under(surface, "seek-speed");
+        QVERIFY(chapter && speed);
+        QTRY_VERIFY(!chapter->property("text").toString().isEmpty());
+        if (chapter->isVisible())
+            QVERIFY2(box(chapter).right() <= box(speed).left(), qPrintable(QString("%1 > %2").arg(box(chapter).right()).arg(box(speed).left())));
+        QTRY_VERIFY(app.items("next-meta").size() >= 3);
+        for (QQuickItem *meta : app.items("next-meta"))
+            QVERIFY2(!meta->property("truncated").toBool(), qPrintable(meta->property("text").toString()));
+    }
+
     void leftLeavesTheChannelPaneOnlyFromItsEdge()
     {
         App app(false, QSize(1280, 720));

@@ -56,6 +56,18 @@ ApplicationWindow {
     // Where a channel's page was opened from.
     property string channelFrom: "home"
     readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
+    // While the help or a menu is open, the keys are theirs (Esc and ? aside).
+    readonly property bool quiet: help.opened || openMenu !== null
+    function tabStep(by) {
+        if (steering)
+            player.chapterStep(by > 0)
+        else if (watching && watch.inSheet)
+            watch.sheet.turn(by)
+        else if (!watching && page === "lenses")
+            lensesPage.step(by)
+        else if (!watching && page === "home")
+            feedPage.tabStep(by)
+    }
     readonly property var pages: ({ home: feedPage, search: searchPage, channel: channelPage,
                                     channels: subsPage, history: historyPage,
                                     lenses: lensesPage, settings: settingsPage })
@@ -386,33 +398,37 @@ ApplicationWindow {
     Shortcut { sequences: ["/", "Ctrl+L"]; context: Qt.ApplicationShortcut; enabled: !win.typing || sequence === "Ctrl+L"; onActivated: search.edit() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.goBack() }
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: help.opened ? help.close() : help.open() }
-    Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: Qt.quit() }
-    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.playing ? player.mpv.togglePause() : win.playCurrent() }
-    Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("home") }
-    Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("lenses") }
-    Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("channels") }
-    Shortcut { sequence: "4"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("history") }
-    Shortcut { sequence: "5"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.go("settings") }
-    Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.watching; onActivated: win.refresh() }
-    Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.toggleRoute() }
-    Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: win.toggleFullscreen() }
-    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.mpv.muted = !player.mpv.muted }
-    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(-5) }
-    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(5) }
-    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(-10) }
-    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: player.nudge(10) }
-    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
-    Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: win.togglePip() }
-    Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.theatre = !watch.theatre }
-    Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.enterSheet("comments") }
-    Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.watching; onActivated: { const p = win.pages[win.page]; if (p && p.openSort) p.openSort() } }
-    Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.watching && win.page === "home"; onActivated: feedPage.openCurrent() }
-    Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.watching; onActivated: watch.playNext() }
-    Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(false) }
-    Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.chapterStep(true) }
-    Shortcut { sequence: "<"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.speedStep(false) }
-    Shortcut { sequence: ">"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.playing; onActivated: player.speedStep(true) }
-    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && win.steering; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
+    Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: Qt.quit() }
+    Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.playing ? player.mpv.togglePause() : win.playCurrent() }
+    Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.go("home") }
+    Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.go("lenses") }
+    Shortcut { sequence: "3"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.go("channels") }
+    Shortcut { sequence: "4"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.go("history") }
+    Shortcut { sequence: "5"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.go("settings") }
+    Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && !win.watching; onActivated: win.refresh() }
+    Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.toggleRoute() }
+    Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.watching; onActivated: win.toggleFullscreen() }
+    Shortcut { sequence: "M"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.playing; onActivated: player.mpv.muted = !player.mpv.muted }
+    Shortcut { sequence: "Left"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.nudge(-5) }
+    Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.nudge(5) }
+    Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.nudge(-10) }
+    Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.nudge(10) }
+    Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
+    Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.playing; onActivated: win.togglePip() }
+    Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.watching; onActivated: watch.theatre = !watch.theatre }
+    Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.watching; onActivated: watch.enterSheet("comments") }
+    Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && !win.watching; onActivated: { const p = win.pages[win.page]; if (p && p.openSort) p.openSort() } }
+    Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && !win.watching && win.page === "home"; onActivated: feedPage.openCurrent() }
+    Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.watching; onActivated: watch.playNext() }
+    // [ and ]: the chapter before or after while the video has the keyboard;
+    // otherwise the tab before or after (lenses, the full feed, the sheet).
+    Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.tabStep(-1) }
+    Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.tabStep(1) }
+    // K pauses and plays, as it does on YouTube, while the video has the keyboard.
+    Shortcut { sequence: "K"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.mpv.togglePause() }
+    Shortcut { sequence: "<"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.playing; onActivated: player.speedStep(false) }
+    Shortcut { sequence: ">"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.playing; onActivated: player.speedStep(true) }
+    Shortcut { sequence: "Down"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: { player.mpv.volume = player.mpv.volume - 5; player.reveal() } }
 
     // Mirrors for right-to-left languages. A top-level window ignores the
     // application's layout direction.

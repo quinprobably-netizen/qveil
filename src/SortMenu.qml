@@ -156,7 +156,7 @@ Act {
                     step(1)
                 else if (event.key === Qt.Key_K || event.key === Qt.Key_Up)
                     step(-1)
-                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
                     const there = option(at)
                     if (there)
                         there.picked()

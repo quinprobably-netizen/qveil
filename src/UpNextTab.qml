@@ -124,9 +124,20 @@ ListView {
                 font.pixelSize: Style.small
             }
             Text {
+                id: metaLine
+                objectName: "next-meta"
+                readonly property var when: entry.modelData.video.date || entry.modelData.video.published || 0
+                readonly property string whole: Format.meta(entry.modelData.video, when)
                 width: parent.width
                 visible: text !== ""
-                text: Format.meta(entry.modelData.video, entry.modelData.video.date || entry.modelData.video.published || 0)
+                // Without the word "views" where all of it won't fit.
+                text: fits.width <= width ? whole : Format.meta(entry.modelData.video, when, true)
+                TextMetrics {
+                    id: fits
+                    font.family: Style.font
+                    font.pixelSize: Style.small
+                    text: metaLine.whole
+                }
                 textFormat: Text.PlainText
                 elide: Text.ElideRight
                 color: Style.faint

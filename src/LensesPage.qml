@@ -38,6 +38,16 @@ FocusScope {
         writing = true
         Qt.callLater(() => editor.edit())
     }
+    // The lens before or after the one that is open, along the strip.
+    function step(by) {
+        const ids = backend.lenses.map(l => l.id)
+        if (ids.length === 0)
+            return
+        const at = ids.indexOf(current)
+        const to = at < 0 ? 0 : Math.max(0, Math.min(ids.length - 1, at + by))
+        if (ids[to] !== current)
+            show(ids[to])
+    }
     function show(id) {
         writing = false
         backend.openLens(id, 1)
