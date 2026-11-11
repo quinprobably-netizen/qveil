@@ -49,6 +49,14 @@ const SPARE_EVERY: Duration = Duration::from_secs(10);
 /// under a second (325 to 691 ms, measured), but one dialled while the
 /// circuit was busy took 11 s, and was never used.
 pub(super) const SPARE_WITHIN: Duration = Duration::from_secs(3);
+/// How long a player's request waits for the answer to its upstream
+/// request to start, before it is taken to have stalled (see
+/// `Server::recover`). Within the idle timeout of a relay client (a
+/// minute), which a request that is tried a second time would wait out
+/// twice: two minutes of a black window before the player is told.
+/// Over Tor an answer takes under a second (300 ms, measured), and a
+/// new connection's under two.
+const FIRST_WITHIN: Duration = Duration::from_secs(15);
 /// How long a connection back in a client's pool is taken to stay there
 /// (see `Pool`). The client keeps one 90 s, but googlevideo may close it
 /// sooner, and then a spare would be wanted.
@@ -91,6 +99,8 @@ pub(super) struct Session {
     /// The last resolve again that failed: the generation it was for, when,
     /// and why (see `Server::resolve_again`).
     failed: Mutex<Option<(u32, Instant, String)>>,
+    /// `FIRST_WITHIN`, which tests shorten.
+    first_within: Duration,
 }
 
 impl Session {
@@ -107,6 +117,7 @@ impl Session {
             spare: Mutex::default(),
             recovered: Mutex::new(None),
             failed: Mutex::new(None),
+            first_within: FIRST_WITHIN,
         }
     }
 
@@ -196,9 +207,14 @@ impl Session {
         let (s, live, kind) = (Arc::clone(self), live.clone(), kind.to_string());
         let spawned = std::thread::Builder::new().spawn(move || {
             let range = Some("bytes=0-0");
-            if let Ok(Some(mut spare)) =
-                send_upstream(&live, &s.route, "GET", &kind, range, Some(SPARE_WITHIN))
-            {
+            if let Ok(Some(mut spare)) = send_upstream(
+                &live,
+                &s.route,
+                "GET",
+                &kind,
+                range,
+                Limit::All(SPARE_WITHIN),
+            ) {
                 let read = io::copy(&mut (&mut spare).take(SPARE_MAX), &mut io::sink());
                 // Read to its end, its connection is back in the pool.
                 if read.is_ok_and(|n| n < SPARE_MAX) {
@@ -484,11 +500,12 @@ impl Server {
         range: Option<&str>,
     ) -> Result<Option<reqwest::blocking::Response>, String> {
         let since = Instant::now();
-        match fetch_upstream(live, &s.route, method, kind, range) {
+        let limit = Limit::Answer(s.first_within);
+        match send_upstream(live, &s.route, method, kind, range, limit) {
             Err(e) => match self.recover(s, live, e.stalled, since) {
                 Some(next) => {
                     *live = next;
-                    fetch_upstream(live, &s.route, method, kind, range).map_err(|e| e.text)
+                    send_upstream(live, &s.route, method, kind, range, limit).map_err(|e| e.text)
                 }
                 None => Err(e.text),
             },
@@ -751,18 +768,30 @@ pub(super) fn fetch_upstream(
     kind: &str,
     range: Option<&str>,
 ) -> Result<Option<reqwest::blocking::Response>, UpError> {
-    send_upstream(live, route, method, kind, range, None)
+    send_upstream(live, route, method, kind, range, Limit::Idle)
 }
 
-/// `fetch_upstream`, given up on if its response hasn't come `within`
-/// (connecting included), where that is set.
+/// How long an upstream request may take, besides the client's idle
+/// timeout.
+#[derive(Clone, Copy)]
+enum Limit {
+    /// No longer.
+    Idle,
+    /// All of it, connecting and the whole body included.
+    All(Duration),
+    /// Its answer, connecting included, has to start within this; the body
+    /// then has the idle timeout.
+    Answer(Duration),
+}
+
+/// `fetch_upstream`, given up on as `limit` says.
 fn send_upstream(
     live: &Live,
     route: &Net,
     method: &str,
     kind: &str,
     range: Option<&str>,
-    within: Option<Duration>,
+    limit: Limit,
 ) -> Result<Option<reqwest::blocking::Response>, UpError> {
     let url = match kind {
         "v" => live.video.as_str(),
@@ -783,11 +812,26 @@ fn send_upstream(
     if let Some(r) = range {
         rb = rb.header(RANGE, r);
     }
-    if let Some(t) = within {
+    if let Limit::All(t) = limit {
         rb = rb.timeout(t);
     }
     live.pool.take();
-    match rb.send() {
+    let sent = match limit {
+        Limit::Answer(within) => match answer_within(rb, within) {
+            Some(sent) => sent,
+            None => {
+                return Err(UpError {
+                    stalled: true,
+                    text: format!(
+                        "the stream's server didn't answer within {} s",
+                        within.as_secs()
+                    ),
+                });
+            }
+        },
+        _ => rb.send(),
+    };
+    match sent {
         Ok(up) => {
             live.served.mark();
             Ok(Some(up))
@@ -797,6 +841,23 @@ fn send_upstream(
             text: friendly(&route.explain(&format!("{:#}", e.without_url()))),
         }),
     }
+}
+
+/// Sends `rb`, and waits `within` for its answer to start: `None` if it
+/// hasn't by then. (A request's own timeout would cover its whole body
+/// too.) The request carries on until the client's idle timeout, on a
+/// thread of its own, and its answer is dropped if it comes later.
+fn answer_within(
+    rb: reqwest::blocking::RequestBuilder,
+    within: Duration,
+) -> Option<reqwest::Result<reqwest::blocking::Response>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // If the thread can't be made, `rb` goes with it, and that is taken
+    // for a stall too: tried again once.
+    let _ = std::thread::Builder::new().spawn(move || {
+        let _ = tx.send(rb.send());
+    });
+    rx.recv_timeout(within).ok()
 }
 
 /// The byte range a player asked for: `bytes=start-` or `bytes=start-end`.
@@ -2357,6 +2418,30 @@ EOF
             "{took:?}"
         );
         drop(player);
+    }
+
+    #[test]
+    fn a_request_whose_answer_does_not_start_is_given_up_on_well_before_the_idle_timeout() {
+        // Every connection is taken and then never answered (for 30 s).
+        let up = KeepAlive::start(Duration::from_secs(30));
+        let (s, base, _d) = server();
+        let rt = s.runtime();
+        let mut session = session_for(&rt, up.url("/big"));
+        session.first_within = Duration::from_millis(500);
+        let sid = s.register(&rt, session).unwrap();
+        let started = Instant::now();
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            &format!("s/{sid}/v"),
+            &[("Range", "bytes=0-")],
+        );
+        let took = started.elapsed();
+        assert_eq!(status, 502, "{}", String::from_utf8_lossy(&body));
+        assert!(!String::from_utf8_lossy(&body).contains("127.0.0.1"));
+        // Once on the client, and once on the new one put in its place.
+        assert_eq!(up.connections(), 2);
+        assert!(took < Duration::from_secs(10), "{took:?}");
     }
 
     #[test]
