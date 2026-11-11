@@ -103,7 +103,8 @@ PRIVACY = {
               "topics_on": None,  # TOPICS_ON, below
               "resume": "On: qveil remembers where you stopped in an unfinished video for 7 days.",
               "comments": "Fetched only when you open them, as one more lookup of that video.",
-              "lenses": "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer."},
+              "lenses": "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.",
+              "lenses_short": None},  # LENSES_SHORT, below
 }
 
 state = {
@@ -134,6 +135,8 @@ TOPICS_OFF = "Off: qveil doesn't work out what the channels you follow are about
 # (core/src/privacy.rs) can check they are the same.
 TOPICS_ON = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old. YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over."
 PRIVACY["pages"]["topics_on"] = TOPICS_ON
+LENSES_SHORT = "A refresh sends each topic to YouTube as a search of its own, sometimes twice."
+PRIVACY["pages"]["lenses_short"] = LENSES_SHORT
 # QVEIL_STANDIN_TOPICS=fetched: they were searched for on an earlier day.
 state["topics"] = {"fetched": os.environ.get("QVEIL_STANDIN_TOPICS") == "fetched", "hidden": [], "new": set()}
 

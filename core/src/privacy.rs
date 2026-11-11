@@ -183,6 +183,9 @@ pub struct Pages {
     pub resume: String,
     pub comments: &'static str,
     pub lenses: &'static str,
+    /// One sentence about lenses, true on its own, for where `lenses` is
+    /// too long to show.
+    pub lenses_short: &'static str,
     /// For whether topic feeds are on.
     pub topics: &'static str,
     /// Both, so that what turning them on does can be said before it is done.
@@ -206,6 +209,8 @@ const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you foll
 const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old. YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
 const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
+const LENSES_SHORT: &str =
+    "A refresh sends each topic to YouTube as a search of its own, sometimes twice.";
 
 /// What is said about resume when positions are kept for `days` (0: not at all).
 fn resume(days: u32) -> String {
@@ -246,6 +251,7 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
             resume: resume(cfg.resume_days),
             comments: COMMENTS,
             lenses: LENSES,
+            lenses_short: LENSES_SHORT,
             topics: if cfg.topic_feeds {
                 TOPICS_ON
             } else {
@@ -309,6 +315,7 @@ pub fn markdown() -> String {
         ("Search", SEARCH),
         ("Subscriptions", SUBSCRIPTIONS),
         ("Lenses", LENSES),
+        ("Lenses, in short", LENSES_SHORT),
         ("Comments", COMMENTS),
         ("History, off", HISTORY_OFF),
         ("History, on", HISTORY_ON),
@@ -513,6 +520,7 @@ mod tests {
                 "history_off",
                 "history_on",
                 "lenses",
+                "lenses_short",
                 "resume",
                 "search",
                 "subscriptions",
@@ -524,9 +532,12 @@ mod tests {
         assert!(v["summary"].is_string());
         let points = v["points"].as_array().unwrap();
         assert!(points.len() >= 4 && points.iter().all(|p| p.is_string()));
-        // One sentence for a tooltip.
+        // One sentence for a tooltip, and one for under a lens.
         let summary = v["summary"].as_str().unwrap();
         assert_eq!(summary.matches(". ").count(), 0, "{summary}");
+        let short = v["pages"]["lenses_short"].as_str().unwrap();
+        assert_eq!(short.matches(". ").count(), 0, "{short}");
+        assert!(short.ends_with('.') && short.len() < 100, "{short}");
         assert_eq!(
             json!(describe(&net(None), &Config::default()).routes)["direct"],
             "YouTube sees your IP address."
@@ -559,6 +570,20 @@ mod tests {
     }
 
     #[test]
+    fn the_short_line_about_lenses_is_true_on_its_own() {
+        let pages = describe(&net(None), &Config::default()).pages;
+        let short = pages.lenses_short;
+        // Each topic is its own search, and a topic can be sent twice (see
+        // `app::search_topics`), which the first sentence of the long text
+        // leaves out.
+        assert!(short.contains("each topic"), "{short}");
+        assert!(short.contains("a search of its own"), "{short}");
+        assert!(short.contains("twice"), "{short}");
+        assert!(pages.lenses.contains("searched a second time"));
+        assert!(markdown().contains(&format!("- **Lenses, in short.** {short}\n")));
+    }
+
+    #[test]
     fn topic_feeds_say_how_the_day_is_counted() {
         let on = describe(&net(None), &Config::default()).pages.topics_on;
         for right in [
@@ -584,7 +609,11 @@ mod tests {
             "/../tests/shots/engine.py"
         ))
         .expect("the stand-in engine is in tests/shots");
-        for (name, text) in [("TOPICS_ON", TOPICS_ON), ("TOPICS_OFF", TOPICS_OFF)] {
+        for (name, text) in [
+            ("TOPICS_ON", TOPICS_ON),
+            ("TOPICS_OFF", TOPICS_OFF),
+            ("LENSES_SHORT", LENSES_SHORT),
+        ] {
             assert!(
                 standin.contains(&format!("{name} = \"{text}\"")),
                 "tests/shots/engine.py's {name} is not the engine's: {text}"

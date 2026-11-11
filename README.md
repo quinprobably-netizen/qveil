@@ -101,6 +101,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - **Search.** Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches. A search with a filter in it ("over 30 min", "-word") is sent as one search per topic, like a lens, and filtered and ordered on this computer.
 - **Subscriptions.** Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels.
 - **Lenses.** A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.
+- **Lenses, in short.** A refresh sends each topic to YouTube as a search of its own, sometimes twice.
 - **Comments.** Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.
 - **History, off.** Off: qveil keeps no history. Where you stopped in unfinished videos is remembered separately, while resume is on.
 - **History, on.** On: kept only on this computer, in a file only you can read, until you clear it.
