@@ -71,6 +71,9 @@ pub struct Fetch {
     pub errors: Vec<String>,
     /// Channels not fetched because the route changed meanwhile.
     pub skipped: usize,
+    /// Channels not fetched because what was fetched before them couldn't
+    /// be saved.
+    pub unsaved: usize,
 }
 
 /// What became of one channel's fetch.
@@ -188,7 +191,13 @@ pub fn fetch_all(
         }
     });
     let (mut res, _) = results.into_inner().unwrap();
-    res.skipped += queue.into_inner().unwrap().len();
+    // What was never started was left for the reason the workers stopped.
+    let left = queue.into_inner().unwrap().len();
+    if broken.into_inner() {
+        res.unsaved += left;
+    } else {
+        res.skipped += left;
+    }
     res
 }
 

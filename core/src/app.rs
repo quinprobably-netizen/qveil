@@ -911,15 +911,28 @@ pub fn refresh(
         fetch
     });
     done.fallbacks = fetch.fallbacks;
-    done.errors = fetch.errors;
+    done.errors = not_fetched(&fetch);
+    done.errors.splice(0..0, fetch.errors);
+    saver.finish()?;
+    Ok(done)
+}
+
+/// Why the channels that a refresh didn't get to were left out, in words.
+fn not_fetched(fetch: &feed::Fetch) -> Vec<String> {
+    let mut said = Vec::new();
     if fetch.skipped > 0 {
-        done.errors.push(format!(
+        said.push(format!(
             "The route changed during the refresh; {} channel(s) were not fetched.",
             fetch.skipped
         ));
     }
-    saver.finish()?;
-    Ok(done)
+    if fetch.unsaved > 0 {
+        said.push(format!(
+            "{} channel(s) were not fetched, because what was fetched couldn't be saved.",
+            fetch.unsaved
+        ));
+    }
+    said
 }
 
 /// The feed as the cache has it now, for a refresh that is over (or none).
@@ -1760,6 +1773,30 @@ echo "{\"id\":\"$id\",\"title\":\"t\",\"channel\":\"C\",\"channel_id\":\"$channe
         );
         let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
         assert!(cache.fetched_at.is_empty(), "all of them are still due");
+    }
+
+    #[test]
+    fn channels_left_out_because_saving_failed_are_not_blamed_on_the_route() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=3 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let ytdlp = listing_ytdlp(&dir.0, "");
+        let rt = offline(&paths, &ytdlp);
+        let subs = load_subs(&paths).unwrap().channels;
+        // The disk is full: the first channel can't be kept, which stops the refresh.
+        let fetch = feed::fetch_all(&rt, &subs, 1, &|| true, &|_| bail!("disk full"), &|_, _| {});
+        assert_eq!((fetch.fetched, fetch.skipped, fetch.unsaved), (0, 0, 2));
+        let said = not_fetched(&fetch);
+        assert_eq!(
+            said,
+            ["2 channel(s) were not fetched, because what was fetched couldn't be saved."]
+        );
+        assert!(!said.iter().any(|s| s.contains("route")));
+        // The one that was fetched says why it wasn't kept.
+        assert_eq!(fetch.errors.len(), 1);
+        assert!(fetch.errors[0].contains("disk full"), "{:?}", fetch.errors);
     }
 
     fn rt_cfg(ytdlp: &str) -> Config {
