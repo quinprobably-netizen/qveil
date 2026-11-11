@@ -32,6 +32,12 @@ pub(super) const CHUNK: u64 = 10 << 20;
 /// player, so it arrives before the player runs out. At most this plus one
 /// chunk is held per relayed stream.
 const LOW_WATER: usize = 2 << 20;
+/// The first chunk of a range that doesn't start at the beginning (a
+/// seek).
+pub(super) const SEEK_CHUNK: u64 = 512 << 10;
+/// What a spare connection's request reads at most: its one byte, or a
+/// short error.
+const SPARE_MAX: u64 = 64 << 10;
 /// How often a relay waiting on the other side of `Ahead` looks at the cancel flag.
 const AHEAD_POLL: Duration = Duration::from_millis(250);
 
@@ -56,6 +62,8 @@ pub(super) struct Session {
     /// The client sockets of the relays in flight, so that cancelling can
     /// wake one that is blocked writing to a player that has paused.
     clients: Mutex<Vec<(u64, TcpStream)>>,
+    /// Set while a spare connection is being made ready (see `keep_spare`).
+    sparing: AtomicBool,
 }
 
 impl Session {
@@ -69,6 +77,7 @@ impl Session {
             cancelled: AtomicBool::new(false),
             warm: Warm::default(),
             clients: Mutex::new(Vec::new()),
+            sparing: AtomicBool::new(false),
         }
     }
 
@@ -81,6 +90,39 @@ impl Session {
             // Wakes a relay blocked in a write, and makes the player's
             // reads end, so it doesn't wait on a stream that is gone.
             let _ = client.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Makes sure the session's client has a connection to spare, now that
+    /// `up` (a chunk's response, over HTTP/1.1) has taken one. A player
+    /// that seeks past what it has hangs up on the range it was reading,
+    /// and the connection that carried it is closed with the rest of the
+    /// chunk unread; the range after the seek then finds this one ready
+    /// instead of making a new one, which over Tor is a TCP and a TLS
+    /// handshake through the circuit (325 to 691 ms, measured). It is a
+    /// one-byte request for the start of the stream, on the same client and
+    /// so on the same circuit, read to its end so that its connection goes
+    /// back to the client's pool; where the pool had an idle connection,
+    /// that is the one it uses. Over HTTP/2 every request shares one
+    /// connection, and there is nothing to spare.
+    fn keep_spare(self: &Arc<Self>, live: &Live, kind: &str, up: &reqwest::blocking::Response) {
+        if up.version() >= reqwest::Version::HTTP_2
+            || self.cancelled.load(Ordering::Acquire)
+            || self.sparing.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let (s, live, kind) = (Arc::clone(self), live.clone(), kind.to_string());
+        let spawned = std::thread::Builder::new().spawn(move || {
+            if let Ok(Some(mut spare)) =
+                fetch_upstream(&live, &s.route, "GET", &kind, Some("bytes=0-0"))
+            {
+                let _ = io::copy(&mut (&mut spare).take(SPARE_MAX), &mut io::sink());
+            }
+            s.sparing.store(false, Ordering::Release);
+        });
+        if spawned.is_err() {
+            self.sparing.store(false, Ordering::Release);
         }
     }
 
@@ -202,6 +244,9 @@ impl Server {
             );
         }
         if let Some(plan) = wanted.and_then(|w| w.plan(&up)) {
+            if self.sparing.load(Ordering::Relaxed) {
+                s.keep_spare(&live, kind, &up);
+            }
             return self.relay_chunked(out, &s, kind, live, up, plan);
         }
         let mut head = format!(
@@ -480,9 +525,14 @@ impl Wanted {
         }
     }
 
-    /// The Range header of the first upstream request: at most one chunk.
+    /// The Range header of the first upstream request: at most one chunk,
+    /// and a small one unless it is the start of the stream. A range that
+    /// starts anywhere else follows a seek, and the player may well seek
+    /// again before it is through: a small chunk is in sooner, and keeps
+    /// one that is given up on from holding the circuit for long.
     fn first_chunk(&self) -> String {
-        let last = self.start.saturating_add(CHUNK - 1);
+        let size = if self.start == 0 { CHUNK } else { SEEK_CHUNK };
+        let last = self.start.saturating_add(size - 1);
         let last = self.end.map_or(last, |e| e.min(last));
         format!("bytes={}-{last}", self.start)
     }
@@ -808,6 +858,9 @@ impl Fetcher {
         match content_range(&up) {
             Some((a, b, total)) if a == self.pos && total == self.total && b <= self.end => {
                 self.chunk_end = b;
+                if self.server.sparing.load(Ordering::Relaxed) {
+                    self.session.keep_spare(&self.live, &self.kind, &up);
+                }
                 Ok(up)
             }
             _ => Err(Failure::Final(
@@ -1230,8 +1283,12 @@ mod tests {
             assert_eq!(Wanted::parse(other), None, "{other}");
         }
         assert_eq!(
+            w(0, None).unwrap().first_chunk(),
+            format!("bytes=0-{}", CHUNK - 1)
+        );
+        assert_eq!(
             w(7, None).unwrap().first_chunk(),
-            format!("bytes=7-{}", 7 + CHUNK - 1)
+            format!("bytes=7-{}", 7 + SEEK_CHUNK - 1)
         );
         assert_eq!(w(7, Some(9)).unwrap().first_chunk(), "bytes=7-9");
     }
@@ -1264,7 +1321,8 @@ mod tests {
             ]
         );
 
-        // After a seek: from wherever the player asks, not from a boundary.
+        // After a seek: from wherever the player asks, not from a boundary,
+        // and a small chunk first.
         let from = CHUNK - 7;
         let before = ranges(&up).len();
         let (status, headers, body) = get(&format!("bytes={from}-"));
@@ -1277,8 +1335,8 @@ mod tests {
         assert_eq!(
             ranges(&up)[before..],
             [
-                format!("bytes={from}-{}", from + CHUNK - 1),
-                format!("bytes={}-{}", from + CHUNK, BIG - 1),
+                format!("bytes={from}-{}", from + SEEK_CHUNK - 1),
+                format!("bytes={}-{}", from + SEEK_CHUNK, BIG - 1),
             ]
         );
 
@@ -1296,8 +1354,13 @@ mod tests {
         assert_eq!(
             ranges(&up)[before..],
             [
-                format!("bytes=100-{}", CHUNK + 99),
-                format!("bytes={}-{last}", CHUNK + 100),
+                format!("bytes=100-{}", 100 + SEEK_CHUNK - 1),
+                format!(
+                    "bytes={}-{}",
+                    100 + SEEK_CHUNK,
+                    100 + SEEK_CHUNK + CHUNK - 1
+                ),
+                format!("bytes={}-{last}", 100 + SEEK_CHUNK + CHUNK),
             ]
         );
 
@@ -1508,6 +1571,69 @@ mod tests {
                 Some(format!("bytes={from}-{}", from + 99)),
             ]
         );
+    }
+
+    #[test]
+    fn a_seek_finds_a_connection_ready_instead_of_dialling_one() {
+        // Over Tor a new connection costs about 400 ms before its first
+        // answer, and every answer 300 ms; then about 400 KB/s.
+        let dial = Duration::from_millis(400);
+        let up = KeepAlive::start(dial);
+        let (s, base, _d) = server();
+        s.sparing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let size = 40u64 << 20;
+        let sid = add_session(&s, up.url(&format!("/big?size={size}&ttfb=300&pace=40")));
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0;
+        while got < 100 << 10 {
+            got += player.read(&mut buf).unwrap();
+        }
+        // It plays a while, and then the owner seeks past what is cached.
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(player);
+        let from = 20u64 << 20;
+        let (head, took, _, _seek) =
+            first_byte(&base, &format!("s/{sid}/v"), &format!("bytes={from}-"));
+        eprintln!("first byte after the seek: {took:?}");
+        assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+        assert!(took < Duration::from_millis(600), "{took:?}");
+        // The spare was made while the first range played, and the range
+        // after the seek, which is small, went over it.
+        let asked = up.ranges();
+        assert_eq!(asked[1], "bytes=0-0", "{asked:?}");
+        assert!(
+            asked.contains(&format!("bytes={from}-{}", from + SEEK_CHUNK - 1)),
+            "{asked:?}"
+        );
+        assert!(up.connections() >= 2);
+    }
+
+    #[test]
+    fn the_first_chunk_after_a_seek_is_small_and_the_next_is_full_size() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        let size = 40u64 << 20;
+        let sid = add_session(&s, up.url(&format!("/big?size={size}")));
+        let from = 20u64 << 20;
+        let (_, _, _, _seek) = first_byte(&base, &format!("s/{sid}/v"), &format!("bytes={from}-"));
+        wait_for("the second chunk", Duration::from_secs(5), || {
+            ranges(&up).len() >= 2
+        });
+        let next = from + SEEK_CHUNK;
+        assert_eq!(
+            ranges(&up)[..2],
+            [
+                format!("bytes={from}-{}", next - 1),
+                format!("bytes={next}-{}", next + CHUNK - 1)
+            ]
+        );
+        // From the start, it is a full chunk at once.
+        let (_, _, _, _start) = first_byte(&base, &format!("s/{sid}/v"), "bytes=0-");
+        wait_for("the first chunk", Duration::from_secs(5), || {
+            ranges(&up).len() >= 3
+        });
+        assert!(ranges(&up).contains(&format!("bytes=0-{}", CHUNK - 1)));
     }
 
     /// A server whose clients speak HTTP/2 and give up on a connection

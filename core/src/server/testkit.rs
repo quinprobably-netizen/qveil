@@ -41,6 +41,7 @@ pub fn server_tuned(
     // Most tests count what the upstream is asked; the ones about warming
     // turn it back on.
     s.warming.store(false, Ordering::Relaxed);
+    s.sparing.store(false, Ordering::Relaxed);
     let base = s.listen().unwrap();
     (s, base, dir)
 }
@@ -281,6 +282,20 @@ pub fn big_bytes(from: u64, to: u64) -> Vec<u8> {
 /// `B` unanswered for ten seconds, and `cut=B` stops one half-way. `Gauge::cuts`
 /// makes that many responses stop half-way.
 pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: bool, gauge: &Gauge) {
+    big_to(&mut conn, query, range, head_only, gauge, true);
+}
+
+/// `big`, on a connection that is kept open afterwards unless `close`.
+/// False when the connection is no good for another request.
+fn big_to(
+    conn: &mut TcpStream,
+    query: &str,
+    range: Option<&str>,
+    head_only: bool,
+    gauge: &Gauge,
+    close: bool,
+) -> bool {
+    let connection = if close { "close" } else { "keep-alive" };
     let param = |k: &str| {
         query
             .split('&')
@@ -303,22 +318,22 @@ pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: boo
     let ends_at = |k: &str| param(k).and_then(|s| s.parse::<u64>().ok()) == Some(b);
     if ends_at("hold") {
         std::thread::sleep(Duration::from_secs(10));
-        return;
+        return false;
     }
     let past_first = a > 0;
     if past_first && (param("gen") == Some("1") || param("stale").is_some()) {
         let _ = write!(
             conn,
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied"
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: {connection}\r\n\r\ndenied"
         );
-        return;
+        return !close;
     }
     if a >= size {
         let _ = write!(
             conn,
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nConnection: {connection}\r\n\r\n"
         );
-        return;
+        return !close;
     }
     let status = if range.is_some() {
         format!("206 Partial Content\r\nContent-Range: bytes {a}-{b}/{size}")
@@ -327,11 +342,11 @@ pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: boo
     };
     let _ = write!(
         conn,
-        "HTTP/1.1 {status}\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
         b - a + 1
     );
     if head_only {
-        return;
+        return !close;
     }
     let mut stop = b + 1;
     if past_first && param("dead").is_some() {
@@ -352,7 +367,8 @@ pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: boo
         let n = (16 << 10).min(stop - at);
         let block = big_bytes(at, at + n);
         if conn.write_all(&block).is_err() {
-            break;
+            gauge.live.fetch_sub(1, Ordering::SeqCst);
+            return false;
         }
         gauge.sent.fetch_add(block.len(), Ordering::SeqCst);
         at += n;
@@ -361,6 +377,136 @@ pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: boo
         }
     }
     gauge.live.fetch_sub(1, Ordering::SeqCst);
+    !close && stop == b + 1
+}
+
+/// A stand-in for googlevideo as it really answers: HTTP/1.1, keeping each
+/// connection open for the next request, where a new connection costs
+/// `dial` before its first answer (the TCP and TLS handshakes through a Tor
+/// circuit). It serves `/big` (see `big`), and counts its connections.
+pub struct KeepAlive {
+    pub addr: std::net::SocketAddr,
+    seen: Seen,
+    connections: Arc<AtomicUsize>,
+}
+
+impl KeepAlive {
+    pub fn start(dial: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen, gauge) = (Seen::default(), Arc::new(Gauge::default()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let (log, counted, count) = (
+            Arc::clone(&seen),
+            Arc::clone(&gauge),
+            Arc::clone(&connections),
+        );
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                count.fetch_add(1, Ordering::SeqCst);
+                let (log, gauge) = (Arc::clone(&log), Arc::clone(&counted));
+                std::thread::spawn(move || {
+                    std::thread::sleep(dial);
+                    keep_alive_serve(conn, &log, &gauge);
+                });
+            }
+        });
+        KeepAlive {
+            addr,
+            seen,
+            connections,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// The Range headers it has been sent, in order.
+    pub fn ranges(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.1.clone())
+            .collect()
+    }
+}
+
+fn keep_alive_serve(
+    mut conn: TcpStream,
+    log: &Mutex<Vec<(String, Option<String>)>>,
+    gauge: &Gauge,
+) {
+    let mut r = BufReader::new(conn.try_clone().unwrap());
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let head_only = line.starts_with("HEAD");
+        let mut range = None;
+        loop {
+            let mut h = String::new();
+            if r.read_line(&mut h).unwrap_or(0) == 0 {
+                return;
+            }
+            if h.trim().is_empty() {
+                break;
+            }
+            if let Some(v) = h.to_ascii_lowercase().strip_prefix("range:") {
+                range = Some(v.trim().to_string());
+            }
+        }
+        log.lock().unwrap().push((target.clone(), range.clone()));
+        let query = target.split_once('?').map_or("", |(_, q)| q);
+        if !big_to(&mut conn, query, range.as_deref(), head_only, gauge, false) {
+            return;
+        }
+    }
+}
+
+/// Asks the relay for `range` of `stream` and returns the response head
+/// and the socket, with the time it took for the first byte of the
+/// body to arrive.
+pub fn first_byte(base: &str, stream: &str, range: &str) -> (String, Duration, Vec<u8>, TcpStream) {
+    let mut c = TcpStream::connect(addr(base)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let started = Instant::now();
+    write!(
+        c,
+        "GET {} HTTP/1.1\r\nHost: x\r\nRange: {range}\r\n\r\n",
+        path(base, stream)
+    )
+    .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "the relay hung up");
+        got.extend_from_slice(&buf[..n]);
+        if let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n")
+            && got.len() > at + 4
+        {
+            let head = String::from_utf8_lossy(&got[..at]).into_owned();
+            return (head, started.elapsed(), got[at + 4..].to_vec(), c);
+        }
+    }
+}
+
+/// Reads from `c` until `have` holds `n` bytes.
+pub fn read_up_to(c: &mut TcpStream, have: &mut Vec<u8>, n: usize) {
+    let mut buf = vec![0u8; 64 << 10];
+    while have.len() < n {
+        let got = c.read(&mut buf).unwrap();
+        assert!(got > 0, "the relay hung up after {} bytes", have.len());
+        have.extend_from_slice(&buf[..got]);
+    }
 }
 
 pub type Fetched = (u16, HashMap<String, String>, Vec<u8>);

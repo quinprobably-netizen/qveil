@@ -335,11 +335,9 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::server::relay;
+    use crate::server::relay::SEEK_CHUNK;
     use crate::server::testkit::*;
     use crate::store::testing::TempDir;
-    use std::io::Write;
-    use std::net::TcpStream;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -359,44 +357,6 @@ mod tests {
         });
         s.warming.store(true, Ordering::Relaxed);
         (s, base, d, bin)
-    }
-
-    /// Asks the relay for `range` of `stream` and returns the response head
-    /// and the socket, with the time it took for the first byte of the
-    /// body to arrive.
-    fn first_byte(base: &str, stream: &str, range: &str) -> (String, Duration, Vec<u8>, TcpStream) {
-        let mut c = TcpStream::connect(addr(base)).unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        let started = Instant::now();
-        write!(
-            c,
-            "GET {} HTTP/1.1\r\nHost: x\r\nRange: {range}\r\n\r\n",
-            path(base, stream)
-        )
-        .unwrap();
-        let mut got = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = c.read(&mut buf).unwrap();
-            assert!(n > 0, "the relay hung up");
-            got.extend_from_slice(&buf[..n]);
-            if let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n")
-                && got.len() > at + 4
-            {
-                let head = String::from_utf8_lossy(&got[..at]).into_owned();
-                return (head, started.elapsed(), got[at + 4..].to_vec(), c);
-            }
-        }
-    }
-
-    /// Reads from `c` until `have` holds `n` bytes.
-    fn read_up_to(c: &mut TcpStream, have: &mut Vec<u8>, n: usize) {
-        let mut buf = vec![0u8; 64 << 10];
-        while have.len() < n {
-            let got = c.read(&mut buf).unwrap();
-            assert!(got > 0, "the relay hung up after {} bytes", have.len());
-            have.extend_from_slice(&buf[..got]);
-        }
     }
 
     #[test]
@@ -435,6 +395,29 @@ mod tests {
                 format!("bytes=0-{}", AUDIO_HEAD - 1)
             ]
         );
+    }
+
+    #[test]
+    fn what_follows_the_head_goes_over_the_heads_connection() {
+        let up = KeepAlive::start(Duration::from_millis(400));
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(&bin.0, &up.url(&format!("/big?size={SIZE}&pace=2&run=")));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        s.warming.store(true, Ordering::Relaxed);
+        let info = s.open(&test_video()).unwrap();
+        let (_, _, mut body, mut c) = first_byte(&base, rel(&base, &info.video), "bytes=0-");
+        read_up_to(&mut c, &mut body, HEAD as usize + 100_000);
+        assert!(body[..HEAD as usize + 100_000] == big_bytes(0, HEAD + 100_000));
+        assert_eq!(
+            up.ranges()[2..],
+            [format!("bytes={HEAD}-{}", SIZE - 1)],
+            "{:?}",
+            up.ranges()
+        );
+        assert_eq!(up.connections(), 2, "a new connection was made");
     }
 
     #[test]
@@ -477,7 +460,7 @@ mod tests {
             [
                 format!("bytes=0-{}", HEAD - 1),
                 format!("bytes=0-{}", AUDIO_HEAD - 1),
-                format!("bytes={tail}-{}", tail + relay::CHUNK - 1),
+                format!("bytes={tail}-{}", tail + SEEK_CHUNK - 1),
             ],
             "the player's requests for the start went upstream"
         );

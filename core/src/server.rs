@@ -77,6 +77,10 @@ pub struct Server {
     /// when it is opened (see `warm`). Always on, except in the tests that
     /// count every request the upstream gets.
     warming: AtomicBool,
+    /// Whether a relayed stream keeps a connection to spare for the range
+    /// after a seek (see `Session::keep_spare`). Always on, except in the
+    /// tests that count every request the upstream gets.
+    sparing: AtomicBool,
     /// The lookups of the videos played lately (see `lookups`).
     lookups: lookups::Lookups,
     /// What tells the lookup of the next video that is running, if one is,
@@ -176,6 +180,7 @@ impl Server {
             connections: Arc::new(AtomicUsize::new(0)),
             unverified: Arc::new(Unverified::default()),
             warming: AtomicBool::new(true),
+            sparing: AtomicBool::new(true),
             lookups: lookups::Lookups::default(),
             preparing: Mutex::new(None),
             recording: Default::default(),
