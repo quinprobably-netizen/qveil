@@ -80,6 +80,18 @@ impl Launch {
     }
 }
 
+#[cfg(test)]
+impl Launch {
+    /// A launch that is only ever compared with another, never run.
+    pub fn testing(name: &str) -> Launch {
+        Launch {
+            python: PathBuf::from("/nowhere/python3"),
+            script: PathBuf::from(name),
+            zipped: false,
+        }
+    }
+}
+
 /// How `bin` (a name looked up in `PATH`, or a path) could be run as a
 /// spare, if it can.
 pub fn launch_for(bin: &str) -> Option<Launch> {

@@ -220,9 +220,12 @@ impl Inflight {
         if sp.broken || (sp.want.as_ref() == Some(launch) && sp.keeper) {
             return;
         }
+        // Ending its process waits for it to go, which is for the end of
+        // this function, once the lock that calls take spares by is free.
+        let mut old = None;
         if sp.want.as_ref() != Some(launch) {
             sp.want = Some(launch.clone());
-            sp.ready = None;
+            old = sp.ready.take();
         }
         if !sp.keeper {
             let calls = Arc::clone(self);
@@ -232,6 +235,8 @@ impl Inflight {
             }
         }
         self.spares_changed.notify_all();
+        drop(sp);
+        drop(old);
     }
 
     /// Whether a spare is ready to take a call.
@@ -547,6 +552,57 @@ mod tests {
         assert!(run.wait_exit(Duration::from_secs(5)));
         assert!(started.elapsed() < Duration::from_secs(1));
         killer.join().unwrap();
+    }
+
+    /// Puts a spare of `launch`, ready, in the registry, as if a keeper had
+    /// started it (one is marked as running, so none is). Returns its process.
+    fn ready_spare(calls: &Arc<Inflight>, launch: &Launch, dir: &TempDir) -> u32 {
+        let run = calls.start(&mut sleeper(dir), &dir.0).unwrap();
+        let pid = run.proc.child.lock().unwrap().id();
+        let mut sp = locked(&calls.spares);
+        sp.want = Some(launch.clone());
+        sp.keeper = true;
+        sp.ready = Some(Ready {
+            launch: launch.clone(),
+            run,
+        });
+        pid
+    }
+
+    #[test]
+    fn a_spare_that_is_swapped_out_is_ended_without_the_lock_that_calls_take_spares_by() {
+        let dir = TempDir::new();
+        let calls = Arc::new(Inflight::default());
+        let (old, new) = (Launch::testing("old"), Launch::testing("new"));
+        let pid = ready_spare(&calls, &old, &dir);
+        // The last thing that ending a run does is take the registry's state
+        // lock, so holding it keeps the swap from finishing for as long as
+        // the test likes.
+        let held = locked(&calls.state);
+        let swapper = {
+            let calls = Arc::clone(&calls);
+            std::thread::spawn(move || calls.want_spare(&new))
+        };
+        // It has killed the old spare by now, and is stuck on the state lock.
+        let started = Instant::now();
+        while !gone(pid) {
+            assert!(started.elapsed() < Duration::from_secs(5), "not swapped");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let claimer = {
+            let calls = Arc::clone(&calls);
+            let dir = dir.0.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(calls.claim_spare(&old, "[]\n", &dir).is_none());
+            })
+        };
+        // A call that comes for the spare meanwhile finds none, at once.
+        let answered = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        swapper.join().unwrap();
+        claimer.join().unwrap();
+        assert_eq!(answered, Ok(true), "claim_spare waited for the swap");
     }
 
     #[test]
