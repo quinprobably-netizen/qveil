@@ -42,6 +42,9 @@ FocusScope {
     property bool moved: false
     readonly property bool leadSelected: navigating && activeFocus && onLead && first !== null
     onFirstChanged: {
+        // A new video leads with Resume marked (Forget on the last must not
+        // carry over to the next).
+        leadAction = 0
         if (first === null)
             onLead = false
         else if (!moved)
@@ -175,8 +178,8 @@ FocusScope {
     function move(by) {
         navigating = true
         if (onLead) {
-            // Along the lead's actions; a strip has only the one.
-            leadAction = compact ? 0 : Math.max(0, Math.min(2, leadAction + by))
+            // Along the lead's actions.
+            leadAction = Math.max(0, Math.min(2, leadAction + by))
             return
         }
         const key = keys[row]
@@ -371,16 +374,6 @@ FocusScope {
                 color: panel
                 clip: true
 
-                // The keyboard's cursor, when it is on the lead.
-                Rectangle {
-                    objectName: "lead-cursor"
-                    anchors.fill: parent
-                    z: 2
-                    visible: page.leadSelected
-                    color: "transparent"
-                    border.width: 2
-                    border.color: Style.accent
-                }
                 MouseArea {
                     id: leadArea
                     anchors.fill: parent
@@ -426,10 +419,12 @@ FocusScope {
                     }
                 }
                 Column {
+                    id: words
                     anchors.left: parent.left
                     anchors.leftMargin: page.compact ? Style.u * 5 : Style.u * 8
+                    // (In a strip, the actions stand between the words and the picture.)
                     anchors.right: picture.visible ? picture.left : parent.right
-                    anchors.rightMargin: picture.visible ? -Style.u * 8 : Style.u * 5
+                    anchors.rightMargin: page.compact ? acts.width + Style.u * 12 + (picture.visible ? 0 : -Style.u * 5) : picture.visible ? -Style.u * 8 : Style.u * 5
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: page.compact ? Style.u : Style.u * 3
 
@@ -471,46 +466,56 @@ FocusScope {
                         font.family: Style.font
                         font.pixelSize: Style.body
                     }
-                    Row {
-                        // In a strip, pressing the lead is the way to resume.
+                    // Where the actions are, under the words (a strip has them beside).
+                    Item {
                         visible: !page.compact
-                        topPadding: Style.u
-                        spacing: Style.u * 2
-                        Act {
-                            objectName: "lead-resume"
-                            implicitHeight: 36
-                            text: qsTr("Resume")
-                            primary: true
-                            marked: page.leadSelected && page.leadAction === 0
-                            onClicked: page.resumed({ id: lead.kept.id, title: lead.kept.title || "", channel: lead.kept.channel || "" })
-                        }
-                        Act {
-                            objectName: "lead-over"
-                            implicitHeight: 36
-                            text: qsTr("Start over")
-                            filled: true
-                            marked: page.leadSelected && page.leadAction === 1
-                            onClicked: page.startOver(lead.kept)
-                        }
-                        Act {
-                            objectName: "lead-forget"
-                            implicitHeight: 36
-                            text: qsTr("Forget")
-                            quiet: true
-                            marked: page.leadSelected && page.leadAction === 2
-                            tip: qsTr("Forget where you stopped in this video")
-                            onClicked: backend.forgetResume(lead.kept.id)
-                        }
-                        Text {
-                            objectName: "lead-kept"
-                            anchors.verticalCenter: parent.verticalCenter
-                            leftPadding: Style.u * 2
-                            text: qsTr("kept for %n days", "", page.days)
-                            textFormat: Text.PlainText
-                            color: Style.faint
-                            font.family: Style.font
-                            font.pixelSize: Style.small
-                        }
+                        width: 1
+                        height: acts.height
+                    }
+                }
+                Row {
+                    id: acts
+                    // Under the words; in a strip, in the room between them and the picture.
+                    x: page.compact ? (picture.visible ? picture.x : lead.width) - width - Style.u * 6 : words.x
+                    y: page.compact ? Math.round((lead.height - height) / 2) : words.y + words.height - height
+                    spacing: page.compact ? Style.u : Style.u * 2
+                    Act {
+                        objectName: "lead-resume"
+                        implicitHeight: page.compact ? Style.control + Style.u : 36
+                        text: qsTr("Resume")
+                        primary: !page.compact
+                        quiet: page.compact
+                        marked: page.leadSelected && page.leadAction === 0
+                        onClicked: page.resumed({ id: lead.kept.id, title: lead.kept.title || "", channel: lead.kept.channel || "" })
+                    }
+                    Act {
+                        objectName: "lead-over"
+                        implicitHeight: page.compact ? Style.control + Style.u : 36
+                        text: qsTr("Start over")
+                        filled: !page.compact
+                        quiet: page.compact
+                        marked: page.leadSelected && page.leadAction === 1
+                        onClicked: page.startOver(lead.kept)
+                    }
+                    Act {
+                        objectName: "lead-forget"
+                        implicitHeight: page.compact ? Style.control + Style.u : 36
+                        text: qsTr("Forget")
+                        quiet: true
+                        marked: page.leadSelected && page.leadAction === 2
+                        tip: qsTr("Forget where you stopped in this video")
+                        onClicked: backend.forgetResume(lead.kept.id)
+                    }
+                    Text {
+                        objectName: "lead-kept"
+                        visible: !page.compact
+                        anchors.verticalCenter: parent.verticalCenter
+                        leftPadding: Style.u * 2
+                        text: qsTr("kept for %n days", "", page.days)
+                        textFormat: Text.PlainText
+                        color: Style.faint
+                        font.family: Style.font
+                        font.pixelSize: Style.small
                     }
                 }
             }

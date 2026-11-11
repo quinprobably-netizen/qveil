@@ -8,10 +8,12 @@ FocusScope {
     id: page
 
     readonly property bool on: !!backend.config.history
-    // Where focus belongs when the page is shown.
-    readonly property Item content: list
+    // Where focus belongs when the page is shown: what was watched, or,
+    // with the history off, the unfinished videos that are kept.
+    readonly property Item content: on ? list : kept
     // Whether Clear has been pressed once, and waits for the second.
     property bool arming: false
+    property string thumbs: "clear"
     signal playRequested(var video)
 
     onVisibleChanged: arming = false
@@ -61,19 +63,30 @@ FocusScope {
                 }
             }
         }
-        Notice {
-            objectName: "history-note"
+        // The history's sentence, in the engine's words; off, its switch on the same line.
+        Item {
             width: parent.width
-            text: (page.on ? backend.privacy.pages.history_on : backend.privacy.pages.history_off) || ""
-        }
-        Act {
-            objectName: "history-turn-on"
-            visible: !page.on
-            text: qsTr("Turn on")
-            filled: true
-            onClicked: {
-                backend.setConfig({ history: true })
-                backend.loadHistory()
+            height: Math.max(historyNote.height, turnOn.visible ? turnOn.height : 0)
+            Notice {
+                id: historyNote
+                objectName: "history-note"
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.min(implicitWidth, parent.width - (turnOn.visible ? turnOn.width + Style.u * 4 : 0))
+                text: (page.on ? backend.privacy.pages.history_on : backend.privacy.pages.history_off) || ""
+            }
+            Act {
+                id: turnOn
+                objectName: "history-turn-on"
+                anchors.left: historyNote.right
+                anchors.leftMargin: Style.u * 4
+                anchors.verticalCenter: parent.verticalCenter
+                visible: !page.on
+                text: qsTr("Turn on")
+                filled: true
+                onClicked: {
+                    backend.setConfig({ history: true })
+                    backend.loadHistory()
+                }
             }
         }
         Rule {
@@ -81,84 +94,160 @@ FocusScope {
             visible: page.on
         }
         // Off, there is still something kept: where unfinished videos were
-        // stopped. It is said here, in the engine's words, and can be forgotten.
+        // stopped. It has a heading of its own, and its sentence (the engine's).
+        Text {
+            objectName: "history-kept-head"
+            visible: !page.on && backend.resume.length > 0
+            topPadding: Style.u * 2
+            text: qsTr("Unfinished")
+            textFormat: Text.PlainText
+            color: Style.fg
+            font.family: Style.font
+            font.pixelSize: Style.title
+            font.weight: Style.strong
+        }
         Notice {
             objectName: "history-kept-note"
             width: parent.width
             visible: !page.on && backend.resume.length > 0
             text: backend.privacy.pages.resume || ""
         }
-        Column {
-            width: parent.width
-            visible: !page.on
-            Repeater {
-                model: page.on ? [] : backend.resume
-                delegate: Rectangle {
-                    id: kept
-                    required property var modelData
-                    objectName: "history-kept"
+    }
+
+    // The unfinished videos that are kept, with their pictures (the same
+    // ones home shows for them). j and k move, Enter plays, Delete forgets.
+    ListView {
+        id: kept
+        objectName: "history-kept-list"
+        anchors.left: top.left
+        anchors.right: parent.right
+        anchors.rightMargin: Style.gutter
+        anchors.top: top.bottom
+        anchors.topMargin: Style.u * 2
+        anchors.bottom: parent.bottom
+        visible: !page.on
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        model: page.on ? [] : backend.resume
+        Keys.onPressed: event => {
+            event.accepted = true
+            if (event.key === Qt.Key_J)
+                incrementCurrentIndex()
+            else if (event.key === Qt.Key_K)
+                decrementCurrentIndex()
+            else if ((event.key === Qt.Key_Delete || event.key === Qt.Key_Backspace) && currentItem)
+                backend.forgetResume(currentItem.modelData.id)
+            else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && currentItem)
+                currentItem.play()
+            else
+                event.accepted = false
+        }
+
+        delegate: Rectangle {
+            id: keptRow
+            required property var modelData
+            required property int index
+            readonly property bool current: ListView.isCurrentItem && kept.activeFocus
+            function play() {
+                page.playRequested({ id: modelData.id, title: modelData.title || "", channel: modelData.channel || "" })
+            }
+            objectName: "history-kept"
+            width: kept.width
+            height: 92
+            color: current ? Style.sel : keptArea.containsMouse ? Style.hover : "transparent"
+            MouseArea {
+                id: keptArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: keptRow.play()
+            }
+            Item {
+                id: keptPicture
+                objectName: "history-kept-picture"
+                x: Style.u * 2
+                anchors.verticalCenter: parent.verticalCenter
+                width: 136
+                height: 76
+                clip: true
+                Rectangle {
+                    anchors.fill: parent
+                    color: Style.rest
+                }
+                Frost {
+                    anchors.fill: parent
+                    source: Format.thumb(backend.thumbBase, keptRow.modelData.id, 0)
+                    clear: keptRow.current || keptArea.containsMouse
+                    mode: page.thumbs
+                }
+                // How far it was watched.
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.bottom: parent.bottom
+                    width: parent.width * Math.min(1, (keptRow.modelData.pos || 0) / Math.max(1, keptRow.modelData.dur || 1))
+                    height: 3
+                    color: Style.accent
+                }
+                // The keyboard's cursor: a frame on the picture, as on a card.
+                Rectangle {
+                    objectName: "cursor"
+                    anchors.fill: parent
+                    visible: keptRow.current
+                    color: "transparent"
+                    border.width: 2
+                    border.color: Style.accent
+                }
+            }
+            Column {
+                anchors.left: keptPicture.right
+                anchors.leftMargin: Style.u * 3
+                anchors.right: gone.left
+                anchors.rightMargin: Style.u * 3
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 2
+                Text {
                     width: parent.width
-                    height: 52
-                    color: keptArea.containsMouse ? Style.hover : "transparent"
-                    MouseArea {
-                        id: keptArea
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: page.playRequested({ id: kept.modelData.id, title: kept.modelData.title || "", channel: kept.modelData.channel || "" })
+                    text: keptRow.modelData.title || ""
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    color: Style.fg
+                    font.family: Style.font
+                    font.pixelSize: Style.body
+                    font.weight: Style.strong
+                }
+                Row {
+                    spacing: Style.u * 2
+                    Text {
+                        visible: text !== ""
+                        text: keptRow.modelData.channel || ""
+                        textFormat: Text.PlainText
+                        color: Style.dim
+                        font.family: Style.font
+                        font.pixelSize: Style.small
                     }
-                    Column {
-                        anchors.left: parent.left
-                        anchors.leftMargin: Style.u * 3
-                        anchors.right: gone.left
-                        anchors.rightMargin: Style.u * 3
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 2
-                        Text {
-                            width: parent.width
-                            text: kept.modelData.title || ""
-                            textFormat: Text.PlainText
-                            elide: Text.ElideRight
-                            color: Style.fg
-                            font.family: Style.font
-                            font.pixelSize: Style.body
-                        }
-                        Text {
-                            width: parent.width
-                            text: [kept.modelData.channel || "", qsTr("%1 left").arg(Format.clock(Math.max(0, kept.modelData.dur - kept.modelData.pos)))]
-                                      .filter(s => s !== "").join("  ·  ")
-                            textFormat: Text.PlainText
-                            elide: Text.ElideRight
-                            color: Style.dim
-                            font.family: Style.font
-                            font.pixelSize: Style.small
-                        }
-                    }
-                    Act {
-                        id: gone
-                        objectName: "history-forget"
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("Forget")
-                        quiet: true
-                        onClicked: backend.forgetResume(kept.modelData.id)
-                    }
-                    Rule {
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
+                    Text {
+                        text: qsTr("%1 left").arg(Format.clock(Math.max(0, (keptRow.modelData.dur || 0) - (keptRow.modelData.pos || 0))))
+                        textFormat: Text.PlainText
+                        color: Style.accent
+                        font.family: Style.font
+                        font.pixelSize: Style.small
                     }
                 }
             }
-        }
-    }
-
-    // The history is asked for again when it has just been turned on.
-    Connections {
-        target: backend
-        function onConfigChanged() {
-            if (page.visible && page.on)
-                backend.loadHistory()
+            Act {
+                id: gone
+                objectName: "history-forget"
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: qsTr("Forget")
+                quiet: true
+                onClicked: backend.forgetResume(keptRow.modelData.id)
+            }
+            Rule {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+            }
         }
     }
 

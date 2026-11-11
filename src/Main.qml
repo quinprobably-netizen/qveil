@@ -637,6 +637,7 @@ ApplicationWindow {
                 HistoryPage {
                     id: historyPage
                     anchors.fill: parent
+                    thumbs: win.thumbs
                     visible: win.page === "history" && !win.watching
                     onPlayRequested: video => win.play(video)
                 }

@@ -1069,6 +1069,43 @@ private slots:
         QTRY_COMPARE(app.asked("POST api/history/clear"), 1);
     }
 
+    void historyWhileOffShowsWhatIsKeptWithPicturesAndKeys()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_4);
+        QTRY_COMPARE(app.page(), QString("history"));
+        QTRY_COMPARE(app.items("history-kept").size(), 3);
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        // The history's sentence and its switch share one line; what is kept
+        // has a heading of its own, with its own sentence under it.
+        QQuickItem *note = app.item("history-note"), *turnOn = app.item("history-turn-on");
+        QVERIFY2(qAbs(box(note).center().y() - box(turnOn).center().y()) < 4,
+                 qPrintable(QString("%1 vs %2").arg(box(note).center().y()).arg(box(turnOn).center().y())));
+        QVERIFY(box(turnOn).left() > box(note).left());
+        QQuickItem *heading = app.item("history-kept-head");
+        QVERIFY(heading && heading->isVisible());
+        QVERIFY(box(heading).top() > box(note).bottom() && box(app.item("history-kept-note")).top() > box(heading).top());
+        // Each row has its picture, and the keyboard is on the first.
+        QQuickItem *first = app.items("history-kept").first();
+        QVERIFY(App::under(first, "history-kept-picture"));
+        QQuickItem *kept = app.item("history-kept-list");
+        QTRY_VERIFY(kept->hasActiveFocus());
+        QCOMPARE(kept->property("currentIndex").toInt(), 0);
+        QVERIFY(App::under(first, "cursor")->isVisible());
+        QVERIFY2(box(app.items("history-kept").at(1)).bottom() <= 508, qPrintable(QString::number(box(app.items("history-kept").at(1)).bottom())));
+        // j and k move; Delete forgets the one the keyboard is on; Enter plays.
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(kept->property("currentIndex").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_Delete);
+        QTRY_COMPARE(app.asked("POST api/resume/rm"), 1);
+        QTRY_COMPARE(app.items("history-kept").size(), 2);
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000001"));
+    }
+
     void everyPageLoadsCleanInBothDirections()
     {
         for (const Qt::LayoutDirection direction : {Qt::LeftToRight, Qt::RightToLeft}) {
@@ -1449,15 +1486,33 @@ private slots:
         // It still says what it is and how much is left, and pressing it resumes.
         QCOMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
         QVERIFY(app.item("lead-title")->isVisible() && app.item("lead-meta")->isVisible());
-        QVERIFY(!app.item("lead-over")->isVisible());
+        // Its three actions are words in the strip, between what it is and its picture.
+        for (const char *name : {"lead-resume", "lead-over", "lead-forget"}) {
+            QQuickItem *act = app.item(name);
+            QVERIFY2(act->isVisible(), name);
+            QVERIFY2(box(lead).contains(box(act)), qPrintable(QString("%1 %2,%3 %4x%5 in %6,%7 %8x%9").arg(name).arg(box(act).x()).arg(box(act).y()).arg(box(act).width()).arg(box(act).height()).arg(box(lead).x()).arg(box(lead).y()).arg(box(lead).width()).arg(box(lead).height())));
+            QVERIFY2(box(act).left() >= box(app.item("lead-meta")).right() - 1, name);
+            QVERIFY2(box(act).right() <= box(app.item("lead-picture")).left() + 1, name);
+        }
+        // Left and right go along them, and Enter does what is marked; the next
+        // video to lead starts on Resume again.
+        QTRY_VERIFY(app.item("shelves-home")->property("leadSelected").toBool());
+        QVERIFY(app.item("lead-resume")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_VERIFY(app.item("lead-forget")->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.asked("POST api/resume/rm"), 1);
+        QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Crossing the Pamir on a steel bike, part 3"));
+        QCOMPARE(app.item("shelves-home")->property("leadAction").toInt(), 0);
         // A whole row of the latest fits under it.
         QQuickItem *shelf = nullptr;
         QTRY_VERIFY((shelf = app.item("shelf-latest")));
         QTRY_VERIFY(App::count(shelf, "card") >= 3);
         QQuickItem *card = App::under(shelf, "card");
         QTRY_VERIFY2(box(card).bottom() <= 508, qPrintable(QString::number(box(card).bottom())));
-        app.click(lead);
-        QTRY_COMPARE(app.item("surface")->property("startedAt").toInt(), 845);
+        app.click(app.item("lead-title"));
+        QTRY_VERIFY(app.page() == QString("watch") || app.window->property("watching").toBool());
 
         // In a tile with room, the lead is the lead.
         App tall(false, QSize(941, 1030));
@@ -1796,9 +1851,9 @@ private slots:
         };
         // No key has been pressed: the cursor is on the lead, and on nothing else.
         QTRY_VERIFY(home->property("leadSelected").toBool());
-        QQuickItem *frame = app.item("lead-cursor");
-        QVERIFY(frame && frame->isVisible());
-        QCOMPARE(frame->property("border").value<QObject *>()->property("width").toInt(), 2);
+        // It is one mark, on the action Enter does: no frame round the whole lead.
+        QVERIFY(!app.item("lead-cursor") || !app.item("lead-cursor")->isVisible());
+        QVERIFY(app.item("lead-resume")->property("marked").toBool());
         QVERIFY(marked().isEmpty());
         // Down is the first shelf's first card, framed on its picture; Up is the lead again.
         QTest::keyClick(app.window, Qt::Key_Down);
@@ -1871,6 +1926,28 @@ private slots:
         QVERIFY(app.item("watch-about")->isVisible());
         QVERIFY(!app.item("tab-about"));
         QVERIFY(app.item("tab-chapters")->isVisible());
+    }
+
+    void inTheQuarterTileThePictureTakesWhatTheTileHas()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QQuickItem *surface = app.item("surface"), *watch = app.item("watch");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        QTRY_COMPARE(app.item("stage")->opacity(), 1.0);
+        // Beside the sheet, the picture is as wide as its place, and only the
+        // title and the channel's row are kept under it.
+        QVERIFY2(box(surface).height() >= 300, qPrintable(QString::number(box(surface).height())));
+        QVERIFY(box(app.item("sheet")).left() >= box(surface).right());
+        QVERIFY2(box(app.item("watch-stats")).bottom() <= 508, qPrintable(QString::number(box(app.item("watch-stats")).bottom())));
+        // In theatre it takes the width as well, and the title stays in view.
+        watch->setProperty("theatre", true);
+        QTRY_VERIFY2(box(surface).height() >= 360, qPrintable(QString::number(box(surface).height())));
+        QVERIFY2(box(app.item("watch-title")).top() < 508 - 20, qPrintable(QString::number(box(app.item("watch-title")).top())));
     }
 
     void theSheetCanBeUsedFromTheKeyboard()

@@ -35,6 +35,11 @@ FocusScope {
     // Whether the keyboard is in the sheet, and not the video's.
     readonly property bool inSheet: sheet.keyed
     readonly property bool beside: !narrow && !theatre && !full
+    // What is kept under the video for what it is: the title and the
+    // channel's row (in theatre, the title only). The rest (the description)
+    // is below, a scroll away; the picture takes what is left.
+    readonly property int keptUnder: column.y + column.spacing + Style.head + 8
+        + (theatre ? 0 : column.spacing + Style.control) + Style.gutter
     // How wide the sheet is when it stands beside the video.
     readonly property int sheetWidth: width >= 1180 ? 384 : 320
     readonly property bool subscribed: !!info.channelId && backend.subs.some(s => s.id === info.channelId)
@@ -122,7 +127,7 @@ FocusScope {
                 id: slot
                 width: parent.width
                 // 16:9, but never so tall that the title is pushed off the page.
-                height: Math.min(Math.round(width * 9 / 16), Math.max(200, page.height - 190))
+                height: Math.min(Math.round(width * 9 / 16), Math.max(200, page.height - page.keptUnder))
             }
             Text {
                 objectName: "watch-title"
