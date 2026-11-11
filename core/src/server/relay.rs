@@ -109,6 +109,10 @@ impl Drop for Attached<'_> {
 pub(super) struct Live {
     /// Counts resolves, so a waiter can tell that someone else already refreshed.
     pub(super) generation: u32,
+    /// Counts the clients put in place of a stalled one since the last
+    /// resolve (see `Server::redial`), so that requests that failed on the
+    /// same client make one new client between them.
+    pub(super) dial: u32,
     pub(super) video: String,
     pub(super) audio: Option<String>,
     pub(super) headers: Vec<(String, String)>,
@@ -152,7 +156,7 @@ impl Server {
         {
             return self.relay_kept(out, &s, kind, live, w, kept);
         }
-        let mut up = match fetch_upstream(&live, &s.route, &req.method, kind, range) {
+        let mut up = match self.fetch_redialling(&s, &mut live, &req.method, kind, range) {
             Ok(Some(up)) => up,
             Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
             Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
@@ -170,7 +174,7 @@ impl Server {
                     return respond(out, 502, "text/plain", msg.as_bytes());
                 }
             };
-            up = match fetch_upstream(&live, &s.route, &req.method, kind, range) {
+            up = match self.fetch_redialling(&s, &mut live, &req.method, kind, range) {
                 Ok(Some(up)) => up,
                 Ok(None) => return respond(out, 404, "text/plain", b"no separate audio"),
                 Err(e) => return respond(out, 502, "text/plain", e.as_bytes()),
@@ -216,9 +220,67 @@ impl Server {
         out.write_all(head.as_bytes())?;
         if req.method != "HEAD" {
             out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
-            copy_body(&mut up, out, &s.cancelled)?;
+            if let Err(e) = copy_body(&mut up, out, &s.cancelled) {
+                // The player asks again, and that has to find a client
+                // that isn't stuck on the connection that just stalled.
+                self.redial(&s, &live);
+                return Err(e);
+            }
         }
         Ok(())
+    }
+
+    /// `fetch_upstream`, and once more on a new client if the request
+    /// timed out or its connection failed (see `redial`). `live` is then
+    /// the session's new upstream half.
+    fn fetch_redialling(
+        &self,
+        s: &Session,
+        live: &mut Live,
+        method: &str,
+        kind: &str,
+        range: Option<&str>,
+    ) -> Result<Option<reqwest::blocking::Response>, String> {
+        match fetch_upstream(live, &s.route, method, kind, range) {
+            Err(e) => match self.redial(s, live) {
+                Some(fresh) => {
+                    *live = fresh;
+                    fetch_upstream(live, &s.route, method, kind, range)
+                }
+                None => Err(e),
+            },
+            done => done,
+        }
+    }
+
+    /// Puts a new relay client in place of the one `seen` has, after a
+    /// request on it timed out or its connection failed, and returns the
+    /// session's upstream half with it. HTTP/2 puts all of a session's
+    /// requests on one connection, and one that stalls without closing (a
+    /// Tor circuit that stops moving) is never given up by the client: every
+    /// later request would wait out the idle timeout on it. The new client
+    /// dials again, and over SOCKS with new credentials, so Tor builds a new
+    /// circuit; a different exit then gets a 403, which resolves the stream
+    /// again as usual. Requests that failed on the same client (video and
+    /// audio together) make one new client between them: the first to
+    /// get here makes it, and the others find it. The lookup kept for
+    /// playing the video again holds the old client, so it is dropped.
+    /// `None` when the session is over or the route has changed.
+    pub(super) fn redial(&self, s: &Session, seen: &Live) -> Option<Live> {
+        if s.cancelled.load(Ordering::Acquire) || !self.runtime().net.same_route(&s.route) {
+            return None;
+        }
+        let fresh = {
+            let mut live = lock(&s.live);
+            if live.generation != seen.generation || live.dial != seen.dial {
+                return Some(live.clone());
+            }
+            live.client = s.route.pinned().relay_client().ok()?;
+            live.dial += 1;
+            live.clone()
+        };
+        self.lookups.forget(&s.source.id);
+        Some(fresh)
     }
 
     /// Answers a range with one response while a second thread fetches it
@@ -366,6 +428,7 @@ impl Server {
         let streams = yt.resolve(&s.source.watch_url(), &s.format)?;
         let fresh = Live {
             generation: seen + 1,
+            dial: 0,
             video: streams.video,
             audio: streams.audio,
             headers: streams.headers,
@@ -575,7 +638,10 @@ struct Fetcher {
 enum Taken {
     Complete,
     Stopped,
+    /// Upstream ended it, or sent more than it was asked for.
     Broke(String),
+    /// A read failed: it timed out, or the connection broke.
+    Failed(String),
 }
 
 impl Fetcher {
@@ -607,6 +673,10 @@ impl Fetcher {
                 Taken::Complete if self.pos > self.end => return Ok(()),
                 Taken::Complete => {}
                 Taken::Broke(e) => once_at(self.pos, &mut failed_at, e)?,
+                Taken::Failed(e) => {
+                    self.redial();
+                    once_at(self.pos, &mut failed_at, e)?;
+                }
             }
             up = match self.next(&mut failed_at)? {
                 Some(up) => up,
@@ -628,7 +698,10 @@ impl Fetcher {
             match self.request() {
                 Ok(next) => return Ok(Some(next)),
                 Err(_) if self.stopped() => return Ok(None),
-                Err(Failure::Connection(e)) => once_at(self.pos, failed_at, e)?,
+                Err(Failure::Connection(e)) => {
+                    self.redial();
+                    once_at(self.pos, failed_at, e)?;
+                }
                 Err(Failure::Final(e)) => return Err(e),
             }
         }
@@ -647,7 +720,7 @@ impl Fetcher {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) if self.stopped() => return Taken::Stopped,
-                Err(e) => return Taken::Broke(e.to_string()),
+                Err(e) => return Taken::Failed(e.to_string()),
             };
             // The read can have taken a long time.
             if self.stopped() {
@@ -664,6 +737,14 @@ impl Fetcher {
             st.blocks.push_back(buf[..n].to_vec());
             drop(st);
             self.ahead.changed.notify_all();
+        }
+    }
+
+    /// A new client for the next request, after the last one stalled or
+    /// failed (see `Server::redial`).
+    fn redial(&mut self) {
+        if let Some(fresh) = self.server.redial(&self.session, &self.live) {
+            self.live = fresh;
         }
     }
 
@@ -804,6 +885,7 @@ mod tests {
             rt.net.clone(),
             Live {
                 generation: 0,
+                dial: 0,
                 video: url,
                 audio: None,
                 headers: vec![],
@@ -1410,6 +1492,190 @@ mod tests {
                 Some(format!("bytes={from}-{}", from + 99)),
             ]
         );
+    }
+
+    /// A server whose clients speak HTTP/2 and give up on a connection
+    /// that has said nothing for `IDLE`, and whose yt-dlp resolves both
+    /// streams to `/big` behind `relay`.
+    fn behind_a_freezer(
+        relay: &Freezer,
+        bin: &TempDir,
+        pace: u64,
+    ) -> (Arc<Server>, String, TempDir) {
+        let later = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 6 * 3600;
+        let ytdlp = fake_ytdlp(
+            &bin.0,
+            &relay.url(&format!("/big?pace={pace}&expire={later}&n=")),
+        );
+        server_tuned(
+            Config {
+                ytdlp,
+                ..Config::default()
+            },
+            |rt| {
+                rt.net = rt.net.clone().speaking_h2c().idling_after(IDLE);
+                rt.yt.net = rt.net.clone();
+            },
+        )
+    }
+
+    const IDLE: Duration = Duration::from_millis(800);
+
+    fn sid_of(base: &str, url: &str) -> String {
+        rel(base, url).split('/').nth(1).unwrap().to_string()
+    }
+
+    #[test]
+    fn a_connection_that_stalls_without_closing_is_dialled_again() {
+        use crate::h2up::{H2Upstream, big_bytes_h2};
+        let up = H2Upstream::start();
+        let relay = Freezer::start(up.addr);
+        let bin = TempDir::new();
+        let (s, base, _d) = behind_a_freezer(&relay, &bin, 0);
+        let info = s.open(&test_video()).unwrap();
+        let sid = sid_of(&base, &info.video);
+        let range = |kind: &str, from: u64| {
+            fetch(
+                &base,
+                "GET",
+                &format!("s/{sid}/{kind}"),
+                &[("Range", &format!("bytes={from}-{}", from + 99))],
+            )
+        };
+        let (status, _, body) = range("v", 0);
+        assert_eq!((status, body), (206, big_bytes_h2(0, 100)));
+        assert_eq!(relay.connections(), 1);
+
+        // The connection stalls, and stays open. The next request waits out
+        // the idle timeout once, and is then made again on a new one.
+        relay.freeze();
+        let started = Instant::now();
+        let (status, _, body) = range("v", 100);
+        assert_eq!((status, body), (206, big_bytes_h2(100, 200)));
+        assert!(started.elapsed() < IDLE * 4, "{:?}", started.elapsed());
+        assert_eq!(relay.connections(), 2);
+        // The ones after it use the new connection at once.
+        let started = Instant::now();
+        let (status, _, body) = range("a", 300);
+        assert_eq!((status, body), (206, big_bytes_h2(300, 400)));
+        assert!(started.elapsed() < IDLE, "{:?}", started.elapsed());
+        assert_eq!(relay.connections(), 2);
+        // The lookup kept for playing it again held the stalled client: it
+        // is looked up again instead.
+        s.open(&test_video()).unwrap();
+        assert_eq!(runs(&bin.0), 2);
+    }
+
+    #[test]
+    fn video_and_audio_stalling_together_get_one_new_client() {
+        use crate::h2up::{H2Upstream, big_bytes_h2};
+        let up = H2Upstream::start();
+        let relay = Freezer::start(up.addr);
+        let bin = TempDir::new();
+        let (s, base, _d) = behind_a_freezer(&relay, &bin, 0);
+        let info = s.open(&test_video()).unwrap();
+        let sid = sid_of(&base, &info.video);
+        let (status, _, _) = fetch(
+            &base,
+            "GET",
+            &format!("s/{sid}/v"),
+            &[("Range", "bytes=0-99")],
+        );
+        assert_eq!(status, 206);
+        relay.freeze();
+        let both: Vec<_> = ["v", "a"]
+            .into_iter()
+            .map(|kind| {
+                let (base, path) = (base.clone(), format!("s/{sid}/{kind}"));
+                std::thread::spawn(move || {
+                    fetch(&base, "GET", &path, &[("Range", "bytes=1000-1099")])
+                })
+            })
+            .collect();
+        for got in both {
+            let (status, _, body) = got.join().unwrap();
+            assert_eq!((status, body), (206, big_bytes_h2(1000, 1100)));
+        }
+        assert_eq!(lock(&s.session(&sid).unwrap().live).dial, 1);
+    }
+
+    #[test]
+    fn a_stream_that_stalls_part_way_carries_on_over_a_new_connection() {
+        use crate::h2up::{H2Upstream, big_bytes_h2};
+        let up = H2Upstream::start();
+        let relay = Freezer::start(up.addr);
+        let bin = TempDir::new();
+        // 16 KiB every 5 ms: the first chunk takes a while to come.
+        let (s, base, _d) = behind_a_freezer(&relay, &bin, 5);
+        let info = s.open(&test_video()).unwrap();
+        let sid = sid_of(&base, &info.video);
+        let want = 2u64 << 20;
+        let player = {
+            let (base, path) = (base.clone(), format!("s/{sid}/v"));
+            std::thread::spawn(move || {
+                fetch(
+                    &base,
+                    "GET",
+                    &path,
+                    &[("Range", &format!("bytes=0-{}", want - 1))],
+                )
+            })
+        };
+        wait_for("bytes to flow", Duration::from_secs(5), || {
+            up.sent() > 256 << 10
+        });
+        relay.freeze();
+        let (status, _, body) = player.join().unwrap();
+        assert_eq!(status, 206);
+        assert!(body == big_bytes_h2(0, want), "{} bytes", body.len());
+        assert_eq!(relay.connections(), 2);
+    }
+
+    #[test]
+    fn a_warm_up_that_stalls_leaves_a_new_client_for_the_player() {
+        use crate::h2up::{H2Upstream, big_bytes_h2};
+        let up = H2Upstream::start();
+        let relay = Freezer::start(up.addr);
+        let bin = TempDir::new();
+        let (s, base, _d) = behind_a_freezer(&relay, &bin, 0);
+        s.warming.store(true, std::sync::atomic::Ordering::Relaxed);
+        s.open(&test_video()).unwrap();
+        wait_for("the warm-up", Duration::from_secs(5), || {
+            up.ranges().len() >= 2
+        });
+        // Played again from the kept lookup, on its client, whose connection
+        // has stalled meanwhile: the warm-up of the new session waits it out.
+        relay.freeze();
+        let rt = s.runtime();
+        let info = s.open(&test_video()).unwrap();
+        assert_eq!(runs(&bin.0), 1);
+        let sid = sid_of(&base, &info.video);
+        wait_for(
+            "the stalled client to be replaced",
+            Duration::from_secs(5),
+            || {
+                s.lookups
+                    .get(&test_video().id, &rt.cfg.format(), &rt.net)
+                    .is_none()
+            },
+        );
+        // Video and audio, head and tail, all stalled: one new client.
+        std::thread::sleep(IDLE);
+        assert_eq!(lock(&s.session(&sid).unwrap().live).dial, 1);
+        let started = Instant::now();
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            &format!("s/{sid}/v"),
+            &[("Range", "bytes=0-99")],
+        );
+        assert_eq!((status, body), (206, big_bytes_h2(0, 100)));
+        assert!(started.elapsed() < IDLE, "{:?}", started.elapsed());
+        assert_eq!(relay.connections(), 2);
     }
 
     #[test]

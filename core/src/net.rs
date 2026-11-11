@@ -44,6 +44,9 @@ pub struct Net {
     /// way a local stand-in for googlevideo expects. Only tests set it; over
     /// TLS, HTTP/2 is agreed on in the handshake.
     h2c: bool,
+    /// The relay's idle timeout, when not `RELAY_IDLE_TIMEOUT`. Only tests
+    /// set it, to see one run out in less than a minute.
+    relay_idle: Option<Duration>,
 }
 
 impl Net {
@@ -80,6 +83,7 @@ impl Net {
             isolate,
             allow_http: false,
             h2c: false,
+            relay_idle: None,
         })
     }
 
@@ -95,6 +99,13 @@ impl Net {
     pub fn speaking_h2c(mut self) -> Self {
         self.allow_http = true;
         self.h2c = true;
+        self
+    }
+
+    /// The same route, with relay clients that give up after `idle`.
+    #[cfg(test)]
+    pub fn idling_after(mut self, idle: Duration) -> Self {
+        self.relay_idle = Some(idle);
         self
     }
 
@@ -198,9 +209,11 @@ impl Net {
     /// reqwest's blocking client applies its timeout to waiting for the
     /// response head and then to each separate read of the body, so a stalled
     /// upstream (a dead Tor circuit, say) ends the stream with an error
-    /// instead of holding a thread and a connection forever.
+    /// instead of holding a thread and a connection forever. The relay then
+    /// replaces the client (see `Server::redial`): this one would keep its
+    /// stalled HTTP/2 connection for every later request.
     pub fn relay_client(&self) -> Result<Client> {
-        self.relay_client_idle(RELAY_IDLE_TIMEOUT)
+        self.relay_client_idle(self.relay_idle.unwrap_or(RELAY_IDLE_TIMEOUT))
     }
 
     fn relay_client_idle(&self, idle: Duration) -> Result<Client> {

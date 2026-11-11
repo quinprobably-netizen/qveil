@@ -290,7 +290,7 @@ impl Server {
         if let Some(s) = &session
             && self.warming.load(Ordering::Relaxed)
         {
-            warm::start(s, [video_size, audio_size]);
+            warm::start(self, s, [video_size, audio_size]);
         }
         let watched = rt.cfg.history.then(|| Watched {
             id: v.id.clone(),
@@ -409,6 +409,7 @@ impl Server {
         let s = yt.resolve_until(&v.watch_url(), format, abort)?;
         let live = Live {
             generation: 0,
+            dial: 0,
             video: s.video.clone(),
             audio: s.audio.clone(),
             headers: s.headers.clone(),

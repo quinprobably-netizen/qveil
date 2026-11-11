@@ -560,3 +560,96 @@ pub fn settled(up: &Upstream) -> usize {
     });
     last.0
 }
+
+/// A TCP relay in front of `upstream` whose connections can be frozen: kept
+/// open with nothing more passed on either way, as a Tor circuit that
+/// stalls does. Connections made after a freeze pass bytes as usual.
+pub struct Freezer {
+    pub addr: std::net::SocketAddr,
+    connections: Arc<AtomicUsize>,
+    /// One flag per connection made so far.
+    frozen: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+}
+
+impl Freezer {
+    pub fn start(upstream: std::net::SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let frozen: Arc<Mutex<Vec<Arc<AtomicBool>>>> = Arc::default();
+        let (count, flags) = (Arc::clone(&connections), Arc::clone(&frozen));
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let flag = Arc::new(AtomicBool::new(false));
+                flags.lock().unwrap().push(Arc::clone(&flag));
+                for (from, to) in [
+                    (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                    (server, client),
+                ] {
+                    let flag = Arc::clone(&flag);
+                    std::thread::spawn(move || pass_on(from, to, &flag));
+                }
+            }
+        });
+        Freezer {
+            addr,
+            connections,
+            frozen,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    /// Freezes every connection there is now.
+    pub fn freeze(&self) {
+        for flag in self.frozen.lock().unwrap().iter() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+}
+
+/// Copies `from` to `to` until either end closes, or the connection is
+/// frozen: then it holds both open, and passes nothing on, for as long as
+/// the test runs.
+fn pass_on(mut from: TcpStream, mut to: TcpStream, frozen: &AtomicBool) {
+    from.set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let mut buf = vec![0u8; 16 << 10];
+    let hold = |held: (TcpStream, TcpStream)| -> ! {
+        let _held = held;
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    };
+    loop {
+        if frozen.load(Ordering::SeqCst) {
+            hold((from, to));
+        }
+        match from.read(&mut buf) {
+            Ok(0) => return,
+            // What arrived while it froze is not passed on either.
+            Ok(_) if frozen.load(Ordering::SeqCst) => hold((from, to)),
+            Ok(n) => {
+                if to.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return,
+        }
+    }
+}

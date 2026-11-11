@@ -15,6 +15,7 @@
 //! cancelled. A failure here costs nothing: the player's request then goes
 //! upstream as it would have anyway.
 
+use super::Server;
 use super::relay::{Live, Session, content_range, fetch_upstream, is_playlist_type};
 use crate::util::lock;
 use reqwest::StatusCode;
@@ -201,7 +202,7 @@ fn tail_of(total: u64) -> Option<u64> {
 /// the lengths of the video and the audio stream, where yt-dlp knew them:
 /// then the tail is fetched alongside the head, and otherwise once the
 /// head's response has said how long the stream is.
-pub(super) fn start(s: &Arc<Session>, sizes: [Option<u64>; 2]) {
+pub(super) fn start(server: &Arc<Server>, s: &Arc<Session>, sizes: [Option<u64>; 2]) {
     let live = lock(&s.live).clone();
     let mut kinds = vec![("v", sizes[0].and_then(tail_of))];
     if live.audio.is_some() {
@@ -211,9 +212,9 @@ pub(super) fn start(s: &Arc<Session>, sizes: [Option<u64>; 2]) {
         return;
     }
     let spawn = |kind: &'static str, part: Part| {
-        let (session, live) = (Arc::clone(s), live.clone());
-        let spawned =
-            std::thread::Builder::new().spawn(move || fetch_part(&session, &live, kind, part));
+        let (server, session, live) = (Arc::clone(server), Arc::clone(s), live.clone());
+        let spawned = std::thread::Builder::new()
+            .spawn(move || fetch_part(&server, &session, &live, kind, part));
         if spawned.is_err() {
             // Nobody would ever fill it, and a request would wait for it.
             s.warm
@@ -241,10 +242,18 @@ enum Part {
     Tail(u64),
 }
 
-fn fetch_part(s: &Session, live: &Live, kind: &str, part: Part) {
+fn fetch_part(server: &Server, s: &Session, live: &Live, kind: &str, part: Part) {
+    let piece = |start, last| match piece(s, live, kind, start, last) {
+        Ok(found) => found,
+        Err(Stalled) => {
+            // The player's own request then goes upstream, on a new client.
+            server.redial(s, live);
+            None
+        }
+    };
     match part {
         Part::Head { then_tail } => {
-            let head = piece(s, live, kind, 0, HEAD - 1);
+            let head = piece(0, HEAD - 1);
             let tail_from = head
                 .as_ref()
                 .filter(|_| then_tail)
@@ -252,25 +261,38 @@ fn fetch_part(s: &Session, live: &Live, kind: &str, part: Part) {
             if s.warm.put(kind, true, head, tail_from)
                 && let Some(from) = tail_from
             {
-                let tail = piece(s, live, kind, from, from + TAIL - 1);
+                let tail = piece(from, from + TAIL - 1);
                 s.warm.put(kind, false, tail, None);
             }
         }
         Part::Tail(from) => {
-            let tail = piece(s, live, kind, from, from + TAIL - 1);
+            let tail = piece(from, from + TAIL - 1);
             s.warm.put(kind, false, tail, None);
         }
     }
 }
 
+/// A warm-up request timed out, or its connection failed.
+struct Stalled;
+
 /// Bytes `start..=last` of stream `kind`, or `None` if they can't be had
 /// as they are (a 403 is left to the player's own request, which resolves
 /// the stream again).
-fn piece(s: &Session, live: &Live, kind: &str, start: u64, last: u64) -> Option<Piece> {
+fn piece(
+    s: &Session,
+    live: &Live,
+    kind: &str,
+    start: u64,
+    last: u64,
+) -> Result<Option<Piece>, Stalled> {
     let range = format!("bytes={start}-{last}");
-    let mut up = fetch_upstream(live, &s.route, "GET", kind, Some(&range)).ok()??;
+    let Some(mut up) =
+        fetch_upstream(live, &s.route, "GET", kind, Some(&range)).map_err(|_| Stalled)?
+    else {
+        return Ok(None);
+    };
     if up.status() != StatusCode::PARTIAL_CONTENT {
-        return None;
+        return Ok(None);
     }
     let content_type = up
         .headers()
@@ -278,33 +300,35 @@ fn piece(s: &Session, live: &Live, kind: &str, start: u64, last: u64) -> Option<
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     if content_type.as_deref().is_some_and(is_playlist_type) {
-        return None;
+        return Ok(None);
     }
-    let (a, b, total) = content_range(&up)?;
+    let Some((a, b, total)) = content_range(&up) else {
+        return Ok(None);
+    };
     if a != start || b > last {
-        return None;
+        return Ok(None);
     }
     let want = (b + 1 - a) as usize;
     let mut bytes = Vec::with_capacity(want);
     let mut buf = vec![0u8; 64 << 10];
     while bytes.len() < want {
         if s.cancelled.load(Ordering::Acquire) {
-            return None;
+            return Ok(None);
         }
         match up.read(&mut buf) {
-            Ok(0) => return None,
+            Ok(0) => return Ok(None),
             Ok(n) => bytes.extend_from_slice(&buf[..n.min(want - bytes.len())]),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return None,
+            Err(_) => return Err(Stalled),
         }
     }
-    Some(Piece {
+    Ok(Some(Piece {
         start,
         bytes: bytes.into(),
         total,
         content_type,
         generation: live.generation,
-    })
+    }))
 }
 
 #[cfg(test)]
