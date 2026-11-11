@@ -109,8 +109,10 @@ impl Thumbs {
 /// modification time, which a read sets, so it carries over a restart.
 pub(super) struct Disk {
     max: u64,
-    /// What is in the directory, once it has been looked at. Also held while
-    /// writing and deleting, so that a write can't recreate what was deleted.
+    /// What is in the directory, once it has been looked at. Held for what
+    /// changes the directory or the count (putting a file in place, evicting,
+    /// deleting), so that a write can't recreate what was deleted; not for
+    /// reading a file or writing one, which take as long as the disk does.
     index: Mutex<Option<Index>>,
 }
 
@@ -132,8 +134,11 @@ struct Index {
 }
 
 impl Index {
-    /// What is in `dir`, the least recently used first.
+    /// What is in `dir`, the least recently used first. The temp files of
+    /// writers that died are deleted first: they are not thumbnails, and
+    /// nothing else would ever remove them.
     fn scan(dir: &Path) -> Index {
+        crate::store::sweep_temps(dir, crate::store::TEMP_ABANDONED);
         let mut found: Vec<(std::time::SystemTime, String, u64)> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
@@ -183,10 +188,13 @@ impl Disk {
 
     /// The thumbnail of `id`, if it is kept in `dir`.
     fn read(&self, dir: &Path, id: &str) -> Option<Vec<u8>> {
-        let mut slot = lock(&self.index);
         let path = file(dir, id);
-        let Ok(bytes) = std::fs::read(&path) else {
-            // Deleted behind our back (`qveil wipe`, say), or never there.
+        // Outside the lock: reading is the slow part, and it changes nothing.
+        let read = std::fs::read(&path);
+        let mut slot = lock(&self.index);
+        // Deleted behind our back (`qveil wipe`, say), or never there, or
+        // deleted since it was read: then it is not counted either.
+        let Some(bytes) = read.ok().filter(|_| path.exists()) else {
             self.index(&mut slot, dir).remove(id);
             return None;
         };
@@ -199,20 +207,25 @@ impl Disk {
     }
 
     /// Keeps `bytes` as the thumbnail of `id` in `dir`, unless `still` says
-    /// (under the lock that deleting takes) that keeping them is off now,
-    /// and makes room by deleting the least recently used.
-    fn write(
-        &self,
-        dir: &Path,
-        id: &str,
-        bytes: &[u8],
-        still: impl FnOnce() -> bool,
-    ) -> Result<()> {
-        let mut slot = lock(&self.index);
+    /// that keeping them is off now, and makes room by deleting the least
+    /// recently used. The file is written (and synced) before the lock is
+    /// taken, and put in place under it, after asking `still` again: that is
+    /// what deleting takes the lock for, so a write can't bring back what
+    /// was deleted.
+    fn write(&self, dir: &Path, id: &str, bytes: &[u8], still: impl Fn() -> bool) -> Result<()> {
         if !still() {
             return Ok(());
         }
-        crate::store::write_atomic(&file(dir, id), bytes)?;
+        let staged = crate::store::stage(&file(dir, id), bytes)?;
+        let mut slot = lock(&self.index);
+        if !still() {
+            drop(staged);
+            // The directory may be one that was deleted and that writing
+            // made again; if it is empty it is not kept either.
+            let _ = std::fs::remove_dir(dir);
+            return Ok(());
+        }
+        staged.commit()?;
         let index = self.index(&mut slot, dir);
         index.used(id, bytes.len() as u64);
         while index.total > self.max {
@@ -431,6 +444,94 @@ mod tests {
         });
         assert_eq!(left.unwrap(), s.paths.thumbs());
         assert!(!s.paths.thumbs().exists());
+    }
+
+    /// The names in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut n: Vec<_> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    }
+
+    #[test]
+    fn the_first_look_at_the_directory_removes_the_temp_files_of_writers_that_died() {
+        let root = crate::store::testing::TempDir::new();
+        let dir = root.0.join("thumbs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead = ".dQw4w9WgXcQ.jpg.99999999-0123456789abcdef.tmp";
+        // A writer in this process, which may be about to rename its file.
+        let mine = format!(
+            ".bbbbbbbbbbb.jpg.{}-0123456789abcdef.tmp",
+            std::process::id()
+        );
+        std::fs::write(dir.join(dead), b"half").unwrap();
+        std::fs::write(dir.join(&mine), b"half").unwrap();
+        std::fs::write(file(&dir, "aaaaaaaaaaa"), b"whole").unwrap();
+        let disk = Disk::default();
+        assert!(disk.read(&dir, "ccccccccccc").is_none());
+        assert_eq!(names(&dir), [mine.as_str(), "aaaaaaaaaaa.jpg"]);
+        // And what is there is counted: the temp file is not.
+        assert_eq!(lock(&disk.index).as_ref().unwrap().total, 5);
+    }
+
+    #[test]
+    fn a_thumbnail_is_written_to_its_file_before_the_lock_is_taken() {
+        // Writing and syncing a file is the slow part. While another thread
+        // holds the index (reading, evicting, deleting), a write does that
+        // much and waits only to put it in place.
+        let root = crate::store::testing::TempDir::new();
+        let dir = root.0.join("thumbs");
+        let disk = Disk::default();
+        let id = "aaaaaaaaaaa";
+        let held = lock(&disk.index);
+        std::thread::scope(|scope| {
+            let write = scope.spawn(|| disk.write(&dir, id, b"jpeg", || true).unwrap());
+            wait_for("the file to be written", Duration::from_secs(10), || {
+                names(&dir).iter().any(|n| n.ends_with(".tmp"))
+            });
+            assert!(!write.is_finished(), "it didn't wait for the index");
+            assert!(!file(&dir, id).exists());
+            drop(held);
+            write.join().unwrap();
+        });
+        assert_eq!(names(&dir), ["aaaaaaaaaaa.jpg"]);
+        assert_eq!(lock(&disk.index).as_ref().unwrap().total, 4);
+    }
+
+    #[test]
+    fn keeping_turned_off_while_a_thumbnail_is_written_leaves_nothing_behind() {
+        let root = crate::store::testing::TempDir::new();
+        let dir = root.0.join("thumbs");
+        let disk = Disk::default();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        // Asked before the file is written, and again once it is to be put
+        // in place. Between them keeping is turned off and what was kept is
+        // deleted, the directory too; and the write made the directory again
+        // to write in it. Neither the file nor the directory stays.
+        disk.write(&dir, "aaaaaaaaaaa", b"jpeg", || {
+            asked.fetch_add(1, Ordering::SeqCst) == 0
+        })
+        .unwrap();
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert!(!dir.exists(), "left: {:?}", names(&dir));
+        assert!(lock(&disk.index).is_none() || lock(&disk.index).as_ref().unwrap().total == 0);
+    }
+
+    #[test]
+    fn reading_a_thumbnail_that_was_deleted_counts_nothing() {
+        let root = crate::store::testing::TempDir::new();
+        let dir = root.0.join("thumbs");
+        let disk = Disk::default();
+        disk.write(&dir, "aaaaaaaaaaa", b"jpeg", || true).unwrap();
+        disk.forget(&dir).unwrap();
+        assert!(disk.read(&dir, "aaaaaaaaaaa").is_none());
+        let slot = lock(&disk.index);
+        assert_eq!(slot.as_ref().unwrap().total, 0);
+        assert!(slot.as_ref().unwrap().files.is_empty());
     }
 
     #[test]

@@ -668,6 +668,42 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_write_is_put_in_place_by_commit_and_is_gone_without_it() {
+        let dir = TempDir::new();
+        let target = dir.0.join("a.json");
+        fs::write(&target, b"old").unwrap();
+        let names = || -> Vec<String> {
+            let mut n: Vec<_> = fs::read_dir(&dir.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            n.sort();
+            n
+        };
+        let staged = stage(&target, b"new").unwrap();
+        // Written, and not yet in place.
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        let tmp = names().into_iter().find(|n| n.ends_with(".tmp")).unwrap();
+        assert_eq!(fs::read(dir.0.join(&tmp)).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(dir.0.join(&tmp)).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        staged.commit().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(names(), ["a.json"]);
+        // Never committed: nothing is left, and the target is as it was.
+        drop(stage(&target, b"unwanted").unwrap());
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(names(), ["a.json"]);
+        // A commit that fails removes it as well.
+        let blocked = dir.0.join("b.json");
+        fs::create_dir(&blocked).unwrap();
+        assert!(stage(&blocked, b"x").unwrap().commit().is_err());
+        assert_eq!(names(), ["a.json", "b.json"]);
+    }
+
+    #[test]
     fn a_failed_write_leaves_no_temp_file_behind() {
         let dir = TempDir::new();
         let target = dir.0.join("sub.json");
