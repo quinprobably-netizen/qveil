@@ -55,6 +55,27 @@ pub const CANCELLED: &str = "The request was cancelled";
 /// fetches it, to tell a live stream from a video that has no plain download.
 const SKIP_MANIFESTS: &str = "youtube:skip=hls,dash";
 
+/// How a video is looked up to be played: one request, YouTube's player
+/// answer for the client whose streams are played. Left to itself, yt-dlp
+/// first fetches the watch page (a megabyte of HTML, 0.85 to 1.07 s over
+/// Tor, measured), for the `web` client's player answer and the page data
+/// in it (chapters, likes, the channel's name); but `web`'s streams need a
+/// token that yt-dlp doesn't have and are dropped anyway, and without the
+/// page it would ask the player for `web` (and fetch its JavaScript) and
+/// the page data (`next`) one request at a time instead. So the page,
+/// the clients' own configuration pages, the page data and the `web`
+/// client are all left out, and the rest of yt-dlp's default clients are
+/// asked as they would have been. What the page data had is fetched apart,
+/// when it is wanted: see `chapters_of`.
+const LOOKUP: &str =
+    "youtube:skip=hls,dash;player_skip=webpage,configs,initial_data;player_client=default,-web";
+/// How a video's chapters are looked up: the page data, from YouTube's
+/// `next` answer, and the player answer that yt-dlp can't do without (it
+/// has no way to skip that), but neither the page nor the player's
+/// JavaScript, and nothing is downloaded.
+const CHAPTERS_LOOKUP: &str =
+    "youtube:skip=hls,dash;player_skip=webpage,configs,js;player_client=default,-web";
+
 /// yt-dlp exited with an error. `raw` is its last stderr line; the message
 /// shown is the readable version of it.
 #[derive(Debug)]
@@ -96,6 +117,10 @@ pub struct Streams {
     /// Unix seconds.
     pub published: Option<i64>,
     pub chapters: Vec<Chapter>,
+    /// Whether the video may have chapters that the lookup didn't ask for:
+    /// it left the page data out (see `LOOKUP`), and the description named
+    /// none. They are then looked up apart, when they are wanted.
+    pub chapters_later: bool,
 }
 
 /// How much of a description is kept, in characters. YouTube allows 5000;
@@ -457,11 +482,38 @@ impl Ytdlp {
         abort: &dyn Fn() -> bool,
     ) -> Result<Streams> {
         let args = ["-J", "--no-playlist", "-f", format];
-        match self.json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort) {
-            Ok(v) => streams_from(&v, url),
+        let (found, quick) = match self.json_with(&args, Some(LOOKUP), url, RESOLVE, abort) {
+            // A yt-dlp whose only default client is `web` has nothing left to
+            // ask: then it is asked the usual way, page and all.
+            Err(e) if is_no_client(&e) => (
+                self.json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort),
+                false,
+            ),
+            found => (found, true),
+        };
+        match found {
+            Ok(v) => {
+                let mut s = streams_from(&v, url)?;
+                s.chapters_later = quick && s.chapters.is_empty();
+                Ok(s)
+            }
             Err(e) if is_no_format(&e) => Err(self.explain_no_format(url, e, abort)),
             Err(e) => Err(e),
         }
+    }
+
+    /// The chapters of a video, from the page data that a lookup to play it
+    /// leaves out (see `LOOKUP`): what YouTube shows as its chapters, which
+    /// may have been made by YouTube, or else those the description names.
+    pub fn chapters_of(&self, url: &str, abort: &dyn Fn() -> bool) -> Result<Vec<Chapter>> {
+        let args = [
+            "-J",
+            "--no-playlist",
+            "--skip-download",
+            "--ignore-no-formats-error",
+        ];
+        let v = self.json_with(&args, Some(CHAPTERS_LOOKUP), url, QUICK, abort)?;
+        Ok(chapters(&v))
     }
 
     /// The format selector only accepts plain downloads, so a live stream
@@ -550,6 +602,11 @@ fn is_no_format(e: &anyhow::Error) -> bool {
     })
 }
 
+fn is_no_client(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Failed>()
+        .is_some_and(|f| f.raw.contains("No player clients have been requested"))
+}
+
 fn is_live(v: &Value) -> bool {
     v["is_live"].as_bool() == Some(true) || v["live_status"].as_str() == Some("is_live")
 }
@@ -607,24 +664,84 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
                 .collect()
         })
         .unwrap_or_default();
+    let duration = v["duration"].as_f64().map(|d| d as u64);
+    let description: Option<String> =
+        str_field(v, &["description"]).map(|d| d.chars().take(DESCRIPTION_MAX).collect());
+    let mut chapters = chapters(v);
+    if chapters.is_empty()
+        && let (Some(d), Some(length)) = (&description, duration)
+    {
+        chapters = description_chapters(d, length);
+    }
     Ok(Streams {
         title,
         channel: str_field(v, &["channel", "uploader"]),
         channel_id: str_field(v, &["channel_id"]).filter(|c| ids::is_channel_id(c)),
-        duration: v["duration"].as_f64().map(|d| d as u64),
+        duration,
         video: video_fmt["url"]
             .as_str()
             .context("format has no URL")?
             .into(),
         audio,
         headers,
-        description: str_field(v, &["description"])
-            .map(|d| d.chars().take(DESCRIPTION_MAX).collect()),
+        description,
         views: v["view_count"].as_u64(),
         likes: v["like_count"].as_u64(),
         published: v["timestamp"].as_i64().or(v["release_timestamp"].as_i64()),
-        chapters: chapters(v),
+        chapters,
+        chapters_later: false,
     })
+}
+
+/// The chapters a description names, by YouTube's rule for them: lines
+/// that start with a time and go on with a title, the first at 0:00, three
+/// or more, each later than the one before and within the video. (yt-dlp
+/// reads them the same way when it has the page data, but not without it.)
+fn description_chapters(description: &str, duration: u64) -> Vec<Chapter> {
+    let found: Vec<Chapter> = description
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (stamp, rest) = line.split_at(line.find(|c: char| c.is_whitespace())?);
+            let start = clock_seconds(stamp)?;
+            // A dash or the like between the time and the title.
+            let title = rest
+                .trim_start()
+                .trim_start_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace())
+                .trim();
+            (!title.is_empty()).then(|| Chapter {
+                start,
+                title: title.into(),
+            })
+        })
+        .take(CHAPTERS_MAX)
+        .collect();
+    let in_order = found.windows(2).all(|w| w[0].start < w[1].start);
+    let fits = found.last().is_some_and(|c| c.start < duration);
+    if found.len() >= 3 && found[0].start == 0 && in_order && fits {
+        found
+    } else {
+        Vec::new()
+    }
+}
+
+/// `m:ss`, `mm:ss` or `h:mm:ss`, in seconds.
+fn clock_seconds(stamp: &str) -> Option<u64> {
+    let parts: Vec<&str> = stamp.split(':').collect();
+    let num = |p: &str, max_len: usize| {
+        (!p.is_empty() && p.len() <= max_len && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse::<u64>().ok())
+            .flatten()
+    };
+    match parts.as_slice() {
+        [m, s] if s.len() == 2 => Some(num(m, 2)? * 60 + num(s, 2).filter(|&s| s < 60)?),
+        [h, m, s] if m.len() == 2 && s.len() == 2 => Some(
+            num(h, 3)? * 3600
+                + num(m, 2).filter(|&m| m < 60)? * 60
+                + num(s, 2).filter(|&s| s < 60)?,
+        ),
+        _ => None,
+    }
 }
 
 /// The video's chapters, in the order yt-dlp lists them. One without a title
@@ -959,6 +1076,143 @@ echo '{"entries":[]}'
     }
 
     #[test]
+    fn a_lookup_asks_for_the_player_and_not_for_the_watch_page() {
+        let dir = TempDir::new();
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
+        let _ = yt.resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b");
+        assert!(
+            spied(&dir, "config").contains(
+                "--extractor-args 'youtube:skip=hls,dash;player_skip=webpage,configs,initial_data;player_client=default,-web'\n"
+            ),
+            "{}",
+            spied(&dir, "config")
+        );
+    }
+
+    #[test]
+    fn a_yt_dlp_left_with_no_client_to_ask_is_asked_the_usual_way() {
+        let dir = TempDir::new();
+        let yt = ytdlp(
+            script(
+                &dir.0.join("yt-dlp"),
+                r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+if grep -q "player_client=default,-web" "$conf"; then
+  echo quick >> "$(dirname "$0")/calls"
+  echo 'ERROR: [youtube] x: No player clients have been requested' >&2; exit 1
+fi
+echo usual >> "$(dirname "$0")/calls"
+echo '{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"}'"#,
+            ),
+            None,
+        );
+        let s = yt
+            .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
+            .unwrap();
+        assert_eq!(s.video, "https://gv.test/c");
+        // Asked the usual way, the page was in it, chapters and all.
+        assert!(!s.chapters_later);
+        assert_eq!(spied(&dir, "calls"), "quick\nusual\n");
+    }
+
+    #[test]
+    fn chapters_are_looked_up_from_the_watch_data_without_the_page_or_the_streams() {
+        let dir = TempDir::new();
+        let answer = r#"{"duration":600,"chapters":[{"start_time":0,"title":"Intro"},{"start_time":90,"title":"Part"}]}"#;
+        let yt = ytdlp(
+            script(
+                &dir.0.join("yt-dlp"),
+                &format!(
+                    "{}echo '{answer}'\n",
+                    SPY.trim_end().trim_end_matches(r#"echo '{"entries":[]}'"#)
+                ),
+            ),
+            None,
+        );
+        let found = yt
+            .chapters_of("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &|| false)
+            .unwrap();
+        assert_eq!(
+            found,
+            [
+                Chapter {
+                    start: 0,
+                    title: "Intro".into()
+                },
+                Chapter {
+                    start: 90,
+                    title: "Part".into()
+                }
+            ]
+        );
+        let config = spied(&dir, "config");
+        assert!(
+            config.contains(
+                "--extractor-args 'youtube:skip=hls,dash;player_skip=webpage,configs,js;player_client=default,-web'\n"
+            ),
+            "{config}"
+        );
+        let argv = spied(&dir, "argv");
+        for arg in [
+            "--skip-download",
+            "--ignore-no-formats-error",
+            "--no-playlist",
+        ] {
+            assert!(argv.lines().any(|l| l == arg), "{arg} in {argv}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_without_the_page_finds_the_chapters_written_in_the_description() {
+        let json = |desc: &str, chapters: &str| {
+            format!(
+                r#"{{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","duration":600,"description":{},"chapters":{chapters}}}"#,
+                serde_json::to_string(desc).unwrap()
+            )
+        };
+        let chapter = |start, title: &str| Chapter {
+            start,
+            title: title.into(),
+        };
+        let desc =
+            "What this is about.\n\n0:00 Intro\n1:30 - The middle part\n 9:05 The end \nThanks!";
+        let s = resolved(&json(desc, "null")).unwrap();
+        assert_eq!(
+            s.chapters,
+            [
+                chapter(0, "Intro"),
+                chapter(90, "The middle part"),
+                chapter(545, "The end")
+            ]
+        );
+        // As YouTube has them: from 0:00, three or more, in order, within the video.
+        for desc in [
+            "1:00 a\n2:00 b\n3:00 c",
+            "0:00 a\n2:00 b",
+            "0:00 a\n3:00 b\n2:00 c",
+            "0:00 a\n3:00 b\n11:00 c",
+            "0:00 a\n1:00:00 b\n2:00:00 c",
+        ] {
+            assert!(
+                resolved(&json(desc, "null")).unwrap().chapters.is_empty(),
+                "{desc:?}"
+            );
+        }
+        assert_eq!(
+            resolved(&json("0:00 a\n1:00 b\n1:01:00 c", "null"))
+                .unwrap()
+                .chapters
+                .len(),
+            0
+        );
+        // An hour and more is h:mm:ss.
+        let long = r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","duration":7200,"description":"0:00 a\n30:00 b\n1:05:30 c"}"#;
+        assert_eq!(resolved(long).unwrap().chapters[2], chapter(3930, "c"));
+        // YouTube's own chapters, where yt-dlp has them, win.
+        let s = resolved(&json(desc, r#"[{"start_time":0,"title":"Theirs"}]"#)).unwrap();
+        assert_eq!(s.chapters, [chapter(0, "Theirs")]);
+    }
+
+    #[test]
     fn manifests_are_skipped_when_resolving_but_not_when_explaining_a_failure() {
         let dir = TempDir::new();
         // A live stream: without its HLS manifest yt-dlp finds no format at
@@ -967,7 +1221,7 @@ echo '{"entries":[]}'
             script(
                 &dir.0.join("yt-dlp"),
                 r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
-if grep -q "^--extractor-args 'youtube:skip=hls,dash'$" "$conf"; then
+if grep -q "^--extractor-args 'youtube:skip=hls,dash" "$conf"; then
   echo skipped >> "$(dirname "$0")/calls"
   echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2; exit 1
 fi

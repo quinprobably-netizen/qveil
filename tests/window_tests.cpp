@@ -910,6 +910,43 @@ private slots:
         QCOMPARE(app.page(), QString("home"));
     }
 
+    void chaptersTheAnswerLeftOutAreOnlyLookedUpWhenTheTabIsOpened()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "later000001"}, {"title", "From a card"}, {"channel", "The card's channel"}});
+        QQuickItem *surface = app.item("surface");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        // The channel the card named stays, where the answer has none.
+        QCOMPARE(surface->property("info").toMap().value("channel").toString(), QString("The card's channel"));
+        QVERIFY(QUrl::fromPercentEncoding(app.asked().filter("POST api/play").last().toUtf8()).contains("channel=The card's channel"));
+        QTest::qWait(300);
+        QCOMPARE(app.asked("GET api/chapters"), 0);
+        QVERIFY(!app.item("seek-chapter")->isVisible());
+
+        // There may be chapters, so there is a tab for them; opening it looks them up.
+        QVERIFY(app.item("tab-chapters")->isVisible());
+        app.click(app.item("tab-chapters"));
+        QTRY_COMPARE(app.items("chapter").size(), 7);
+        QCOMPARE(app.asked("GET api/chapters"), 1);
+        QVERIFY(app.asked().filter("GET api/chapters").first().contains("v=later000001"));
+        // The bar has them now too.
+        QTRY_VERIFY(app.item("seek-chapter")->isVisible());
+        // Coming back to the tab asks for nothing.
+        app.click(app.item("tab-next"));
+        app.click(app.item("tab-chapters"));
+        QTest::qWait(300);
+        QCOMPARE(app.asked("GET api/chapters"), 1);
+
+        // A video that has none says so.
+        app.play({{"id", "laternone00"}});
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        app.click(app.item("tab-chapters"));
+        QTRY_VERIFY(app.item("chapters-empty")->isVisible());
+        QVERIFY(app.items("chapter").isEmpty());
+        QCOMPARE(app.asked("GET api/chapters"), 2);
+    }
+
     void commentsAreOnlyFetchedWhenTheTabIsOpened()
     {
         App app;

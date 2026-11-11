@@ -405,6 +405,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.lines(progress + [{"result": result}], 0.15 if fetch else 0)
             else:
                 self.send(200, result)
+        elif path == "api/chapters":
+            # Looked up apart for a video whose play said `chaptersLater`.
+            found = [] if q.get("v") == "laternone00" else [{"start": s, "title": t} for s, t in CHAPTERS]
+            self.send(200, {"chapters": found})
         elif path == "api/comments":
             if q.get("v") == "slowslowslo":
                 time.sleep(5)
@@ -498,6 +502,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             stream = base + "/s/x/v" if CLIP else ""
             if v.startswith("bare"):
                 self.send(200, {"id": v, "title": "A video with nothing but streams", "video": stream})
+                return
+            # Looked up without the watch page: no channel's name, no age,
+            # and its chapters asked for apart (see `api/chapters`).
+            if v.startswith("later"):
+                self.send(200, {"id": v, "title": "A video looked up without its page", "video": stream,
+                                "duration": 2463, "description": DESCRIPTION, "views": 59000, "chaptersLater": True})
                 return
             known = next((f for f in FEED if f["id"] == v), FEED[0])
             info = {"id": v, "title": known["title"], "channel": known["channel"], "channelId": known["channel_id"],

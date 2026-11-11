@@ -55,6 +55,9 @@ class Backend : public QObject {
     // The comments last asked for: {video, sort, n, replies, count, items}, or
     // empty while there are none to show.
     Q_PROPERTY(QVariantMap comments READ comments NOTIFY commentsChanged)
+    // The chapters last looked up apart from the play (see `chaptersLater`
+    // in the play's answer): {video, items}, or empty.
+    Q_PROPERTY(QVariantMap chapters READ chapters NOTIFY chaptersChanged)
     // The lenses, as the engine lists them: {id, text, tags, searches, count, fetchedAt}.
     Q_PROPERTY(QVariantList lenses READ lenses NOTIFY lensesChanged)
     // What each lens last found, by its id, for the shelves of the home
@@ -120,6 +123,7 @@ public:
     QVariantList history() const { return m_history; }
     QVariantList resume() const { return m_resume; }
     QVariantMap comments() const { return m_comments; }
+    QVariantMap chapters() const { return m_chapters; }
     QVariantList lenses() const { return m_lenses; }
     QVariantMap shelves() const { return m_shelves; }
     QVariantMap topics() const { return m_topics; }
@@ -144,7 +148,9 @@ public:
     Q_INVOKABLE void clearHistory();
     Q_INVOKABLE void loadConfig();
     Q_INVOKABLE void setConfig(const QVariantMap &patch);
-    Q_INVOKABLE void play(const QString &video);
+    // `channel`: the channel's name on the card it was opened from, for an
+    // answer that has none of its own.
+    Q_INVOKABLE void play(const QString &video, const QString &channel = QString());
     // Drops the answer of a video still being looked up, and hangs up on the
     // engine, which can then stop looking: the player it was for has been closed.
     Q_INVOKABLE void cancelPlay();
@@ -163,6 +169,11 @@ public:
     Q_INVOKABLE void loadComments(const QString &video, const QString &sort, int n, bool replies);
     // Hangs up on a lookup still running and shows nothing: the tab was left.
     Q_INVOKABLE void closeComments();
+    // The chapters of a video whose play answer said `chaptersLater`: a
+    // lookup of their own, made when the Chapters tab is opened.
+    Q_INVOKABLE void loadChapters(const QString &video);
+    // Hangs up on a lookup still running: the video was left.
+    Q_INVOKABLE void closeChapters();
     Q_INVOKABLE void loadLenses();
     // Reads what the lens `id` last found from what the engine keeps. It
     // never searches: a lens that was never fetched has an empty shelf.
@@ -212,6 +223,7 @@ signals:
     void historyChanged();
     void resumeChanged();
     void commentsChanged();
+    void chaptersChanged();
     void lensesChanged();
     void shelvesChanged();
     void topicsChanged();
@@ -331,6 +343,7 @@ private:
     QVariantList m_history;
     QVariantList m_resume;
     QVariantMap m_comments;
+    QVariantMap m_chapters;
     QVariantList m_lenses;
     QVariantMap m_shelves;
     QVariantMap m_topics;

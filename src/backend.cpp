@@ -276,7 +276,7 @@ void Backend::refuse(const QString &task) {
 }
 
 bool Backend::newestOnly(const QString &task) {
-    static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "lens", "read"};
+    static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "chapters", "lens", "read"};
     return tasks.contains(task);
 }
 
@@ -689,9 +689,11 @@ void Backend::clearHistory() {
     });
 }
 
-void Backend::play(const QString &video) {
+void Backend::play(const QString &video, const QString &channel) {
     QUrlQuery q;
     q.addQueryItem("v", video);
+    if (!channel.isEmpty())
+        q.addQueryItem("channel", channel);
     call("POST", "api/play", q, {}, "play", [this](const QJsonValue &v) {
         emit playReady(v.toObject().toVariantMap());
         if (m_config.value("history").toBool())
@@ -777,6 +779,20 @@ void Backend::closeComments() {
         return;
     m_comments.clear();
     emit commentsChanged();
+}
+
+void Backend::loadChapters(const QString &video) {
+    QUrlQuery q;
+    q.addQueryItem("v", video);
+    call("GET", "api/chapters", q, {}, "chapters", [this, video](const QJsonValue &v) {
+        m_chapters = {{"video", video}, {"items", v.toObject().value("chapters").toArray().toVariantList()}};
+        emit chaptersChanged();
+    });
+}
+
+void Backend::closeChapters() {
+    // The engine sees the hang-up and stops looking.
+    supersede("chapters");
 }
 
 void Backend::loadLenses() {

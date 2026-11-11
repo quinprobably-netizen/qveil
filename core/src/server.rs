@@ -16,9 +16,11 @@
 //! - `thumbs`: thumbnails, fetched a page at a time.
 //! - `relay`: the video relay, chunked and Range-forwarding.
 //! - `lookups`: the lookups of the videos played lately, to play them again.
-//! - `warm`: the start and end of a video's streams, fetched when it is opened.
+//! - `warm`: the start of a video's streams, fetched when it is opened.
+//! - `chapters`: a video's chapters, when the page data had to be asked for.
 
 mod api;
+mod chapters;
 mod comments;
 mod http;
 mod jobs;
@@ -65,6 +67,8 @@ pub struct Server {
     thumbs: thumbs::Thumbs,
     /// The comments fetched lately (see `comments`).
     comments: comments::Kept,
+    /// The chapters fetched lately (see `chapters`).
+    chapters: chapters::Kept,
     /// The feed refresh that is running, if one is.
     jobs: jobs::Jobs,
     /// Serializes settings changes.
@@ -136,6 +140,11 @@ pub struct PlayInfo {
     pub published: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chapters: Vec<Chapter>,
+    /// Whether the video may have chapters that are not in `chapters`
+    /// (none were named in the description, and YouTube's own weren't asked
+    /// for): `GET api/chapters` has them.
+    #[serde(rename = "chaptersLater", skip_serializing_if = "std::ops::Not::not")]
+    pub chapters_later: bool,
 }
 
 /// A video that is resolved and registered for relaying, and what is left to
@@ -175,6 +184,7 @@ impl Server {
             sessions: Mutex::new(VecDeque::new()),
             thumbs: thumbs::Thumbs::default(),
             comments: comments::Kept::default(),
+            chapters: chapters::Kept::default(),
             jobs: jobs::Jobs::default(),
             settings: Mutex::new(()),
             connections: Arc::new(AtomicUsize::new(0)),
@@ -318,6 +328,7 @@ impl Server {
                 likes: s.likes,
                 published: s.published,
                 chapters: s.chapters,
+                chapters_later: s.chapters_later,
             },
             watched,
             session,
@@ -523,6 +534,7 @@ impl Server {
             ("POST", ["api", "play"]) => self.play(&mut stream, &req),
             ("POST", ["api", "prepare"]) => self.prepare_next(&mut stream, &req),
             ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),
+            ("GET", ["api", "chapters"]) => self.chapters(&mut stream, &req),
             _ => self.json_api(&mut stream, &req, &segs),
         }
     }

@@ -4,12 +4,35 @@ import "Format.js" as Format
 import "Linkify.js" as Linkify
 
 // The video's chapters as a list. (Its description is under the video, once.)
+// Those its description doesn't name are looked up when this is first shown
+// for a video, and never before: it costs a lookup of its own.
 Flickable {
     id: tab
 
     property string description
     // [{ start, title }]
     property var chapters: []
+    // The video's ID, when its chapters are to be looked up; empty when the
+    // play's answer had them all.
+    property string video
+    // Whether the tab is the one showing.
+    property bool active: false
+    readonly property bool loaded: video === "" || backend.chapters.video === video
+    readonly property bool loading: backend.busy.indexOf("chapters") >= 0
+    // The video this tab last asked about.
+    property string asked
+    function load() {
+        if (video !== "" && !loaded) {
+            asked = video
+            backend.loadChapters(video)
+        }
+    }
+    onVideoChanged: if (active) load()
+    onActiveChanged: if (active && !loading) load()
+    // A lookup for another video was still running when this was shown, so
+    // nothing was asked: it is now. (A lookup of this video that failed is
+    // not asked again by itself.)
+    onLoadingChanged: if (!loading && active && asked !== video) load()
     // The chapter that is playing, from 0.
     property int current: -1
     signal linkActivated(string link)
@@ -43,6 +66,21 @@ Flickable {
         width: tab.width - Style.u * 6
         spacing: Style.u * 4
 
+        BusyLine {
+            width: parent.width
+            visible: tab.loading && !tab.loaded
+        }
+        Text {
+            objectName: "chapters-empty"
+            width: parent.width
+            visible: tab.video !== "" && tab.loaded && !tab.loading && tab.chapters.length === 0
+            text: qsTr("This video has no chapters.")
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: Style.dim
+            font.family: Style.font
+            font.pixelSize: Style.small
+        }
         Column {
             width: parent.width
             visible: tab.chapters.length > 0

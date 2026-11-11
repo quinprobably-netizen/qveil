@@ -58,8 +58,9 @@ FocusScope {
     function prepare(video) {
         // A new video has the keyboard in the video, wherever it was last.
         surface.forceActiveFocus()
-        // A lookup of the last video's comments is for nobody now.
+        // A lookup of the last video's comments or chapters is for nobody now.
         backend.closeComments()
+        backend.closeChapters()
         expanded = false
         sheet.current = "next"
         ahead.reset(video.id)
@@ -74,6 +75,7 @@ FocusScope {
             return false
         surface.forceActiveFocus()
         backend.closeComments()
+        backend.closeChapters()
         expanded = false
         sheet.current = "next"
         flick.contentY = 0
@@ -104,8 +106,9 @@ FocusScope {
             page.videoRequested(list.get(index + 1), list, index + 1)
     }
     function close() {
-        // A lookup of comments that is still running is for nobody now.
+        // A lookup of comments or chapters that is still running is for nobody now.
         backend.closeComments()
+        backend.closeChapters()
         ahead.reset()
         surface.stop()
     }
@@ -256,10 +259,12 @@ FocusScope {
         width: page.beside ? page.sheetWidth : below.width
         height: page.beside ? page.height - Style.u * 5 - Style.gutter : below.height
         commentCount: comments.count
-        hasChapters: surface.chapters.length > 0
+        hasChapters: surface.chapters.length > 0 || !!page.info.chaptersLater
 
         chapters: ChaptersTab {
             anchors.fill: parent
+            video: page.info.chaptersLater ? (page.info.id || "") : ""
+            active: sheet.visible && sheet.current === "chapters" && page.active
             chapters: surface.chapters
             current: bar.chapter
             keyed: sheet.keyed

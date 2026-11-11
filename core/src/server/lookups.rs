@@ -275,6 +275,7 @@ mod tests {
             likes: None,
             published: None,
             chapters: vec![],
+            chapters_later: false,
         }
     }
 

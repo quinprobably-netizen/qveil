@@ -286,7 +286,7 @@ ApplicationWindow {
             watch.prepare(video)
             watch.forceActiveFocus()
         }
-        backend.play(video.id)
+        backend.play(video.id, video.channel || "")
     }
 
     // How the video that is being opened is to begin, when that is not as the

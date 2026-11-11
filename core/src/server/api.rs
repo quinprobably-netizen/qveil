@@ -64,7 +64,28 @@ impl Server {
             self.open_until(&v, &|| watch.gone())
         });
         match opened {
-            Ok(opened) => {
+            Ok(mut opened) => {
+                // A lookup without the page has no name for the channel (see
+                // `ytdlp::LOOKUP`), and the window has it from the card the
+                // video was clicked on. It came from this computer, so the
+                // name is taken as no more than a name.
+                let hint = req
+                    .query
+                    .get("channel")
+                    .map(|c| {
+                        c.chars()
+                            .filter(|c| !c.is_control())
+                            .take(200)
+                            .collect::<String>()
+                    })
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty());
+                if opened.info.channel.is_none() && hint.is_some() {
+                    opened.info.channel = hint.clone();
+                    if let Some(w) = &mut opened.watched {
+                        w.channel = hint;
+                    }
+                }
                 let body = json!(opened.info).to_string();
                 let _recording = opened.watched.is_some().then(|| self.recording());
                 if let Err(e) = respond(out, 200, "application/json", body.as_bytes()) {
@@ -1175,6 +1196,40 @@ echo '{"entries":[]}'"#,
         );
         assert_eq!(status, 200);
         assert_eq!(get()["ignoredKeys"], json!([]));
+    }
+
+    #[test]
+    fn a_play_without_the_channels_name_takes_the_one_the_window_had() {
+        let bin = TempDir::new();
+        // fake_ytdlp's answer has no channel, as a lookup without the page has none.
+        let ytdlp = fake_ytdlp(&bin.0, "https://gv.test/v?expire=99999999999&n=");
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            history: true,
+            ..Config::default()
+        });
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/play?v=dQw4w9WgXcQ&channel=Some%20Channel"),
+            "",
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["channel"], "Some Channel");
+        let watched = app::load_history(&s.paths).unwrap().watched;
+        assert_eq!(watched[0].channel.as_deref(), Some("Some Channel"));
+        // Without one, there is none; and a name that is no name is none.
+        for query in ["", "&channel=", "&channel=%20%0A"] {
+            let (_, body) = http(
+                &base,
+                "POST",
+                &path(&base, &format!("api/play?v=dQw4w9WgXcQ{query}")),
+                "",
+            );
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert!(v.get("channel").is_none(), "{query}: {body}");
+        }
     }
 
     #[test]

@@ -33,7 +33,10 @@ FocusScope {
     // second it was last sent to: what the window asked of the player.
     property real startedAt: 0
     property real lastSeek: -1
-    readonly property var chapters: info.chapters || []
+    // The answer's, or (when it said there may be more, `chaptersLater`)
+    // those looked up once the Chapters tab was opened.
+    readonly property var chapters: info.chapters && info.chapters.length > 0 ? info.chapters
+        : (info.chaptersLater && backend.chapters.video === info.id ? (backend.chapters.items || []) : [])
     // What the player says once it knows; until then, what the engine said.
     readonly property real length: mpv.duration > 0 ? mpv.duration : (info.duration || 0)
 
@@ -53,6 +56,7 @@ FocusScope {
             title: video.title || "",
             channel: video.channel || "",
             channelId: video.channel_id || video.channelId || "",
+            published: video.published || 0,
             // The card's page, so the poster is the thumbnail it already has.
             batch: video.batch || 0
         }
@@ -72,7 +76,10 @@ FocusScope {
     // up from the other window carries on where that one was).
     function openAt(i, at) {
         pending = false
-        info = Object.assign({ batch: info.batch || 0 }, i)
+        // The card's channel and age stay where the answer has none (a lookup
+        // without the watch page has neither) and it is the same video.
+        const card = info.id === i.id ? { channel: info.channel || "", published: info.published || 0 } : {}
+        info = Object.assign({ batch: info.batch || 0 }, card, i)
         active = true
         const resumed = at === undefined && !(i.start > 0) && i.resume > 0
         startedAt = at !== undefined ? at : (i.start > 0 ? i.start : (i.resume > 0 ? i.resume : 0))
