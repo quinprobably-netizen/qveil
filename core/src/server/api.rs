@@ -135,6 +135,7 @@ impl Server {
                     .run
                     .give_up(mine.load(Ordering::Acquire) || watch.gone())
             };
+            let started = self.lookups.start();
             let done = self.look_up(&rt, &v, &format, &given_up);
             {
                 let mut preparing = lock(&self.preparing);
@@ -147,7 +148,7 @@ impl Server {
             // no longer found running, so that a play that comes in between
             // finds one or the other.
             if let Ok((s, live)) = &done {
-                self.keep_lookup(&rt, &v.id, &format, s, live);
+                self.keep_lookup(&rt, &v.id, &format, s, live, started);
             }
             running.finish(&done);
             drop(running);

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,7 +245,7 @@ pub(super) fn read_request_rest(
 
 /// The connections that haven't shown the token, kept apart from the main
 /// pool so that a program that merely connects can't use up the places the
-/// app needs. A full pool doesn't turn the newcomer away, because the app's own
+/// app needs. Only connections of our own user get here (`from_our_user`). A full pool doesn't turn the newcomer away, because the app's own
 /// connection is a newcomer too: the oldest stranger is closed instead. A
 /// connection that has been served ends up out of here within microseconds,
 /// so the one that is closed is nearly always one that is just sitting there.
@@ -281,6 +281,62 @@ impl Drop for Pending {
     fn drop(&mut self) {
         lock(&self.pool.0).retain(|(id, _)| *id != self.id);
     }
+}
+
+/// Whether the other end of `conn`, a connection to the loopback listener,
+/// belongs to the user qveil runs as. Only those are let into `Unverified`:
+/// a process of another user on this machine could otherwise keep the pool
+/// full of connections and close the window's own before it shows the
+/// token. A process of the same user can compete for those places, but it
+/// could just as well kill qveil, so shutting it out would protect nothing.
+///
+/// Read from /proc/net/tcp, where the client's end of the connection is the
+/// row whose own address is our peer's. Should that table be unreadable,
+/// the token alone guards the server, as it does elsewhere.
+pub(super) fn from_our_user(conn: &TcpStream) -> bool {
+    let (Ok(peer), Ok(local)) = (conn.peer_addr(), conn.local_addr()) else {
+        // Already gone.
+        return false;
+    };
+    let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (peer, local) else {
+        // The listener is IPv4; anything else can't be looked up here.
+        return true;
+    };
+    let table = std::fs::read_to_string("/proc/net/tcp").ok();
+    // SAFETY: geteuid has no preconditions and can't fail.
+    let me = unsafe { libc::geteuid() };
+    owned_by(table.as_deref(), peer, local, me)
+}
+
+/// The decision of `from_our_user`, given the table (if it could be read).
+fn owned_by(table: Option<&str>, peer: SocketAddrV4, local: SocketAddrV4, me: u32) -> bool {
+    match table {
+        None => true,
+        Some(table) => uid_in(table, peer, local) == Some(me),
+    }
+}
+
+/// The owner of the socket whose own end is `at`, connected to `to`, in a
+/// table laid out as /proc/net/tcp.
+fn uid_in(table: &str, at: SocketAddrV4, to: SocketAddrV4) -> Option<u32> {
+    table.lines().find_map(|row| {
+        // `sl`, local, remote, state, queues, timer, retransmits, uid, ...
+        let mut cols = row.split_whitespace();
+        let (local, remote) = (cols.nth(1)?, cols.next()?);
+        if addr_hex(local)? != at || addr_hex(remote)? != to {
+            return None;
+        }
+        cols.nth(4)?.parse().ok()
+    })
+}
+
+/// An address as /proc/net/tcp writes it: `0100007F:1F90` is the address's
+/// four bytes as one number in the machine's byte order, then the port.
+fn addr_hex(s: &str) -> Option<SocketAddrV4> {
+    let (ip, port) = s.split_once(':')?;
+    let ip = u32::from_str_radix(ip, 16).ok()?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    Some(SocketAddrV4::new(Ipv4Addr::from(ip.to_ne_bytes()), port))
 }
 
 /// One of the `MAX_CONNECTIONS` places; given back when dropped.
@@ -419,6 +475,47 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
+    /// Rows of /proc/net/tcp: a listener, the server's end of a
+    /// connection to it (ours), and the client's end (another user's).
+    const TABLE: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 593353 1 0 100 0 0 10 0
+   1: 0100007F:1F90 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 593354 1 0 20 4 30 10 -1
+   2: 0100007F:D431 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1001        0 593355 1 0 20 4 30 10 -1
+";
+
+    #[test]
+    fn the_owner_of_the_other_end_is_read_from_the_table() {
+        let server: std::net::SocketAddrV4 = "127.0.0.1:8080".parse().unwrap();
+        let client: std::net::SocketAddrV4 = "127.0.0.1:54321".parse().unwrap();
+        // The row whose own end is the client's, talking to the server.
+        assert_eq!(uid_in(TABLE, client, server), Some(1001));
+        assert_eq!(uid_in(TABLE, server, client), Some(1000));
+        // A port nobody has, or the header line and junk, say nothing.
+        let other: std::net::SocketAddrV4 = "127.0.0.1:54322".parse().unwrap();
+        assert_eq!(uid_in(TABLE, other, server), None);
+        assert_eq!(uid_in("garbage\n   0: x y z\n", client, server), None);
+        assert_eq!(addr_hex("0100007F:1F90"), Some(server));
+        assert_eq!(addr_hex("0100007F"), None);
+    }
+
+    #[test]
+    fn a_connection_of_our_own_user_is_ours_and_one_of_another_is_not() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (conn, _) = listener.accept().unwrap();
+        assert!(from_our_user(&conn));
+        // The same decision, with the client's end owned by another user.
+        let me = unsafe { libc::geteuid() };
+        let server: std::net::SocketAddrV4 = "127.0.0.1:8080".parse().unwrap();
+        let client: std::net::SocketAddrV4 = "127.0.0.1:54321".parse().unwrap();
+        assert!(!owned_by(Some(TABLE), client, server, 1000));
+        assert!(owned_by(Some(TABLE), client, server, 1001));
+        // Not found: it is gone, or was never ours.
+        assert!(!owned_by(Some(""), client, server, me));
+        // A table that can't be read leaves it to the token.
+        assert!(owned_by(None, client, server, me));
+    }
+
     #[test]
     fn a_client_without_the_token_gets_nothing_more_than_one_line() {
         let (_s, base, _d) = server();
@@ -464,11 +561,21 @@ mod tests {
         let (_s, base, _d) = server();
         // More silent connections than the server has places for.
         let idle = idle_clients(&base, MAX_UNVERIFIED + MAX_CONNECTIONS + 16);
-        // The app, which has the token, is served all the same, and at once.
-        let started = Instant::now();
+        // The app, which has the token, is served all the same, and at once:
+        // before a single stranger has been told it was too slow, so it
+        // didn't have to wait for their places to run out.
         let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
         assert_eq!(status, 200, "{body}");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        for c in &idle {
+            c.set_nonblocking(true).unwrap();
+            let mut head = [0u8; 12];
+            let n = c.peek(&mut head).unwrap_or(0);
+            assert!(
+                !head[..n].starts_with(b"HTTP/1.1 408"),
+                "the app was served only after the strangers timed out"
+            );
+            c.set_nonblocking(false).unwrap();
+        }
 
         // And the silent ones don't linger: each is closed, within the short
         // deadline for a request line, not left for the full 15 s.

@@ -4,15 +4,21 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use std::time::Duration;
 
-/// The one browser identity qveil presents. The engine's own requests (feeds,
-/// thumbnails) send it, and every yt-dlp call is told to send it too, so the
-/// video bytes carry it as well (yt-dlp's player lookups still name the
-/// YouTube client it is pretending to be): otherwise the engine would say
-/// Firefox while yt-dlp, which picks a random Chrome version for each call,
-/// said Chrome, and one circuit would show two browsers. It has the shape of yt-dlp's own
-/// default, with a Chrome major version inside the range yt-dlp currently
-/// picks from (145 to 151), so it is no more conspicuous than yt-dlp's
-/// traffic is anyway. Bump it when yt-dlp's range moves on.
+/// The User-Agent qveil's requests send. The engine's own requests (feeds,
+/// thumbnails, the relayed video bytes) send it, and every yt-dlp call is
+/// told to send it too: otherwise the engine would say Firefox while
+/// yt-dlp, which picks a random Chrome version for each call, said Chrome.
+/// It has the shape of yt-dlp's own default, with a Chrome major version
+/// inside the range yt-dlp currently picks from (145 to 151), so it is no
+/// more conspicuous than yt-dlp's traffic is anyway. Bump it when yt-dlp's
+/// range moves on.
+///
+/// It is a header, not an identity. The TLS and HTTP/2 handshakes are
+/// rustls's and hyper's, not Chrome's, and yt-dlp's are Python's; and
+/// yt-dlp's player lookups send the User-Agent of the YouTube client they
+/// pretend to be. A circuit that carries a lookup and its video can show
+/// more than one client, and the fingerprints don't match the browser the
+/// header names.
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
 pub const TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
@@ -28,9 +34,20 @@ pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// ahead of what has been read. A stream can carry no more than this per
 /// round trip, and a round trip over Tor is half a second or more, so the
 /// HTTP/2 default of 64 KiB (or hyper's 2 MiB) would hold a video back.
-/// These are the values Chrome announces, so they say nothing new about us.
+/// These are the window sizes Chrome uses. They don't make the connection
+/// look like Chrome's, whose other SETTINGS, and their order, hyper doesn't copy.
 const STREAM_WINDOW: u32 = 6 << 20;
 const CONNECTION_WINDOW: u32 = 15 << 20;
+
+/// How many idle connections to one host a client keeps for later
+/// requests. A session's relay rarely has more than its video's, its
+/// audio's and a spare open at once, and over Tor every one kept is a
+/// connection the exit sees held open.
+pub const POOLED_PER_HOST: usize = 4;
+/// How long a client keeps an idle connection. googlevideo may close one
+/// sooner; the relay counts the idle connections (`relay::Pool`) by the
+/// same two numbers.
+pub const POOLED_FOR: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default)]
 pub struct Net {
@@ -47,6 +64,9 @@ pub struct Net {
     /// The relay's idle timeout, when not `RELAY_IDLE_TIMEOUT`. Only tests
     /// set it, to see one run out in less than a minute.
     relay_idle: Option<Duration>,
+    /// A root certificate (PEM) trusted on top of the usual ones. Only
+    /// tests set it, for a local stand-in that speaks TLS.
+    trusted: Option<&'static [u8]>,
 }
 
 impl Net {
@@ -84,6 +104,7 @@ impl Net {
             allow_http: false,
             h2c: false,
             relay_idle: None,
+            trusted: None,
         })
     }
 
@@ -99,6 +120,14 @@ impl Net {
     pub fn speaking_h2c(mut self) -> Self {
         self.allow_http = true;
         self.h2c = true;
+        self
+    }
+
+    /// The same route, trusting `root` (PEM) as well, for a local upstream
+    /// over TLS. Nothing else changes: plain http is still refused.
+    #[cfg(test)]
+    pub fn trusting(mut self, root: &'static [u8]) -> Self {
+        self.trusted = Some(root);
         self
     }
 
@@ -152,8 +181,10 @@ impl Net {
             return Some(p.clone());
         }
         let (scheme, rest) = p.split_once("://")?;
-        let user: u64 = rand::random();
-        Some(format!("{scheme}://qveil{user:016x}:x@{rest}"))
+        // Both parts random, so the credentials the proxy sees say nothing
+        // about which program sent them.
+        let (user, pass): (u64, u64) = (rand::random(), rand::random());
+        Some(format!("{scheme}://{user:016x}:{pass:016x}@{rest}"))
     }
 
     pub fn proxy(&self) -> Option<&str> {
@@ -236,12 +267,17 @@ impl Net {
             .timeout(timeout)
             .http2_initial_stream_window_size(STREAM_WINDOW)
             .http2_initial_connection_window_size(CONNECTION_WINDOW)
+            .pool_max_idle_per_host(POOLED_PER_HOST)
+            .pool_idle_timeout(POOLED_FOR)
             // The route is the one chosen in qveil, never HTTP_PROXY or
             // ALL_PROXY from the environment: on Direct, the app tells you
             // YouTube sees your IP, and that has to be true.
             .no_proxy();
         if self.h2c {
             b = b.http2_prior_knowledge();
+        }
+        if let Some(root) = self.trusted {
+            b = b.add_root_certificate(reqwest::Certificate::from_pem(root)?);
         }
         if let Some(p) = self.proxy_url() {
             b = b.proxy(reqwest::Proxy::all(&p).context("invalid proxy URL")?);
@@ -374,7 +410,24 @@ mod tests {
         let n = Net::new(Some(TOR_PROXY.into()), true).unwrap();
         let (a, b) = (n.proxy_url().unwrap(), n.proxy_url().unwrap());
         assert_ne!(a, b);
-        assert!(a.starts_with("socks5h://qveil") && a.ends_with(":x@127.0.0.1:9050"));
+        // Random hex for both the user and the password, so nothing in them
+        // names the app, and two calls share neither.
+        let creds = |u: &str| {
+            let rest = u.strip_prefix("socks5h://").unwrap();
+            let (creds, host) = rest.rsplit_once('@').unwrap();
+            assert_eq!(host, "127.0.0.1:9050");
+            let (user, pass) = creds.split_once(':').unwrap();
+            for part in [user, pass] {
+                assert!(
+                    part.len() == 16 && part.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{u}"
+                );
+            }
+            (user.to_string(), pass.to_string())
+        };
+        let ((ua, pa), (ub, pb)) = (creds(&a), creds(&b));
+        assert!(ua != ub && pa != pb, "{a} {b}");
+        assert!(!a.contains("qveil") && !b.contains("qveil"));
         let pinned = n.pinned();
         assert_eq!(
             pinned.proxy_url(),
@@ -633,21 +686,111 @@ mod tests {
             .header("range", "bytes=0-")
             .send()
             .unwrap();
-        let mut last = 0;
-        loop {
-            std::thread::sleep(Duration::from_millis(200));
-            let now = up.sent();
-            if now == last {
-                break;
-            }
-            last = now;
+        // It gets that far however slow the sender is (10 s is far more
+        // than it takes)...
+        let started = std::time::Instant::now();
+        while up.sent() < STREAM_WINDOW as usize {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{} KiB let through",
+                up.sent() >> 10
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
+        // ...and no further, with nothing read.
+        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(
-            last,
+            up.sent(),
             STREAM_WINDOW as usize,
             "{} KiB let through",
-            last >> 10
+            up.sent() >> 10
         );
+    }
+
+    #[test]
+    fn a_client_keeps_no_more_than_a_few_idle_connections() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{Arc, Barrier};
+        const AT_ONCE: usize = POOLED_PER_HOST + 2;
+        // Answers each request only once `AT_ONCE` of them are waiting, so
+        // every round needs that many connections at the same time. Counts
+        // the requests each connection served.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let served = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let barrier = Arc::new(Barrier::new(AT_ONCE));
+        let (log, gate) = (Arc::clone(&served), Arc::clone(&barrier));
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let (log, gate) = (Arc::clone(&log), Arc::clone(&gate));
+                std::thread::spawn(move || {
+                    let mut out = conn.try_clone().unwrap();
+                    let mut r = BufReader::new(conn);
+                    let me = {
+                        let mut log = log.lock().unwrap();
+                        log.push(0);
+                        log.len() - 1
+                    };
+                    loop {
+                        let mut line = String::new();
+                        while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                            line.clear();
+                        }
+                        if line.is_empty() {
+                            return;
+                        }
+                        log.lock().unwrap()[me] += 1;
+                        gate.wait();
+                        let _ = write!(out, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+                    }
+                });
+            }
+        });
+        let client = Net::new(None, true)
+            .unwrap()
+            .allowing_http()
+            .relay_client()
+            .unwrap();
+        let round = || {
+            std::thread::scope(|s| {
+                for _ in 0..AT_ONCE {
+                    s.spawn(|| {
+                        let body = client.get(&url).send().unwrap().text().unwrap();
+                        assert_eq!(body, "hi");
+                    });
+                }
+            })
+        };
+        round();
+        assert_eq!(served.lock().unwrap().len(), AT_ONCE);
+        // Time for the connections to go back to the pool.
+        std::thread::sleep(Duration::from_millis(300));
+        round();
+        // Of the connections the first round opened, only the few the
+        // client kept were used again. (Fewer, if the client hadn't put them
+        // back yet; never more.)
+        let reused = served.lock().unwrap().iter().filter(|&&n| n > 1).count();
+        assert!(reused <= POOLED_PER_HOST, "{reused} reused");
+    }
+
+    #[test]
+    fn over_tls_the_production_clients_agree_on_http2() {
+        use crate::h2up::{TEST_ROOT, big_bytes_h2};
+        let up = H2Upstream::start_tls();
+        // What production builds, with only the stand-in's root added: no
+        // plain http, no h2 without asking. ALPN has to pick it.
+        let net = Net::new(None, true).unwrap().trusting(TEST_ROOT);
+        for client in [net.client().unwrap(), net.relay_client().unwrap()] {
+            let resp = client
+                .get(up.url("/big?size=5000"))
+                .header("range", "bytes=10-19")
+                .send()
+                .unwrap();
+            assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+            assert_eq!(resp.status(), 206);
+            assert!(resp.bytes().unwrap() == big_bytes_h2(10, 20));
+        }
+        assert!(up.url("/").starts_with("https://127.0.0.1:"));
     }
 
     #[test]

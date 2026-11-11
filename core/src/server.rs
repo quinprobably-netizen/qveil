@@ -300,24 +300,31 @@ impl Server {
         // played from that lookup once it is done, instead of from a lookup
         // that starts from zero. Asked before the kept lookups: one that
         // finishes meanwhile is kept before it stops being found here.
+        // If that lookup failed, the play looks the video up itself, once:
+        // the failure may have been the lookup's own (its circuit, say).
         let ahead = match self.lookups.join(&v.id, &format, &rt.net, abort) {
-            Some(done) => Some(self.guarded(&rt, done)?),
+            Some(Ok(found)) => Some(self.guarded(&rt, Ok(found))?),
+            Some(Err(_)) if !self.still_on(&rt) => bail!(ROUTE_CHANGED),
+            // Its own caller gave up, not the lookup ahead.
+            Some(Err(e)) if abort() => return Err(e),
+            Some(Err(_)) => None,
             None => None,
         };
         // A video played again a little later is played from the same lookup.
         let kept = ahead.or_else(|| self.lookups.get(&v.id, &format, &rt.net));
         let (s, live, fresh) = match kept {
-            Some((s, live)) => (s, live, false),
+            Some((s, live)) => (s, live, None),
             None => {
+                let started = self.lookups.start();
                 let (s, live) = self.look_up(&rt, v, &format, abort)?;
-                (s, live, true)
+                (s, live, Some(started))
             }
         };
         let has_audio = s.audio.is_some();
         let session = Session::new(v.clone(), format.clone(), rt.net.clone(), live.clone());
         let sid = self.register(&rt, session)?;
-        if fresh {
-            self.keep_lookup(&rt, &v.id, &format, &s, &live);
+        if let Some(started) = fresh {
+            self.keep_lookup(&rt, &v.id, &format, &s, &live, started);
         }
         // What mpv will ask for first is fetched while the answer travels
         // and mpv starts.
@@ -480,10 +487,18 @@ impl Server {
     /// unless the route has changed since. Under the sessions lock, like
     /// `register`, so that it can't slip in after `update_config` has
     /// cleared the lookups of the old route.
-    fn keep_lookup(&self, rt: &Runtime, id: &str, format: &str, s: &Streams, live: &Live) {
+    fn keep_lookup(
+        &self,
+        rt: &Runtime,
+        id: &str,
+        format: &str,
+        s: &Streams,
+        live: &Live,
+        started: lookups::Started,
+    ) {
         let _sessions = lock(&self.sessions);
         if self.still_on(rt) {
-            self.lookups.put(id, format, &rt.net, s, live);
+            self.lookups.put(id, format, &rt.net, s, live, started);
         }
     }
 
@@ -496,8 +511,13 @@ impl Server {
 
     /// Serves one connection on its own thread. Until it has shown the token
     /// it only counts against the pool of unverified connections, whose
-    /// oldest member is closed to make room for a newcomer.
+    /// oldest member is closed to make room for a newcomer. A connection
+    /// from another user's process is closed at once (see `from_our_user`).
     fn accept(self: &Arc<Self>, conn: TcpStream) {
+        if !http::from_our_user(&conn) {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+            return;
+        }
         let Ok(pending) = Pending::admit(&self.unverified, &conn) else {
             return;
         };

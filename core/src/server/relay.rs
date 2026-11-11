@@ -6,7 +6,7 @@ use super::http::{Request, Watch, respond};
 use super::warm::{Head, Meta, Warm};
 use crate::errors::friendly;
 use crate::ids::VideoRef;
-use crate::net::Net;
+use crate::net::{Net, POOLED_FOR, POOLED_PER_HOST};
 use crate::util::lock;
 use anyhow::{Result, bail};
 use reqwest::blocking::Client;
@@ -57,10 +57,6 @@ pub(super) const SPARE_WITHIN: Duration = Duration::from_secs(3);
 /// Over Tor an answer takes under a second (300 ms, measured), and a
 /// new connection's under two.
 const FIRST_WITHIN: Duration = Duration::from_secs(15);
-/// How long a connection back in a client's pool is taken to stay there
-/// (see `Pool`). The client keeps one 90 s, but googlevideo may close it
-/// sooner, and then a spare would be wanted.
-const POOLED_FOR: Duration = Duration::from_secs(30);
 /// How often a relay waiting on the other side of `Ahead` looks at the cancel flag.
 const AHEAD_POLL: Duration = Duration::from_millis(250);
 /// How long a resolve again that failed is the answer for the requests on
@@ -323,14 +319,20 @@ pub(super) struct Live {
 /// spare's one byte) puts its connection back. One that is cut short is
 /// closed. What the warm-up reads isn't counted, so there may be more than
 /// it says, which costs a spare too many and never one too few; and one is
-/// taken to be gone after `POOLED_FOR`.
+/// taken to be gone after `POOLED_FOR`, when the client closes it. The
+/// client keeps `POOLED_PER_HOST` at most, and so does the count.
 #[derive(Default)]
 pub(super) struct Pool(Mutex<Vec<Instant>>);
 
 impl Pool {
-    /// A response was read to its end, and its connection is idle again.
+    /// A response was read to its end, and its connection is idle again,
+    /// unless the client already keeps as many as it will (it then closes
+    /// this one).
     pub(super) fn put_back(&self) {
-        lock(&self.0).push(Instant::now());
+        let mut idle = self.fresh();
+        if idle.len() < POOLED_PER_HOST {
+            idle.push(Instant::now());
+        }
     }
 
     /// A request is about to go out, on an idle connection if there is one.
@@ -347,6 +349,24 @@ impl Pool {
         let mut idle = lock(&self.0);
         idle.retain(|t| t.elapsed() < POOLED_FOR);
         idle
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn the_count_of_idle_connections_keeps_no_more_than_the_client_does() {
+        let pool = Pool::default();
+        for _ in 0..POOLED_PER_HOST + 2 {
+            pool.put_back();
+        }
+        for _ in 0..POOLED_PER_HOST {
+            assert!(pool.has_idle());
+            pool.take();
+        }
+        assert!(!pool.has_idle(), "it counts more than the client keeps");
     }
 }
 

@@ -859,9 +859,11 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "roxmltree",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "toml",
  "url",
 ]

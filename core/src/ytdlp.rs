@@ -1607,8 +1607,13 @@ echo '{"is_live":true}'"#,
         let first = spied(&dir, "config");
         yt.search("x", 1).unwrap();
         assert_ne!(first, spied(&dir, "config"));
-        assert!(first.contains("socks5h://qveil"), "{first}");
-        assert!(!spied(&dir, "argv").contains("qveil0"));
+        // The credentials are in the config file, never on the command line.
+        let creds = first
+            .split_once("socks5h://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+            .map(|(creds, _)| creds.to_string())
+            .unwrap_or_else(|| panic!("{first}"));
+        assert!(!spied(&dir, "argv").contains(&creds));
     }
 
     #[test]
