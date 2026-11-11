@@ -1,7 +1,8 @@
 #!/bin/sh
 # A stand-in for yt-dlp that answers the engine from canned JSON (see
-# engine_tests.cpp). The engine puts what it wants fetched (a URL or a search)
-# as the last line of the config file named by --config-locations.
+# engine_tests.cpp). The engine puts the call's own options in the config
+# file named by --config-locations, one to a line, and what it wants fetched
+# (a URL or a search) as its last line.
 #
 # The tests steer it with files next to the script (the test copies the script
 # into a directory of its own, so every engine has its own steering):
@@ -12,16 +13,13 @@
 #   <kind>-error     a line to fail with on stderr instead of answering
 here=$(dirname "$0")
 config=
-range=
-comments=
 while [ $# -gt 0 ]; do
-  case "$1" in
-  --config-locations) config="$2" ;;
-  -I) range="$2" ;;
-  --write-comments) comments=1 ;;
-  esac
+  [ "$1" = --config-locations ] && config="$2"
   shift
 done
+range=$(sed -n "s/^-I '\(.*\)'\$/\1/p" "$config")
+comments=
+grep -qx -- --write-comments "$config" && comments=1
 target=$(tail -n 1 "$config")
 case "$target" in
 *ytsearch* | *results\?*) kind=search ;;

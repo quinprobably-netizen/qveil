@@ -209,11 +209,12 @@ echo '{{"duration":600,"channel":"Chan","upload_date":"20251109","chapters":[{{"
         assert_eq!(runs(&bin.0), 1);
         let args = std::fs::read_to_string(bin.0.join("args")).unwrap();
         assert!(
-            args.contains("--skip-download") && !args.contains(ID),
+            !args.contains("--skip-download") && !args.contains(ID),
             "{args}"
         );
         // The page and all: the quick lookup is off.
         let asked = std::fs::read_to_string(bin.0.join("asked")).unwrap();
+        assert!(asked.lines().any(|l| l == "--skip-download"), "{asked}");
         assert!(
             asked.contains("--extractor-args 'youtube:skip=hls,dash'\n"),
             "{asked}"

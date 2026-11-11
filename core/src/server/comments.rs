@@ -166,17 +166,18 @@ JSON
         assert_eq!(v["comments"].as_array().unwrap().len(), 2);
         assert_eq!(v["comments"][1]["replies"][0]["text"], "Agreed");
 
+        // Neither the video, what is asked about it nor that it is comments
+        // that are asked for is on the command line: all of it is in the
+        // call's private file.
         let args = std::fs::read_to_string(bin.0.join("args")).unwrap();
         assert!(
-            args.contains("--write-comments") && args.contains("--skip-download"),
-            "{args}"
-        );
-        // Neither the video nor what is asked about it is on the command line.
-        assert!(
-            !args.contains(ID) && !args.contains("max_comments"),
+            !args.contains(ID) && !args.contains("max_comments") && !args.contains("comments"),
             "{args}"
         );
         let asked = std::fs::read_to_string(bin.0.join("asked")).unwrap();
+        for option in ["--write-comments", "--skip-download"] {
+            assert!(asked.lines().any(|l| l == option), "{option}: {asked}");
+        }
         assert!(
             asked.contains(
                 "--extractor-args 'youtube:skip=hls,dash;comment_sort=top;max_comments=40,40,0,0'"

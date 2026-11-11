@@ -2,9 +2,10 @@
 //! signature/n-param deciphering, PO tokens), so qveil follows its fixes for free.
 //! Every invocation is sandboxed from the user's own yt-dlp setup.
 //!
-//! What it is asked for (a search, the video being watched) and the proxy's
-//! password would be readable by every local user in /proc/*/cmdline, so they
-//! never go on the command line: see `Call`.
+//! What it is asked for (a search, the video being watched), the proxy's
+//! password and even the kind of call (a search, a lookup, comments) would be
+//! readable by every local user in /proc/*/cmdline, so they never go on the
+//! command line: see `Call`.
 
 use crate::comments::{self, Comments, Sort};
 use crate::errors::friendly;
@@ -169,7 +170,10 @@ const CHAPTERS_MAX: usize = 200;
 
 impl Ytdlp {
     /// The options every call shares. None of them is private, and none is
-    /// what makes a call different: that is in the call's config file.
+    /// what makes a call different: everything that does (what kind of call
+    /// it is, its target and its route) is in the call's config file, so
+    /// another program on the machine, which can read any process's command
+    /// line, learns from it only that yt-dlp runs.
     fn command(&self, call: &Call) -> Command {
         let mut c = Command::new(&self.bin);
         c.args([
@@ -275,7 +279,7 @@ impl Ytdlp {
     }
 
     /// Runs yt-dlp on `target` (a URL or a `ytsearchN:` query) with `args`
-    /// and parses its JSON. It is killed if it takes longer than `limit`.
+    /// (in the call's config file, see `Call`) and parses its JSON. It is killed if it takes longer than `limit`.
     fn json(&self, args: &[&str], target: &str, limit: Duration) -> Result<Value> {
         self.json_with(args, None, target, limit, &|| false)
     }
@@ -294,8 +298,8 @@ impl Ytdlp {
         // yt-dlp would create it with the default mode, and every directory
         // above it that doesn't exist yet along with it.
         crate::store::ensure_dir(&self.cache_dir)?;
-        let call = Call::new(&self.net, extractor_args, target)?;
-        let out = self.output_within(self.command(&call).args(args), &call, limit, abort)?;
+        let call = Call::new(&self.net, args, extractor_args, target)?;
+        let out = self.output_within(&mut self.command(&call), &call, limit, abort)?;
         // The files are only needed while it runs.
         drop(call);
         let Some(out) = out else {
@@ -368,18 +372,18 @@ impl Ytdlp {
             ),
         };
         crate::store::ensure_dir(&self.cache_dir)?;
-        let call = Call::new(&self.net, None, &q)?;
-        let mut cmd = self.command(&call);
-        cmd.args([
+        let mut args = vec![
             "--flat-playlist",
             "--lazy-playlist",
             "--extractor-args",
             SEARCH_ARGS,
             "-j",
-        ]);
+        ];
         if let Some(range) = &range {
-            cmd.args(["-I", range]);
+            args.extend(["-I", range]);
         }
+        let call = Call::new(&self.net, &args, None, &q)?;
+        let mut cmd = self.command(&call);
         let mut run = self.start(&mut cmd, &call)?;
         let stdout = run.stdout.take().context("no stdout")?;
         let stderr = drain(run.stderr.take());
@@ -589,8 +593,9 @@ impl Ytdlp {
 
 /// The private files of one yt-dlp call, removed when it is dropped.
 ///
-/// yt-dlp reads one config file, and the proxy and the target go in it: one
-/// option per line, and a bare word is a URL to fetch. It is split the way a
+/// yt-dlp reads one config file, and the proxy, the call's own options and
+/// the target go in it: one option per line, and a bare word is a URL to
+/// fetch. It is split the way a
 /// shell would split it, which is why every value is quoted. (A batch file
 /// would do for the target, but it treats ` #` as the start of a comment, and
 /// searches like "rust #shorts" are ordinary.)
@@ -600,7 +605,9 @@ struct Call {
 }
 
 impl Call {
-    fn new(net: &Net, extractor_args: Option<&str>, target: &str) -> Result<Self> {
+    /// `args` are the call's own options, as they would be on the command
+    /// line (`-f`, its selector, …).
+    fn new(net: &Net, args: &[&str], extractor_args: Option<&str>, target: &str) -> Result<Self> {
         // A target that began with `-` would be read as an option. Ours are
         // always `ytsearch…` or an https URL, so this can't happen.
         ensure!(
@@ -619,6 +626,7 @@ impl Call {
         // The byte order mark makes yt-dlp read the file as UTF-8 whatever
         // the locale is, so a search in any script arrives intact.
         let mut text = format!("\u{feff}--proxy {}\n", quote(&proxy));
+        text.push_str(&options_text(args));
         if let Some(e) = extractor_args {
             text.push_str(&format!("--extractor-args {}\n", quote(e)));
         }
@@ -627,6 +635,34 @@ impl Call {
         let config = dir.write("yt-dlp.conf", text.as_bytes())?;
         Ok(Call { dir, config })
     }
+}
+
+/// Options for the config file: each on a line of its own, its value (if
+/// it has one) after it in quotes. yt-dlp splits the whole file into words
+/// before it parses them, so this is only for the reader: the words are the
+/// same as they were on the command line.
+fn options_text(args: &[&str]) -> String {
+    let is_option = |a: &str| {
+        a.starts_with('-')
+            && a.len() > 1
+            && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let mut text = String::new();
+    for a in args {
+        if is_option(a) {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(a);
+        } else {
+            text.push(' ');
+            text.push_str(&quote(a));
+        }
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 /// Shell-style single quotes: nothing inside is special, so `#`, spaces and
@@ -1115,12 +1151,17 @@ echo '{"entries":[]}'
         yt.search("secret query #1 it's", 5).unwrap();
 
         let argv = spied(&dir, "argv");
+        // Nor what kind of call it is: those options are in the file too.
         for needle in [
             "SECRETPW",
             "127.0.0.1:3128",
             "secret",
             "ytsearch",
             "youtube.com",
+            "--flat-playlist",
+            "--extractor-args",
+            "youtubetab",
+            "-J",
         ] {
             assert!(!argv.contains(needle), "{needle} is in argv:\n{argv}");
         }
@@ -1141,7 +1182,7 @@ echo '{"entries":[]}'
         // They are in a private file instead, quoted the way yt-dlp reads it.
         assert_eq!(
             spied(&dir, "config"),
-            "\u{feff}--proxy 'http://user:SECRETPW@127.0.0.1:3128'\n'ytsearch5:secret query #1 it'\\''s'\n"
+            "\u{feff}--proxy 'http://user:SECRETPW@127.0.0.1:3128'\n--flat-playlist\n--extractor-args 'youtubetab:approximate_date;skip=webpage'\n-J\n'ytsearch5:secret query #1 it'\\''s'\n"
         );
         assert_eq!(spied(&dir, "file-mode").trim(), "600");
         assert_eq!(spied(&dir, "dir-mode").trim(), "700");
@@ -1208,17 +1249,26 @@ echo '{"entries":[]}'
     fn a_search_skips_the_homepage_however_it_is_asked() {
         let dir = TempDir::new();
         let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
-        let skips = |argv: &str| {
-            argv.lines()
-                .any(|l| l == "youtubetab:approximate_date;skip=webpage")
+        let skips = |config: &str| {
+            config
+                .lines()
+                .any(|l| l == "--extractor-args 'youtubetab:approximate_date;skip=webpage'")
         };
         yt.search("x", 1).unwrap();
-        assert!(skips(&spied(&dir, "argv")), "{}", spied(&dir, "argv"));
+        assert!(skips(&spied(&dir, "config")), "{}", spied(&dir, "config"));
         for sp in [None, Some("EgIYAg%3D%3D")] {
             yt.search_each("x", 1, sp, &mut |_| true).unwrap();
+            let config = spied(&dir, "config");
+            assert!(skips(&config), "{sp:?}: {config}");
+            // A results page is cut to the number asked for.
+            assert_eq!(
+                config.lines().any(|l| l == "-I '1:1'"),
+                sp.is_some(),
+                "{config}"
+            );
             assert!(
-                skips(&spied(&dir, "argv")),
-                "{sp:?}: {}",
+                !spied(&dir, "argv").contains("-I"),
+                "{}",
                 spied(&dir, "argv")
             );
         }
@@ -1469,7 +1519,8 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
             "--ignore-no-formats-error",
             "--no-playlist",
         ] {
-            assert!(argv.lines().any(|l| l == arg), "{arg} in {argv}");
+            assert!(config.lines().any(|l| l == arg), "{arg} in {config}");
+            assert!(!argv.contains(arg), "{arg} in {argv}");
         }
     }
 
@@ -1621,10 +1672,10 @@ echo '{"is_live":true}'"#,
         assert_eq!(quote(""), "''");
         assert_eq!(quote("a b #c"), "'a b #c'");
         assert_eq!(quote(r"it's \n"), r"'it'\''s \n'");
-        assert!(Call::new(&Net::default(), None, "--exec=evil").is_err());
+        assert!(Call::new(&Net::default(), &[], None, "--exec=evil").is_err());
         // A newline or NUL can't end the value early or break the file.
         let net = Net::default();
-        let call = Call::new(&net, None, "ytsearch1:a\nb\0c").unwrap();
+        let call = Call::new(&net, &[], None, "ytsearch1:a\nb\0c").unwrap();
         let text = std::fs::read_to_string(&call.config).unwrap();
         assert!(text.ends_with("'ytsearch1:a b c'\n"), "{text:?}");
     }

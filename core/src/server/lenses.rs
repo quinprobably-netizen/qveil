@@ -302,8 +302,9 @@ mod tests {
             &dir.join("yt-dlp"),
             r#"d=$(dirname "$0")
 whole=
-for a in "$@"; do [ "$a" = -J ] && whole=1; done
-while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" >> "$d/asked"; shift; done
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+grep -qx -- -J "$conf" && whole=1
+tail -n 1 "$conf" >> "$d/asked"
 [ -f "$d/delay" ] && sleep "$(cat "$d/delay")"
 # `failfor`: a search for what it says fails.
 if [ -f "$d/failfor" ] && tail -n 1 "$d/asked" | grep -qF "$(cat "$d/failfor")"; then echo "ERROR: no" >&2; exit 1; fi

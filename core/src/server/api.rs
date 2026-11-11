@@ -759,7 +759,7 @@ echo '{"entries":[]}'"#,
             &format!(
                 // Carries on when its output is closed, like a program that
                 // doesn't die of SIGPIPE: only being killed stops it.
-                "trap '' PIPE\necho \"$*\" > \"$(dirname \"$0\")/args\"\n{}\n{}\nsleep 1\n{}\n{tail}\n",
+                "trap '' PIPE\nwhile [ $# -gt 0 ]; do [ \"$1\" = --config-locations ] && cp \"$2\" \"$(dirname \"$0\")/config\"; shift; done\n{}\n{}\nsleep 1\n{}\n{tail}\n",
                 line("aaaaaaaaaaa"),
                 line("bbbbbbbbbbb"),
                 line("ccccccccccc")
@@ -808,8 +808,8 @@ echo '{"entries":[]}'"#,
             })
             .collect();
         assert_eq!(ids, ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"]);
-        let args = std::fs::read_to_string(bin.0.join("args")).unwrap();
-        assert!(args.contains("--lazy-playlist"), "{args}");
+        let config = std::fs::read_to_string(bin.0.join("config")).unwrap();
+        assert!(config.lines().any(|l| l == "--lazy-playlist"), "{config}");
     }
 
     #[test]
