@@ -922,10 +922,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         // Said once, for all the groups it held back.
         let errors = v["errors"].as_array().unwrap();
         assert_eq!(errors.len(), 1, "{v}");
-        assert!(
-            errors[0].as_str().unwrap().contains("twelve searches"),
-            "{v}"
-        );
+        assert_eq!(errors[0], crate::app::TOPICS_SPENT, "{v}");
         // A day on, there is a budget again.
         let old = crate::topics::Searched {
             at: vec![now - 25 * 3600; 12],
@@ -942,6 +939,32 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         let kept: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(kept.as_object().unwrap().len(), 1, "{kept}");
         assert_eq!(kept["at"].as_array().unwrap().len(), asked(&bin).len());
+    }
+
+    #[test]
+    fn a_day_with_some_room_left_says_so_and_searches_what_fits() {
+        let (bin, base, d) = rig();
+        follow_some_channels(&d);
+        topics_on(&base);
+        // Eleven made in the last day: one more fits, which the first group's
+        // two searches don't.
+        let now = crate::app::now();
+        let spent = crate::topics::Searched {
+            at: vec![now - 60; crate::topics::BUDGET - 1],
+        };
+        crate::store::save_compact(&d.paths().topic_searches(), &spent).unwrap();
+        let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(asked(&bin), ["'ytsearch20:borrow checker'"]);
+        let errors = v["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{v}");
+        let said = errors[0].as_str().unwrap();
+        // Not that the twelve were made, nor that one more is all it takes.
+        assert!(
+            !said.contains("twelve") && !said.contains("oldest"),
+            "{said}"
+        );
+        assert_eq!(said, crate::app::TOPICS_SPENT);
     }
 
     /// Topic feeds on, outside the server: for driving `app::topics` directly.

@@ -356,8 +356,9 @@ fn topic_groups(paths: &Paths) -> Result<(Vec<topics::Group>, HashSet<String>)> 
 /// searched for twice.
 static TOPICS_REFRESH: Mutex<()> = Mutex::new(());
 
-/// What a refresh says when the day's searches are used up.
-const TOPICS_SPENT: &str = "The topic feeds have made their twelve searches of the last day; what is due is searched for once the oldest of them is a day old.";
+/// What a refresh says when the day's budget has no room for a group's
+/// searches: all of it used, or only some, by this process or another.
+pub(crate) const TOPICS_SPENT: &str = "The last day's topic searches leave no room for what is due (a search that failed counts too); it can be searched for once enough of them are a day old.";
 
 /// What a refresh says when the day's searches can't be counted.
 fn topics_uncounted(e: &anyhow::Error) -> String {
