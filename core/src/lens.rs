@@ -43,6 +43,18 @@ pub struct Cached {
     pub videos: Vec<Ranked>,
 }
 
+/// How far in the future results can be dated and still count as found now:
+/// a clock put right by a few seconds or minutes is not a new day.
+pub const SLACK: i64 = 600;
+
+/// Whether results `found` are to be fetched again at `now`, when they are
+/// good for `max_age` seconds: nothing was found, or it is that old. Found
+/// more than `SLACK` "later" than now means the clock was set back since, and
+/// their age is not known: they are due.
+pub fn due(found: Option<&Cached>, now: i64, max_age: i64) -> bool {
+    found.is_none_or(|c| c.fetched_at > now + SLACK || now - c.fetched_at >= max_age)
+}
+
 /// The lenses, in the order they were added. They are the user's writing, so
 /// a file that can't be read is an error, and is left as it is.
 pub fn load(paths: &Paths) -> Result<Vec<Lens>> {

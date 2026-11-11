@@ -172,9 +172,7 @@ pub fn lens(
     let stored = lens::cached(paths, id)?;
     let due = match refresh {
         LensRefresh::Off => false,
-        LensRefresh::Stale => stored
-            .as_ref()
-            .is_none_or(|c| at - c.fetched_at >= lens::STALE),
+        LensRefresh::Stale => lens::due(stored.as_ref(), at, lens::STALE),
         LensRefresh::Force => true,
     };
     let stored = if due {

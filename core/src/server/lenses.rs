@@ -393,6 +393,27 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
     }
 
     #[test]
+    fn a_lens_whose_results_are_dated_in_the_future_is_due() {
+        let (bin, base, d) = rig();
+        let id = add(&base, "bread")["id"].as_str().unwrap().to_string();
+        json(&base, "GET", &format!("api/lens?id={id}&refresh=1"), "");
+        assert_eq!(asked(&bin).len(), 1);
+        // The clock was set back since: what was found seems to be from next week.
+        let path = d.paths().lens_cache(&id);
+        let mut kept: crate::lens::Cached = crate::store::load(&path).unwrap();
+        kept.fetched_at = app::now() + 7 * 24 * 3600;
+        crate::store::save_compact(&path, &kept).unwrap();
+        json(&base, "GET", &format!("api/lens?id={id}&refresh=1"), "");
+        assert_eq!(asked(&bin).len(), 2);
+        // A clock put right by a few minutes is not a reason to search again.
+        let mut kept: crate::lens::Cached = crate::store::load(&path).unwrap();
+        kept.fetched_at = app::now() + 60;
+        crate::store::save_compact(&path, &kept).unwrap();
+        json(&base, "GET", &format!("api/lens?id={id}&refresh=1"), "");
+        assert_eq!(asked(&bin).len(), 2);
+    }
+
+    #[test]
     fn lenses_are_changed_and_removed_and_a_bad_one_is_refused() {
         let (_bin, base, _d) = rig();
         let id = add(&base, "bread")["id"].as_str().unwrap().to_string();

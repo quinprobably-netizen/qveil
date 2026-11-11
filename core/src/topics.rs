@@ -79,16 +79,10 @@ pub struct Results {
     pub searched: Vec<i64>,
 }
 
-/// How far in the future results can be dated and still count as found now:
-/// a clock put right by a few seconds or minutes is not a new day.
-pub const SLACK: i64 = 600;
-
 /// Whether a group whose searches found `found` is to be searched for again
-/// at `now`: nothing was found, or it is a day old. Found more than `SLACK`
-/// "later" than now means the clock was set back since, and its age is not
-/// known: it is due.
+/// at `now`: nothing was found, or it is a day old (see `lens::due`).
 pub fn due(found: Option<&crate::lens::Cached>, now: i64) -> bool {
-    found.is_none_or(|c| c.fetched_at > now + SLACK || now - c.fetched_at >= STALE)
+    crate::lens::due(found, now, STALE)
 }
 
 /// When each of the last day's searches was sent. Kept apart from what they
@@ -353,6 +347,7 @@ pub fn groups(channels: &[Channel]) -> Vec<Group> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lens::SLACK;
 
     fn wood_a() -> Channel<'static> {
         Channel {
