@@ -575,6 +575,10 @@ void MpvItem::ensureCore() {
         QMutexLocker lock(&m_core->mutex);
         m_core->item = this;
     }
+    // mpv wakes this up once for the events that wait, and not again until
+    // they are read; one that came before the item was set went nowhere, so
+    // they are read now.
+    QMetaObject::invokeMethod(this, "handleEvents", Qt::QueuedConnection);
     // A new player is as this item was told to be.
     double volume = m_volume, speed = m_speed;
     int mute = m_muted;

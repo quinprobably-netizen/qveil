@@ -1294,6 +1294,18 @@ srv.serve_forever()
         QCOMPARE(backend.lensVideos()->get(0).value("title").toString(), QString("new 0"));
     }
 
+    void aNewPlayerHearsEverythingMpvSaysFromTheStart()
+    {
+        // mpv wakes the window once for events that wait, and not again
+        // until they are read. A wakeup that came before the item had the
+        // player was lost, and with it every event after: here, a pause.
+        for (int i = 0; i < 40; ++i) {
+            MpvItem item;
+            item.togglePause();
+            QTRY_VERIFY2_WITH_TIMEOUT(item.paused(), qPrintable(QString("player %1 never said it paused").arg(i)), 3000);
+        }
+    }
+
 private:
     // Sets environment variables for its lifetime, and puts back what was there.
     struct EnvironmentVariables {
