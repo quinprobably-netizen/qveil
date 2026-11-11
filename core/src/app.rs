@@ -225,6 +225,18 @@ pub fn smart_search(
     search_topics(rt, paths, reading, limit, &|_, _| {}, &|| Ok(()), wanted)
 }
 
+/// How many searches `search_topics` may send for `reading` at `now`: one
+/// per topic, and where YouTube's own filter is used, a second one for a
+/// topic that it finds nothing for.
+fn searches_needed(reading: &Reading, now: i64) -> usize {
+    let per_topic = if lens::sp::sp(reading, now).is_some() {
+        2
+    } else {
+        1
+    };
+    reading.topics.len() * per_topic
+}
+
 /// One search per topic, one after the other, then the ranking. The searches
 /// are all that leaves the machine: the rules and the order are applied here.
 /// `charge` is called before each search is sent, and an error from it stops
@@ -509,22 +521,24 @@ pub fn topics(
                     continue;
                 }
             }
-            match topic_searches_left(paths) {
-                Err(e) => {
-                    held_back = Some(topics_uncounted(&e));
-                    break;
-                }
-                Ok(left) if left < group.searches.len() => {
-                    held_back.get_or_insert_with(|| TOPICS_SPENT.into());
-                    continue;
-                }
-                Ok(_) => {}
-            }
             let reading = Reading {
                 topics: group.searches.clone(),
                 subs: crate::lens::read::Subs::Exclude,
                 ..Reading::default()
             };
+            // Room for every search the group may send, so that the budget
+            // doesn't cut it off half-way.
+            match topic_searches_left(paths) {
+                Err(e) => {
+                    held_back = Some(topics_uncounted(&e));
+                    break;
+                }
+                Ok(left) if left < searches_needed(&reading, now()) => {
+                    held_back.get_or_insert_with(|| TOPICS_SPENT.into());
+                    continue;
+                }
+                Ok(_) => {}
+            }
             // Each search is counted before it is sent, so what is sent is
             // counted, however this ends.
             let refused: std::cell::RefCell<Option<String>> = Default::default();
@@ -1140,6 +1154,59 @@ mod tests {
             ..Config::default()
         };
         Runtime::new(cfg, paths, Some("http://127.0.0.1:1".into()), false).unwrap()
+    }
+
+    /// A yt-dlp that finds nothing through YouTube's own filter, and one
+    /// video for any other search; each search's target is added to `asked`.
+    fn unfiltered_ytdlp(dir: &std::path::Path) -> String {
+        crate::store::testing::script(
+            &dir.join("yt-dlp"),
+            r#"d=$(dirname "$0")
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" >> "$d/asked"; shift; done
+tail -n 1 "$d/asked" | grep -q "results?" && exit 0
+n=$(wc -l < "$d/asked")
+echo "{\"id\":\"aaaaaaaaa${n}1\",\"title\":\"t\",\"channel\":\"C\",\"channel_id\":\"UCaaaaaaaaaaaaaaaaaaaaa${n}\",\"duration\":2000.0}"
+"#,
+        )
+    }
+
+    fn asked(dir: &TempDir) -> Vec<String> {
+        fs::read_to_string(dir.0.join("asked"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_topic_searched_again_without_its_filter_counts_twice_and_room_is_made_for_that() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let rt = Runtime::new(rt_cfg(&unfiltered_ytdlp(&dir.0)), &paths, None, false).unwrap();
+        // YouTube has a filter for the length, which finds nothing here.
+        let reading = read("bread, sourdough over 30 min", now());
+        assert!(lens::sp::sp(&reading, now()).is_some());
+        let charged = std::cell::Cell::new(0);
+        let found = search_topics(
+            &rt,
+            &paths,
+            &reading,
+            5,
+            &|_, _| {},
+            &|| {
+                charged.set(charged.get() + 1);
+                Ok(())
+            },
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(asked(&dir).len(), 4, "{:?}", asked(&dir));
+        assert_eq!(charged.get(), 4, "every search that was sent is counted");
+        // So a refresh needs room for both of each topic's searches before it
+        // begins, or the budget would cut it off half-way.
+        assert_eq!(searches_needed(&reading, now()), 4);
+        assert_eq!(searches_needed(&read("bread, sourdough", now()), now()), 2);
     }
 
     #[test]
