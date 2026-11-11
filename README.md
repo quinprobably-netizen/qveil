@@ -237,6 +237,8 @@ core/        qveil-core, the engine (Rust)
   server.rs    loopback server: state, lifecycle, routing
   server/      http (limits, token), api, jobs (the feed refresh), thumbs,
                relay, comments, lenses
+  app.rs       what the commands and the server share; app/ has its parts:
+               runtime, feed, lens (searches), topics, subs, history
   privacy.rs   every privacy claim, for the window, `qveil config` and this README
   errors.rs    plain-language errors, and the code each carries
   proc.rs      every child process: own process group, killed with the engine
