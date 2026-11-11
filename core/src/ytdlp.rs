@@ -181,10 +181,14 @@ impl Ytdlp {
             "--no-warnings",
             "--socket-timeout",
             SOCKET_TIMEOUT,
-            // yt-dlp picks a random Chrome version for each call, which would
-            // put a second browser identity beside the engine's own on the
-            // same circuit. With qveil's, the video bytes (whose headers
-            // yt-dlp resolves) and the engine's requests agree.
+            // The User-Agent of yt-dlp's page and web requests. It picks a
+            // random Chrome version for each call, which would put a second
+            // browser identity beside the engine's own on the same circuit.
+            // With qveil's, those requests, the video bytes (whose headers
+            // yt-dlp resolves) and the engine's agree. It does not reach the
+            // player requests of yt-dlp's InnerTube clients: each carries
+            // its own client's identity (with this yt-dlp, a Safari one from
+            // its visionOS client), however this is set.
             "--user-agent",
             USER_AGENT,
         ]);
