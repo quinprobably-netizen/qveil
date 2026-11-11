@@ -633,7 +633,8 @@ pub fn assert_stopped_and_cleaned_up(pid: &str, private: &std::path::Path) {
 pub fn fake_ytdlp(dir: &std::path::Path, url: &str) -> String {
     let script = r#"n=$(cat '@COUNT@' 2>/dev/null || echo 0)
 n=$((n + 1))
-echo $n > '@COUNT@'
+# Whole or not at all: a test may be reading it meanwhile.
+echo $n > '@COUNT@.new' && mv '@COUNT@.new' '@COUNT@'
 cat <<EOF
 {"title":"T","requested_formats":[
  {"url":"@URL@$n","protocol":"https","vcodec":"avc1"},
@@ -1048,7 +1049,8 @@ fn gate_serve(
 pub fn gate_ytdlp(dir: &std::path::Path, url: &str) -> String {
     let script = r#"n=$(cat '@COUNT@' 2>/dev/null || echo 0)
 n=$((n + 1))
-echo $n > '@COUNT@'
+# Whole or not at all: a test may be reading it meanwhile.
+echo $n > '@COUNT@.new' && mv '@COUNT@.new' '@COUNT@'
 while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
 who=$(sed -n "s|.*--proxy 'socks5h://\([^:]*\):.*|\1|p" "$conf")
 cat <<EOF
