@@ -25,7 +25,7 @@ Column {
                 parts.push(qsTr("pinned"))
             if (item.comment.timeText)
                 parts.push(item.comment.timeText)
-            return parts.join("  \u00b7  ")
+            return parts.join(" \u00b7 ")
         }
         textFormat: Text.PlainText
         leftPadding: who.implicitWidth + (text !== "" ? Style.u * 2 : 0)

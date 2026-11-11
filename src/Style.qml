@@ -2,7 +2,7 @@ pragma Singleton
 import QtQuick
 
 // Everything the window looks like, in one place: the colours of the theme
-// it sits in, the desktop's interface typeface, and the handful of sizes and
+// it sits in, its one typeface, and the handful of sizes and
 // fills that every part is drawn with. Pictures lead and type is sized to be
 // read from a seat, as on a video site; surfaces are the text colour at a
 // low alpha, corners follow Hyprland, and nothing is rounded into a bubble.
@@ -26,7 +26,11 @@ QtObject {
     readonly property color sel: tint(0.18)
     readonly property color line: tint(0.13)
 
-    readonly property string font: theme.uiFamily
+    // The one typeface: JetBrains Mono, in the Nerd Font build Omarchy ships,
+    // whatever the desktop's interface font is. Where it isn't installed the
+    // desktop's interface font stands in.
+    readonly property string typeface: "JetBrainsMono Nerd Font"
+    readonly property string font: Qt.fontFamilies().indexOf(typeface) >= 0 ? typeface : theme.uiFamily
     readonly property int caption: 12
     readonly property int small: 13
     readonly property int body: 14
@@ -37,6 +41,9 @@ QtObject {
     // The one large size: the video that leads the home page.
     readonly property int lead: 32
     // What "bold" is: a weight the face has, since a synthesized bold smears.
+    // JetBrains Mono's SemiBold, or its Bold where only Regular and Bold are
+    // installed (Omarchy's ttf-jetbrains-mono-nerd-basic): Qt takes the
+    // nearest real face and doesn't embolden it.
     readonly property int strong: Font.DemiBold
 
     readonly property int radius: theme.radius

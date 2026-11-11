@@ -10,7 +10,9 @@ url='https://github.com/quinprobably-netizen/qveil'
 # The icons in src/icons are Apache-2.0 (Material Design); everything else is MIT.
 license=('MIT' 'Apache-2.0')
 # yt-dlp needs a JavaScript runtime to read YouTube, hence the hard dependency on deno.
-depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'qt6-svg' 'mpv' 'yt-dlp' 'deno')
+# The one typeface is JetBrains Mono, in its Nerd Font build (Omarchy's
+# ttf-jetbrains-mono-nerd-basic provides it).
+depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'qt6-svg' 'mpv' 'yt-dlp' 'deno' 'ttf-jetbrains-mono-nerd')
 # The app was called veil before.
 provides=('veil')
 conflicts=('veil')

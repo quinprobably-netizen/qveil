@@ -82,7 +82,7 @@ ListView {
                 Text {
                     id: count
                     objectName: "next-from-count"
-                    text: "  \u00b7  " + tab.remaining
+                    text: " \u00b7 " + tab.remaining
                     textFormat: Text.PlainText
                     color: Style.faint
                     font.family: Style.font

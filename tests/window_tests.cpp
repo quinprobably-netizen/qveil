@@ -2,6 +2,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QFontDatabase>
 #include <QQuickStyle>
 #include <QGuiApplication>
 #include <QNetworkAccessManager>
@@ -958,7 +959,7 @@ private slots:
         QVERIFY2(app.backend->error().isEmpty(), qPrintable(app.backend->error()));
     }
 
-    void theCommentsNoteIsTheEnginesShortSentenceBesideTheOrderAndNoneIsSaidPlainly()
+    void theCommentsNoteIsTheEnginesShortSentenceByTheOrderAndNoneIsSaidPlainly()
     {
         App app;
         READY(app);
@@ -973,7 +974,9 @@ private slots:
         QVERIFY(!app.item("comments-note-all")->isVisible());
         QVERIFY(app.items("comment").isEmpty());
 
-        // The order is two plain words, and the note is on their line, at the far end.
+        // The order is two plain words, and the note is near them: on their line
+        // at the far end where it fits, else under them. In JetBrains Mono the
+        // sheet's 384 pixels hold the words and the note's 36 letters only one above the other.
         const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
         QQuickItem *top = app.item("comments-top"), *newest = app.item("comments-new"), *note = app.item("comments-note");
         QVERIFY(top->isVisible() && newest->isVisible() && note->isVisible());
@@ -982,11 +985,16 @@ private slots:
         QVERIFY(top->property("current").toBool());
         // (No fill under the current one, as the other text tabs have none.)
         QCOMPARE(top->property("color").value<QColor>().alpha(), 0);
-        QVERIFY2(qAbs(box(note).center().y() - box(top).center().y()) <= 2, "the note is on the words' line");
-        QVERIFY(box(note).left() >= box(newest).right());
         QQuickItem *sheet = app.item("sheet");
         QVERIFY(box(note).right() <= box(sheet).right());
-        QVERIFY(box(note).center().x() > box(sheet).center().x());
+        if (qAbs(box(note).center().y() - box(top).center().y()) <= 2) {
+            QVERIFY(box(note).left() >= box(newest).right());
+            QVERIFY(box(note).center().x() > box(sheet).center().x());
+        } else {
+            QVERIFY2(box(note).top() >= box(top).bottom() - 1, "the note is under the words");
+            QVERIFY(box(note).left() >= box(sheet).left() && box(note).left() <= box(top).left() + 12);
+            QVERIFY(QFontDatabase::hasFamily("JetBrainsMono Nerd Font"));
+        }
 
         // Pressing it shows the engine's whole sentence under, and again hides it.
         app.click(note);
@@ -2319,11 +2327,13 @@ private slots:
         QCOMPARE(page->property("category").toString(), QString("about"));
     }
 
-    void typeIsTheSystemsAndPicturesAreClearUnlessAskedOtherwise()
+    void typeIsJetBrainsMonoAndPicturesAreClearUnlessAskedOtherwise()
     {
         App app;
         READY(app);
-        const QString family = app.theme->property("uiFamily").toString();
+        // JetBrains Mono, where it is installed; the desktop's interface font where it isn't.
+        const QString jetBrains("JetBrainsMono Nerd Font");
+        const QString family = QFontDatabase::hasFamily(jetBrains) ? jetBrains : app.theme->property("uiFamily").toString();
         QVERIFY(!family.isEmpty());
         QTRY_VERIFY(app.item("lead")->isVisible());
         QCOMPARE(app.item("lead-title")->property("font").value<QFont>().family(), family);

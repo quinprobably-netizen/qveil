@@ -69,7 +69,7 @@ function meta(video, date, brief) {
     const v = brief ? views(video.views).replace(/\s*\S+$/, "") : views(video.views)
     if (v)
         parts.push(v)
-    return parts.join("  ·  ")
+    return parts.join(" · ")
 }
 
 // A thumbnail's address: `base` is the engine's thumbnail base (empty while

@@ -504,12 +504,13 @@ FocusScope {
                         width: parent.width
                         text: [page.compact ? qsTr("Continue watching") : "", lead.kept.channel || "",
                                qsTr("%1 left").arg(Format.clock(Math.max(0, (lead.kept.dur || 0) - (lead.kept.pos || 0))))]
-                                  .filter(s => s !== "").join("  ·  ")
+                                  .filter(s => s !== "").join(" · ")
                         textFormat: Text.PlainText
                         elide: Text.ElideRight
                         color: Style.dim
                         font.family: Style.font
-                        font.pixelSize: Style.body
+                        // (A strip's line holds three things, and the time left comes last.)
+                        font.pixelSize: page.compact ? Style.small : Style.body
                     }
                     // Where the actions are, under the words (a strip has them beside).
                     Item {
@@ -608,8 +609,8 @@ FocusScope {
             // A topic says which of your channels it comes from.
             readonly property var from: topic.channels || []
             note: modelData === "latest" ? page.status : isLens ? qsTr("Lens")
-                : isTopic ? (from.length > 1 ? qsTr("Topic  ·  from %1 and %n more", "", from.length - 1).arg(from[0])
-                                             : qsTr("Topic  ·  from %1").arg(from[0] || "")) : ""
+                : isTopic ? (from.length > 1 ? qsTr("Topic · from %1 and %n more", "", from.length - 1).arg(from[0])
+                                             : qsTr("Topic · from %1").arg(from[0] || "")) : ""
             all: modelData !== "resume" && !isTopic
             arrange: page.arrangements[modelData] || ({})
             sourceLabel: modelData === "latest" ? qsTr("Newest") : modelData === "resume" ? qsTr("Last watched") : qsTr("Best match")

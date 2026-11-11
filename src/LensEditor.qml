@@ -153,9 +153,12 @@ Column {
     // sentence for it, with its whole text a press away, in place.
     Flow {
         width: parent.width
-        spacing: Style.u * 2
+        // (Apart along the line, but not between lines when it wraps: each
+        // part keeps its own room after it.)
+        spacing: 0
         Text {
             objectName: "lens-searches"
+            rightPadding: Style.u * 2
             visible: editor.searches.length > 0
             text: editor.refreshing && backend.lensTotal > 0
                   ? qsTr("Refreshing %1 of %2").arg(backend.lensDone).arg(backend.lensTotal)
@@ -163,16 +166,17 @@ Column {
             textFormat: Text.PlainText
             color: Style.dim
             font.family: Style.font
-            font.pixelSize: Style.small
+            font.pixelSize: Style.caption
         }
         Text {
             objectName: "lens-note-first"
             visible: text !== ""
+            rightPadding: Style.u * 2
             text: backend.privacy.pages.lenses_short || ""
             textFormat: Text.PlainText
             color: Style.faint
             font.family: Style.font
-            font.pixelSize: Style.small
+            font.pixelSize: Style.caption
         }
         Text {
             objectName: "lens-note-more"
@@ -182,7 +186,7 @@ Column {
             textFormat: Text.PlainText
             color: moreArea.containsMouse ? Style.fg : Style.accent
             font.family: Style.font
-            font.pixelSize: Style.small
+            font.pixelSize: Style.caption
             MouseArea {
                 id: moreArea
                 anchors.fill: parent
@@ -204,6 +208,6 @@ Column {
         lineHeight: 1.2
         color: Style.faint
         font.family: Style.font
-        font.pixelSize: Style.small
+        font.pixelSize: Style.caption
     }
 }
