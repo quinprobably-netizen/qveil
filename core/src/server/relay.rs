@@ -2741,6 +2741,54 @@ EOF
     }
 
     #[test]
+    fn a_stream_that_stalls_part_way_over_http1_with_a_spare_carries_on_over_a_new_connection() {
+        let up = KeepAlive::start(Duration::ZERO);
+        let relay = Freezer::start(up.addr);
+        let (s, base, _d) = server_tuned(Config::default(), |rt| {
+            rt.net = rt.net.clone().idling_after(IDLE);
+            rt.yt.net = rt.net.clone();
+        });
+        s.sparing.store(true, Ordering::Relaxed);
+        let sid = add_session(&s, relay.url("/big?size=8000000&pace=5"));
+        let want = 4u64 << 20;
+        let player = {
+            let (base, path) = (base.clone(), format!("s/{sid}/v"));
+            std::thread::spawn(move || {
+                fetch(
+                    &base,
+                    "GET",
+                    &path,
+                    &[("Range", &format!("bytes=0-{}", want - 1))],
+                )
+            })
+        };
+        // The spare is ready, and the range well on its way, when the route
+        // stalls: both connections freeze.
+        wait_for(
+            "the spare and bytes to flow",
+            Duration::from_secs(5),
+            || up.ranges().iter().any(|r| r == "bytes=0-0") && relay.connections() == 2,
+        );
+        relay.freeze();
+        let (status, _, body) = player.join().unwrap();
+        assert_eq!(status, 206);
+        assert!(body == big_bytes(0, want), "{} bytes", body.len());
+        // One new client, whose one new connection carried the rest; the
+        // frozen spare wasn't used, and no other was asked for.
+        assert_eq!(lock(&s.session(&sid).unwrap().live).dial, 1);
+        let asked = up.ranges_on();
+        let probes = asked
+            .iter()
+            .filter(|(_, r)| r.as_deref() == Some("bytes=0-0"));
+        assert_eq!(probes.count(), 1, "{asked:?}");
+        assert_eq!(relay.connections(), 3, "{asked:?}");
+        assert!(
+            asked.iter().skip(2).all(|(conn, _)| *conn == 2),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
     fn a_warm_up_that_stalls_leaves_a_new_client_for_the_player() {
         use crate::h2up::{H2Upstream, big_bytes_h2};
         let up = H2Upstream::start();
@@ -2875,6 +2923,42 @@ EOF
         assert_eq!(runs(&bin.0), 2);
         assert_eq!(gate.identities().len(), 2, "{:?}", gate.requests());
         assert_eq!(gate.refused(), 0, "{:?}", gate.requests());
+    }
+
+    #[test]
+    fn a_stall_on_an_isolating_route_with_a_spare_looks_the_video_up_again_on_one_new_identity() {
+        let gate = Gate::start();
+        let bin = TempDir::new();
+        let (s, base, _d) = behind_a_gate(&gate, &bin, 5);
+        s.sparing.store(true, Ordering::Relaxed);
+        let info = s.open(&test_video()).unwrap();
+        let want = 2u64 << 20;
+        let player = play_from_start(&base, &info.video, want);
+        wait_for(
+            "the spare and bytes to flow",
+            Duration::from_secs(5),
+            || {
+                sent(&gate) > 256 << 10
+                    && gate
+                        .requests()
+                        .iter()
+                        .any(|(_, _, r)| r.as_deref() == Some("bytes=0-0"))
+            },
+        );
+        gate.freeze();
+        let (status, _, body) = player.join().unwrap();
+        assert_eq!(status, 206);
+        assert!(body == big_bytes(0, want), "{} bytes", body.len());
+        // The spare on the old identity wasn't used after the lookup, and
+        // nothing went over an identity its URL wasn't for.
+        assert_eq!(runs(&bin.0), 2);
+        assert_eq!(gate.identities().len(), 2, "{:?}", gate.requests());
+        assert_eq!(gate.refused(), 0, "{:?}", gate.requests());
+        let probes = gate
+            .requests()
+            .into_iter()
+            .filter(|(_, _, r)| r.as_deref() == Some("bytes=0-0"));
+        assert_eq!(probes.count(), 1, "{:?}", gate.requests());
     }
 
     #[test]
