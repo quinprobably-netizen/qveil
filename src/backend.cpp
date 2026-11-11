@@ -785,8 +785,15 @@ void Backend::loadChapters(const QString &video) {
     QUrlQuery q;
     q.addQueryItem("v", video);
     call("GET", "api/chapters", q, {}, "chapters", [this, video](const QJsonValue &v) {
-        m_chapters = {{"video", video}, {"items", v.toObject().value("chapters").toArray().toVariantList()}};
+        const QJsonObject found = v.toObject();
+        m_chapters = {{"video", video},
+                      {"items", found.value("chapters").toArray().toVariantList()},
+                      {"channel", found.value("channel").toString()},
+                      {"published", found.value("published").toDouble()}};
         emit chaptersChanged();
+        // The engine has named the channel in the video's history entry.
+        if (!found.value("channel").toString().isEmpty() && m_config.value("history").toBool())
+            loadHistory();
     });
 }
 

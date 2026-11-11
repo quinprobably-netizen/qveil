@@ -1,18 +1,24 @@
-//! `GET api/chapters`: a video's chapters, fetched when the window asks.
+//! `GET api/chapters`: what a video's page data says, fetched when the
+//! window asks: its chapters, its channel's name and when it was uploaded.
 //!
-//! A lookup to play a video leaves out YouTube's page data, where the
-//! chapters are (see `ytdlp::LOOKUP`), so a video whose description names
-//! none may still have some (YouTube makes them for some videos). They cost
-//! a lookup of their own, so they are only fetched when the Chapters tab is
-//! opened, one lookup at a time, and what was fetched is kept (in memory
-//! only) so that opening the tab again doesn't ask YouTube again.
+//! A lookup to play a video leaves out YouTube's page data (see
+//! `ytdlp::LOOKUP`), so a video whose description names no chapters may
+//! still have some (YouTube makes them for some videos), and a video played
+//! without a card to take them from (a pasted link) has no channel name or
+//! age. They cost a lookup of their own, so they are only fetched when the
+//! window wants them (the Chapters tab is opened, or the video has no
+//! channel name or age to show), one lookup at a time, and what was fetched
+//! is kept (in memory only) so that asking again doesn't ask YouTube again.
+//! A channel name found this way goes in the video's history entry, if it
+//! has one without a name.
 
 use super::Server;
 use super::http::{Request, Watch, respond};
+use crate::app;
 use crate::errors;
-use crate::ids;
+use crate::ids::{self, VideoRef};
 use crate::util::lock;
-use crate::video::Chapter;
+use crate::ytdlp::Details;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::collections::VecDeque;
@@ -27,22 +33,22 @@ const KEPT: usize = 16;
 /// first and takes its answer, instead of asking YouTube a second time.
 #[derive(Default)]
 pub(super) struct Kept {
-    found: Mutex<VecDeque<(String, Arc<Vec<Chapter>>)>>,
+    found: Mutex<VecDeque<(String, Arc<Details>)>>,
     running: Mutex<()>,
 }
 
 impl Kept {
-    fn get(&self, id: &str) -> Option<Arc<Vec<Chapter>>> {
+    fn get(&self, id: &str) -> Option<Arc<Details>> {
         lock(&self.found)
             .iter()
             .find(|(v, _)| v == id)
             .map(|(_, c)| Arc::clone(c))
     }
 
-    fn put(&self, id: &str, chapters: Arc<Vec<Chapter>>) {
+    fn put(&self, id: &str, details: Arc<Details>) {
         let mut kept = lock(&self.found);
         kept.retain(|(v, _)| v != id);
-        kept.push_back((id.to_string(), chapters));
+        kept.push_back((id.to_string(), details));
         while kept.len() > KEPT {
             kept.pop_front();
         }
@@ -50,15 +56,22 @@ impl Kept {
 }
 
 impl Server {
-    /// `GET api/chapters?v=…`: `{"chapters": [{start, title}]}`. Like a
-    /// play lookup, it ends (and yt-dlp with it) when the window hangs up:
-    /// it left the video.
+    /// `GET api/chapters?v=…`: `{"chapters": [{start, title}], "channel",
+    /// "published"}`, the last two where the page data has them. Like a play
+    /// lookup, it ends (and yt-dlp with it) when the window hangs up: it left
+    /// the video.
     pub(super) fn chapters(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let watch = Watch::new(out);
-        match self.chapters_for(req, &|| watch.gone()) {
+        match self.details_for(req, &|| watch.gone()) {
             Ok(found) => {
-                let body = json!({ "chapters": *found }).to_string();
-                respond(out, 200, "application/json", body.as_bytes())
+                let mut body = json!({ "chapters": found.chapters });
+                if let Some(c) = &found.channel {
+                    body["channel"] = json!(c);
+                }
+                if let Some(p) = found.published {
+                    body["published"] = json!(p);
+                }
+                respond(out, 200, "application/json", body.to_string().as_bytes())
             }
             // Nobody is listening for the reason.
             Err(_) if watch.gone() => Ok(()),
@@ -69,10 +82,31 @@ impl Server {
         }
     }
 
-    fn chapters_for(&self, req: &Request, abort: &dyn Fn() -> bool) -> Result<Arc<Vec<Chapter>>> {
+    fn details_for(&self, req: &Request, abort: &dyn Fn() -> bool) -> Result<Arc<Details>> {
         let target = req.param("v")?;
         let video = ids::parse_video(target)
             .with_context(|| format!("{target:?} isn't a YouTube video"))?;
+        self.details(&video, abort)
+    }
+
+    /// Looks up what `video`'s page data says on a thread of its own, for
+    /// the history entry of a video played without its channel's name
+    /// (`qveil play` with a pasted link). Nobody waits for it.
+    pub fn name_later(self: &Arc<Self>, video: &VideoRef) {
+        let (server, video) = (Arc::clone(self), video.clone());
+        let _ = std::thread::Builder::new().spawn(move || {
+            if let Err(e) = server.details(&video, &|| false) {
+                note!("qveil: couldn't look up the video's channel: {e:#}");
+            }
+        });
+    }
+
+    /// What `video`'s page data says: kept, or looked up.
+    pub(super) fn details(
+        &self,
+        video: &VideoRef,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Arc<Details>> {
         if let Some(found) = self.chapters.get(&video.id) {
             return Ok(found);
         }
@@ -85,11 +119,21 @@ impl Server {
             bail!(crate::ytdlp::CANCELLED);
         }
         let rt = self.runtime();
-        let found = rt.yt.chapters_of(&video.watch_url(), abort);
+        let found = rt.yt.details_of(&video.watch_url(), abort);
         // Not kept if the route changed meanwhile: what came over a route
         // that was left is dropped, like everything else that did.
         let found = Arc::new(self.guarded(&rt, found)?);
         self.chapters.put(&video.id, Arc::clone(&found));
+        if rt.cfg.history
+            && let Some(channel) = &found.channel
+            && let Err(e) = {
+                // The play this follows adds its entry once it has answered.
+                self.history_settled();
+                app::name_in_history(&self.paths, &video.id, channel)
+            }
+        {
+            note!("qveil: couldn't name the channel in the history: {e:#}");
+        }
         Ok(found)
     }
 }
@@ -118,7 +162,7 @@ echo $((n + 1)) > "$d/runs"
 echo "$*" > "$d/args"
 while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && cp "$2" "$d/asked"; shift; done
 sleep {delay}
-echo '{{"duration":600,"chapters":[{{"start_time":0,"title":"Intro"}},{{"start_time":90.5,"title":"Part"}}]}}'
+echo '{{"duration":600,"channel":"Chan","upload_date":"20251109","chapters":[{{"start_time":0,"title":"Intro"}},{{"start_time":90.5,"title":"Part"}}]}}'
 "#
             ),
         )
@@ -153,7 +197,11 @@ echo '{{"duration":600,"chapters":[{{"start_time":0,"title":"Intro"}},{{"start_t
             let v: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(
                 v,
-                serde_json::json!({"chapters": [{"start": 0, "title": "Intro"}, {"start": 90, "title": "Part"}]})
+                serde_json::json!({
+                    "chapters": [{"start": 0, "title": "Intro"}, {"start": 90, "title": "Part"}],
+                    "channel": "Chan",
+                    "published": 1762646400
+                })
             );
         }
         assert_eq!(runs(&bin.0), 1);
@@ -167,6 +215,45 @@ echo '{{"duration":600,"chapters":[{{"start_time":0,"title":"Intro"}},{{"start_t
         assert!(asked.lines().last().unwrap().contains(ID), "{asked}");
         // And again later, from memory.
         assert_eq!(get(&base, &format!("v={ID}")).0, 200);
+        assert_eq!(runs(&bin.0), 1);
+    }
+
+    #[test]
+    fn the_channel_found_with_the_chapters_names_it_in_the_history() {
+        for history in [true, false] {
+            let bin = TempDir::new();
+            let (s, base, _d) = server_with(Config {
+                ytdlp: chapters_ytdlp(&bin.0, "0"),
+                history,
+                ..Config::default()
+            });
+            // Played from a pasted link: the lookup had no name for the channel.
+            crate::app::record_history(&s.paths, watched()).unwrap();
+            let (status, body) = get(&base, &format!("v={ID}"));
+            assert_eq!(status, 200, "{body}");
+            let entry = &crate::app::load_history(&s.paths).unwrap().watched[0];
+            let named = entry.channel.as_deref();
+            // With the history off, it is not written to.
+            assert_eq!(named, history.then_some("Chan"), "history {history}");
+        }
+    }
+
+    #[test]
+    fn a_video_played_without_its_channels_name_has_it_looked_up_for_the_history() {
+        let bin = TempDir::new();
+        let (s, _base, _d) = server_with(Config {
+            ytdlp: chapters_ytdlp(&bin.0, "0"),
+            history: true,
+            ..Config::default()
+        });
+        crate::app::record_history(&s.paths, watched()).unwrap();
+        s.name_later(&crate::server::testkit::test_video());
+        wait_for("the channel to be named", Duration::from_secs(10), || {
+            crate::app::load_history(&s.paths).unwrap().watched[0]
+                .channel
+                .as_deref()
+                == Some("Chan")
+        });
         assert_eq!(runs(&bin.0), 1);
     }
 

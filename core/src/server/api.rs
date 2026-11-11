@@ -58,34 +58,28 @@ impl Server {
     /// has been written in full: one that never reached the window wasn't watched.
     pub(super) fn play(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let watch = Watch::new(out);
+        // A lookup without the page has no name for the channel (see
+        // `ytdlp::LOOKUP`), and the window has it from the card the video
+        // was clicked on. It came from this computer, so the name is taken
+        // as no more than a name.
+        let hint = req
+            .query
+            .get("channel")
+            .map(|c| {
+                c.chars()
+                    .filter(|c| !c.is_control())
+                    .take(200)
+                    .collect::<String>()
+            })
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
         let opened = req.param("v").and_then(|target| {
             let v = ids::parse_video(target)
                 .with_context(|| format!("{target:?} isn't a YouTube video"))?;
-            self.open_until(&v, &|| watch.gone())
+            self.open_until(&v, hint, &|| watch.gone())
         });
         match opened {
-            Ok(mut opened) => {
-                // A lookup without the page has no name for the channel (see
-                // `ytdlp::LOOKUP`), and the window has it from the card the
-                // video was clicked on. It came from this computer, so the
-                // name is taken as no more than a name.
-                let hint = req
-                    .query
-                    .get("channel")
-                    .map(|c| {
-                        c.chars()
-                            .filter(|c| !c.is_control())
-                            .take(200)
-                            .collect::<String>()
-                    })
-                    .map(|c| c.trim().to_string())
-                    .filter(|c| !c.is_empty());
-                if opened.info.channel.is_none() && hint.is_some() {
-                    opened.info.channel = hint.clone();
-                    if let Some(w) = &mut opened.watched {
-                        w.channel = hint;
-                    }
-                }
+            Ok(opened) => {
                 let body = json!(opened.info).to_string();
                 let _recording = opened.watched.is_some().then(|| self.recording());
                 if let Err(e) = respond(out, 200, "application/json", body.as_bytes()) {
@@ -1230,6 +1224,64 @@ echo '{"entries":[]}'"#,
             let v: Value = serde_json::from_str(&body).unwrap();
             assert!(v.get("channel").is_none(), "{query}: {body}");
         }
+    }
+
+    /// A yt-dlp that answers a lookup without the page as YouTube's player
+    /// does: the channel's ID, but neither its name nor the upload date.
+    fn player_only_ytdlp(dir: &std::path::Path) -> String {
+        crate::store::testing::script(
+            &dir.join("yt-dlp"),
+            r#"echo '{"title":"T","channel_id":"UCsBjURrPoezykLs9EqgamOA","url":"https://gv.test/c?expire=99999999999","protocol":"https","vcodec":"avc1"}'"#,
+        )
+    }
+
+    fn play_json(base: &str, query: &str) -> Value {
+        let (status, body) = http(base, "POST", &path(base, &format!("api/play?{query}")), "");
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn a_play_without_a_card_takes_the_channels_name_from_the_subscriptions() {
+        let bin = TempDir::new();
+        let (s, base, _d) = server_with(Config {
+            ytdlp: player_only_ytdlp(&bin.0),
+            history: true,
+            ..Config::default()
+        });
+        // Not subscribed: no name, and the window is told it can be had.
+        let v = play_json(&base, "v=dQw4w9WgXcQ");
+        assert!(v.get("channel").is_none(), "{v}");
+        assert_eq!(v["detailsLater"], true, "{v}");
+        app::import_subs(&s.paths, "UCsBjURrPoezykLs9EqgamOA,http://x,Fireship\n").unwrap();
+        let v = play_json(&base, "v=aaaaaaaaaaa");
+        assert_eq!(v["channel"], "Fireship");
+        // The upload date is still for the page data to say.
+        assert_eq!(v["detailsLater"], true, "{v}");
+        s.history_settled();
+        let watched = app::load_history(&s.paths).unwrap().watched;
+        let named: Vec<_> = watched.iter().map(|w| w.channel.as_deref()).collect();
+        assert_eq!(named, [None, Some("Fireship")]);
+    }
+
+    #[test]
+    fn a_play_whose_lookup_had_the_page_has_nothing_more_to_ask() {
+        let bin = TempDir::new();
+        let (_s, base, _d) = server_with(Config {
+            ytdlp: crate::store::testing::script(
+                &bin.0.join("yt-dlp"),
+                r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+grep -q player_skip "$conf" && { echo 'ERROR: [youtube] x: Video unavailable' >&2; exit 1; }
+echo '{"title":"T","channel":"Chan","timestamp":5,"url":"https://gv.test/c?expire=99999999999","protocol":"https","vcodec":"avc1"}'"#,
+            ),
+            ..Config::default()
+        });
+        let v = play_json(&base, "v=dQw4w9WgXcQ");
+        assert_eq!(
+            (&v["channel"], &v["published"]),
+            (&json!("Chan"), &json!(5))
+        );
+        assert!(v.get("detailsLater").is_none(), "{v}");
     }
 
     #[test]

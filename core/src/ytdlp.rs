@@ -80,7 +80,7 @@ const SEARCH_ARGS: &str = "youtubetab:approximate_date;skip=webpage";
 /// the clients' own configuration pages, the page data and the `web`
 /// client are all left out, and the rest of yt-dlp's default clients are
 /// asked as they would have been. What the page data had is fetched apart,
-/// when it is wanted: see `chapters_of`. A video these clients can't play
+/// when it is wanted: see `details_of`. A video these clients can't play
 /// is asked for again the usual way: see `worth_the_usual_way`.
 const LOOKUP: &str =
     "youtube:skip=hls,dash;player_skip=webpage,configs,initial_data;player_client=default,-web";
@@ -136,6 +136,19 @@ pub struct Streams {
     /// it left the page data out (see `LOOKUP`), and the description named
     /// none. They are then looked up apart, when they are wanted.
     pub chapters_later: bool,
+    /// Whether the lookup left the page data out, and with it the
+    /// channel's name and the upload date: see `details_of`.
+    pub details_later: bool,
+}
+
+/// What the page data says of a video, which a lookup to play it leaves
+/// out (see `Ytdlp::details_of`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Details {
+    pub chapters: Vec<Chapter>,
+    pub channel: Option<String>,
+    /// Unix seconds.
+    pub published: Option<i64>,
 }
 
 /// How much of a description is kept, in characters. YouTube allows 5000;
@@ -494,6 +507,7 @@ impl Ytdlp {
         match quick.and_then(|v| streams_from(&v, url)) {
             Ok(mut s) => {
                 s.chapters_later = s.chapters.is_empty();
+                s.details_later = true;
                 return Ok(s);
             }
             Err(e) if !worth_the_usual_way(&e) => return Err(e),
@@ -509,10 +523,11 @@ impl Ytdlp {
         }
     }
 
-    /// The chapters of a video, from the page data that a lookup to play it
-    /// leaves out (see `LOOKUP`): what YouTube shows as its chapters, which
-    /// may have been made by YouTube, or else those the description names.
-    pub fn chapters_of(&self, url: &str, abort: &dyn Fn() -> bool) -> Result<Vec<Chapter>> {
+    /// What the page data says of a video, which a lookup to play it leaves
+    /// out (see `LOOKUP`): its chapters (what YouTube shows as its chapters,
+    /// which may have been made by YouTube, or else those the description
+    /// names), its channel's name and when it was uploaded.
+    pub fn details_of(&self, url: &str, abort: &dyn Fn() -> bool) -> Result<Details> {
         let args = [
             "-J",
             "--no-playlist",
@@ -525,7 +540,11 @@ impl Ytdlp {
             }
             found => found?,
         };
-        Ok(chapters(&v))
+        Ok(Details {
+            chapters: chapters(&v),
+            channel: str_field(&v, &["channel", "uploader"]),
+            published: published(&v),
+        })
     }
 
     /// The format selector only accepts plain downloads, so a live stream
@@ -713,10 +732,28 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
         description,
         views: v["view_count"].as_u64(),
         likes: v["like_count"].as_u64(),
-        published: v["timestamp"].as_i64().or(v["release_timestamp"].as_i64()),
+        published: published(v),
         chapters,
         chapters_later: false,
+        details_later: false,
     })
+}
+
+/// When the video was uploaded (or, for a stream, started), in Unix seconds:
+/// to the second where yt-dlp has it, or else the start of the day it was.
+fn published(v: &Value) -> Option<i64> {
+    v["timestamp"]
+        .as_i64()
+        .or(v["release_timestamp"].as_i64())
+        .or_else(|| {
+            let day = jiff::civil::Date::strptime("%Y%m%d", v["upload_date"].as_str()?).ok()?;
+            Some(
+                day.to_zoned(jiff::tz::TimeZone::UTC)
+                    .ok()?
+                    .timestamp()
+                    .as_second(),
+            )
+        })
 }
 
 /// The chapters a description names, by YouTube's rule for them: lines
@@ -894,6 +931,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.published, Some(5));
+        // And the day it was uploaded, at its start, for either.
+        let s = resolved(
+            r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","upload_date":"20251109"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.published, Some(1762646400));
         assert!(s.description.is_none() && s.views.is_none() && s.chapters.is_empty());
     }
 
@@ -1271,10 +1314,10 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
             "echo 'ERROR: [youtube] x: Video unavailable. This video is not available' >&2; exit 1",
         );
         let found = yt
-            .chapters_of("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &|| false)
+            .details_of("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &|| false)
             .unwrap();
         assert_eq!(
-            found,
+            found.chapters,
             [Chapter {
                 start: 0,
                 title: "Intro".into()
@@ -1286,7 +1329,7 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
     #[test]
     fn chapters_are_looked_up_from_the_watch_data_without_the_page_or_the_streams() {
         let dir = TempDir::new();
-        let answer = r#"{"duration":600,"chapters":[{"start_time":0,"title":"Intro"},{"start_time":90,"title":"Part"}]}"#;
+        let answer = r#"{"duration":600,"channel":"Chan","uploader":"Chan","upload_date":"20251109","chapters":[{"start_time":0,"title":"Intro"},{"start_time":90,"title":"Part"}]}"#;
         let yt = ytdlp(
             script(
                 &dir.0.join("yt-dlp"),
@@ -1298,10 +1341,10 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
             None,
         );
         let found = yt
-            .chapters_of("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &|| false)
+            .details_of("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &|| false)
             .unwrap();
         assert_eq!(
-            found,
+            found.chapters,
             [
                 Chapter {
                     start: 0,
@@ -1313,6 +1356,10 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
                 }
             ]
         );
+        // The page data names the channel, and the day it was uploaded,
+        // which a lookup to play the video has neither of.
+        assert_eq!(found.channel.as_deref(), Some("Chan"));
+        assert_eq!(found.published, Some(1762646400));
         let config = spied(&dir, "config");
         assert!(
             config.contains(

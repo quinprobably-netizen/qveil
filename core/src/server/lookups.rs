@@ -276,6 +276,7 @@ mod tests {
             published: None,
             chapters: vec![],
             chapters_later: false,
+            details_later: false,
         }
     }
 

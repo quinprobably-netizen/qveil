@@ -55,8 +55,9 @@ class Backend : public QObject {
     // The comments last asked for: {video, sort, n, replies, count, items}, or
     // empty while there are none to show.
     Q_PROPERTY(QVariantMap comments READ comments NOTIFY commentsChanged)
-    // The chapters last looked up apart from the play (see `chaptersLater`
-    // in the play's answer): {video, items}, or empty.
+    // What the page data says of the video last looked up apart from the
+    // play (see `chaptersLater` and `detailsLater` in the play's answer):
+    // {video, items (its chapters), channel, published}, or empty.
     Q_PROPERTY(QVariantMap chapters READ chapters NOTIFY chaptersChanged)
     // The lenses, as the engine lists them: {id, text, tags, searches, count, fetchedAt}.
     Q_PROPERTY(QVariantList lenses READ lenses NOTIFY lensesChanged)
@@ -169,8 +170,10 @@ public:
     Q_INVOKABLE void loadComments(const QString &video, const QString &sort, int n, bool replies);
     // Hangs up on a lookup still running and shows nothing: the tab was left.
     Q_INVOKABLE void closeComments();
-    // The chapters of a video whose play answer said `chaptersLater`: a
-    // lookup of their own, made when the Chapters tab is opened.
+    // The chapters of a video whose play answer said `chaptersLater`, with
+    // its channel's name and upload date: a lookup of their own, made when
+    // the Chapters tab is opened, or when the video has no channel or age
+    // to show (`detailsLater`).
     Q_INVOKABLE void loadChapters(const QString &video);
     // Hangs up on a lookup still running: the video was left.
     Q_INVOKABLE void closeChapters();

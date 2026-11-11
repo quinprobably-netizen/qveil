@@ -40,6 +40,24 @@ FocusScope {
     // What the player says once it knows; until then, what the engine said.
     readonly property real length: mpv.duration > 0 ? mpv.duration : (info.duration || 0)
 
+    // The channel's name and the age that were looked up apart (see
+    // `openAt`) fill what the video has none of.
+    Connections {
+        target: backend
+        function onChaptersChanged() {
+            const found = backend.chapters
+            if (!surface.active || !found.video || found.video !== surface.info.id)
+                return
+            const add = {}
+            if (!surface.info.channel && found.channel)
+                add.channel = found.channel
+            if (!surface.info.published && found.published > 0)
+                add.published = found.published
+            if (Object.keys(add).length > 0)
+                surface.info = Object.assign({}, surface.info, add)
+        }
+    }
+
     signal closed()
     signal pipRequested()
     signal theatreToggled()
@@ -88,6 +106,10 @@ FocusScope {
         note.shown = resumed
         if (resumed)
             noteTimer.restart()
+        // What neither the card nor the answer had (a pasted link has no
+        // card, and the lookup left the page out) is looked up apart.
+        if (i.detailsLater && (!info.channel || !info.published))
+            backend.loadChapters(i.id)
         mpv.volume = savedVolume
         // A video without a stream has nothing to load (and makes no sound).
         if (i.video)

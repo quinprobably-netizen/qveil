@@ -1075,13 +1075,42 @@ pub fn load_history(paths: &Paths) -> Result<History> {
     store::load(&paths.history())
 }
 
-pub fn record_history(paths: &Paths, w: Watched) -> Result<()> {
+/// Adds `w` to the history, in place of the same video's entry if it has
+/// one. A video played without its channel's name (from a pasted link: see
+/// `ytdlp::LOOKUP`) keeps the name its entry had.
+pub fn record_history(paths: &Paths, mut w: Watched) -> Result<()> {
     let _lock = store::lock(paths)?;
     let mut h = load_history(paths)?;
+    if w.channel.is_none() {
+        w.channel = h
+            .watched
+            .iter()
+            .find(|x| x.id == w.id)
+            .and_then(|x| x.channel.clone());
+    }
     h.watched.retain(|x| x.id != w.id);
     h.watched.push(w);
     let excess = h.watched.len().saturating_sub(HISTORY_CAP);
     h.watched.drain(..excess);
+    store::save(&paths.history(), &h)
+}
+
+/// Names the channel of video `id` in its history entry, if it has one
+/// without a name: one found after it was played.
+pub fn name_in_history(paths: &Paths, id: &str, channel: &str) -> Result<()> {
+    let _lock = store::lock(paths)?;
+    if !paths.history().exists() {
+        return Ok(());
+    }
+    let mut h = load_history(paths)?;
+    let Some(w) = h
+        .watched
+        .iter_mut()
+        .find(|x| x.id == id && x.channel.is_none())
+    else {
+        return Ok(());
+    };
+    w.channel = Some(channel.to_string());
     store::save(&paths.history(), &h)
 }
 
@@ -1269,6 +1298,47 @@ mod tests {
         }
         assert_eq!(load_subs(&paths).unwrap().channels.len(), 40);
         assert_eq!(load_history(&paths).unwrap().watched.len(), 40);
+    }
+
+    #[test]
+    fn a_channel_once_known_is_never_taken_out_of_the_history() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let w = |channel: Option<&str>, at| Watched {
+            id: "dQw4w9WgXcQ".into(),
+            title: "t".into(),
+            channel: channel.map(String::from),
+            at,
+        };
+        let only = |paths: &Paths| {
+            let h = load_history(paths).unwrap().watched;
+            assert_eq!(h.len(), 1);
+            (h[0].channel.clone(), h[0].at)
+        };
+        record_history(&paths, w(Some("Chan"), 1)).unwrap();
+        // Watched again from a pasted link: it moves up, and keeps its channel.
+        record_history(&paths, w(None, 2)).unwrap();
+        assert_eq!(only(&paths), (Some("Chan".into()), 2));
+        // A name that came later is taken.
+        record_history(&paths, w(Some("Renamed"), 3)).unwrap();
+        assert_eq!(only(&paths), (Some("Renamed".into()), 3));
+
+        // A channel found afterwards fills an entry without one, and only that.
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        record_history(&paths, w(None, 1)).unwrap();
+        name_in_history(&paths, "dQw4w9WgXcQ", "Found").unwrap();
+        assert_eq!(only(&paths), (Some("Found".into()), 1));
+        name_in_history(&paths, "dQw4w9WgXcQ", "Other").unwrap();
+        assert_eq!(only(&paths), (Some("Found".into()), 1));
+        // A video that isn't in the history isn't added to it.
+        name_in_history(&paths, "aaaaaaaaaaa", "Other").unwrap();
+        assert_eq!(only(&paths).0.as_deref(), Some("Found"));
+        // Nor is a history made where there is none.
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        name_in_history(&paths, "dQw4w9WgXcQ", "Found").unwrap();
+        assert!(!paths.history().exists());
     }
 
     #[test]

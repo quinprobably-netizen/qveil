@@ -145,6 +145,11 @@ pub struct PlayInfo {
     /// for): `GET api/chapters` has them.
     #[serde(rename = "chaptersLater", skip_serializing_if = "std::ops::Not::not")]
     pub chapters_later: bool,
+    /// Whether the channel's name or the upload date is missing because the
+    /// lookup left the page data out: `GET api/chapters` has them, for a
+    /// video that wasn't played from a card that has them (see `chapters`).
+    #[serde(rename = "detailsLater", skip_serializing_if = "std::ops::Not::not")]
+    pub details_later: bool,
 }
 
 /// A video that is resolved and registered for relaying, and what is left to
@@ -261,7 +266,13 @@ impl Server {
     /// Resolves a video through one pinned identity of the route, registers
     /// relay URLs for it, and adds it to the history (if that is on).
     pub fn open(self: &Arc<Self>, v: &VideoRef) -> Result<PlayInfo> {
-        let opened = self.open_until(v, &|| false)?;
+        self.open_as(v, None)
+    }
+
+    /// `open`, with the name of the channel as the list the video was picked
+    /// from has it, for a lookup that has none (see `open_until`).
+    pub fn open_as(self: &Arc<Self>, v: &VideoRef, channel: Option<String>) -> Result<PlayInfo> {
+        let opened = self.open_until(v, channel, &|| false)?;
         self.remember(&opened);
         Ok(opened.info)
     }
@@ -271,7 +282,17 @@ impl Server {
     /// the window gave up on (and never got the answer for) isn't recorded as
     /// watched. `abort` is asked while yt-dlp runs, and ends it as soon as it
     /// says yes (see `Ytdlp::resolve_until`).
-    fn open_until(self: &Arc<Self>, v: &VideoRef, abort: &dyn Fn() -> bool) -> Result<Opened> {
+    ///
+    /// A lookup without the page has no name for the channel (see
+    /// `ytdlp::LOOKUP`): it is then `channel`, the name on the card the video
+    /// was picked from, or else the name of the subscription to it, if
+    /// there is one.
+    fn open_until(
+        self: &Arc<Self>,
+        v: &VideoRef,
+        channel: Option<String>,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Opened> {
         let base = self.listen()?;
         let rt = self.runtime();
         let format = rt.cfg.format();
@@ -306,17 +327,23 @@ impl Server {
         {
             warm::start(self, s);
         }
+        let channel = s
+            .channel
+            .clone()
+            .or(channel)
+            .or_else(|| self.subscribed_name(s.channel_id.as_deref()));
         let watched = rt.cfg.history.then(|| Watched {
             id: v.id.clone(),
             title: s.title.clone(),
-            channel: s.channel.clone(),
+            channel: channel.clone(),
             at: app::now(),
         });
+        let details_later = s.details_later && (channel.is_none() || s.published.is_none());
         Ok(Opened {
             info: PlayInfo {
                 id: v.id.clone(),
                 title: s.title,
-                channel: s.channel,
+                channel,
                 channel_id: s.channel_id,
                 duration: s.duration,
                 start: v.start,
@@ -329,10 +356,24 @@ impl Server {
                 published: s.published,
                 chapters: s.chapters,
                 chapters_later: s.chapters_later,
+                details_later,
             },
             watched,
             session,
         })
+    }
+
+    /// The name of the subscription to channel `id`, if there is one.
+    fn subscribed_name(&self, id: Option<&str>) -> Option<String> {
+        let id = id?;
+        let subs = app::load_subs(&self.paths)
+            .inspect_err(|e| note!("qveil: couldn't read the subscriptions: {e:#}"))
+            .ok()?;
+        subs.channels
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name)
+            .filter(|n| !n.is_empty())
     }
 
     /// Where `v` was stopped, if that is still remembered. A link that names

@@ -176,6 +176,7 @@ FocusScope {
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.u * 3
                     Text {
+                        objectName: "watch-channel"
                         anchors.verticalCenter: parent.verticalCenter
                         text: page.info.channel || ""
                         textFormat: Text.PlainText

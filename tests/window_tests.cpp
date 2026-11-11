@@ -915,11 +915,12 @@ private slots:
     {
         App app;
         READY(app);
-        app.play({{"id", "later000001"}, {"title", "From a card"}, {"channel", "The card's channel"}});
+        app.play({{"id", "later000001"}, {"title", "From a card"}, {"channel", "The card's channel"}, {"published", 1700000000}});
         QQuickItem *surface = app.item("surface");
         QTRY_VERIFY(!surface->property("pending").toBool());
-        // The channel the card named stays, where the answer has none.
+        // The channel and the age the card had stay, where the answer has none.
         QCOMPARE(surface->property("info").toMap().value("channel").toString(), QString("The card's channel"));
+        QCOMPARE(surface->property("info").toMap().value("published").toLongLong(), 1700000000);
         QVERIFY(QUrl::fromPercentEncoding(app.asked().filter("POST api/play").last().toUtf8()).contains("channel=The card's channel"));
         QTest::qWait(300);
         QCOMPARE(app.asked("GET api/chapters"), 0);
@@ -946,6 +947,26 @@ private slots:
         QTRY_VERIFY(app.item("chapters-empty")->isVisible());
         QVERIFY(app.items("chapter").isEmpty());
         QCOMPARE(app.asked("GET api/chapters"), 2);
+    }
+
+    void aVideoPlayedWithoutACardHasItsChannelAndAgeLookedUp()
+    {
+        App app;
+        READY(app);
+        // A pasted link: nothing but the ID, and an answer without the page.
+        app.play({{"id", "later000002"}});
+        QQuickItem *surface = app.item("surface");
+        QTRY_VERIFY(!surface->property("pending").toBool());
+        // What only the page has is asked for at once, and shown when it comes.
+        QTRY_COMPARE(app.item("watch-channel")->property("text").toString(), QString("The page's channel"));
+        QCOMPARE(app.asked("GET api/chapters"), 1);
+        QVERIFY(app.asked().filter("GET api/chapters").first().contains("v=later000002"));
+        QVERIFY(surface->property("info").toMap().value("published").toLongLong() > 0);
+        // The same answer has the chapters: the tab asks for nothing more.
+        app.click(app.item("tab-chapters"));
+        QTRY_COMPARE(app.items("chapter").size(), 7);
+        QTest::qWait(300);
+        QCOMPARE(app.asked("GET api/chapters"), 1);
     }
 
     void commentsAreOnlyFetchedWhenTheTabIsOpened()

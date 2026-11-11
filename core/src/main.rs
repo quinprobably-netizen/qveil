@@ -420,7 +420,13 @@ fn run() -> Result<()> {
         Cmd::Play { target, .. } => {
             let v = ids::parse_video(&target)
                 .with_context(|| format!("{target:?} isn't a YouTube video URL or ID"))?;
-            player::play(&rt.cfg, &server.open(&v)?)
+            let info = server.open(&v)?;
+            // A pasted link has no card to take the channel's name from,
+            // and the history should have it.
+            if info.channel.is_none() && rt.cfg.history {
+                server.name_later(&v);
+            }
+            player::play(&rt.cfg, &info)
         }
         Cmd::Feed {
             limit,
@@ -593,7 +599,11 @@ fn browse(
             id: rows[i].0.id.clone(),
             start: None,
         };
-        if let Err(e) = server.open(&r).and_then(|info| player::play(cfg, &info)) {
+        let channel = rows[i].0.channel.clone();
+        if let Err(e) = server
+            .open_as(&r, channel)
+            .and_then(|info| player::play(cfg, &info))
+        {
             note!("qveil: {}", friendly(&format!("{e:#}")));
         }
     }
