@@ -1236,6 +1236,64 @@ private slots:
         QCOMPARE(notices.at(1).at(0).toString(), QString("History cleared"));
     }
 
+    void anEditedLensShowsNoneOfWhatItsOldWordsFound()
+    {
+        // The lens's refresh takes 1.5 s; what it found for its old words
+        // goes as soon as the new ones are saved, not when the refresh lands.
+        QTemporaryDir dir;
+        const QString fake = engine(dir, R"PY(import http.server,json,time,urllib.parse
+state={'text':'old words'}
+def lens(): return {'id':'lens1','text':state['text'],'tags':[state['text']],'searches':[state['text']],'count':2}
+class H(http.server.BaseHTTPRequestHandler):
+  protocol_version='HTTP/1.0'
+  def send(s,body):
+    b=json.dumps(body).encode()
+    s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)
+  def do_GET(s):
+    u=urllib.parse.urlparse(s.path);q=urllib.parse.parse_qs(u.query);path=u.path.split('/t/',1)[-1]
+    if path=='api/config': s.send({'route':'direct','thumbnails':False})
+    elif path=='api/lenses': s.send([lens()])
+    elif path=='api/lens':
+      s.send_response(200);s.send_header('Content-Type','application/x-ndjson');s.end_headers()
+      if q.get('refresh')==['1']: time.sleep(1.5)
+      word=state['text'].split()[0]
+      videos=[{'id':'%s%07d'%(word[:4],i),'title':word+' %d'%i} for i in range(2)]
+      s.wfile.write((json.dumps({'result':{'lens':lens(),'videos':videos,'tags':[state['text']],'searches':[state['text']],'fetchedAt':1}})+'\n').encode())
+    elif path in ('api/subs','api/history','api/resume'): s.send([])
+    elif path=='api/feed': s.send({'channels':0,'entries':[]})
+    else: s.send({})
+  def do_POST(s):
+    u=urllib.parse.urlparse(s.path);path=u.path.split('/t/',1)[-1]
+    body=json.loads(s.rfile.read(int(s.headers.get('Content-Length') or 0)) or b'{}')
+    if path=='api/lenses/lens1': state['text']=body['text'];s.send(lens())
+    else: s.send({})
+  def log_message(s,*a): pass
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)
+print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)
+srv.serve_forever()
+)PY");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
+        backend.loadLenses();
+        QTRY_COMPARE_WITH_TIMEOUT(backend.lenses().size(), 1, 5000);
+        backend.openLens("lens1", 0);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.lensVideos()->count(), 2, 5000);
+        QCOMPARE(backend.lensInfo().value("text").toString(), QString("old words"));
+
+        QElapsedTimer clock;
+        clock.start();
+        backend.editLens("lens1", "new words");
+        QTRY_VERIFY_WITH_TIMEOUT(backend.lensInfo().value("text").toString() == "new words", 5000);
+        QVERIFY2(clock.elapsed() < 1200, "the new words waited for the refresh");
+        QCOMPARE(backend.lensVideos()->count(), 0);
+        QCOMPARE(backend.lensInfo().value("tags").toStringList(), QStringList({"new words"}));
+        QVERIFY(!backend.lensInfo().contains("fetchedAt"));
+        // And then what the new words found.
+        QTRY_COMPARE_WITH_TIMEOUT(backend.lensVideos()->count(), 2, 5000);
+        QCOMPARE(backend.lensVideos()->get(0).value("title").toString(), QString("new 0"));
+    }
+
 private:
     // Sets environment variables for its lifetime, and puts back what was there.
     struct EnvironmentVariables {

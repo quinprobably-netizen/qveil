@@ -833,14 +833,23 @@ void Backend::addLens(const QString &text) {
 
 void Backend::editLens(const QString &id, const QString &text) {
     const QByteArray body = QJsonDocument(QJsonObject{{"text", text}}).toJson(QJsonDocument::Compact);
-    write("api/lenses/" + id, {}, body, "lens-write", [this, id](const QJsonValue &) {
+    write("api/lenses/" + id, {}, body, "lens-write", [this, id](const QJsonValue &v) {
         loadLenses();
         // What its shelf showed was for the old words.
         if (m_shelves.remove(id) > 0)
             emit shelvesChanged();
-        // Its results were for the old words; saving new ones asks for them again.
-        if (m_lensInfo.value("id").toString() == id)
+        // Its results were for the old words: they go at once, the new
+        // words show as the engine read them, and what they find is asked for.
+        if (m_lensInfo.value("id").toString() == id) {
+            m_lensVideos->clear();
+            const QJsonObject lens = v.toObject();
+            m_lensInfo = {{"id", id},
+                          {"text", lens.value("text").toString()},
+                          {"tags", lens.value("tags").toVariant()},
+                          {"searches", lens.value("searches").toVariant()}};
+            emit lensChanged();
             openLens(id, 1);
+        }
     });
 }
 
