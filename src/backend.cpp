@@ -127,7 +127,7 @@ QVariantMap Backend::privacyOf(const QVariantMap &config) {
     const QVariantMap sentRoutes = sent.value("routes").toMap(), sentPages = sent.value("pages").toMap();
     for (const char *key : {"direct", "tor", "proxy"})
         routes.insert(key, text(sentRoutes, key));
-    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses", "topics", "topics_on", "topics_off"})
+    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses", "lenses_short", "topics", "topics_on", "topics_off"})
         pages.insert(key, text(sentPages, key));
     QStringList points;
     for (const QVariant &point : sent.value("points").toList())
@@ -831,7 +831,7 @@ void Backend::refreshTopics() {
                     // engine names it, and that is said.
                     const QStringList errors = m_topics.value("errors").toStringList();
                     if (!errors.isEmpty())
-                        setError(tr("A topic couldn't be searched: %1").arg(errors.join(QStringLiteral("; "))));
+                        setError(tr("Topic feeds: %1").arg(errors.join(QStringLiteral("; "))));
                 }
             }
         },

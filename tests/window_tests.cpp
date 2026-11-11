@@ -870,11 +870,13 @@ private slots:
         READY(app);
         QTest::keyClick(app.window, Qt::Key_2);
         const QString said = app.backend->privacy().value("pages").toMap().value("lenses").toString();
-        QVERIFY(said.contains(". "));
-        // Its first sentence is always there, as the engine wrote it...
+        const QString shortly = app.backend->privacy().value("pages").toMap().value("lenses_short").toString();
+        QVERIFY(!shortly.isEmpty() && shortly != said);
+        // The engine's short sentence is always there, as it wrote it (the
+        // window cuts nothing out of the engine's text)...
         QQuickItem *first = app.item("lens-note-first"), *note = app.item("lens-note");
         QVERIFY(first && note);
-        QTRY_COMPARE(first->property("text").toString(), said.left(said.indexOf(". ") + 1));
+        QTRY_COMPARE(first->property("text").toString(), shortly);
         QVERIFY(first->isVisible() && !note->isVisible());
         // ...and the whole of it opens in place.
         app.click(app.item("lens-note-more"));
@@ -2469,7 +2471,7 @@ private slots:
         READY(app);
         QTRY_VERIFY(app.item("shelf-topic-aa11bb22cc33"));
         QTRY_VERIFY_WITH_TIMEOUT(!app.backend->busy().contains("topics"), 4000);
-        // The engine names the group whose search failed; the window says so.
+        // The engine names the group whose search failed; the window shows its words.
         QTRY_VERIFY2(app.backend->error().contains("borrow checker, allocators: YouTube didn't answer"),
                      qPrintable(app.backend->error()));
         QVERIFY(app.item("shelf-topic-aa11bb22cc33"));

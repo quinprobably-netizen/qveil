@@ -147,8 +147,8 @@ Column {
         font.family: Style.font
         font.pixelSize: Style.small
     }
-    // What a refresh asks for, and what that means: the first sentence of
-    // the engine's own text, with the rest of it a press away, in place.
+    // What a refresh asks for, and what that means: the engine's short
+    // sentence for it, with its whole text a press away, in place.
     Flow {
         width: parent.width
         spacing: Style.u * 2
@@ -165,9 +165,8 @@ Column {
         }
         Text {
             objectName: "lens-note-first"
-            readonly property string whole: backend.privacy.pages.lenses || ""
             visible: text !== ""
-            text: whole.indexOf(". ") > 0 ? whole.slice(0, whole.indexOf(". ") + 1) : whole
+            text: backend.privacy.pages.lenses_short || ""
             textFormat: Text.PlainText
             color: Style.faint
             font.family: Style.font
@@ -175,7 +174,7 @@ Column {
         }
         Text {
             objectName: "lens-note-more"
-            visible: (backend.privacy.pages.lenses || "").indexOf(". ") > 0
+            visible: !!backend.privacy.pages.lenses
             // (Only a way to the rest of the engine's text: the window says nothing of its own here.)
             text: editor.telling ? qsTr("Less") : qsTr("More")
             textFormat: Text.PlainText
