@@ -55,6 +55,16 @@ pub const CANCELLED: &str = "The request was cancelled";
 /// fetches it, to tell a live stream from a video that has no plain download.
 const SKIP_MANIFESTS: &str = "youtube:skip=hls,dash";
 
+/// How a search is asked for. `approximate_date` turns YouTube's "3 days
+/// ago" into a timestamp, so results can show an age like the feed does.
+/// `skip=webpage` leaves out the YouTube homepage that yt-dlp otherwise
+/// fetches before every search, only for its configuration (8.2 s of an
+/// 11 s search over Tor, measured): it uses its built-in one instead, and
+/// the search requests themselves are the same. (A channel's tabs are not
+/// asked for this way: there it would put two requests in place of the
+/// channel's page, not leave one out.)
+const SEARCH_ARGS: &str = "youtubetab:approximate_date;skip=webpage";
+
 /// How a video is looked up to be played: one request, YouTube's player
 /// answer for the client whose streams are played. Left to itself, yt-dlp
 /// first fetches the watch page (a megabyte of HTML, 0.85 to 1.07 s over
@@ -287,15 +297,8 @@ impl Ytdlp {
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Video>> {
         let q = format!("ytsearch{limit}:{query}");
-        // `approximate_date` turns YouTube's "3 days ago" into a timestamp, so
-        // search results can show an age like the feed does.
         let v = self.json(
-            &[
-                "--flat-playlist",
-                "--extractor-args",
-                "youtubetab:approximate_date",
-                "-J",
-            ],
+            &["--flat-playlist", "--extractor-args", SEARCH_ARGS, "-J"],
             &q,
             QUICK,
         )?;
@@ -339,7 +342,7 @@ impl Ytdlp {
             "--flat-playlist",
             "--lazy-playlist",
             "--extractor-args",
-            "youtubetab:approximate_date",
+            SEARCH_ARGS,
             "-j",
         ]);
         if let Some(range) = &range {
@@ -1073,6 +1076,26 @@ echo '{"entries":[]}'
             "{argv}"
         );
         assert!(spied(&dir, "config").contains("'https://www.youtube.com/watch?v=dQw4w9WgXcQ'"));
+    }
+
+    #[test]
+    fn a_search_skips_the_homepage_however_it_is_asked() {
+        let dir = TempDir::new();
+        let yt = ytdlp(script(&dir.0.join("yt-dlp"), SPY), None);
+        let skips = |argv: &str| {
+            argv.lines()
+                .any(|l| l == "youtubetab:approximate_date;skip=webpage")
+        };
+        yt.search("x", 1).unwrap();
+        assert!(skips(&spied(&dir, "argv")), "{}", spied(&dir, "argv"));
+        for sp in [None, Some("EgIYAg%3D%3D")] {
+            yt.search_each("x", 1, sp, &mut |_| true).unwrap();
+            assert!(
+                skips(&spied(&dir, "argv")),
+                "{sp:?}: {}",
+                spied(&dir, "argv")
+            );
+        }
     }
 
     #[test]
