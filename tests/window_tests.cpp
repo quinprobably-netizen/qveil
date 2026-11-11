@@ -218,6 +218,17 @@ struct App {
     int asked(const QString &start) { return asked().filter(QRegularExpression("^" + QRegularExpression::escape(start))).size(); }
 };
 
+// Something to play: a clip, made with ffmpeg in `dir`, which the stand-in
+// engine serves as the video. Empty when there is no ffmpeg to make it.
+QString makeClip(const QTemporaryDir &dir)
+{
+    const QString clip = dir.filePath("clip.mkv");
+    QProcess make;
+    make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=d=120:s=160x90:r=5", "-f", "lavfi", "-i", "anullsrc",
+                          "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", clip});
+    return make.waitForFinished(60000) && make.exitCode() == 0 && QFile::exists(clip) ? clip : QString();
+}
+
 #define READY(app) QVERIFY2((app).ok, "the window didn't load, or the stand-in engine didn't start")
 
 } // namespace
@@ -3192,11 +3203,8 @@ private slots:
     {
         // Something to play: the stand-in engine serves it as the video.
         QTemporaryDir dir;
-        const QString clip = dir.filePath("clip.mkv");
-        QProcess make;
-        make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=d=120:s=160x90:r=5", "-f", "lavfi", "-i", "anullsrc",
-                              "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", clip});
-        if (!make.waitForFinished(60000) || make.exitCode() != 0 || !QFile::exists(clip))
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
             QSKIP("ffmpeg couldn't make a clip to play");
         App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
         READY(app);
@@ -3239,6 +3247,64 @@ private slots:
         QTRY_COMPARE(app.asked("POST api/resume"), 5);
         QTRY_COMPARE(app.backend->resume().first().toMap().value("id").toString(), QString("vid00000003"));
         QVERIFY(!note->isVisible());
+    }
+
+    void qQuitsAtOnceWhenNothingIsPlaying()
+    {
+        App app;
+        READY(app);
+        QObject::disconnect(app.qml.get(), &QQmlEngine::quit, nullptr, nullptr);
+        QSignalSpy quit(app.qml.get(), &QQmlApplicationEngine::quit);
+        QTest::keyClick(app.window, Qt::Key_Q);
+        QCOMPARE(quit.count(), 1);
+    }
+
+    void qReportsWhereAVideoIsBeforeItQuits()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        QObject::disconnect(app.qml.get(), &QQmlEngine::quit, nullptr, nullptr);
+        QSignalSpy quit(app.qml.get(), &QQmlApplicationEngine::quit);
+        app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
+        QQuickItem *surface = app.item("surface");
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mpv && mpv->property("duration").toDouble() > 0, 15000);
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 40));
+        QTRY_COMPARE(app.asked("POST api/resume"), 1);
+
+        // Up to fifteen seconds of it would be lost without this: the position
+        // goes to the engine, and the window quits once it has been heard.
+        QTest::keyClick(app.window, Qt::Key_Q);
+        QTRY_COMPARE(quit.count(), 1);
+        QCOMPARE(app.asked("POST api/resume"), 2);
+    }
+
+    void qDoesNotWaitLongForAnEngineThatDoesNotAnswer()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_SLOW_RESUME", "8"}});
+        READY(app);
+        QObject::disconnect(app.qml.get(), &QQmlEngine::quit, nullptr, nullptr);
+        QSignalSpy quit(app.qml.get(), &QQmlApplicationEngine::quit);
+        app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
+        QObject *mpv = app.item("surface")->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mpv && mpv->property("duration").toDouble() > 0, 15000);
+
+        QElapsedTimer waited;
+        waited.start();
+        QTest::keyClick(app.window, Qt::Key_Q);
+        QTRY_COMPARE(app.asked("POST api/resume"), 1);
+        QTest::qWait(300);
+        QCOMPARE(quit.count(), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(quit.count(), 1, 4000);
+        QVERIFY2(waited.elapsed() < 5000, qPrintable(QString::number(waited.elapsed())));
     }
 
     void escapeFromTheSearchFieldGivesTheKeysBackToTheGrid()

@@ -481,6 +481,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 info["resume"] = kept["pos"]
             self.send(200, info)
         elif path == "api/resume":
+            # For the tests of a window that quits while the engine is not answering.
+            time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_RESUME", "0")))
             state["resume"] = [r for r in state["resume"] if r["id"] != body.get("v")]
             pos, dur = int(body.get("pos", 0)), int(body.get("dur", 0))
             if dur <= 0 or pos > dur:

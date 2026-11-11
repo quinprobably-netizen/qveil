@@ -299,6 +299,22 @@ ApplicationWindow {
         }
     }
 
+    // Quits. A video that is playing says where it is first (a quit would lose
+    // up to the last fifteen seconds of it), and the window goes once the
+    // engine has answered, or after a short while if it doesn't.
+    function quit() {
+        player.report()
+        if (backend.busy.indexOf("resume-note") < 0)
+            Qt.quit()
+        else
+            quitting.restart()
+    }
+    Timer {
+        id: quitting
+        interval: 1500
+        onTriggered: Qt.quit()
+    }
+
     // Puts `text` on the clipboard. (Only a text item can.)
     function copy(text) {
         clipboard.text = text
@@ -400,6 +416,12 @@ ApplicationWindow {
             if (win.pip)
                 pipWindow.end()
         }
+        function onBusyChanged() {
+            if (quitting.running && backend.busy.indexOf("resume-note") < 0) {
+                quitting.stop()
+                Qt.quit()
+            }
+        }
         function onPlayReady(info) {
             if (win.pip)
                 pipWindow.surface.open(info)
@@ -426,7 +448,7 @@ ApplicationWindow {
     Shortcut { sequences: ["/", "Ctrl+L"]; context: Qt.ApplicationShortcut; enabled: !win.typing || sequence === "Ctrl+L"; onActivated: search.edit() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: win.goBack() }
     Shortcut { sequence: "?"; context: Qt.ApplicationShortcut; enabled: !win.typing; onActivated: help.opened ? help.close() : help.open() }
-    Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: Qt.quit() }
+    Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.quit() }
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.playing ? player.mpv.togglePause() : win.playCurrent() }
     Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.go("home") }
     Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.go("lenses") }
