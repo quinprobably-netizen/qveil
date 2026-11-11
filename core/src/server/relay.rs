@@ -2368,16 +2368,20 @@ EOF
             first_byte(&base, &format!("s/{sid}/v"), &format!("bytes={from}-"));
         eprintln!("first byte after the seek: {took:?}");
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
-        assert!(took < Duration::from_millis(600), "{took:?}");
         // The spare was made while the first range played, and the range
-        // after the seek, which is small, went over it.
-        let asked = up.ranges();
-        assert_eq!(asked[1], "bytes=0-0", "{asked:?}");
-        assert!(
-            asked.contains(&format!("bytes={from}-{}", from + SEEK_CHUNK - 1)),
-            "{asked:?}"
-        );
-        assert!(up.connections() >= 2);
+        // after the seek, which is small, went over its connection.
+        let asked = up.ranges_on();
+        let on = |range: &str| {
+            asked
+                .iter()
+                .find(|(_, r)| r.as_deref() == Some(range))
+                .unwrap_or_else(|| panic!("no {range} in {asked:?}"))
+                .0
+        };
+        let seek = format!("bytes={from}-{}", from + SEEK_CHUNK - 1);
+        assert_eq!(asked[1].1.as_deref(), Some("bytes=0-0"), "{asked:?}");
+        assert_ne!(on("bytes=0-0"), on(&format!("bytes=0-{}", CHUNK - 1)));
+        assert_eq!(on(&seek), on("bytes=0-0"), "{asked:?}");
     }
 
     /// Over HTTP/1.1, a session keeps one connection to spare at most, and

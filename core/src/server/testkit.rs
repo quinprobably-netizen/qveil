@@ -429,7 +429,12 @@ pub struct KeepAlive {
     pub addr: std::net::SocketAddr,
     seen: Seen,
     connections: Arc<AtomicUsize>,
+    /// The Range header of each request, with the number of the connection
+    /// (from 0) it came on.
+    on: OnConnection,
 }
+
+type OnConnection = Arc<Mutex<Vec<(usize, Option<String>)>>>;
 
 impl KeepAlive {
     pub fn start(dial: Duration) -> Self {
@@ -442,18 +447,24 @@ impl KeepAlive {
         let addr = listener.local_addr().unwrap();
         let (seen, gauge) = (Seen::default(), Arc::new(Gauge::default()));
         let connections = Arc::new(AtomicUsize::new(0));
-        let (log, counted, count) = (
+        let on = OnConnection::default();
+        let (log, counted, count, on_log) = (
             Arc::clone(&seen),
             Arc::clone(&gauge),
             Arc::clone(&connections),
+            Arc::clone(&on),
         );
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
-                let dial = dial(count.fetch_add(1, Ordering::SeqCst));
-                let (log, gauge) = (Arc::clone(&log), Arc::clone(&counted));
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let dial = dial(n);
+                let (log, gauge, on) =
+                    (Arc::clone(&log), Arc::clone(&counted), Arc::clone(&on_log));
                 std::thread::spawn(move || {
                     std::thread::sleep(dial);
-                    keep_alive_serve(conn, &log, &gauge);
+                    keep_alive_serve(conn, &log, &gauge, |range| {
+                        on.lock().unwrap().push((n, range));
+                    });
                 });
             }
         });
@@ -461,7 +472,14 @@ impl KeepAlive {
             addr,
             seen,
             connections,
+            on,
         }
+    }
+
+    /// The Range header of each request, in order, with the number of the
+    /// connection it came on (from 0, in the order they were made).
+    pub fn ranges_on(&self) -> Vec<(usize, Option<String>)> {
+        self.on.lock().unwrap().clone()
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -487,6 +505,7 @@ fn keep_alive_serve(
     mut conn: TcpStream,
     log: &Mutex<Vec<(String, Option<String>)>>,
     gauge: &Gauge,
+    on: impl Fn(Option<String>),
 ) {
     let mut r = BufReader::new(conn.try_clone().unwrap());
     loop {
@@ -510,6 +529,7 @@ fn keep_alive_serve(
             }
         }
         log.lock().unwrap().push((target.clone(), range.clone()));
+        on(range.clone());
         let query = target.split_once('?').map_or("", |(_, q)| q);
         if !big_to(&mut conn, query, range.as_deref(), head_only, gauge, false) {
             return;
