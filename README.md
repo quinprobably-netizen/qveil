@@ -169,8 +169,9 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
   folded search field in a narrow column), and everything can be reached from
   the keyboard. What moves moves briefly, and not at all when the desktop's
   animations are off.
-- It takes its colours and accent from the Omarchy theme, its type from the
-  desktop's interface font, and its corners from Hyprland's window rounding.
+- It takes its colours and accent from the Omarchy theme and its corners from
+  Hyprland's window rounding. Its type is JetBrains Mono (the Nerd Font build
+  Omarchy ships), or the desktop's interface font where that isn't installed.
 
 | Key | Action |
 |---|---|
@@ -255,7 +256,7 @@ src/         the window (C++ / Qt Quick)
   backend.*    starts qveil-core and talks to it over loopback
   mpvitem.*    libmpv rendered into the scene
   theme.*      the Omarchy theme's colours, the desktop's interface font, Hyprland's rounding
-  Style.qml    the tokens everything is drawn with
+  Style.qml    the tokens everything is drawn with, the typeface among them
   *.qml        the parts (Act, TabWord, Field, …) and the pages built from them
   Linkify.js   what in a description or a comment can be clicked
 tests/       Qt tests; shots/engine.py is a stand-in engine for them and for stills

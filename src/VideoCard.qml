@@ -182,7 +182,7 @@ Item {
             // (Whether it is worth saying is the view's to tell: on every
             // card the same, it says nothing.)
             visible: card.view.reasons && card.why.length > 0
-            text: card.why.join("  ·  ")
+            text: card.why.join(" · ")
             textFormat: Text.PlainText
             elide: Text.ElideRight
             color: card.view.loudReasons ? Style.accent : Style.dim

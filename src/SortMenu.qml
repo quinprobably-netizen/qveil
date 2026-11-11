@@ -35,7 +35,7 @@ Act {
     }
 
     text: [sortName(now.sort), now.length !== "any" ? lengthName(now.length) : "",
-           now.watched === "hide" ? qsTr("unwatched") : ""].filter(s => s !== "").join("  ·  ")
+           now.watched === "hide" ? qsTr("unwatched") : ""].filter(s => s !== "").join(" · ")
     // A quiet word, with the mark of something that opens.
     quiet: !menu.opened
     trailing: "\u25be"

@@ -1,3 +1,5 @@
+#include <QFontDatabase>
+#include <QFontInfo>
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlEngine>
@@ -187,9 +189,9 @@ private slots:
                     "  SectionHead { width: 300; text: \"d\"; Act { text: \"e\" } }  Tip { text: \"f\"; shown: true }  Rule { width: 100 } }");
         QVERIFY2(stage.item, qPrintable(stage.error));
         const QString family = stage.style("font").toString();
-        // The desktop's interface typeface, as the theme has it.
+        // JetBrains Mono where it is installed, else the desktop's interface typeface.
         QVERIFY(!family.isEmpty());
-        QCOMPARE(family, stage.theme->uiFamily());
+        QCOMPARE(family, QFontDatabase::hasFamily(jetBrains) ? jetBrains : stage.theme->uiFamily());
         int texts = 0;
         for (QQuickItem *child : stage.item->findChildren<QQuickItem *>()) {
             if (!child->property("font").isValid())
@@ -199,6 +201,26 @@ private slots:
         }
         QVERIFY2(texts >= 7, qPrintable(QString::number(texts)));
     }
+
+    void theTypefaceIsJetBrainsMonoWhereverItIsInstalled()
+    {
+        if (!QFontDatabase::hasFamily(jetBrains))
+            QSKIP("JetBrainsMono Nerd Font isn't installed here");
+        Stage stage("Item {}");
+        QVERIFY2(stage.item, qPrintable(stage.error));
+        // Whatever the desktop's interface font is.
+        QCOMPARE(stage.style("font").toString(), jetBrains);
+        // Bold is a face it has (SemiBold, or Bold where only Regular and Bold
+        // are installed), never Regular smeared.
+        QFont strong(jetBrains);
+        strong.setPixelSize(stage.style("body").toInt());
+        strong.setWeight(QFont::Weight(stage.style("strong").toInt()));
+        const QString face = QFontInfo(strong).styleName();
+        QVERIFY2(face == "SemiBold" || face == "Bold", qPrintable(face));
+    }
+
+private:
+    inline static const QString jetBrains = QStringLiteral("JetBrainsMono Nerd Font");
 };
 
 QVEIL_SUITE(PartsTests)

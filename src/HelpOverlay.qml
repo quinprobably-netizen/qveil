@@ -132,7 +132,7 @@ Popup {
                                 Text {
                                     width: 96
                                     anchors.verticalCenter: parent.verticalCenter
-                                    text: modelData[0].map(help.shown).join("  ")
+                                    text: modelData[0].map(help.shown).join(" ")
                                     textFormat: Text.PlainText
                                     color: Style.accent
                                     font.family: Style.font
