@@ -17,6 +17,8 @@ FocusScope {
     signal playRequested(var video)
 
     onVisibleChanged: arming = false
+    // Turned on or off here, the keyboard goes to the list that is now showing.
+    onOnChanged: Qt.callLater(() => { if (page.visible) page.content.forceActiveFocus() })
 
     Column {
         id: top

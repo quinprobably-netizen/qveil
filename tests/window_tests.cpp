@@ -2505,6 +2505,68 @@ private slots:
             QVERIFY2(!meta->property("truncated").toBool(), qPrintable(meta->property("text").toString()));
     }
 
+    void popupsKeepTheKeyboardWhereItBelongs()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelves-home")->property("leadSelected").toBool());
+        // The help has the keyboard: Enter under it resumes nothing.
+        QObject *help = app.object("help");
+        QTest::keyClick(app.window, '?');
+        QTRY_VERIFY(help->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTest::keyClick(app.window, Qt::Key_Space);
+        QTest::qWait(200);
+        QVERIFY(!app.window->property("watching").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!help->property("opened").toBool());
+        // ...and gives it back to the page when it closes.
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+
+        // The route's popup, closed by a click in the search field, leaves the keyboard there.
+        QObject *route = app.object("routePopup");
+        QTest::keyClick(app.window, Qt::Key_P);
+        QTRY_VERIFY(route->property("opened").toBool());
+        app.click(app.item("search"));
+        QTRY_VERIFY(!route->property("opened").toBool());
+        QTest::qWait(300);
+        QVERIFY2(app.window->property("typing").toBool(), qPrintable(QDebug::toString(app.window->activeFocusItem())));
+    }
+
+    void switchingTheHistoryKeepsTheKeyboardOnTheList()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_4);
+        QTRY_VERIFY(app.item("history-kept-list")->hasActiveFocus());
+        app.click(app.item("history-turn-on"));
+        QQuickItem *list = nullptr;
+        QTRY_VERIFY((list = app.item("history-list")) && list->isVisible());
+        QTRY_COMPARE(app.items("history-row").size(), 4);
+        QTRY_VERIFY(list->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(list->property("currentIndex").toInt(), 1);
+    }
+
+    void inARightToLeftShortTileTheLeadsActionsAreOnIt()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        QGuiApplication::setLayoutDirection(Qt::RightToLeft);
+        QQuickItem *lead = app.item("lead");
+        QTRY_VERIFY(lead->isVisible());
+        QTest::qWait(250);
+        for (const char *name : {"lead-resume", "lead-over", "lead-forget"}) {
+            QQuickItem *act = app.item(name);
+            QVERIFY2(box(lead).contains(box(act)), name);
+            QVERIFY2(!box(act).intersects(box(app.item("lead-title"))), name);
+            QVERIFY2(!box(act).intersects(box(app.item("lead-picture"))), name);
+        }
+        QGuiApplication::setLayoutDirection(Qt::LeftToRight);
+    }
+
     void leftLeavesTheChannelPaneOnlyFromItsEdge()
     {
         App app(false, QSize(1280, 720));

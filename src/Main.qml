@@ -56,6 +56,24 @@ ApplicationWindow {
     // Where a channel's page was opened from.
     property string channelFrom: "home"
     readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
+    // A field the pointer just put the keyboard in, and when.
+    property Item tappedField: null
+    property real tappedAt: 0
+    // When a popup has gone, the keyboard goes back to what is showing; or to
+    // the field whose tap closed it (Qt takes the keyboard back to the page
+    // as the popup goes, after the tap gave it to the field).
+    function afterPopup() {
+        if (tappedField && tappedField.visible && Date.now() - tappedAt < 1000) {
+            tappedField.forceActiveFocus()
+            return
+        }
+        if (typing)
+            return
+        if (watching)
+            watch.forceActiveFocus()
+        else
+            focusPage(page)
+    }
     // While the help or a menu is open, the keys are theirs (Esc and ? aside).
     readonly property bool quiet: help.opened || openMenu !== null
     function tabStep(by) {
@@ -504,13 +522,9 @@ ApplicationWindow {
                 windowWidth: root.width
                 windowHeight: root.height
                 onSettingsRequested: win.go("settings")
-                // The keyboard goes back to what is showing.
-                onClosed: {
-                    if (win.watching)
-                        watch.forceActiveFocus()
-                    else
-                        win.focusPage(win.page)
-                }
+                // The keyboard goes back to what is showing (unless a click
+                // that closed it put it in a field).
+                onClosed: win.afterPopup()
             }
 
             // Errors stay until dismissed, under the bar.
@@ -808,6 +822,8 @@ ApplicationWindow {
         parent: root
         windowWidth: root.width
         windowHeight: root.height
+        // The keyboard goes back to what is showing.
+        onClosed: win.afterPopup()
     }
     // The video is rendered for the pixels it covers.
     Binding {

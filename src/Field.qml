@@ -102,4 +102,15 @@ Rectangle {
         cursorShape: Qt.IBeamCursor
     }
     TapHandler { onTapped: input.forceActiveFocus() }
+    // (A popup closed by the press that put the keyboard here takes it back to
+    // the page as it goes, a moment later: the window is told, to send it back.)
+    Connections {
+        target: input
+        function onActiveFocusChanged() {
+            if (input.activeFocus && input.Window.window && input.Window.window.tappedField !== undefined) {
+                input.Window.window.tappedField = input
+                input.Window.window.tappedAt = Date.now()
+            }
+        }
+    }
 }

@@ -476,7 +476,10 @@ FocusScope {
                 Row {
                     id: acts
                     // Under the words; in a strip, in the room between them and the picture.
-                    x: page.compact ? (picture.visible ? picture.x : lead.width) - width - Style.u * 6 : words.x
+                    // (Placed by hand, so mirrored by hand for right-to-left.)
+                    x: lead.mirrored
+                       ? (page.compact ? (picture.visible ? picture.x + picture.width : 0) + Style.u * 6 : words.x + words.width - width)
+                       : (page.compact ? (picture.visible ? picture.x : lead.width) - width - Style.u * 6 : words.x)
                     y: page.compact ? Math.round((lead.height - height) / 2) : words.y + words.height - height
                     spacing: page.compact ? Style.u : Style.u * 2
                     Act {

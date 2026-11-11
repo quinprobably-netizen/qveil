@@ -68,6 +68,9 @@ Popup {
     width: Math.min(wide ? 880 : 560, windowWidth - Style.gutter * 2)
     padding: Style.u * 5
     modal: true
+    // It has the keyboard while it is open: no key reaches the page under it
+    // (? and Esc, which close it, are the window's).
+    focus: true
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
     // It arrives and goes briefly.
     enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Style.quick } }
@@ -83,6 +86,8 @@ Popup {
 
     // Never taller than the window: what doesn't fit scrolls.
     contentItem: Flickable {
+        focus: true
+        Keys.onPressed: event => event.accepted = true
         implicitHeight: Math.min(all.height, help.windowHeight - Style.gutter * 2 - 2 * help.padding)
         contentHeight: all.height
         clip: true
