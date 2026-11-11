@@ -11,6 +11,7 @@
 use crate::proc::{self, Group};
 use crate::util::lock as locked;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -55,6 +56,10 @@ pub enum StartError {
 /// both, which is why the child is behind a lock that is never held while waiting.
 pub struct Proc {
     child: Mutex<Group>,
+    /// Becomes readable when the process ends (a pidfd), so that waiting for
+    /// that needs neither the lock nor a poll. `None` where the kernel has no
+    /// pidfds; waiting then polls.
+    exit: Option<OwnedFd>,
     /// Where its private files are, which `close` removes when the engine is exiting.
     dir: PathBuf,
     /// Set (once) by the registry when it stopped the process, so its owner
@@ -72,9 +77,30 @@ impl Proc {
         locked(&self.child).try_wait()
     }
 
-    /// Waits for it to end, polling so that `kill` can take the lock in
-    /// between (a blocking `wait` would hold it until the process ended on
-    /// its own). `None` if it is still there after `limit`.
+    /// Waits up to `limit` for the process to end, without the lock (so that
+    /// `kill` can take it meanwhile) and without reaping it. True once it
+    /// has ended: `try_wait` then has its status.
+    pub fn wait_exit(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        if let Some(fd) = &self.exit {
+            // On an error, it falls back to polling for what is left of the time.
+            if let Ok(ended) = proc::wait_readable(fd, limit) {
+                return ended;
+            }
+        }
+        loop {
+            if !matches!(self.try_wait(), Ok(None)) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL.min(deadline - now));
+        }
+    }
+
+    /// Waits for it to end. `None` if it is still there after `limit`.
     fn wait_up_to(&self, limit: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + limit;
         loop {
@@ -82,9 +108,13 @@ impl Proc {
                 Ok(Some(status)) => return Some(status),
                 // Nothing more to wait for.
                 Err(_) => return None,
-                Ok(None) if Instant::now() >= deadline => return None,
-                Ok(None) => std::thread::sleep(POLL),
+                Ok(None) => {}
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            self.wait_exit(deadline - now);
         }
     }
 
@@ -127,8 +157,11 @@ impl Inflight {
         let mut child = proc::spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
             .map_err(StartError::Spawn)?;
         let (stdout, stderr) = (child.take_stdout(), child.take_stderr());
+        // While the child is unreaped its id is its own, so this is the right process.
+        let exit = proc::pidfd(child.pid());
         let proc = Arc::new(Proc {
             child: Mutex::new(child),
+            exit,
             dir: dir.to_path_buf(),
             stopped: OnceLock::new(),
         });
@@ -204,8 +237,13 @@ impl Run {
             if let Some(status) = self.proc.try_wait()? {
                 return Ok(status);
             }
-            std::thread::sleep(POLL);
+            self.proc.wait_exit(Duration::from_secs(60));
         }
+    }
+
+    /// See `Proc::wait_exit`.
+    pub fn wait_exit(&self, limit: Duration) -> bool {
+        self.proc.wait_exit(limit)
     }
 
     /// Set when the registry killed the process while it was running (a route
@@ -301,6 +339,44 @@ mod tests {
         // Its result was in before the route changed; only what was still
         // running is cut off (the API's own check covers a late reply).
         assert_eq!(run.stopped(), None);
+    }
+
+    #[test]
+    fn waiting_for_the_end_wakes_up_as_it_ends_and_leaves_reaping_to_the_owner() {
+        let dir = TempDir::new();
+        let calls = Arc::new(Inflight::default());
+        let mut short = Command::new("sleep");
+        short.arg("0.3").stdin(Stdio::null());
+        let run = calls.start(&mut short, &dir.0).unwrap();
+        let started = Instant::now();
+        assert!(run.wait_exit(Duration::from_secs(5)));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(250) && took < Duration::from_millis(300 + 50),
+            "{took:?}"
+        );
+        // Not reaped by the wait: the status is still there for the owner.
+        assert!(run.try_wait().unwrap().unwrap().success());
+
+        // One that goes on running is waited for no longer than asked.
+        let run = calls.start(&mut sleeper(&dir), &dir.0).unwrap();
+        let started = Instant::now();
+        assert!(!run.wait_exit(Duration::from_millis(100)));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(100) && took < Duration::from_secs(1),
+            "{took:?}"
+        );
+        // And a kill from elsewhere ends the wait at once.
+        let handle = run.handle();
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            handle.kill();
+        });
+        let started = Instant::now();
+        assert!(run.wait_exit(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        killer.join().unwrap();
     }
 
     #[test]

@@ -32,6 +32,9 @@ const RESOLVE: Duration = Duration::from_secs(90);
 const COMMENTS: Duration = Duration::from_secs(120);
 /// How many replies are asked for under each comment, when they are.
 const REPLIES_EACH: usize = 3;
+/// How often a running call asks whether it is still wanted. The window
+/// hanging up is only looked for this often anyway (`http::WATCH_EVERY`).
+const ABORT_EVERY: Duration = Duration::from_millis(100);
 /// yt-dlp's own limit for one connection. The deadlines above bound the whole
 /// call, and this keeps a single dead connection from using up all of it.
 const SOCKET_TIMEOUT: &str = "20";
@@ -146,9 +149,10 @@ impl Ytdlp {
     /// returns `None`. The output is read on separate threads, so a child that
     /// fills a pipe isn't left waiting for us. An error if the registry
     /// stopped it, because what it printed belongs to a route that was left.
-    /// `abort` is asked every few milliseconds while the child runs, and when
+    /// `abort` is asked every `ABORT_EVERY` while the child runs, and when
     /// it says yes the child is killed (with everything it started) and the
-    /// call ends with `CANCELLED`.
+    /// call ends with `CANCELLED`. In between, this waits for the child to
+    /// end and wakes up the moment it does.
     fn output_within(
         &self,
         cmd: &mut Command,
@@ -175,7 +179,11 @@ impl Ytdlp {
                     None => Ok(None),
                 };
             }
-            std::thread::sleep(Duration::from_millis(20));
+            run.wait_exit(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(ABORT_EVERY),
+            );
         };
         if let Some(why) = run.stopped() {
             bail!(why.message());
