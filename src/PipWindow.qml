@@ -19,6 +19,15 @@ Window {
         surface.openAt(info, at)
         visible = true
     }
+    // Takes over the video the page's surface `from` is playing, with its
+    // player (see PlayerSurface.adopt). False if it had none to give.
+    // (The player first: mpv starts on it while the window is being mapped.)
+    function adopt(from) {
+        if (!surface.adopt(from))
+            return false
+        visible = true
+        return true
+    }
     // Stops the video and goes away.
     function end() {
         surface.stop()
@@ -46,8 +55,17 @@ Window {
         onSavedVolumeChanged: pip.savedVolume = savedVolume
         onPipRequested: pip.backRequested()
         // Stopped from anywhere (its own Close, the engine going away): no
-        // video, no window.
-        onClosed: pip.visible = false
+        // video, no window. A player handed back is drawn here until the
+        // page has it (see MpvItem::takeOver), so the window stays till then.
+        onClosed: if (!surface.mpv.handingOver) pip.visible = false
+    }
+
+    Connections {
+        target: surface.mpv
+        function onHandingOverChanged() {
+            if (!surface.mpv.handingOver && !surface.active)
+                pip.visible = false
+        }
     }
 
     Row {

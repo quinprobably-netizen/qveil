@@ -1126,6 +1126,104 @@ private slots:
         QVERIFY(small->property("startedAt").toDouble() >= 38);
     }
 
+    void pictureInPictureHandsOverThePlayerWithoutOpeningTheVideoAgain()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
+        QQuickItem *main = app.item("surface");
+        QObject *mainMpv = main->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mainMpv && mainMpv->property("started").toBool(), 15000);
+        QMetaObject::invokeMethod(main, "seekTo", Q_ARG(QVariant, 40));
+        QTRY_VERIFY_WITH_TIMEOUT(mainMpv->property("position").toDouble() >= 40, 10000);
+        QTRY_VERIFY(!mainMpv->property("buffering").toBool());
+        // (Where a seek got to is told once it has rested.)
+        QTest::qWait(1000);
+        // What opening the video asks of the engine: a lookup, and its stream.
+        const int looked = app.asked("POST api/play"), streamed = app.asked("GET s/");
+        QVERIFY(streamed >= 1);
+        // A handover says nothing of where the video is: it is the same playing
+        // on. (The player that has it tells, every so often, as it did.)
+        int noted = app.asked("POST api/resume");
+        auto noteless = [&] {
+            QTest::qWait(200);
+            const int now = app.asked("POST api/resume");
+            const bool same = now == noted;
+            noted = now;
+            return same;
+        };
+
+        // Out to the small window: the player it was playing in goes with it.
+        const double before = mainMpv->property("position").toDouble();
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QVERIFY(noteless());
+        QQuickItem *small = app.inPip("pip-surface");
+        QObject *smallMpv = small->property("mpv").value<QObject *>();
+        QVERIFY(small->property("active").toBool() && !main->property("active").toBool());
+        // Where it was, at once: not at the start of a file being opened.
+        QVERIFY(smallMpv->property("started").toBool() && smallMpv->property("loaded").toBool());
+        QVERIFY2(qAbs(smallMpv->property("position").toDouble() - before) < 1.5,
+                 qPrintable(QString::number(smallMpv->property("position").toDouble())));
+        // The page's player has nothing any more.
+        QVERIFY(!mainMpv->property("loaded").toBool() && !mainMpv->property("started").toBool());
+        // And it goes on playing.
+        QTRY_VERIFY_WITH_TIMEOUT(smallMpv->property("position").toDouble() > before + 0.5, 5000);
+        QVERIFY(!App::under(small, "resumed")->isVisible());
+
+        // And back.
+        const double out = smallMpv->property("position").toDouble();
+        QTest::keyClick(app.pip(), Qt::Key_I);
+        QTRY_VERIFY(!app.pip()->isVisible());
+        QVERIFY(noteless());
+        QVERIFY(main->property("active").toBool() && !small->property("active").toBool());
+        QVERIFY(app.window->property("watching").toBool());
+        QVERIFY(mainMpv->property("started").toBool());
+        QVERIFY2(mainMpv->property("position").toDouble() >= out - 0.5 && mainMpv->property("position").toDouble() < out + 1.5,
+                 qPrintable(QString::number(mainMpv->property("position").toDouble())));
+        QTRY_VERIFY_WITH_TIMEOUT(mainMpv->property("position").toDouble() > out + 0.5, 5000);
+        // The "Resumed at" line doesn't come up again, as for a video picked up.
+        QVERIFY(!App::under(main, "resumed")->isVisible());
+
+        // Leaving the page while it plays hands it over the same way.
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QVERIFY(noteless());
+        QVERIFY(smallMpv->property("started").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(smallMpv->property("position").toDouble() > out + 1, 5000);
+
+        // Nothing was looked up or opened again.
+        QTest::qWait(300);
+        QCOMPARE(app.asked("POST api/play"), looked);
+        QCOMPARE(app.asked("GET s/"), streamed);
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void onlyThePlayerThatIsShowingTellsWhereTheVideoIs()
+    {
+        App app;
+        READY(app);
+        app.play({{"id", "vid00000002"}});
+        QQuickItem *main = app.item("surface");
+        QTRY_VERIFY(!main->property("pending").toBool());
+        QObject *mainTimer = main->findChild<QObject *>("report-timer");
+        QVERIFY(mainTimer);
+        QTRY_VERIFY(mainTimer->property("running").toBool());
+        QTest::keyClick(app.window, Qt::Key_I);
+        QTRY_VERIFY(app.pip()->isVisible());
+        QObject *smallTimer = app.inPip("pip-surface")->findChild<QObject *>("report-timer");
+        QVERIFY(smallTimer->property("running").toBool());
+        QVERIFY(!mainTimer->property("running").toBool());
+        QTest::keyClick(app.pip(), Qt::Key_I);
+        QTRY_VERIFY(!app.pip()->isVisible());
+        QVERIFY(mainTimer->property("running").toBool());
+        QVERIFY(!smallTimer->property("running").toBool());
+    }
+
     void theLastWordOfALinesActionsStandsAtTheEdgeOfWhatIsUnderIt()
     {
         const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
