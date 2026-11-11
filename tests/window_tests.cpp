@@ -1060,7 +1060,8 @@ private slots:
 
         // The order is two plain words, and the note is near them: on their line
         // at the far end where it fits, else under them. In JetBrains Mono the
-        // sheet's 384 pixels hold the words and the note's 36 letters only one above the other.
+        // sheet's 384 pixels hold the words and the note's 36 letters only one above the other,
+        // so with it installed that is the one layout; with another typeface either is.
         const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
         QQuickItem *top = app.item("comments-top"), *newest = app.item("comments-new"), *note = app.item("comments-note");
         QVERIFY(top->isVisible() && newest->isVisible() && note->isVisible());
@@ -1071,13 +1072,17 @@ private slots:
         QCOMPARE(top->property("color").value<QColor>().alpha(), 0);
         QQuickItem *sheet = app.item("sheet");
         QVERIFY(box(note).right() <= box(sheet).right());
-        if (qAbs(box(note).center().y() - box(top).center().y()) <= 2) {
+        const bool beside = qAbs(box(note).center().y() - box(top).center().y()) <= 2;
+        if (QFontDatabase::hasFamily("JetBrainsMono Nerd Font"))
+            QVERIFY2(!beside, "the note is on the words' line, which JetBrains Mono's width has no room for");
+        else
+            qInfo("JetBrainsMono Nerd Font isn't installed here: the note is %s the words, which either layout passes", beside ? "beside" : "under");
+        if (beside) {
             QVERIFY(box(note).left() >= box(newest).right());
             QVERIFY(box(note).center().x() > box(sheet).center().x());
         } else {
             QVERIFY2(box(note).top() >= box(top).bottom() - 1, "the note is under the words");
             QVERIFY(box(note).left() >= box(sheet).left() && box(note).left() <= box(top).left() + 12);
-            QVERIFY(QFontDatabase::hasFamily("JetBrainsMono Nerd Font"));
         }
 
         // Pressing it shows the engine's whole sentence under, and again hides it.
