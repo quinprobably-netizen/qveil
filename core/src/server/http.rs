@@ -290,9 +290,13 @@ impl Drop for Pending {
 /// token. A process of the same user can compete for those places, but it
 /// could just as well kill qveil, so shutting it out would protect nothing.
 ///
-/// Read from /proc/net/tcp, where the client's end of the connection is the
-/// row whose own address is our peer's. Should that table be unreadable,
-/// the token alone guards the server, as it does elsewhere.
+/// The kernel is asked for the owner of the client's end of the connection
+/// (see `sock_diag`), which it looks up by its addresses. Where it can't be
+/// asked, it is read from /proc/net/tcp, where that end is the row whose own
+/// address is our peer's; that lists every TCP socket on the machine, and a
+/// busy one has thousands, which is too slow to read for every connection.
+/// Should neither be possible, the token alone guards the server, as it
+/// does elsewhere.
 pub(super) fn from_our_user(conn: &TcpStream) -> bool {
     let (Ok(peer), Ok(local)) = (conn.peer_addr(), conn.local_addr()) else {
         // Already gone.
@@ -302,10 +306,159 @@ pub(super) fn from_our_user(conn: &TcpStream) -> bool {
         // The listener is IPv4; anything else can't be looked up here.
         return true;
     };
-    let table = std::fs::read_to_string("/proc/net/tcp").ok();
     // SAFETY: geteuid has no preconditions and can't fail.
     let me = unsafe { libc::geteuid() };
-    owned_by(table.as_deref(), peer, local, me)
+    match sock_diag::owner(peer, local) {
+        Ok(owner) => owner == Some(me),
+        Err(_) => {
+            let table = std::fs::read_to_string("/proc/net/tcp").ok();
+            owned_by(table.as_deref(), peer, local, me)
+        }
+    }
+}
+
+/// The owner of one TCP socket, asked of the kernel over netlink
+/// (`NETLINK_SOCK_DIAG`, as `ss` does), which finds it by its addresses
+/// instead of listing every socket there is. No privilege is needed for it.
+mod sock_diag {
+    use std::io;
+    use std::net::SocketAddrV4;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    const NETLINK_SOCK_DIAG: libc::c_int = 4;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLMSG_ERROR: u16 = 2;
+    const INET_DIAG_NOCOOKIE: u32 = !0;
+
+    /// `struct inet_diag_sockid`: ports and addresses in network order.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct SockId {
+        sport: u16,
+        dport: u16,
+        src: [u32; 4],
+        dst: [u32; 4],
+        interface: u32,
+        cookie: [u32; 2],
+    }
+
+    /// `struct nlmsghdr` and `struct inet_diag_req_v2`, as one message.
+    #[repr(C)]
+    struct Request {
+        len: u32,
+        kind: u16,
+        flags: u16,
+        seq: u32,
+        pid: u32,
+        family: u8,
+        protocol: u8,
+        ext: u8,
+        pad: u8,
+        states: u32,
+        id: SockId,
+    }
+
+    /// The owner of the socket whose own end is `at`, connected to `to`;
+    /// `None` when there is no such socket. An error when the kernel can't
+    /// be asked.
+    pub fn owner(at: SocketAddrV4, to: SocketAddrV4) -> io::Result<Option<u32>> {
+        // SAFETY: a plain socket(2) call; the descriptor is owned below.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                NETLINK_SOCK_DIAG,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened and nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The answer comes at once; this only bounds a kernel that never says.
+        let wait = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        // SAFETY: `wait` is a valid timeval for the length given.
+        unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&wait as *const libc::timeval).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        let request = Request {
+            len: std::mem::size_of::<Request>() as u32,
+            kind: SOCK_DIAG_BY_FAMILY,
+            flags: NLM_F_REQUEST,
+            seq: 1,
+            pid: 0,
+            family: libc::AF_INET as u8,
+            protocol: libc::IPPROTO_TCP as u8,
+            ext: 0,
+            pad: 0,
+            states: !0,
+            id: SockId {
+                sport: at.port().to_be(),
+                dport: to.port().to_be(),
+                src: [u32::from_ne_bytes(at.ip().octets()), 0, 0, 0],
+                dst: [u32::from_ne_bytes(to.ip().octets()), 0, 0, 0],
+                interface: 0,
+                cookie: [INET_DIAG_NOCOOKIE; 2],
+            },
+        };
+        // SAFETY: `request` is a plain C struct of the length given; with no
+        // address, the message goes to the kernel.
+        let sent = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                (&request as *const Request).cast(),
+                std::mem::size_of::<Request>(),
+                0,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut answer = [0u8; 512];
+        // SAFETY: the buffer is valid for its length.
+        let got =
+            unsafe { libc::recv(fd.as_raw_fd(), answer.as_mut_ptr().cast(), answer.len(), 0) };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        parse(&answer[..got as usize])
+    }
+
+    /// Reads the answer: an `inet_diag_msg` after the 16-byte header, whose
+    /// `idiag_uid` is 4 + 48 + 12 bytes in, or an error message, which
+    /// "no such socket" is.
+    pub(super) fn parse(answer: &[u8]) -> io::Result<Option<u32>> {
+        let word = |at: usize| -> Option<u32> {
+            Some(u32::from_ne_bytes(answer.get(at..at + 4)?.try_into().ok()?))
+        };
+        let kind = answer
+            .get(4..6)
+            .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+            .ok_or_else(|| io::Error::other("a short answer"))?;
+        if kind == NLMSG_ERROR {
+            let code = word(16).ok_or_else(|| io::Error::other("a short error"))? as i32;
+            return match -code {
+                libc::ENOENT => Ok(None),
+                errno => Err(io::Error::from_raw_os_error(errno)),
+            };
+        }
+        if kind != SOCK_DIAG_BY_FAMILY {
+            return Err(io::Error::other(format!("an answer of kind {kind}")));
+        }
+        word(16 + 4 + std::mem::size_of::<SockId>() + 12)
+            .map(Some)
+            .ok_or_else(|| io::Error::other("a short answer"))
+    }
 }
 
 /// The decision of `from_our_user`, given the table (if it could be read).
@@ -517,6 +670,55 @@ mod tests {
     }
 
     #[test]
+    fn the_kernel_names_a_sockets_owner_without_listing_them_all() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (conn, _) = listener.accept().unwrap();
+        let v4 = |a: SocketAddr| match a {
+            SocketAddr::V4(a) => a,
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let (peer, local) = (
+            v4(conn.peer_addr().unwrap()),
+            v4(conn.local_addr().unwrap()),
+        );
+        let me = unsafe { libc::geteuid() };
+        // Where the kernel can be asked (it can wherever `ss` works).
+        let Ok(owner) = sock_diag::owner(peer, local) else {
+            eprintln!("netlink's sock_diag isn't there; /proc/net/tcp is read instead");
+            return;
+        };
+        assert_eq!(owner, Some(me));
+        // Either end, as /proc/net/tcp has them.
+        assert_eq!(sock_diag::owner(local, peer).unwrap(), Some(me));
+        // No such socket.
+        let nobody: SocketAddrV4 = "127.0.0.1:9".parse().unwrap();
+        assert_eq!(sock_diag::owner(nobody, local).unwrap(), None);
+        // And it agrees with the table.
+        let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        assert_eq!(uid_in(&table, peer, local), Some(me));
+        drop(client);
+    }
+
+    #[test]
+    fn an_answer_that_is_not_an_owner_is_no_owner() {
+        assert!(sock_diag::parse(&[]).is_err());
+        // An error message: no such socket, or another error.
+        let mut error = vec![0u8; 36];
+        error[4..6].copy_from_slice(&2u16.to_ne_bytes());
+        error[16..20].copy_from_slice(&(-libc::ENOENT).to_ne_bytes());
+        assert_eq!(sock_diag::parse(&error).unwrap(), None);
+        error[16..20].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert!(sock_diag::parse(&error).is_err());
+        // A message of the kind asked for, with its owner where the kernel puts it.
+        let mut found = vec![0u8; 88];
+        found[4..6].copy_from_slice(&20u16.to_ne_bytes());
+        found[80..84].copy_from_slice(&1234u32.to_ne_bytes());
+        assert_eq!(sock_diag::parse(&found).unwrap(), Some(1234));
+        assert!(sock_diag::parse(&found[..60]).is_err());
+    }
+
+    #[test]
     fn a_client_without_the_token_gets_nothing_more_than_one_line() {
         let (_s, base, _d) = server();
         // The request line alone is enough to be refused: the server doesn't
@@ -552,40 +754,55 @@ mod tests {
     #[test]
     fn clients_without_the_token_cannot_lock_the_app_out() {
         let (_s, base, _d) = server();
-        // More silent connections than the server has places for, and when
-        // each was made.
-        let idle: Vec<(TcpStream, Instant)> = (0..MAX_UNVERIFIED + MAX_CONNECTIONS + 16)
-            .map(|_| (TcpStream::connect(addr(&base)).unwrap(), Instant::now()))
+        // More silent connections than the server has places for.
+        let strangers = MAX_UNVERIFIED + MAX_CONNECTIONS + 16;
+        let idle: Vec<TcpStream> = (0..strangers)
+            .map(|_| TcpStream::connect(addr(&base)).unwrap())
             .collect();
-        // The app, which has the token, is served all the same, and at once:
-        // before a single stranger has been told it was too slow, so it
-        // didn't have to wait for their places to run out.
-        let asked = Instant::now();
-        let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
-        let served = Instant::now();
-        assert_eq!(status, 200, "{body}");
-        assert!(
-            served - asked < REQUEST_LINE_TIMEOUT,
-            "the app waited {:?} to be served",
-            served - asked
-        );
-        // A stranger may have been told it was too slow only if it had been
-        // waiting that long: on a busy machine, making the connections alone
-        // can take longer than that.
-        for (c, made) in &idle {
-            if served - *made >= REQUEST_LINE_TIMEOUT {
-                continue;
-            }
+        // Each newcomer made room by closing the oldest stranger, without
+        // waiting for anyone to be too slow. On a busy machine, taking them
+        // all in can take longer than the deadline for a request line, and
+        // then some are told they were too slow first, which makes room too:
+        // so this waits until every place over the pool's has gone one way
+        // or the other, and asks that it was not only by the deadline.
+        let gone = |c: &TcpStream| -> Option<bool> {
             c.set_nonblocking(true).unwrap();
             let mut head = [0u8; 12];
-            let n = c.peek(&mut head).unwrap_or(0);
-            assert!(
-                !head[..n].starts_with(b"HTTP/1.1 408"),
-                "the app was served only after the strangers timed out"
-            );
+            let said = match c.peek(&mut head) {
+                Ok(0) => Some(false),
+                Ok(n) => Some(head[..n].starts_with(b"HTTP/1.1 408")),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(_) => Some(false),
+            };
             c.set_nonblocking(false).unwrap();
-        }
-        let idle: Vec<TcpStream> = idle.into_iter().map(|(c, _)| c).collect();
+            said
+        };
+        let started = Instant::now();
+        let (closed, told) = loop {
+            let ends: Vec<bool> = idle.iter().filter_map(gone).collect();
+            let told = ends.iter().filter(|&&t| t).count();
+            if ends.len() >= strangers - MAX_UNVERIFIED
+                || started.elapsed() > Duration::from_secs(20)
+            {
+                break (ends.len() - told, told);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            closed + told >= strangers - MAX_UNVERIFIED,
+            "{closed} closed and {told} told they were too slow"
+        );
+        assert!(closed > 0, "no stranger was closed to make room");
+        // The app, which has the token, is served all the same, and at once:
+        // the pool is full, and it doesn't wait for a place to run out.
+        let asked = Instant::now();
+        let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            asked.elapsed() < REQUEST_LINE_TIMEOUT,
+            "the app waited {:?}",
+            asked.elapsed()
+        );
 
         // And the silent ones don't linger: each is closed, within the short
         // deadline for a request line, not left for the full 15 s.
