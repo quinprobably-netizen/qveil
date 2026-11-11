@@ -508,6 +508,22 @@ private slots:
         }
     }
 
+    void whatIsTypedInASearchReachesTheEngineAsTyped() {
+        // A plus is a plus: a query string leaves it as it is, and the engine
+        // would read it as a space ("c++ tutorial" searched for "c   tutorial").
+        Rig rig;
+        if (Rig::core().isEmpty())
+            QSKIP("build/qveil-core isn't built; bin/build builds it");
+        QVERIFY(rig.start());
+        Backend &window = rig.window();
+
+        window.search("c++ 1+1=2 100% 50%25 a&b #c");
+        WAIT_FOR(rig.calls("search") == 1, 10000);
+        WAIT_FOR(!window.busy().contains("search"), 10000);
+        // The fake yt-dlp logs the target the engine gave it, quoted.
+        QCOMPARE(rig.calls().last(), QString("search 'ytsearch40:c++ 1+1=2 100% 50%25 a&b #c'"));
+    }
+
     void aRouteChangedUnderARequestIsNotAnError() {
         // The user did it: they chose another route while a search was still
         // running on the old one, and the engine ended it. They know.

@@ -40,6 +40,19 @@ void remember(const QString &base) {
     std::sort(secrets.begin(), secrets.end(), [](const QString &a, const QString &b) { return a.size() > b.size(); });
 }
 
+// A query as the engine reads it: every key and value percent-encoded whole.
+// QUrlQuery leaves a plus as it is, which the engine decodes as a space, so
+// "c++ tutorial" would be searched for as "c   tutorial".
+QString encoded(const QUrlQuery &query) {
+    QByteArray text;
+    for (const auto &[key, value] : query.queryItems(QUrl::FullyDecoded)) {
+        if (!text.isEmpty())
+            text += '&';
+        text += QUrl::toPercentEncoding(key) + '=' + QUrl::toPercentEncoding(value);
+    }
+    return text.isEmpty() ? QString() : QString::fromLatin1(text);
+}
+
 } // namespace
 
 Backend::Backend(const QProcessEnvironment &environment, const QString &core, QObject *parent)
@@ -282,7 +295,7 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
         return;
     }
     QUrl url(m_base + "/" + path);
-    url.setQuery(query);
+    url.setQuery(encoded(query), QUrl::StrictMode);
     QNetworkRequest request(url);
     // A stuck request still ends eventually. The slow ones (a feed refresh
     // over Tor) are streamed, which keeps this from running out (see stream()).
@@ -469,7 +482,7 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
         return;
     }
     QUrl url(m_base + "/" + path);
-    url.setQuery(query);
+    url.setQuery(encoded(query), QUrl::StrictMode);
     QNetworkRequest request(url);
     // Qt counts this from the last bytes received, so a stream that keeps
     // sending (a refresh sends a line per channel) never runs into it.
