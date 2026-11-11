@@ -1742,6 +1742,33 @@ def main(argv=None):
         }
     }
 
+    /// Puts a `python3` of its own in front of the yt-dlp that `python_ytdlp`
+    /// made: it runs a call (`python3 yt-dlp ...`) with the real one, but
+    /// answers the spare's start (`python3 -P -c ...`) with `spare`, a piece
+    /// of shell. It can look at `fixed`, a file in `dir`.
+    fn wrap_python(dir: &Path, bin: &str, spare: &str) {
+        let text = std::fs::read_to_string(bin).unwrap();
+        let real = text.lines().next().unwrap().strip_prefix("#!").unwrap();
+        let body = format!(
+            "cd '{}'\ncase \"$1\" in -P)\n{spare}\n;; esac\nexec {real} \"$@\"\n",
+            dir.display()
+        );
+        // As the first line of the entry script, in the same place.
+        crate::store::testing::script(&dir.join("python3"), &body);
+        let rest = text.split_once('\n').unwrap().1;
+        let shebang = format!("#!{}\n{rest}", dir.join("python3").display());
+        std::fs::write(bin, shebang).unwrap();
+    }
+
+    /// Waits until `n` spares in a row have failed.
+    fn wait_failures(yt: &Ytdlp, n: u32) {
+        let started = Instant::now();
+        while yt.calls.spare_failures() < n {
+            assert!(started.elapsed() < Duration::from_secs(10), "no failure");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// The log's lines: what happened, and in which process.
     fn log(dir: &Path) -> Vec<(String, u32)> {
         std::fs::read_to_string(dir.join("log"))
@@ -1965,6 +1992,67 @@ def main(argv=None):
         assert_eq!(last_import.1, last_run.1, "a fresh process ran the call");
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(yt.calls.running(), 0, "another spare was started");
+        yt.calls.close(Why::RouteChanged);
+    }
+
+    #[test]
+    fn a_spare_that_exits_at_once_is_given_up_on_for_a_while_and_then_tried_again() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        wrap_python(&dir.0, &bin, "[ -e fixed ] || exit 1");
+        let hour = Duration::from_secs(3600);
+        let first = yt(bin.clone());
+        first
+            .calls
+            .set_spare_timing(Duration::from_secs(10), hour, hour);
+        first.keep_spare();
+        wait_failures(&first, 1);
+        // No more are tried for the time being, and calls go the usual way.
+        assert!(first.calls.spare_backoff_left().unwrap() > hour / 2);
+        assert!(!first.calls.spare_ready());
+        first.search("q", 1).unwrap();
+        let log = log(&dir.0);
+        assert_eq!(log[log.len() - 2].1, log[log.len() - 1].1, "{log:?}");
+        first.calls.close(Why::RouteChanged);
+
+        // Once the time is up, the keeper tries again, and the spare is
+        // there when yt-dlp can be started that way.
+        let yt = yt(bin);
+        yt.calls
+            .set_spare_timing(Duration::from_secs(10), Duration::from_millis(50), hour);
+        yt.keep_spare();
+        wait_failures(&yt, 1);
+        std::fs::write(dir.0.join("fixed"), "").unwrap();
+        let spare = ready_spare(&yt, &dir.0);
+        assert_eq!(yt.calls.spare_failures(), 0);
+        assert_eq!(yt.calls.spare_backoff_left(), None);
+        yt.calls.close(Why::RouteChanged);
+        wait_gone(spare);
+    }
+
+    #[test]
+    fn a_spare_that_never_says_it_is_ready_is_killed_and_calls_go_the_usual_way() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        wrap_python(&dir.0, &bin, "echo $$ > hung-spare\nexec sleep 60");
+        let yt = yt(bin);
+        let hour = Duration::from_secs(3600);
+        yt.calls
+            .set_spare_timing(Duration::from_millis(300), hour, hour);
+        yt.keep_spare();
+        wait_failures(&yt, 1);
+        let pid: u32 = std::fs::read_to_string(dir.0.join("hung-spare"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        wait_gone(pid);
+        assert!(!yt.calls.spare_ready());
+        yt.search("q", 1).unwrap();
         yt.calls.close(Why::RouteChanged);
     }
 }

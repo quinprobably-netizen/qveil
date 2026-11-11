@@ -12,7 +12,7 @@ use crate::proc::{self, Group};
 use crate::spare::{self, Launch};
 use crate::util::lock as locked;
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -142,6 +142,37 @@ pub struct Inflight {
     spares_changed: Condvar,
 }
 
+/// How long a spare is given to say it is ready (Python starting and importing
+/// yt-dlp takes a second at the most, on a busy machine), and how long no
+/// more are tried after one failed: the first time, and each time after.
+#[derive(Clone, Copy)]
+struct Timing {
+    ready_within: Duration,
+    backoff: Duration,
+    backoff_long: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            ready_within: Duration::from_secs(10),
+            backoff: Duration::from_secs(60),
+            backoff_long: Duration::from_secs(600),
+        }
+    }
+}
+
+impl Timing {
+    /// How long to wait after the `failures`th failure in a row.
+    fn after(&self, failures: u32) -> Duration {
+        if failures <= 1 {
+            self.backoff
+        } else {
+            self.backoff_long
+        }
+    }
+}
+
 #[derive(Default)]
 struct Spares {
     /// What to keep a spare of, once a call has asked for one.
@@ -150,9 +181,44 @@ struct Spares {
     ready: Option<Ready>,
     /// Whether the thread that starts them is running.
     keeper: bool,
-    /// Set when a spare failed to start: there are no more, and calls start
-    /// the usual way.
-    broken: bool,
+    /// How many spares in a row failed to start, until one is ready.
+    failures: u32,
+    /// Until when no spare is tried, after one failed: calls start the usual
+    /// way meanwhile.
+    broken_until: Option<Instant>,
+    timing: Timing,
+}
+
+impl Spares {
+    /// A spare failed to start (or to say it was ready).
+    fn failed(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        self.broken_until = Some(Instant::now() + self.timing.after(self.failures));
+    }
+
+    /// How much is left of the time that no spare is tried for.
+    fn backing_off(&self) -> Option<Duration> {
+        self.broken_until?
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    }
+}
+
+/// Lets the registry know that its keeper has gone, however it ended, so that
+/// the next `want_spare` starts another: one that panicked would otherwise
+/// leave `keeper` set, and `want_spare` returning early for good. Whatever
+/// spare it left is let go, as its process ends with the thread anyway.
+struct KeeperGuard<'a>(&'a Inflight);
+
+impl Drop for KeeperGuard<'_> {
+    fn drop(&mut self) {
+        let gone = {
+            let mut sp = locked(&self.0.spares);
+            sp.keeper = false;
+            sp.ready.take()
+        };
+        drop(gone);
+    }
 }
 
 /// A spare that is waiting for its arguments. Its process is in
@@ -217,7 +283,7 @@ impl Inflight {
     /// one. A spare of anything else is let go.
     pub fn want_spare(self: &Arc<Self>, launch: &Launch) {
         let mut sp = locked(&self.spares);
-        if sp.broken || (sp.want.as_ref() == Some(launch) && sp.keeper) {
+        if sp.want.as_ref() == Some(launch) && sp.keeper {
             return;
         }
         // Ending its process waits for it to go, which is for the end of
@@ -227,11 +293,12 @@ impl Inflight {
             sp.want = Some(launch.clone());
             old = sp.ready.take();
         }
-        if !sp.keeper {
+        // A thread that couldn't be started isn't tried again for a while.
+        if !sp.keeper && sp.backing_off().is_none() {
             let calls = Arc::clone(self);
             match std::thread::Builder::new().spawn(move || calls.keep_spares()) {
                 Ok(_) => sp.keeper = true,
-                Err(_) => sp.broken = true,
+                Err(_) => sp.failed(),
             }
         }
         self.spares_changed.notify_all();
@@ -243,6 +310,29 @@ impl Inflight {
     #[cfg(test)]
     pub fn spare_ready(&self) -> bool {
         locked(&self.spares).ready.is_some()
+    }
+
+    /// Changes how long a spare is given to be ready, and how long no more
+    /// are tried after a failure (the first time, and each time after).
+    #[cfg(test)]
+    pub fn set_spare_timing(&self, ready_within: Duration, backoff: Duration, long: Duration) {
+        locked(&self.spares).timing = Timing {
+            ready_within,
+            backoff,
+            backoff_long: long,
+        };
+    }
+
+    /// How many spares in a row failed to start.
+    #[cfg(test)]
+    pub fn spare_failures(&self) -> u32 {
+        locked(&self.spares).failures
+    }
+
+    /// How long no spare is tried for, if that is so.
+    #[cfg(test)]
+    pub fn spare_backoff_left(&self) -> Option<Duration> {
+        locked(&self.spares).backing_off()
     }
 
     /// What a spare is kept of, if anything.
@@ -282,39 +372,49 @@ impl Inflight {
     /// The thread that starts the spares. Started by the first `want_spare`,
     /// it is the thread that spawns them, and must outlive them: a child is
     /// killed when the *thread* that started it ends (see `proc::Group`). So
-    /// it ends only once the registry is closed and they have all ended.
+    /// it ends only once the registry is closed and they have all ended. One
+    /// that failed is tried again by this same thread when its time is up.
     fn keep_spares(self: Arc<Self>) {
+        let _gone = KeeperGuard(&self);
         let mut started: Vec<Arc<Proc>> = Vec::new();
         loop {
-            let launch = {
+            let found = {
                 let mut sp = locked(&self.spares);
                 loop {
-                    if locked(&self.state).closed.is_some() || sp.broken {
+                    if locked(&self.state).closed.is_some() {
                         break None;
                     }
-                    if sp.ready.is_none()
+                    let backing_off = sp.backing_off();
+                    if backing_off.is_none()
+                        && sp.ready.is_none()
                         && let Some(want) = &sp.want
                     {
-                        break Some(want.clone());
+                        break Some((want.clone(), sp.timing.ready_within));
                     }
-                    sp = match self.spares_changed.wait_timeout(sp, Duration::from_secs(1)) {
+                    let wait = Duration::from_secs(1).min(backing_off.unwrap_or(Duration::MAX));
+                    sp = match self.spares_changed.wait_timeout(sp, wait) {
                         Ok((sp, _)) => sp,
                         Err(e) => e.into_inner().0,
                     };
                 }
             };
-            let Some(launch) = launch else { break };
-            started.retain(|p| !p.wait_exit(Duration::ZERO));
-            let Ok(mut run) = self.spawn(&mut launch.command()) else {
-                locked(&self.spares).broken = true;
+            let Some((launch, ready_within)) = found else {
                 break;
             };
+            started.retain(|p| !p.wait_exit(Duration::ZERO));
+            let Ok(mut run) = self.spawn(&mut launch.command()) else {
+                locked(&self.spares).failed();
+                continue;
+            };
             started.push(Arc::clone(&run.proc));
-            if !ready(&mut run) {
-                locked(&self.spares).broken = true;
-                break;
+            // One that isn't ready in time is killed as `run` is dropped.
+            if !ready(&mut run, ready_within) {
+                locked(&self.spares).failed();
+                continue;
             }
             let mut sp = locked(&self.spares);
+            sp.failures = 0;
+            sp.broken_until = None;
             if sp.want.as_ref() == Some(&launch) && sp.ready.is_none() {
                 sp.ready = Some(Ready { launch, run });
             }
@@ -324,7 +424,6 @@ impl Inflight {
         for p in started {
             while !p.wait_exit(Duration::from_secs(60)) {}
         }
-        locked(&self.spares).keeper = false;
     }
 
     /// Stops every running process and refuses new ones. For `Why::Exiting`
@@ -410,16 +509,27 @@ impl Run {
 }
 
 /// Waits until a spare that was just started has imported yt-dlp and says
-/// so. False if it ended first, or said anything else.
-fn ready(run: &mut Run) -> bool {
+/// so. False if it ended first, or said anything else, or hasn't said so
+/// within `within`.
+fn ready(run: &mut Run, within: Duration) -> bool {
     let Some(stderr) = run.stderr.as_mut() else {
         return false;
     };
+    // Polled through a copy of the descriptor, which the pipe keeps.
+    let Ok(watch) = stderr.as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    let deadline = Instant::now() + within;
     let mut said = Vec::new();
     let mut byte = [0u8];
     // Byte by byte, so that nothing after the line is taken from the call
     // that gets the pipe.
     while said.len() < spare::READY.len() && !said.ends_with(b"\n") {
+        // A byte is there to read once this says so (or the pipe is closed).
+        match proc::wait_readable(&watch, deadline.saturating_duration_since(Instant::now())) {
+            Ok(true) => {}
+            _ => return false,
+        }
         match stderr.read(&mut byte) {
             Ok(1) => said.push(byte[0]),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -603,6 +713,57 @@ mod tests {
         swapper.join().unwrap();
         claimer.join().unwrap();
         assert_eq!(answered, Ok(true), "claim_spare waited for the swap");
+    }
+
+    #[test]
+    fn a_spare_that_failed_is_waited_out_for_a_minute_and_then_for_ten() {
+        let t = Timing::default();
+        assert_eq!(t.after(1), Duration::from_secs(60));
+        for n in [2, 3, 50, u32::MAX] {
+            assert_eq!(t.after(n), Duration::from_secs(600), "{n}");
+        }
+        let mut sp = Spares::default();
+        assert_eq!(sp.backing_off(), None);
+        sp.failed();
+        let left = sp.backing_off().unwrap();
+        assert!(left > Duration::from_secs(50) && left <= Duration::from_secs(60));
+        sp.failed();
+        assert!(sp.backing_off().unwrap() > Duration::from_secs(590));
+        // Up to its time, and no longer.
+        sp.broken_until = Some(Instant::now());
+        assert_eq!(sp.backing_off(), None);
+    }
+
+    #[test]
+    fn a_keeper_that_panics_leaves_the_next_want_spare_to_start_another() {
+        let calls = Arc::new(Inflight::default());
+        let dir = TempDir::new();
+        let launch = Launch::testing("x");
+        let pid = ready_spare(&calls, &launch, &dir);
+        let dying = {
+            let calls = Arc::clone(&calls);
+            std::thread::spawn(move || {
+                let _gone = KeeperGuard(&calls);
+                panic!("a keeper that panicked, for a test");
+            })
+        };
+        assert!(dying.join().is_err());
+        let sp = locked(&calls.spares);
+        assert!(!sp.keeper, "want_spare would return early for good");
+        assert!(sp.ready.is_none());
+        drop(sp);
+        // Its spare was let go with it.
+        assert!(gone(pid));
+        // And the next ask starts a keeper again (which finds that there is
+        // no Python to start, and waits to try again).
+        calls.want_spare(&launch);
+        assert!(locked(&calls.spares).keeper);
+        let started = Instant::now();
+        while calls.spare_failures() == 0 {
+            assert!(started.elapsed() < Duration::from_secs(5), "no keeper");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        calls.close(Why::RouteChanged);
     }
 
     #[test]
