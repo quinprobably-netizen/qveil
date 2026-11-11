@@ -6,7 +6,7 @@ use std::path::Path;
 /// loading (see `Config::load`): `save` writes every setting, so a file that a
 /// newer qveil saved has keys that an older one has to get past. One that is
 /// a letter or two off a setting does stop it: that is a typo.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Route every request (search, feeds, metadata *and* video bytes)
@@ -52,6 +52,11 @@ pub struct Config {
     /// in by `load`.
     #[serde(skip)]
     pub ignored: Vec<String>,
+    /// Those keys with their values, which `save` writes back as they were,
+    /// so that an older qveil that changes a setting doesn't take a newer
+    /// qveil's out of the file. Only ever filled in by `load`.
+    #[serde(skip)]
+    pub kept: toml::Table,
 }
 
 impl Default for Config {
@@ -72,6 +77,7 @@ impl Default for Config {
             mpv: "mpv".into(),
             mpv_args: vec![],
             ignored: vec![],
+            kept: toml::Table::new(),
         }
     }
 }
@@ -89,13 +95,22 @@ fn known_keys() -> Vec<String> {
 }
 
 /// The keys of `text` that this version has no setting for, in order.
+#[cfg(test)]
 fn unknown_keys(text: &str) -> Vec<String> {
+    text.parse::<toml::Table>()
+        .map(|t| unknown_in(&t).into_iter().map(|(k, _)| k).collect())
+        .unwrap_or_default()
+}
+
+/// The entries of `table` that this version has no setting for, in order.
+fn unknown_in(table: &toml::Table) -> Vec<(String, toml::Value)> {
     let known = known_keys();
-    let mut unknown: Vec<String> = text
-        .parse::<toml::Table>()
-        .map(|t| t.keys().filter(|k| !known.contains(*k)).cloned().collect())
-        .unwrap_or_default();
-    unknown.sort();
+    let mut unknown: Vec<_> = table
+        .iter()
+        .filter(|(k, _)| !known.contains(*k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    unknown.sort_by(|a, b| a.0.cmp(&b.0));
     unknown
 }
 
@@ -127,8 +142,16 @@ fn distance(a: &str, b: &str) -> usize {
 }
 
 /// How many edits apart an unknown key may be from a setting to be taken
-/// for a typo of it.
-const TYPO: usize = 2;
+/// for a typo of it. It grows with the length of the shorter of the two: two
+/// edits are most of a three-letter key (`fps` is not a typo of `mpv`, and a
+/// newer qveil may well have it), but only a letter or two in `isolate_circuits`.
+fn typo_edits(a: &str, b: &str) -> usize {
+    match a.chars().count().min(b.chars().count()) {
+        0..=4 => 1,
+        5..=8 => 2,
+        _ => 3,
+    }
+}
 
 /// The setting that `key` (which isn't one) looks like a typo of, if any.
 /// Case and `-` for `_` don't count as different.
@@ -137,9 +160,48 @@ fn meant(key: &str, known: &[String]) -> Option<String> {
     known
         .iter()
         .map(|k| (distance(&typed, k), k))
-        .filter(|(d, _)| *d <= TYPO)
+        .filter(|(d, k)| *d <= typo_edits(&typed, k))
         .min_by_key(|(d, _)| *d)
         .map(|(_, k)| k.clone())
+}
+
+/// The words of a key: split at anything but letters and digits, and at a
+/// capital after a lower-case letter (`useTor` is `use` and `tor`).
+fn words(key: &str) -> Vec<String> {
+    let mut words = vec![String::new()];
+    let mut before_lower = false;
+    for c in key.chars() {
+        if !c.is_alphanumeric() {
+            words.push(String::new());
+        } else {
+            if c.is_uppercase() && before_lower {
+                words.push(String::new());
+            }
+            words.last_mut().unwrap().extend(c.to_lowercase());
+        }
+        before_lower = c.is_lowercase();
+    }
+    words.retain(|w| !w.is_empty());
+    words
+}
+
+/// Why an unknown key may be about the route even though it isn't close to a
+/// setting, if it may be: it names a proxy, SOCKS or Tor, or it is a section
+/// (which could hold any of those). Left out, such a setting would put the
+/// engine on Direct without anyone having asked for it. `tor` counts as a
+/// word, not as letters (`history_limit` has them in it).
+fn about_the_route(key: &str, value: &toml::Value) -> Option<&'static str> {
+    let lower = key.to_lowercase();
+    if lower.contains("prox") || lower.contains("socks") || words(key).iter().any(|w| w == "tor") {
+        return Some("it looks like a route setting (it mentions a proxy, SOCKS or Tor)");
+    }
+    let section = |v: &toml::Value| v.is_table();
+    if section(value) || value.as_array().is_some_and(|a| a.iter().any(section)) {
+        return Some(
+            "it is a section, which this version has no settings in, and a proxy in it would be left out",
+        );
+    }
+    None
 }
 
 impl Config {
@@ -147,20 +209,31 @@ impl Config {
     /// that this version doesn't know is left out, said so on stderr and
     /// kept in `ignored` for the window to show: it may be a setting of a
     /// newer qveil, and that is no reason not to start. One that is within
-    /// `TYPO` edits of a setting is refused instead: that is a typo, and a
+    /// `typo_edits` of a setting is refused instead: that is a typo, and a
     /// setting left out because of one can matter (`prxoy` would mean no
-    /// proxy, and the real IP). (`save` writes only the keys it knows.)
+    /// proxy, and the real IP). So is one that may be about the route (see
+    /// `about_the_route`). (`save` writes the unknown keys back as they
+    /// were: see `kept`.)
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
                 let mut cfg: Config =
                     toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
-                let unknown = unknown_keys(&s);
+                let table: toml::Table = s
+                    .parse()
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                let unknown = unknown_in(&table);
                 let known = known_keys();
-                for key in &unknown {
+                for (key, value) in &unknown {
                     if let Some(setting) = meant(key, &known) {
                         bail!(
                             "{}: `{key}` isn't a setting; did you mean `{setting}`? Correct it or remove it. qveil doesn't start with a setting that may be misspelt, because it would be left out (a misspelt `proxy` would mean no proxy)",
+                            path.display()
+                        );
+                    }
+                    if let Some(why) = about_the_route(key, value) {
+                        bail!(
+                            "{}: `{key}` isn't a setting of this version, and {why}. Correct or remove it. qveil doesn't start with a setting that may be about the route, because it would be left out and the route would be direct",
                             path.display()
                         );
                     }
@@ -169,10 +242,15 @@ impl Config {
                     note!(
                         "qveil: ignoring settings in {} that this version doesn't have: {} (from a newer qveil?)",
                         path.display(),
-                        unknown.join(", ")
+                        unknown
+                            .iter()
+                            .map(|(k, _)| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
-                cfg.ignored = unknown;
+                cfg.ignored = unknown.iter().map(|(k, _)| k.clone()).collect();
+                cfg.kept = unknown.into_iter().collect();
                 Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -181,10 +259,16 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let text = format!(
+        let mut text = format!(
             "# Written by qveil when a setting changes in the app; comments are not kept.\n{}",
             toml::to_string_pretty(self)?
         );
+        if !self.kept.is_empty() {
+            // None of these is a setting of this version, so none can repeat
+            // a key above. Written after them, where a section would also be valid.
+            text.push_str("\n# Not settings of this version, kept as they were.\n");
+            text.push_str(&toml::to_string_pretty(&self.kept)?);
+        }
         crate::store::write_atomic(path, text.as_bytes())
     }
 
@@ -303,12 +387,115 @@ mod tests {
             assert!(err.contains(&format!("`{meant}`")), "{typo}: {err}");
             assert!(err.contains(&path.display().to_string()), "{err}");
         }
-        // One that is far from every setting is a newer qveil's, and passes.
-        std::fs::write(&path, "proxy_rotation_minutes = 5\n").unwrap();
+        // One that is far from every setting is a newer qveil's, and passes
+        // (unless it is about the route: see `what_may_be_about_the_route…`).
+        std::fs::write(&path, "circuit_rotation_minutes = 5\n").unwrap();
         assert_eq!(
             Config::load(&path).unwrap().ignored,
-            ["proxy_rotation_minutes"]
+            ["circuit_rotation_minutes"]
         );
+    }
+
+    #[test]
+    fn a_short_key_is_a_typo_only_one_edit_away_and_a_long_one_up_to_three() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        // `fps` is two edits from `mpv`, and a newer qveil's, not a typo of it.
+        std::fs::write(&path, "fps = 30\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().ignored, ["fps"]);
+        // One edit from a short setting still is.
+        for typo in ["mvp", "mp", "mpx", "ytdpl"] {
+            std::fs::write(&path, format!("{typo} = 1\n")).unwrap();
+            assert!(Config::load(&path).is_err(), "{typo}");
+        }
+        // A longer setting leaves more room: three letters off `isolate_circuits`.
+        std::fs::write(&path, "isolat_circts = true\n").unwrap();
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(err.contains("`isolate_circuits`"), "{err}");
+        // Four are too many, and a key that merely starts alike is not a typo.
+        for far in ["isolat_cirts", "isolate_everything_now"] {
+            std::fs::write(&path, format!("{far} = true\n")).unwrap();
+            assert_eq!(Config::load(&path).unwrap().ignored, [far]);
+        }
+    }
+
+    #[test]
+    fn what_may_be_about_the_route_is_never_left_out_quietly() {
+        // A setting left out because it is not known to this version is bad
+        // for a route: the engine would start on Direct. So a key that
+        // mentions one, and a section (which could hold one), stop the start
+        // like a typo, and say why.
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        for text in [
+            "proxies = [\"socks5h://127.0.0.1:9050\"]\n",
+            "proxy_url = \"socks5h://127.0.0.1:9050\"\n",
+            "[network]\nproxy = \"socks5h://127.0.0.1:9050\"\n",
+            "socks_port = 9050\n",
+            "SOCKS5 = true\n",
+            "use_tor = true\n",
+            "useTor = true\n",
+            "tor = true\n",
+            "Tor-bridge = \"x\"\n",
+            "[[routes]]\nproxy = \"x\"\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let err = format!("{:#}", Config::load(&path).unwrap_err());
+            let key = text
+                .trim_start_matches('[')
+                .split(|c| " =]".contains(c))
+                .next()
+                .unwrap();
+            assert!(err.contains(&format!("`{key}`")), "{text}: {err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(
+                err.contains("left out") && (err.contains("route") || err.contains("section")),
+                "{text}: {err}"
+            );
+        }
+        // A newer qveil's other keys are only left out, and so are keys that
+        // only contain the letters of those words.
+        for key in [
+            "something_newer",
+            "history_limit",
+            "monitor_count",
+            "torrent_ui",
+            "stored_things",
+            "extractor",
+        ] {
+            std::fs::write(&path, format!("{key} = 1\n")).unwrap();
+            assert_eq!(Config::load(&path).unwrap().ignored, [key], "{key}");
+        }
+    }
+
+    #[test]
+    fn the_values_of_the_keys_left_out_are_kept_in_what_is_saved() {
+        // An older qveil that rewrites the file must not take a newer
+        // qveil's settings out of it.
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        std::fs::write(
+            &path,
+            "history = true\nsomething_newer = 3\nlists = [\"a\", \"b\"]\n\"odd key\" = \"x\"\n",
+        )
+        .unwrap();
+        let mut c = Config::load(&path).unwrap();
+        c.max_height = 720;
+        c.save(&path).unwrap();
+        let back = std::fs::read_to_string(&path).unwrap();
+        let table: toml::Table = back.parse().unwrap();
+        assert_eq!(table["something_newer"].as_integer(), Some(3));
+        assert_eq!(table["lists"].as_array().unwrap().len(), 2);
+        assert_eq!(table["odd key"].as_str(), Some("x"));
+        assert_eq!(table["max_height"].as_integer(), Some(720));
+        let again = Config::load(&path).unwrap();
+        assert_eq!(again.ignored, ["lists", "odd key", "something_newer"]);
+        assert_eq!(again.max_height, 720);
+        // A setting that is known and set is written once.
+        assert_eq!(back.matches("history").count(), 1, "{back}");
+        // Nothing is added when nothing was left out.
+        Config::default().save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("newer"));
     }
 
     #[test]

@@ -1120,9 +1120,13 @@ pub fn name_in_history(paths: &Paths, id: &str, channel: &str) -> Result<()> {
 pub fn clear_history(paths: &Paths) -> Result<()> {
     let _lock = store::lock(paths)?;
     match std::fs::remove_file(paths.history()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
     }
+    // A write that a crash cut short left its temp file, with the history
+    // it was writing: that is part of what was asked to be forgotten.
+    store::sweep_temps(&paths.data, store::TEMP_ABANDONED);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1140,6 +1144,39 @@ mod tests {
             ..Config::default()
         };
         Runtime::new(cfg, paths, Some("http://127.0.0.1:1".into()), false).unwrap()
+    }
+
+    #[test]
+    fn clearing_the_history_removes_what_a_write_cut_short_by_a_crash_left_too() {
+        let d = TempDir::new();
+        let paths = d.paths();
+        store::save(
+            &paths.history(),
+            &History {
+                watched: vec![Watched {
+                    id: "dQw4w9WgXcQ".into(),
+                    title: "T".into(),
+                    channel: None,
+                    at: 1,
+                }],
+            },
+        )
+        .unwrap();
+        // What a process that died while writing the history left, and the
+        // temp file of one that is still running, which isn't for us to take.
+        let crashed = paths
+            .data
+            .join(".history.json.99999999-0123456789abcdef.tmp");
+        fs::write(&crashed, br#"{"watched":[{"id":"dQw4w9WgXcQ""#).unwrap();
+        let writing = paths.data.join(format!(
+            ".history.json.{}-0123456789abcdef.tmp",
+            std::process::id()
+        ));
+        fs::write(&writing, b"{").unwrap();
+        clear_history(&paths).unwrap();
+        assert!(!paths.history().exists());
+        assert!(!crashed.exists(), "the crashed write's temp file");
+        assert!(writing.exists());
     }
 
     #[test]

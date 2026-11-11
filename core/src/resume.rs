@@ -81,10 +81,12 @@ fn save(paths: &Paths, mut file: File, days: u32, now: i64) -> Result<()> {
 }
 
 /// Records where a video was stopped, or forgets it, as the position says.
-pub fn note(paths: &Paths, days: u32, p: Position, now: i64) -> Result<Noted> {
-    if days == 0 {
-        return Ok(Noted::Off);
-    }
+///
+/// `days` is how many days positions are kept, asked under the store's lock.
+/// Turning resume off takes that lock to delete what was kept; a position
+/// that waited behind it asks after, and finds it is off, instead of
+/// writing back what was just deleted.
+pub fn note(paths: &Paths, days: impl Fn() -> u32, p: Position, now: i64) -> Result<Noted> {
     if p.dur == 0 || p.pos > p.dur {
         return Ok(Noted::Unknown);
     }
@@ -96,6 +98,10 @@ pub fn note(paths: &Paths, days: u32, p: Position, now: i64) -> Result<Noted> {
         Noted::Kept
     };
     let _lock = store::lock(paths)?;
+    let days = days();
+    if days == 0 {
+        return Ok(Noted::Off);
+    }
     let mut file = load(paths)?;
     let had = file.positions.iter().any(|x| x.id == p.id);
     if noted != Noted::Kept && !had {
@@ -137,9 +143,12 @@ pub fn forget(paths: &Paths, id: &str) -> Result<()> {
 pub fn clear(paths: &Paths) -> Result<()> {
     let _lock = store::lock(paths)?;
     match std::fs::remove_file(paths.resume()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
     }
+    // And what a write that a crash cut short left of it (see `store::sweep_temps`).
+    store::sweep_temps(&paths.data, store::TEMP_ABANDONED);
+    Ok(())
 }
 
 /// Deletes what has expired, so that it doesn't sit on disk until the next
@@ -180,7 +189,7 @@ mod tests {
         let d = TempDir::new();
         let p = d.paths();
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 845, 2463, 1000), 1000).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 845, 2463, 1000), 1000).unwrap(),
             Noted::Kept
         );
         assert_eq!(get(&p, 7, "aaaaaaaaaaa", 1000).unwrap().unwrap().pos, 845);
@@ -196,30 +205,30 @@ mod tests {
         let d = TempDir::new();
         let p = d.paths();
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 29, 2463, 0), 0).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 29, 2463, 0), 0).unwrap(),
             Noted::TooEarly
         );
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 845, 2463, 0), 0).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 845, 2463, 0), 0).unwrap(),
             Noted::Kept
         );
         // The last 30 seconds.
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 2433, 2463, 0), 0).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 2433, 2463, 0), 0).unwrap(),
             Noted::Finished
         );
         assert!(list(&p, 7, 0).unwrap().is_empty());
         // Past 95 %.
         assert_eq!(
-            note(&p, 7, pos("bbbbbbbbbbb", 9500, 10_000, 0), 0).unwrap(),
+            note(&p, || 7, pos("bbbbbbbbbbb", 9500, 10_000, 0), 0).unwrap(),
             Noted::Finished
         );
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 845, 2463, 0), 0).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 845, 2463, 0), 0).unwrap(),
             Noted::Kept
         );
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 5, 2463, 1), 1).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 5, 2463, 1), 1).unwrap(),
             Noted::TooEarly
         );
         assert!(
@@ -233,15 +242,15 @@ mod tests {
         let d = TempDir::new();
         let p = d.paths();
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 100, 0, 0), 0).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 100, 0, 0), 0).unwrap(),
             Noted::Unknown
         );
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 500, 400, 0), 0).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 500, 400, 0), 0).unwrap(),
             Noted::Unknown
         );
         assert_eq!(
-            note(&p, 0, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap(),
+            note(&p, || 0, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap(),
             Noted::Off
         );
         assert!(!p.resume().exists());
@@ -252,7 +261,7 @@ mod tests {
         let d = TempDir::new();
         let p = d.paths();
         for i in 0..(MAX as i64 + 3) {
-            note(&p, 365, pos(&format!("v{i:010}"), 100, 400, i), i).unwrap();
+            note(&p, || 365, pos(&format!("v{i:010}"), 100, 400, i), i).unwrap();
         }
         let all = list(&p, 365, 600).unwrap();
         assert_eq!(all.len(), MAX);
@@ -264,8 +273,8 @@ mod tests {
     fn a_later_position_replaces_the_earlier_one_for_the_same_video() {
         let d = TempDir::new();
         let p = d.paths();
-        note(&p, 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap();
-        note(&p, 7, pos("aaaaaaaaaaa", 200, 400, 5), 5).unwrap();
+        note(&p, || 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap();
+        note(&p, || 7, pos("aaaaaaaaaaa", 200, 400, 5), 5).unwrap();
         let all = list(&p, 7, 5).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!((all[0].pos, all[0].at), (200, 5));
@@ -279,7 +288,7 @@ mod tests {
         std::fs::write(p.resume(), b"{ not json").unwrap();
         assert!(list(&p, 7, 0).unwrap().is_empty());
         assert_eq!(
-            note(&p, 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap(),
+            note(&p, || 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap(),
             Noted::Kept
         );
         use std::os::unix::fs::PermissionsExt;
@@ -291,11 +300,64 @@ mod tests {
     }
 
     #[test]
+    fn how_many_days_are_kept_is_read_under_the_lock_that_a_purge_takes() {
+        // Turning resume off purges under the lock. A position that was
+        // reported meanwhile must see that it is off, not the setting it
+        // was handed before it waited for the lock.
+        let d = TempDir::new();
+        let p = d.paths();
+        let held = store::lock(&p).unwrap();
+        let days = std::sync::atomic::AtomicU32::new(7);
+        let noted = std::thread::scope(|scope| {
+            let note = scope.spawn(|| {
+                let days = || {
+                    // Asked while the note holds the lock: this can't have it.
+                    std::fs::create_dir_all(&p.data).unwrap();
+                    let other = std::fs::File::open(p.lock_file()).unwrap();
+                    assert!(
+                        matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                        "days were read without the lock"
+                    );
+                    days.load(std::sync::atomic::Ordering::SeqCst)
+                };
+                note(&p, days, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap()
+            });
+            days.store(0, std::sync::atomic::Ordering::SeqCst);
+            drop(held);
+            note.join().unwrap()
+        });
+        assert_eq!(noted, Noted::Off);
+        assert!(!p.resume().exists());
+    }
+
+    #[test]
+    fn clearing_removes_what_a_write_cut_short_by_a_crash_left_too() {
+        let d = TempDir::new();
+        let p = d.paths();
+        note(&p, || 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap();
+        // The temp file of a process that died, with what it was writing.
+        let crashed = p.data.join(".resume.json.99999999-0123456789abcdef.tmp");
+        std::fs::write(&crashed, br#"{"positions":[{"id":"aaaaaaaaaaa"}"#).unwrap();
+        clear(&p).unwrap();
+        assert!(!p.resume().exists() && !crashed.exists());
+        // Turning resume off does the same: it purges to zero days.
+        std::fs::write(&crashed, b"{").unwrap();
+        purge(&p, 0, 0).unwrap();
+        assert!(!crashed.exists());
+    }
+
+    #[test]
     fn purging_drops_the_expired_and_zero_days_removes_the_file() {
         let d = TempDir::new();
         let p = d.paths();
-        note(&p, 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap();
-        note(&p, 7, pos("bbbbbbbbbbb", 100, 400, 86_400 * 5), 86_400 * 5).unwrap();
+        note(&p, || 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap();
+        note(
+            &p,
+            || 7,
+            pos("bbbbbbbbbbb", 100, 400, 86_400 * 5),
+            86_400 * 5,
+        )
+        .unwrap();
         purge(&p, 7, 86_400 * 8).unwrap();
         let text = std::fs::read_to_string(p.resume()).unwrap();
         assert!(!text.contains("aaaaaaaaaaa") && text.contains("bbbbbbbbbbb"));

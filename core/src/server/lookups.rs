@@ -320,6 +320,18 @@ fn expires(url: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+impl Lookups {
+    /// How many plays are waiting on a lookup ahead now, for a test to wait
+    /// until they do before it asserts that something hasn't happened.
+    pub(super) fn waiting(&self) -> usize {
+        lock(&self.running)
+            .iter()
+            .map(|r| lock(&r.state).waiting)
+            .sum()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::net::TOR_PROXY;
