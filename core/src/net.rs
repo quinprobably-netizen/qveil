@@ -28,7 +28,8 @@ pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// ahead of what has been read. A stream can carry no more than this per
 /// round trip, and a round trip over Tor is half a second or more, so the
 /// HTTP/2 default of 64 KiB (or hyper's 2 MiB) would hold a video back.
-/// These are the values Chrome announces, so they say nothing new about us.
+/// These are the window sizes Chrome uses. They don't make the connection
+/// look like Chrome's, whose other SETTINGS, and their order, hyper doesn't copy.
 const STREAM_WINDOW: u32 = 6 << 20;
 const CONNECTION_WINDOW: u32 = 15 << 20;
 
