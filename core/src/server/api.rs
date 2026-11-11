@@ -391,7 +391,7 @@ impl Server {
             cfg.keep_thumbnails = on;
         }
         // Validates the proxy before anything is saved.
-        let mut next = Runtime::new(cfg, &self.paths, None, false)?;
+        let mut next = Runtime::new(cfg, &self.paths, None, false)?.carrying_test_bases(&rt);
         let resume_changed = next.cfg.resume_days != rt.cfg.resume_days;
         let keep_thumbnails = next.cfg.keep_thumbnails;
         let thumbnails_off = rt.cfg.keep_thumbnails && !keep_thumbnails;
@@ -1336,6 +1336,38 @@ echo '{"entries":[]}'"#,
             "a video that was never answered"
         );
         assert!(lock(&s.sessions).is_empty());
+    }
+
+    #[test]
+    fn a_settings_change_keeps_the_tests_local_stand_ins() {
+        let (s, base, _d) = server_tuned(Config::default(), |rt| {
+            rt.feed_base = "http://127.0.0.1:1".into();
+            rt.thumb_base = "http://127.0.0.1:2".into();
+            rt.save_every = Duration::from_millis(7);
+            rt.net = rt.net.clone().idling_after(Duration::from_millis(900));
+            rt.yt.net = rt.net.clone();
+        });
+        let same = |rt: &Runtime| {
+            assert_eq!(rt.feed_base, "http://127.0.0.1:1");
+            assert_eq!(rt.thumb_base, "http://127.0.0.1:2");
+            assert_eq!(rt.save_every, Duration::from_millis(7));
+            let knobs = (true, false, Some(Duration::from_millis(900)), false);
+            assert_eq!(rt.net.knobs(), knobs);
+            assert_eq!(rt.yt.net.knobs(), knobs);
+        };
+        // A setting that keeps the route, and one that changes it: each
+        // builds a new runtime from the config, which knows none of this.
+        let (status, body) = http(
+            &base,
+            "POST",
+            &path(&base, "api/config"),
+            r#"{"history":true}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        same(&s.runtime());
+        switch_to_tor(&base);
+        same(&s.runtime());
+        assert!(s.runtime().net.isolates());
     }
 
     #[test]

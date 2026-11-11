@@ -138,6 +138,31 @@ impl Net {
         self
     }
 
+    /// What only tests change: plain http, HTTP/2 over it, the relay's idle
+    /// timeout and whether an extra root is trusted.
+    #[cfg(test)]
+    pub fn knobs(&self) -> (bool, bool, Option<Duration>, bool) {
+        (
+            self.allow_http,
+            self.h2c,
+            self.relay_idle,
+            self.trusted.is_some(),
+        )
+    }
+
+    /// This route, with what only tests change taken from `from`: whether
+    /// plain http (and HTTP/2 over it) is allowed, the relay's idle timeout
+    /// and an extra trusted root. A settings change builds a new `Net`, and
+    /// a test's must keep talking to its local stand-ins. In production
+    /// these are the same on every `Net`, so this changes nothing there.
+    pub fn with_knobs_of(mut self, from: &Net) -> Self {
+        self.allow_http = from.allow_http;
+        self.h2c = from.h2c;
+        self.relay_idle = from.relay_idle;
+        self.trusted = from.trusted;
+        self
+    }
+
     /// Whether both go through the same proxy with the same isolation, which
     /// is what decides if a stream resolved on one can be played on the other.
     pub fn same_route(&self, other: &Net) -> bool {
@@ -280,9 +305,64 @@ impl Net {
             b = b.add_root_certificate(reqwest::Certificate::from_pem(root)?);
         }
         if let Some(p) = self.proxy_url() {
+            #[cfg(test)]
+            loopback_only::check_proxy(&p)?;
             b = b.proxy(reqwest::Proxy::all(&p).context("invalid proxy URL")?);
         }
+        #[cfg(test)]
+        {
+            b = b.dns_resolver(std::sync::Arc::new(loopback_only::Resolver));
+        }
         Ok(b.build()?)
+    }
+}
+
+/// Under test, nothing the engine builds can reach a real host: a client
+/// resolves no name but `localhost` (an IP address is never resolved, and
+/// the tests only ever name 127.0.0.1), and a proxy has to be on this
+/// machine. A test that forgot to point something at its stand-in fails at
+/// once instead of going out to YouTube.
+#[cfg(test)]
+mod loopback_only {
+    use anyhow::{Result, ensure};
+    use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    pub struct Resolver;
+
+    impl Resolve for Resolver {
+        fn resolve(&self, name: Name) -> Resolving {
+            let name = name.as_str().to_ascii_lowercase();
+            Box::pin(async move {
+                if name == "localhost" {
+                    let addrs: Addrs = Box::new(
+                        [
+                            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+                        ]
+                        .into_iter(),
+                    );
+                    Ok(addrs)
+                } else {
+                    Err(format!("{name}: tests resolve no name but localhost").into())
+                }
+            })
+        }
+    }
+
+    /// Refuses a proxy that is not on this machine.
+    pub fn check_proxy(proxy: &str) -> Result<()> {
+        let rest = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
+        let host_port = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        let host = match host_port.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or_default(),
+            None => host_port.split(':').next().unwrap_or_default(),
+        };
+        ensure!(
+            matches!(host, "127.0.0.1" | "::1" | "localhost"),
+            "tests use no proxy but one on this machine, not {host:?}"
+        );
+        Ok(())
     }
 }
 
@@ -816,5 +896,92 @@ mod tests {
         let n = Net::new(Some("socks5h://me:pw@h:1".into()), true).unwrap();
         assert_eq!(n.proxy_url().unwrap(), "socks5h://me:pw@h:1");
         assert_eq!(redact("socks5h://me:pw@h:1"), "socks5h://***@h:1");
+    }
+
+    #[test]
+    fn under_test_no_name_but_localhost_is_resolved() {
+        // An https URL of the real site, which a test must never reach: it
+        // fails before anything is sent, at the name.
+        let client = Net::new(None, true).unwrap().client().unwrap();
+        let err = client.get("https://www.youtube.com/").send().unwrap_err();
+        let chain = format!("{:#}", anyhow::Error::new(err));
+        assert!(
+            chain.contains("tests resolve no name but localhost"),
+            "{chain}"
+        );
+        // A local server named `localhost` is reached as usual.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut c, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = c.read(&mut buf);
+            let _ =
+                c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        let open = Net::new(None, true)
+            .unwrap()
+            .allowing_http()
+            .client()
+            .unwrap();
+        let body = open
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert_eq!(body, "ok");
+    }
+
+    #[test]
+    fn under_test_a_proxy_has_to_be_on_this_machine() {
+        for far in [
+            "socks5h://10.1.2.3:9050",
+            "http://proxy.example:3128",
+            "https://user:pw@[2001:db8::1]:443",
+        ] {
+            let err = Net::new(Some(far.into()), true)
+                .unwrap()
+                .client()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("no proxy but one on this machine"),
+                "{far}: {err}"
+            );
+        }
+        for near in [
+            "socks5h://127.0.0.1:9050",
+            "http://localhost:3128",
+            "http://u:p@[::1]:3128",
+        ] {
+            assert!(
+                Net::new(Some(near.into()), true).unwrap().client().is_ok(),
+                "{near}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_test_knobs_are_carried_onto_another_route() {
+        let tuned = Net::new(None, true)
+            .unwrap()
+            .speaking_h2c()
+            .idling_after(Duration::from_millis(300))
+            .trusting(b"pem");
+        let next = Net::new(Some(TOR_PROXY.into()), true)
+            .unwrap()
+            .with_knobs_of(&tuned);
+        assert_eq!(
+            next.knobs(),
+            (true, true, Some(Duration::from_millis(300)), true)
+        );
+        // And nothing else: the route is the new one.
+        assert_eq!(next.proxy(), Some(TOR_PROXY));
+        assert!(next.isolates());
+        assert_eq!(
+            Net::new(None, true).unwrap().knobs(),
+            (false, false, None, false)
+        );
     }
 }

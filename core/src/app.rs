@@ -111,6 +111,23 @@ impl Runtime {
         }
     }
 
+    /// This runtime, with what only tests change carried over from `from`:
+    /// where the feeds and thumbnails are fetched, how often a refresh
+    /// saves, the pause between searches, and the test knobs of the route
+    /// (see `Net::with_knobs_of`). A settings change builds a new runtime
+    /// from the config, and a test's must keep using its local stand-ins
+    /// instead of YouTube. In production these are constants, so this
+    /// changes nothing there.
+    pub fn carrying_test_bases(mut self, from: &Runtime) -> Self {
+        self.feed_base.clone_from(&from.feed_base);
+        self.thumb_base.clone_from(&from.thumb_base);
+        self.save_every = from.save_every;
+        self.pause = Arc::clone(&from.pause);
+        self.net = self.net.with_knobs_of(&from.net);
+        self.yt.net = self.yt.net.with_knobs_of(&from.net);
+        self
+    }
+
     /// Carries the registry of running yt-dlp calls over from `from`, whose
     /// route this one has: a settings change that keeps the route must not
     /// lose track of the calls still running under the old runtime.

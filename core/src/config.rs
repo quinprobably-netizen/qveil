@@ -59,6 +59,18 @@ pub struct Config {
     pub kept: toml::Table,
 }
 
+/// The programs run when the config names none: found on PATH. Under test
+/// they are paths that don't exist, so a test that forgot to give its fake
+/// can never run the real yt-dlp (which would go out to YouTube) or mpv.
+#[cfg(not(test))]
+const DEFAULT_YTDLP: &str = "yt-dlp";
+#[cfg(not(test))]
+const DEFAULT_MPV: &str = "mpv";
+#[cfg(test)]
+const DEFAULT_YTDLP: &str = "/nonexistent/qveil-test-yt-dlp";
+#[cfg(test)]
+const DEFAULT_MPV: &str = "/nonexistent/qveil-test-mpv";
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -73,8 +85,8 @@ impl Default for Config {
             prepare_next: false,
             feed_workers: 4,
             quick_lookup: false,
-            ytdlp: "yt-dlp".into(),
-            mpv: "mpv".into(),
+            ytdlp: DEFAULT_YTDLP.into(),
+            mpv: DEFAULT_MPV.into(),
             mpv_args: vec![],
             ignored: vec![],
             kept: toml::Table::new(),
