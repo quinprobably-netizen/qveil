@@ -152,8 +152,10 @@ impl Net {
             return Some(p.clone());
         }
         let (scheme, rest) = p.split_once("://")?;
-        let user: u64 = rand::random();
-        Some(format!("{scheme}://qveil{user:016x}:x@{rest}"))
+        // Both parts random, so the credentials the proxy sees say nothing
+        // about which program sent them.
+        let (user, pass): (u64, u64) = (rand::random(), rand::random());
+        Some(format!("{scheme}://{user:016x}:{pass:016x}@{rest}"))
     }
 
     pub fn proxy(&self) -> Option<&str> {
@@ -374,7 +376,24 @@ mod tests {
         let n = Net::new(Some(TOR_PROXY.into()), true).unwrap();
         let (a, b) = (n.proxy_url().unwrap(), n.proxy_url().unwrap());
         assert_ne!(a, b);
-        assert!(a.starts_with("socks5h://qveil") && a.ends_with(":x@127.0.0.1:9050"));
+        // Random hex for both the user and the password, so nothing in them
+        // names the app, and two calls share neither.
+        let creds = |u: &str| {
+            let rest = u.strip_prefix("socks5h://").unwrap();
+            let (creds, host) = rest.rsplit_once('@').unwrap();
+            assert_eq!(host, "127.0.0.1:9050");
+            let (user, pass) = creds.split_once(':').unwrap();
+            for part in [user, pass] {
+                assert!(
+                    part.len() == 16 && part.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{u}"
+                );
+            }
+            (user.to_string(), pass.to_string())
+        };
+        let ((ua, pa), (ub, pb)) = (creds(&a), creds(&b));
+        assert!(ua != ub && pa != pb, "{a} {b}");
+        assert!(!a.contains("qveil") && !b.contains("qveil"));
         let pinned = n.pinned();
         assert_eq!(
             pinned.proxy_url(),
