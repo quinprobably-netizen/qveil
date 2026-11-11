@@ -22,6 +22,7 @@
 mod api;
 mod chapters;
 mod comments;
+mod flights;
 mod http;
 mod jobs;
 mod lenses;

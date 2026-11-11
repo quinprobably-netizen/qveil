@@ -4,6 +4,7 @@
 //! `api/lenses` lists, adds, changes and removes lenses. `GET api/lens`
 //! answers with a lens's ranked results, fetching them when they are due.
 
+use super::flights::Flights;
 use super::http::{NDJSON_HEAD, Request, Watch, respond};
 use super::{MAX_SEARCH, Server};
 use crate::app::{self, LensRefresh, Runtime};
@@ -11,13 +12,13 @@ use crate::errors;
 use crate::lens::read::{Reading, read, read_search};
 use crate::lens::{self, Lens};
 use crate::store::Paths;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// The body of a request that adds or changes a lens.
 #[derive(Deserialize)]
@@ -51,6 +52,9 @@ fn entry(paths: &Paths, lens: &Lens, now: i64) -> Result<Value> {
     }
     Ok(v)
 }
+
+/// The lens refreshes running in this process, by lens.
+static LENS_REFRESHES: LazyLock<Flights<String>> = LazyLock::new(Flights::default);
 
 fn write_line(out: &mut TcpStream, line: &Value) -> std::io::Result<()> {
     out.write_all(format!("{line}\n").as_bytes())
@@ -198,11 +202,43 @@ impl Server {
         };
         let wanted = || !watch.gone() && self.still_on(&rt);
         answer_as_it_goes(out, &watch, req.flag("stream"), |progress| {
-            let result = req
-                .param("id")
-                .and_then(|id| app::lens(&rt, &self.paths, id, refresh, progress, &wanted));
+            let result = self.refresh_lens(req, refresh, progress, &wanted);
             self.guarded(&rt, result)
         })
+    }
+
+    /// `app::lens`, one refresh of a lens at a time: a second request waits
+    /// for the first, and then finds fresh what it found (or, if it found
+    /// nothing, as when its client hung up, searches for itself). A forced
+    /// one that waited for a refresh that has just found something gets that.
+    fn refresh_lens(
+        &self,
+        req: &Request,
+        mut refresh: LensRefresh,
+        progress: &dyn Fn(usize, usize),
+        wanted: &dyn Fn() -> bool,
+    ) -> Result<app::LensResult> {
+        let id = req.param("id")?;
+        let rt = self.runtime();
+        // Only what is stored is read: there is nothing to wait for.
+        if refresh == LensRefresh::Off {
+            return app::lens(&rt, &self.paths, id, refresh, progress, wanted);
+        }
+        let lens = lens::get(&self.paths, id)?;
+        let fetched = || {
+            lens::cached(&self.paths, &lens.id)
+                .ok()
+                .flatten()
+                .map(|c| c.fetched_at)
+        };
+        let before = fetched();
+        let Some(turn) = LENS_REFRESHES.take(&lens.id, &|| !wanted()) else {
+            bail!(crate::ytdlp::CANCELLED);
+        };
+        if turn.waited && refresh == LensRefresh::Force && fetched() != before {
+            refresh = LensRefresh::Stale;
+        }
+        app::lens(&rt, &self.paths, id, refresh, progress, wanted)
     }
 
     /// A search whose query has rules: `api/search`, with or without
@@ -405,6 +441,49 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         let (status, v) = json(&base, "GET", &format!("api/lens?id={id}&refresh=1"), "");
         assert_eq!(status, 500, "{v}");
         assert!(asked(&bin).is_empty(), "{:?}", asked(&bin));
+    }
+
+    /// Two refreshes of the lens `id` at once, as `first` and then `second`
+    /// asks for them; the second once the first's searches are under way.
+    fn twice_at_once(bin: &TempDir, base: &str, id: &str, first: &str, second: &str) -> [Value; 2] {
+        std::fs::write(bin.0.join("delay"), "0.5").unwrap();
+        let ask = |how: &str| {
+            let (base, rest) = (base.to_string(), format!("api/lens?id={id}&{how}"));
+            std::thread::spawn(move || json(&base, "GET", &rest, ""))
+        };
+        let before = asked(bin).len();
+        let one = ask(first);
+        wait_for("the searches to start", Duration::from_secs(10), || {
+            asked(bin).len() > before
+        });
+        let two = ask(second);
+        let ((s1, v1), (s2, v2)) = (one.join().unwrap(), two.join().unwrap());
+        assert_eq!((s1, s2), (200, 200), "{v1} {v2}");
+        [v1, v2]
+    }
+
+    #[test]
+    fn a_lens_refreshed_twice_at_once_is_searched_for_once() {
+        let (bin, base, d) = rig();
+        let id = add(&base, "bread, sourdough")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for (first, second) in [
+            ("refresh=1", "refresh=1"),
+            ("force=1", "force=1"),
+            ("force=1", "refresh=1"),
+        ] {
+            let before = asked(&bin).len();
+            if first == "refresh=1" {
+                // Due again.
+                std::fs::remove_file(d.paths().lens_cache(&id)).unwrap_or(());
+            }
+            let [one, two] = twice_at_once(&bin, &base, &id, first, second);
+            assert_eq!(asked(&bin).len() - before, 2, "{first} then {second}");
+            assert_eq!(one["fetchedAt"], two["fetchedAt"]);
+            assert_eq!(one["videos"], two["videos"]);
+        }
     }
 
     #[test]
