@@ -339,11 +339,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """The clip, whole or as the `Range: bytes=a-[b]` asks (as the real stream is), so a player can seek in it."""
         size = os.path.getsize(CLIP)
         first, last, code = 0, size - 1, 200
-        # QVEIL_STANDIN_NO_RANGES: a stream that can't be seeked in, for the test of what the
-        # window shows at the end of a video (a player that can seek goes back to the last frame
-        # it dropped, and the video is then not at its end until it plays on).
-        ranged = os.environ.get("QVEIL_STANDIN_NO_RANGES") != "1"
-        asked = self.headers.get("Range", "") if ranged else ""
+        asked = self.headers.get("Range", "")
         if asked.startswith("bytes=") and "," not in asked:
             a, _, b = asked[len("bytes="):].partition("-")
             if a.isdigit() and (b.isdigit() or not b):
@@ -359,8 +355,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.send_response(code)
         self.send_header("Content-Type", "video/x-matroska")
-        if ranged:
-            self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Accept-Ranges", "bytes")
         if code == 206:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (first, last, size))
         self.send_header("Content-Length", str(last - first + 1))

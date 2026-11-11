@@ -18,6 +18,7 @@
 #include <QTemporaryDir>
 #include <QtTest>
 
+#include <functional>
 #include <memory>
 
 #include "backend.h"
@@ -78,8 +79,10 @@ struct App {
         window->resize(size);
         window->requestActivate();
         backend->start();
+        // Active too, as a window that was just opened is: the keys a test
+        // sends go to the window that has the keyboard.
         ok = QTest::qWaitFor([this] { return backend->ready() && !backend->config().isEmpty(); }, 10000)
-             && QTest::qWaitForWindowExposed(window);
+             && QTest::qWaitForWindowExposed(window) && QTest::qWaitForWindowActive(window);
     }
 
     ~App()
@@ -182,6 +185,46 @@ struct App {
         QObject::connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
     }
 
+    // Leaves the video page (`how`: by Escape, or by going to a page) and
+    // goes on in this window with no video. Left while it plays, a video
+    // goes on in the small window, which takes the keyboard as it opens (on
+    // the offscreen platform as on a desktop); whether it is playing yet
+    // depends on how soon the engine answered the play, which a busy machine
+    // and a process that has run other tests already both change. So the
+    // small window, if it opened, is closed again, and this one is given the
+    // keyboard back. False if the page couldn't be left.
+    bool leaveTheVideo(const std::function<void()> &how) const
+    {
+        how();
+        if (!QTest::qWaitFor([this] { return !window->property("watching").toBool(); }, 5000))
+            return false;
+        if (pip()->isVisible()) {
+            QMetaObject::invokeMethod(pip(), "end");
+            if (!QTest::qWaitFor([this] { return !pip()->isVisible(); }, 5000))
+                return false;
+        }
+        window->requestActivate();
+        return QTest::qWaitForWindowActive(window);
+    }
+    bool escapeTheVideo() const
+    {
+        return leaveTheVideo([this] { QTest::keyClick(window, Qt::Key_Escape); });
+    }
+    bool goFromTheVideo(const char *page) const
+    {
+        return leaveTheVideo([this, page] { QMetaObject::invokeMethod(window, "go", Q_ARG(QVariant, QString(page))); });
+    }
+
+    // Waits until `popup` is closed and gone. It stops being open at once,
+    // and is gone once its fade has run; only then does Qt give the keyboard
+    // back to the window (to what had it before the popup), so a key sent
+    // before then can go somewhere the test didn't mean. On a busy machine
+    // the fade takes much longer than it says.
+    static bool closed(QObject *popup)
+    {
+        return QTest::qWaitFor([popup] { return !popup->property("opened").toBool() && !popup->property("visible").toBool(); }, 5000);
+    }
+
     // Opens `video` the way a card does, from no list.
     void play(const QVariantMap &video) const
     {
@@ -222,11 +265,11 @@ struct App {
 
 // Something to play: a clip, made with ffmpeg in `dir`, which the stand-in
 // engine serves as the video. Empty when there is no ffmpeg to make it.
-QString makeClip(const QTemporaryDir &dir)
+QString makeClip(const QTemporaryDir &dir, int seconds = 120)
 {
     const QString clip = dir.filePath("clip.mkv");
     QProcess make;
-    make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=d=120:s=160x90:r=5", "-f", "lavfi", "-i", "anullsrc",
+    make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", QString("testsrc2=d=%1:s=160x90:r=5").arg(seconds), "-f", "lavfi", "-i", "anullsrc",
                           "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", clip});
     return make.waitForFinished(60000) && make.exitCode() == 0 && QFile::exists(clip) ? clip : QString();
 }
@@ -369,8 +412,7 @@ private slots:
         QCOMPARE(box(app.item("status-line")), QRectF(0, 720 - 22, 1280, 22));
         QTRY_COMPARE(box(app.item("stage")).bottom(), box(line).top());
         // Back on a page, the page's.
-        QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!app.window->property("watching").toBool());
+        QVERIFY(app.escapeTheVideo());
         QTest::keyClick(app.window, Qt::Key_1);
         QTRY_COMPARE(hintsOf(app), (QStringList{"h j k l move", "/ search", "? keys"}));
     }
@@ -441,11 +483,11 @@ private slots:
                  qPrintable(QString("%1,%2 %3x%4").arg(at.x()).arg(at.y()).arg(at.width()).arg(at.height())));
         // Pressing the word again, or Escape, closes it; the key opens it as it did.
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!popup->property("opened").toBool());
+        QVERIFY(App::closed(popup));
         QTest::keyClick(app.window, Qt::Key_P);
         QTRY_VERIFY(popup->property("opened").toBool());
         QTest::keyClick(app.window, Qt::Key_P);
-        QTRY_VERIFY(!popup->property("opened").toBool());
+        QVERIFY(App::closed(popup));
     }
 
     void theFootDuplicatesNothingAndIsHiddenInFullscreenVideo()
@@ -1352,21 +1394,23 @@ private slots:
     // Once a video has ended: Replay, and the next in its list; nothing starts by itself.
     void onceItHasEndedTheVideoOffersReplayAndTheNextInItsList()
     {
+        // A clip of two seconds, which is played to its end. (A seek to just
+        // before the end of a long one is no way there on a busy machine: a
+        // player that can seek goes back to the last frame it dropped, and
+        // one that can't plays on from where it was.)
         QTemporaryDir dir;
-        const QString clip = makeClip(dir);
+        const QString clip = makeClip(dir, 2);
         if (clip.isEmpty())
             QSKIP("ffmpeg couldn't make a clip to play");
         const auto playToTheEnd = [](App &app) {
-            QQuickItem *surface = app.item("surface");
-            QObject *mpv = surface->property("mpv").value<QObject *>();
-            QTRY_VERIFY_WITH_TIMEOUT(mpv && mpv->property("started").toBool(), 15000);
-            QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 119.5));
-            QTRY_VERIFY_WITH_TIMEOUT(mpv->property("ended").toBool(), 20000);
+            QObject *mpv = app.item("surface")->property("mpv").value<QObject *>();
+            return mpv && QTest::qWaitFor([mpv] { return mpv->property("started").toBool(); }, 15000)
+                   && QTest::qWaitFor([mpv] { return mpv->property("ended").toBool(); }, 30000);
         };
         const auto playing = [](App &app) { return app.item("surface")->property("info").toMap().value("id").toString(); };
         {
             // From a list: Replay beside a primary Next, with its key, and nothing is started.
-            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_NO_RANGES", "1"}});
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
             READY(app);
             QMetaObject::invokeMethod(app.window, "playListed", Q_ARG(QVariant, QString("Latest from your channels")),
                                       Q_ARG(QVariant, app.backend->feed()->get(0)), Q_ARG(QVariant, QVariant::fromValue<QObject *>(app.backend->feed())),
@@ -1374,7 +1418,7 @@ private slots:
             QTRY_COMPARE(playing(app), QString("vid00000001"));
             QVERIFY(!app.item("ended")->isVisible());
             QVERIFY(!app.item("ended-next")->isVisible());
-            playToTheEnd(app);
+            QVERIFY2(playToTheEnd(app), "the video never played to its end");
             QTRY_VERIFY(app.item("ended")->isVisible());
             QVERIFY(app.item("ended-replay")->isVisible() && app.item("ended-next")->isVisible());
             QCOMPARE(app.item("ended-next")->property("text").toString(), QString("Next: A dovetail box with four hand tools"));
@@ -1393,17 +1437,17 @@ private slots:
             app.click(app.item("ended-next"));
             QTRY_COMPARE(playing(app), QString("vid00000002"));
             QVERIFY(!app.item("ended-next")->isVisible());
-            playToTheEnd(app);
+            QVERIFY2(playToTheEnd(app), "the video never played to its end");
             QTRY_VERIFY(app.item("ended-next")->isVisible());
             QTest::keyClick(app.window, Qt::Key_N);
             QTRY_COMPARE(playing(app), QString("vid00000003"));
         }
         {
             // With no list, or at the end of it: Replay alone, filled, as it was.
-            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_NO_RANGES", "1"}});
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
             READY(app);
             app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
-            playToTheEnd(app);
+            QVERIFY2(playToTheEnd(app), "the video never played to its end");
             QTRY_VERIFY(app.item("ended-replay")->isVisible());
             QVERIFY(!app.item("ended-next")->isVisible());
             QVERIFY(app.item("ended-replay")->property("filled").toBool());
@@ -1417,7 +1461,7 @@ private slots:
                                       Q_ARG(QVariant, app.backend->feed()->get(11)), Q_ARG(QVariant, QVariant::fromValue<QObject *>(app.backend->feed())),
                                       Q_ARG(QVariant, 11));
             QTRY_COMPARE(playing(app), app.backend->feed()->get(11).value("id").toString());
-            playToTheEnd(app);
+            QVERIFY2(playToTheEnd(app), "the video never played to its end");
             QTRY_VERIFY(app.item("ended-replay")->isVisible());
             QVERIFY(!app.item("ended-next")->isVisible());
         }
@@ -1966,7 +2010,7 @@ private slots:
         QTest::keyClick(app.window, '?');
         QTRY_VERIFY(help->property("opened").toBool());
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!help->property("opened").toBool());
+        QVERIFY(App::closed(help));
     }
 
     // --- Home as a lead and shelves. ---
@@ -2193,8 +2237,7 @@ private slots:
             app.click(App::under(app.item("shelf-aaaa0002"), "card"));
             QTRY_VERIFY(app.window->property("watching").toBool());
             QTRY_VERIFY(said(app).startsWith("From lens: systems talks over 30 min, this year " + dot + " "));
-            QTest::keyClick(app.window, Qt::Key_Escape);
-            QTRY_VERIFY(!app.window->property("watching").toBool());
+            QVERIFY(app.escapeTheVideo());
             app.click(App::under(app.item("shelf-latest"), "shelf-all"));
             QTRY_COMPARE(app.item("home-grid")->property("count").toInt(), 12);
             QTest::keyClick(app.window, Qt::Key_Return);
@@ -2210,8 +2253,7 @@ private slots:
             QTRY_VERIFY(app.items("card").size() > 0);
             app.click(app.items("card").first());
             QTRY_VERIFY(said(app).startsWith("From lens: slow woodworking with hand tools, no music " + dot + " "));
-            QTest::keyClick(app.window, Qt::Key_Escape);
-            QTRY_VERIFY(!app.window->property("watching").toBool());
+            QVERIFY(app.escapeTheVideo());
 
             QMetaObject::invokeMethod(app.item("search"), "edit");
             app.type("talks over 30 min");
@@ -2220,7 +2262,7 @@ private slots:
             QTRY_VERIFY(app.items("card").size() > 0);
             app.click(app.items("card").first());
             QTRY_VERIFY(said(app).startsWith("From search: talks over 30 min " + dot + " "));
-            QTest::keyClick(app.window, Qt::Key_Escape);
+            QVERIFY(app.escapeTheVideo());
 
             QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
             QTRY_COMPARE(app.page(), QString("channel"));
@@ -2239,13 +2281,13 @@ private slots:
             QTRY_VERIFY(pane->hasActiveFocus());
             QTest::keyClick(app.window, Qt::Key_Return);
             QTRY_COMPARE(said(app), "From Low Level Hours " + dot + " 2");
-            QTest::keyClick(app.window, Qt::Key_Escape);
+            QVERIFY(app.escapeTheVideo());
 
             QTest::keyClick(app.window, Qt::Key_4);
             QTRY_COMPARE(app.items("history-kept").size(), 3);
             app.click(app.items("history-kept").at(1));
             QTRY_COMPARE(said(app), "From Unfinished " + dot + " 1");
-            QTest::keyClick(app.window, Qt::Key_Escape);
+            QVERIFY(app.escapeTheVideo());
             app.backend->setConfig({{"history", true}});
             QTRY_VERIFY(app.backend->config().value("history").toBool());
             QTest::keyClick(app.window, Qt::Key_4);
@@ -2370,7 +2412,7 @@ private slots:
         QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000004"));
         QTRY_VERIFY(!app.items("next-entry").isEmpty());
         // Up has an end, and so has Left.
-        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        QVERIFY(app.goFromTheVideo("home"));
         QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
         QCOMPARE(home->property("row").toInt(), 0);
         for (int i = 0; i < 4; ++i)
@@ -2954,7 +2996,7 @@ private slots:
         QCOMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000001"));
 
         // A grid's cursor is there from the start too.
-        QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
+        QVERIFY(app.goFromTheVideo("home"));
         app.seeAll();
         QTRY_VERIFY(app.item("home-grid")->hasActiveFocus());
         QTRY_COMPARE(marked(), QStringList{"vid00000001"});
@@ -3136,8 +3178,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_Return);
         QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000002"));
         QTRY_COMPARE(app.items("next-entry").size(), 2);
-        QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!app.window->property("watching").toBool());
+        QVERIFY(app.escapeTheVideo());
         QTRY_VERIFY(pane->hasActiveFocus() || list->hasActiveFocus());
         pane->forceActiveFocus();
         QTest::keyClick(app.window, Qt::Key_H);
@@ -3274,7 +3315,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_H);
         QTRY_COMPARE(app.backend->config().value("route").toString(), QString("direct"));
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!popup->property("opened").toBool());
+        QVERIFY(App::closed(popup));
 
         // Settings: Enter goes from the categories into their rows, where up and down
         // move and left and right change the choice; Escape comes back out.
@@ -3408,7 +3449,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_Left);
         QTRY_COMPARE(app.backend->config().value("route").toString(), QString("direct"));
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!popup->property("opened").toBool());
+        QVERIFY(App::closed(popup));
         QTRY_VERIFY(app.window->activeFocusItem() != nullptr);
     }
 
@@ -3511,7 +3552,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_2);
         QCOMPARE(app.page(), QString("home"));
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!help->property("opened").toBool());
+        QVERIFY(App::closed(help));
         QTest::keyClick(app.window, Qt::Key_S);
         QQuickItem *sort = app.item("feed-sort");
         QTRY_VERIFY(sort->property("opened").toBool());
@@ -3559,7 +3600,7 @@ private slots:
         for (const char *key : {"Enter", "[", "]", "K", "S", "O", "U", "N", "C"})
             QVERIFY2(listed.contains(key), key);
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!help->property("opened").toBool());
+        QVERIFY(App::closed(help));
 
         // Watching: the chapter's name stops before the speed; Up next's lines are whole.
         QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
@@ -3592,7 +3633,7 @@ private slots:
         QTest::qWait(200);
         QVERIFY(!app.window->property("watching").toBool());
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!help->property("opened").toBool());
+        QVERIFY(App::closed(help));
         // ...and gives it back to the page when it closes.
         QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
 
@@ -3601,7 +3642,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_P);
         QTRY_VERIFY(route->property("opened").toBool());
         app.click(app.item("search"));
-        QTRY_VERIFY(!route->property("opened").toBool());
+        QVERIFY(App::closed(route));
         QTest::qWait(300);
         QVERIFY2(app.window->property("typing").toBool(), qPrintable(QDebug::toString(app.window->activeFocusItem())));
     }
@@ -4099,7 +4140,7 @@ private slots:
         QVERIFY2(QRectF(0, 84, 1920, 1080 - 84 - 33).contains(box(background)) && box(background).left() < 60,
                  qPrintable(QString("%1,%2 %3x%4").arg(box(background).x()).arg(box(background).y()).arg(box(background).width()).arg(box(background).height())));
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!popup->property("opened").toBool());
+        QVERIFY(App::closed(popup));
         QObject *help = app.object("help");
         QTest::keyClick(app.window, '?');
         QTRY_VERIFY(help->property("opened").toBool());
