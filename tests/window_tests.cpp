@@ -2072,6 +2072,10 @@ private slots:
             return best ? best->property("videoId").toString() : QString();
         };
         QCOMPARE(first(shelf), QString("vid00000002"));
+        // Resume is still the one filled button, at the strip's own height (32).
+        QVERIFY(app.item("lead-resume")->property("primary").toBool());
+        QVERIFY(!app.item("lead-resume")->property("quiet").toBool());
+        QCOMPARE(app.item("lead-resume")->height(), qreal(32));
         QQuickItem *sort = App::under(shelf, "shelf-sort");
         QVERIFY(sort);
         QCOMPARE(sort->property("text").toString(), QString("Newest"));
@@ -2098,6 +2102,8 @@ private slots:
             QVERIFY(card->property("seconds").toInt() > 1800);
             QVERIFY(!QStringList({"vid00000001", "vid00000005", "vid00000004"}).contains(card->property("videoId").toString()));
         }
+        QVERIFY(tall.item("lead-resume")->property("primary").toBool());
+        QCOMPARE(tall.item("lead-resume")->height(), qreal(36));
         // The longest, and the shortest of the long.
         app.click(app.item("sort-longest"));
         QTRY_COMPARE(first(shelf), QString("vid00000006"));

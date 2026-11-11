@@ -517,8 +517,7 @@ FocusScope {
                         objectName: "lead-resume"
                         implicitHeight: page.compact ? Style.control + Style.u : 36
                         text: qsTr("Resume")
-                        primary: !page.compact
-                        quiet: page.compact
+                        primary: true
                         marked: page.leadSelected && page.leadAction === 0
                         onClicked: page.resume(lead.kept)
                     }
