@@ -24,19 +24,16 @@ FocusScope {
     signal arranged(string key, var setting)
     readonly property bool noChannels: backend.feedInfo.channels === 0 && backend.subs.length === 0
     readonly property bool loading: backend.busy.indexOf("feed") >= 0 || backend.busy.indexOf("feed-cache") >= 0 || !backend.ready
-    // What is loading, or what is there, in few words: the heading, over the
-    // shelf and over the feed in full, already says what it is.
+    // What is loading, or what went wrong, in few words. (What the feed is is
+    // its heading's to say, and how many channels there are the window's foot's.)
     readonly property string brief: {
         // While it runs, how far the refresh is.
         if (backend.refreshTotal > 0 && backend.busy.indexOf("feed") >= 0)
             return qsTr("Refreshing %1 of %2").arg(backend.refreshDone).arg(backend.refreshTotal)
         const info = backend.feedInfo
-        if (!info.channels)
-            return ""
-        let s = qsTr("%n channels", "", info.channels)
         if (info.errors && info.errors.length > 0)
-            s += "  ·  " + qsTr("%n couldn't be fetched", "", info.errors.length)
-        return s
+            return qsTr("%n couldn't be fetched", "", info.errors.length)
+        return ""
     }
 
     signal activated(var video, int index)

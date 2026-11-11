@@ -253,7 +253,7 @@ private slots:
                                                            : "qrc:/|\\.qml|QML|TypeError|ReferenceError"));
     }
 
-    void theBarAcrossTheTopHasThePlacesSearchAndTheRoute()
+    void theBarAcrossTheTopHasThePlacesAndSearchAndTheSettings()
     {
         App app;
         READY(app);
@@ -261,7 +261,7 @@ private slots:
         QVERIFY(bar);
         QCOMPARE(bar->mapToScene(QPointF(0, 0)), QPointF(0, 0));
         QCOMPARE(bar->width(), qreal(1280));
-        for (const char *name : {"wordmark", "nav-home", "nav-lenses", "nav-channels", "nav-history", "nav-route", "nav-settings", "search"}) {
+        for (const char *name : {"wordmark", "nav-home", "nav-lenses", "nav-channels", "nav-history", "nav-settings", "search"}) {
             QVERIFY2(app.item(name), name);
             // All of it is in the bar.
             QVERIFY2(app.item(name)->mapToScene(QPointF(0, app.item(name)->height())).y() <= bar->height(), name);
@@ -269,8 +269,10 @@ private slots:
         // The places are words.
         QStringList said;
         App::texts(bar, said);
-        for (const char *word : {"Home", "Lenses", "Channels", "History", "Direct"})
+        for (const char *word : {"Home", "Lenses", "Channels", "History"})
             QVERIFY2(said.contains(word), word);
+        // The route is not here: it is along the foot of the window.
+        QVERIFY(!said.contains("Direct") && !app.item("nav-route"));
         QCOMPARE(app.page(), QString("home"));
         QVERIFY(app.item("nav-home")->property("current").toBool());
         // There is nothing down the side: the page starts at the window's edge.
@@ -286,19 +288,6 @@ private slots:
         app.click(app.item("nav-settings"));
         QCOMPARE(app.page(), QString("settings"));
         QVERIFY(app.item("nav-settings")->property("current").toBool());
-
-        // What the route indicator says when pointed at is the engine's sentence,
-        // and pressing it opens the route, under it and inside the window.
-        QCOMPARE(app.item("nav-route")->property("tip").toString(), app.backend->privacy().value("summary").toString());
-        QVERIFY(!app.item("nav-route")->property("tip").toString().isEmpty());
-        app.click(app.item("nav-route"));
-        QObject *popup = app.object("routePopup");
-        QTRY_VERIFY(popup->property("opened").toBool());
-        QQuickItem *background = popup->property("background").value<QQuickItem *>();
-        QTest::qWait(200);
-        const QRectF at = background->mapRectToScene(QRectF(0, 0, background->width(), background->height()));
-        QVERIFY2(at.top() >= bar->height() - 1 && at.right() <= 1280 && at.left() > 640,
-                 qPrintable(QString("%1,%2 %3x%4").arg(at.x()).arg(at.y()).arg(at.width()).arg(at.height())));
     }
 
     void theBarFitsANarrowWindow()
@@ -313,23 +302,182 @@ private slots:
         QVERIFY2(edges("search").width() >= 150, qPrintable(QString::number(edges("search").width())));
         // Nothing lies over anything else.
         QVERIFY(edges("nav-history").right() <= edges("search").left());
-        QVERIFY(edges("search").right() <= edges("nav-route").left());
-        QVERIFY(edges("nav-route").right() <= edges("nav-settings").left());
-        // The route is still said, by its colour and when pointed at.
-        QVERIFY(!app.item("nav-route")->property("tip").toString().isEmpty());
+        QVERIFY(edges("search").right() <= edges("nav-settings").left());
     }
 
-    void theRouteIndicatorSaysWhereYouStand()
+    // --- The line along the foot of the window. ---
+
+    // What the hints at its right say, as "key what".
+    static QStringList hintsOf(App &app)
     {
+        QStringList said;
+        for (QQuickItem *hint : app.items("status-hint"))
+            said << hint->property("key").toString() + " " + hint->property("what").toString();
+        return said;
+    }
+
+    void theWindowsFootSaysWhatItDoesAndWhichKeysWorkHere()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
         App app;
         READY(app);
-        QQuickItem *route = app.item("nav-route");
-        QVERIFY(route);
+        QQuickItem *line = app.item("status-line");
+        QVERIFY(line && line->isVisible());
+        // 22 high along the foot, and the page ends where it begins: it covers nothing.
+        QCOMPARE(box(line), QRectF(0, 720 - 22, 1280, 22));
+        QTRY_COMPARE(box(app.item("stage")).bottom(), box(line).top());
+        // On the left: the route, whether a history is kept, how long a place is, how many channels.
+        const auto facts = [&] {
+            QStringList said;
+            for (QQuickItem *fact : app.items("status-fact"))
+                said << fact->property("text").toString();
+            return said;
+        };
+        QTRY_COMPARE(facts(), (QStringList{"history off", "resume 7d", "5 channels"}));
+        QQuickItem *route = app.item("status-route");
         QCOMPARE(route->property("label").toString(), QString("Direct"));
-        QCOMPARE(route->property("tone").value<QColor>(), QColor("#e0a93b"));
+        // (Direct is not an alarm: the text's own colour. Hiding is the route that takes a colour.)
+        QCOMPARE(route->property("tone").value<QColor>(), QColor(app.theme->foreground()));
+        QCOMPARE(route->property("tip").toString(), app.backend->privacy().value("summary").toString());
+        QVERIFY(!route->property("tip").toString().isEmpty());
+        app.backend->setConfig({{"history", true}});
+        QTRY_COMPARE(facts().at(0), QString("history on"));
+        app.backend->setConfig({{"resumeDays", 30}});
+        QTRY_COMPARE(facts().at(1), QString("resume 30d"));
+        app.backend->setConfig({{"resumeDays", 0}});
+        QTRY_COMPARE(facts().at(1), QString("resume off"));
+        app.backend->unsubscribe("UCeeeeeeeeeeeeeeeeeeeeee");
+        QTRY_COMPARE(facts().at(2), QString("4 channels"));
+
+        // On the right: the keys of the page that is showing.
+        QCOMPARE(hintsOf(app), (QStringList{"h j k l move", "/ search", "? keys"}));
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(hintsOf(app), (QStringList{"h j k l move", "r refresh", "? keys"}));
+        QTest::keyClick(app.window, Qt::Key_3);
+        QTRY_COMPARE(hintsOf(app), (QStringList{"j k move", "u unsubscribe", "? keys"}));
+        QTest::keyClick(app.window, Qt::Key_4);
+        QTRY_COMPARE(hintsOf(app), (QStringList{"j k move", "Enter play", "? keys"}));
+        QTest::keyClick(app.window, Qt::Key_5);
+        QTRY_COMPARE(hintsOf(app), (QStringList{"j k move", "Enter open", "? keys"}));
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+        QTRY_COMPARE(hintsOf(app), (QStringList{"h j k l move", "s sort", "? keys"}));
+        // Every key it names does what it says: the help lists them all, and the window binds them.
+        app.play({{"id", "vid00000002"}});
+        QTRY_COMPARE(hintsOf(app), (QStringList{"space pause", "n next", "c comments", "f fullscreen", "? keys"}));
+        QCOMPARE(box(app.item("status-line")), QRectF(0, 720 - 22, 1280, 22));
+        QTRY_COMPARE(box(app.item("stage")).bottom(), box(line).top());
+        // Back on a page, the page's.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.window->property("watching").toBool());
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTRY_COMPARE(hintsOf(app), (QStringList{"h j k l move", "/ search", "? keys"}));
+    }
+
+    void theFootGivesWayInANarrowTileAndFitsEverySize()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        // The window's own units: a window wider than 1280 is drawn larger.
+        for (const auto &[size, zoom] : {std::pair{QSize(941, 508), 1.0}, std::pair{QSize(1920, 1080), 1.5}, std::pair{QSize(760, 520), 1.0},
+                                         std::pair{QSize(630, 1030), 1.0}}) {
+            App app(false, size);
+            READY(app);
+            QTRY_VERIFY(!app.items("status-fact").isEmpty());
+            QQuickItem *line = app.item("status-line");
+            const qreal height = 22 * zoom;
+            QCOMPARE(box(line), QRectF(0, size.height() - height, size.width(), height));
+            QTRY_COMPARE(box(app.item("stage")).bottom(), box(line).top());
+            // The route's word is the first thing in it, at the page's own edge.
+            QCOMPARE(box(app.item("status-route")).left(), 24 * zoom);
+            // What is on the left and what is on the right don't lie over each other,
+            // and nothing is past the edge.
+            qreal factsEnd = box(app.item("status-route")).right();
+            for (QQuickItem *fact : app.items("status-fact"))
+                factsEnd = qMax(factsEnd, box(fact).right());
+            QVERIFY2(factsEnd <= size.width(), qPrintable(QString::number(factsEnd)));
+            QVERIFY2(!hintsOf(app).isEmpty(), "the keys are listed");
+            qreal hintsStart = size.width();
+            for (QQuickItem *hint : app.items("status-hint"))
+                hintsStart = qMin(hintsStart, box(hint).left());
+            const bool roomy = app.item("status-line")->property("roomy").toBool();
+            if (roomy)
+                QVERIFY2(factsEnd <= hintsStart, qPrintable(QString("%1 over %2").arg(factsEnd).arg(hintsStart)));
+            if (size.width() >= 760)
+                QVERIFY2(roomy, qPrintable(QString("no room for the keys at %1").arg(size.width())));
+            // The keys of home are three; of a video, three where the tile is narrow and five where it is not.
+            app.play({{"id", "vid00000002"}});
+            QTRY_VERIFY(app.window->property("watching").toBool());
+            QTRY_COMPARE(hintsOf(app).size(), size.width() / zoom < 1000 ? 3 : 5);
+            if (size.width() / zoom < 1000)
+                QCOMPARE(hintsOf(app), (QStringList{"space pause", "n next", "? keys"}));
+            QTRY_COMPARE(box(app.item("stage")).bottom(), box(line).top());
+        }
+    }
+
+    void theRouteIsAWordAtTheFootThatOpensItsChoices()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app;
+        READY(app);
+        QQuickItem *route = app.item("status-route");
+        QCOMPARE(route->property("label").toString(), QString("Direct"));
+        QCOMPARE(route->property("tone").value<QColor>(), QColor(app.theme->foreground()));
         app.backend->setConfig({{"route", "tor"}});
         QTRY_COMPARE(route->property("label").toString(), QString("Tor"));
         QCOMPARE(route->property("tone").value<QColor>(), QColor(app.theme->protectedColor()));
+        app.backend->setConfig({{"route", "direct"}});
+        QTRY_COMPARE(route->property("label").toString(), QString("Direct"));
+
+        // Pressing it opens the route, over the line it is in and inside the window, from its side.
+        app.click(route);
+        QObject *popup = app.object("routePopup");
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QTest::qWait(200);
+        QQuickItem *background = popup->property("background").value<QQuickItem *>();
+        const QRectF at = box(background);
+        QVERIFY2(at.bottom() <= box(app.item("status-line")).top() + 1 && at.top() >= box(app.item("bar")).bottom() - 1
+                     && at.left() >= 0 && at.left() < box(route).left() && at.right() <= 1280,
+                 qPrintable(QString("%1,%2 %3x%4").arg(at.x()).arg(at.y()).arg(at.width()).arg(at.height())));
+        // Pressing the word again, or Escape, closes it; the key opens it as it did.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!popup->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_P);
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QTest::keyClick(app.window, Qt::Key_P);
+        QTRY_VERIFY(!popup->property("opened").toBool());
+    }
+
+    void theFootDuplicatesNothingAndIsHiddenInFullscreenVideo()
+    {
+        App app(false, QSize(1280, 1600));
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(App::count(app.item("shelf-latest"), "card") >= 4);
+        // What it says is not also said on the page: the route, the days positions are kept, the channels.
+        QVERIFY(!app.item("nav-route") && !app.item("lead-kept"));
+        QStringList said;
+        App::texts(app.item("shelves-home"), said);
+        for (const QString &line : said)
+            QVERIFY2(!line.contains("5 channels") && !line.contains("kept for") && !line.contains("Direct"), qPrintable(line));
+        app.seeAll();
+        said.clear();
+        App::texts(app.item("feed-head"), said);
+        for (const QString &line : said)
+            QVERIFY2(!line.contains("5 channels"), qPrintable(line));
+        // (A refresh that goes badly still says so over the shelf.)
+        QTest::keyClick(app.window, Qt::Key_Escape);
+
+        // A video in fullscreen has the whole window.
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QVERIFY(app.item("status-line")->isVisible());
+        app.window->showFullScreen();
+        QTRY_VERIFY(app.window->property("fullscreen").toBool());
+        QTRY_VERIFY(!app.item("status-line")->isVisible());
+        QCOMPARE(app.item("status-line")->height(), qreal(0));
+        QTRY_COMPARE(app.item("stage")->mapRectToScene(QRectF(0, 0, 1, app.item("stage")->height())).bottom(), qreal(app.window->height()));
+        app.window->showNormal();
+        QTRY_VERIFY(!app.window->property("fullscreen").toBool());
+        QTRY_VERIFY(app.item("status-line")->isVisible());
     }
 
     void typingNeverTriggersAShortcut()
@@ -399,8 +547,8 @@ private slots:
         QTRY_VERIFY(lead->isVisible());
         QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
         QVERIFY(app.item("lead-meta")->property("text").toString().contains("26:58 left"));
-        // How long they are kept is the setting's number.
-        QVERIFY(app.item("lead-kept")->property("text").toString().contains("7 days"));
+        // How long they are kept is said at the window's foot, not on the lead.
+        QVERIFY(!app.item("lead-kept"));
         // The others have a shelf, each with what is left of it.
         QTRY_VERIFY(app.item("shelf-resume"));
         QTRY_COMPARE(App::count(app.item("shelf-resume"), "card"), 2);
@@ -1397,7 +1545,7 @@ private slots:
         app.click(app.item("settings-cat-privacy"));
         app.click(app.item("route-tor"));
         QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
-        QTRY_COMPARE(app.item("nav-route")->property("label").toString(), QString("Tor"));
+        QTRY_COMPARE(app.item("status-route")->property("label").toString(), QString("Tor"));
         QCOMPARE(app.item("route-note")->property("text").toString(),
                  app.backend->privacy().value("routes").toMap().value("tor").toString());
     }
@@ -1573,8 +1721,7 @@ private slots:
         QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
         QVERIFY(app.item("lead-meta")->property("text").toString().contains("Low Level Hours"));
         QVERIFY(app.item("lead-meta")->property("text").toString().contains("26:58 left"));
-        QVERIFY(app.item("lead-kept")->property("text").toString().contains("7 days"));
-        // The grid and its tabs are a step away, not what the page opens on.
+        // The grid is a step away, not what the page opens on.
         QVERIFY(!app.item("home-grid")->isVisible());
 
         // The other unfinished videos, the channels' latest, and each lens, as shelves.
@@ -2189,7 +2336,7 @@ private slots:
         QVERIFY2(box(search).width() <= 60, qPrintable(QString::number(box(search).width())));
         // Nothing lies over anything else, and nothing is past the edge.
         QVERIFY(box(app.item("nav-history")).right() <= box(search).left());
-        QVERIFY(box(search).right() <= box(app.item("nav-route")).left());
+        QVERIFY(box(search).right() <= box(app.item("nav-settings")).left());
         QVERIFY(box(app.item("nav-settings")).right() <= 630);
         // Its key, or a press, opens it over the bar; Escape folds it again.
         QTest::keyClick(app.window, '/');
@@ -2605,7 +2752,8 @@ private slots:
         QVERIFY2(box(app.item("watch-stats")).bottom() <= 508, qPrintable(QString::number(box(app.item("watch-stats")).bottom())));
         // In theatre it takes the width as well, and the title stays in view.
         watch->setProperty("theatre", true);
-        QTRY_VERIFY2(box(surface).height() >= 360, qPrintable(QString::number(box(surface).height())));
+        // (The line along the foot takes 22 of the tile's height.)
+        QTRY_VERIFY2(box(surface).height() >= 340, qPrintable(QString::number(box(surface).height())));
         QVERIFY2(box(app.item("watch-title")).top() < 508 - 20, qPrintable(QString::number(box(app.item("watch-title")).top())));
     }
 
@@ -3534,14 +3682,17 @@ private slots:
         // Pressing things still presses them.
         app.click(app.item("nav-channels"));
         QCOMPARE(app.page(), QString("channels"));
-        // What opens over the window is as large, and inside it.
-        app.click(app.item("nav-route"));
+        // The line along the foot is as large too, and ends the page.
+        QCOMPARE(box(app.item("status-line")), QRectF(0, 1080 - 33, 1920, 33));
+        QTRY_COMPARE(box(app.item("stage")).bottom(), qreal(1080 - 33));
+        // What opens over the window is as large, and inside it, over the line it opens from.
+        app.click(app.item("status-route"));
         QObject *popup = app.object("routePopup");
         QTRY_VERIFY(popup->property("opened").toBool());
         QTest::qWait(200);
         QQuickItem *background = popup->property("background").value<QQuickItem *>();
         QVERIFY2(qAbs(box(background).width() - 660) < 2, qPrintable(QString::number(box(background).width())));
-        QVERIFY2(QRectF(0, 0, 1920, 1080).contains(box(background)) && box(background).top() >= 83,
+        QVERIFY2(QRectF(0, 84, 1920, 1080 - 84 - 33).contains(box(background)) && box(background).left() < 60,
                  qPrintable(QString("%1,%2 %3x%4").arg(box(background).x()).arg(box(background).y()).arg(box(background).width()).arg(box(background).height())));
         QTest::keyClick(app.window, Qt::Key_Escape);
         QTRY_VERIFY(!popup->property("opened").toBool());

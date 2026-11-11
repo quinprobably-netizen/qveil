@@ -87,7 +87,7 @@ impl Net {
         self.proxy.as_deref().is_some_and(is_socks_url)
     }
 
-    /// What the route does, for the top bar and `qveil config`. It only claims
+    /// What the route does, for the window's foot and `qveil config`. It only claims
     /// what `proxy_url` really does.
     pub fn describe(&self) -> String {
         let Some(p) = &self.proxy else {

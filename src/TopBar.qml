@@ -2,22 +2,17 @@ import QtQuick
 import Qveil
 
 // The bar across the top of the window: the places as words, the search
-// field in the middle, and at the far end the route (always in view: amber
-// while YouTube can see your address, green once it can't) and the settings.
+// field in the middle, and at the far end the settings. (The route is on
+// the line along the foot of the window: see StatusLine.)
 Rectangle {
     id: bar
     objectName: "bar"
 
     // The place that is showing, by its key.
     property string current
-    // What the engine says about the route in use.
-    property string routeSummary
-    property string route: "direct"
     // What goes in the middle: the search field.
     default property alias middle: slot.data
-    // What the route's popup hangs from.
-    readonly property alias routeAnchor: routePlace
-    // Too narrow for the route to be spelled out beside its dot.
+    // Narrow enough for the places to stand closer.
     readonly property bool tight: width < 900
     // Too narrow for the search field to stand open: it folds into its key,
     // and opens over the places while it is used.
@@ -25,7 +20,6 @@ Rectangle {
     // How wide the field is when it opens over the places.
     readonly property real openWidth: slot.x + slot.width - Style.gutter
     signal picked(string place)
-    signal routeClicked()
 
     readonly property var places: [
         { key: "home", label: qsTr("Home") },
@@ -93,57 +87,6 @@ Rectangle {
         height: parent.height
         spacing: Style.u
 
-        Item {
-            id: routePlace
-            objectName: "nav-route"
-            readonly property string label: bar.route === "tor" ? qsTr("Tor") : bar.route === "proxy" ? qsTr("Proxy") : qsTr("Direct")
-            // Amber while YouTube sees your address, green once it doesn't.
-            readonly property color tone: bar.route === "direct" ? Style.warn : Style.safe
-            readonly property string tip: bar.routeSummary || label
-            width: routeRow.width + Style.u * 6
-            height: parent.height
-
-            Rectangle {
-                anchors.fill: parent
-                anchors.topMargin: (bar.height - Style.control) / 2
-                anchors.bottomMargin: (bar.height - Style.control) / 2
-                radius: Style.radius
-                color: routeArea.containsMouse ? Style.hover : "transparent"
-                Behavior on color { ColorAnimation { duration: Style.quick } }
-            }
-            Row {
-                id: routeRow
-                anchors.centerIn: parent
-                spacing: Style.u * 2
-                Rectangle {
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: 8
-                    height: 8
-                    radius: 4
-                    color: routePlace.tone
-                }
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    visible: !bar.tight
-                    text: routePlace.label
-                    textFormat: Text.PlainText
-                    color: routePlace.tone
-                    font.family: Style.font
-                    font.pixelSize: Style.body
-                }
-            }
-            MouseArea {
-                id: routeArea
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: bar.routeClicked()
-            }
-            Tip {
-                text: routePlace.tip
-                shown: routeArea.containsMouse
-            }
-        }
         TabWord {
             objectName: "nav-settings"
             height: bar.height

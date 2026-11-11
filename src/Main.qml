@@ -566,10 +566,7 @@ ApplicationWindow {
                 // In fullscreen the video has the whole window.
                 visible: !(win.watching && win.fullscreen)
                 current: win.watching ? "" : win.place
-                route: backend.config.route || "direct"
-                routeSummary: backend.privacy.summary
                 onPicked: place => win.go(place)
-                onRouteClicked: win.toggleRoute()
 
                 FindField {
                     id: search
@@ -605,14 +602,17 @@ ApplicationWindow {
                     }
                 }
             }
-            // The route opens under where it is shown.
+            // The route opens over where it is shown, at the foot of the
+            // window, from the side its word is on.
             RoutePopup {
                 id: route
                 objectName: "routePopup"
-                parent: bar.routeAnchor
-                x: Qt.application.layoutDirection === Qt.RightToLeft ? 0 : parent.width - width
-                y: parent.height
-                above: bar.height
+                parent: statusLine
+                x: Qt.application.layoutDirection === Qt.RightToLeft ? parent.width - width - Style.gutter + Style.u * 2
+                                                                      : Style.gutter - Style.u * 2
+                y: -height
+                // The bar, and the line it opens over, are not its room.
+                reserved: (bar.visible ? bar.height : 0) + statusLine.height
                 windowWidth: root.width
                 windowHeight: root.height
                 onSettingsRequested: win.go("settings")
@@ -653,12 +653,27 @@ ApplicationWindow {
                 }
             }
 
+            // Where the window stands, and the keys that work there, along its foot.
+            StatusLine {
+                id: statusLine
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                // In fullscreen the video has the whole window; the page above
+                // ends where this begins.
+                visible: !(win.watching && win.fullscreen)
+                height: visible ? implicitHeight : 0
+                context: win.watching ? "watch" : win.page
+                z: 3
+                onRouteClicked: win.toggleRoute()
+            }
+
             // What plays in the small window, along the foot of this one.
             NowPlayingBar {
                 id: nowPlaying
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.bottom: parent.bottom
+                anchors.bottom: statusLine.top
                 visible: win.pip
                 surface: pipWindow.surface
                 onBackRequested: win.togglePip()
@@ -673,7 +688,7 @@ ApplicationWindow {
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.top: top.bottom
-                anchors.bottom: nowPlaying.visible ? nowPlaying.top : parent.bottom
+                anchors.bottom: nowPlaying.visible ? nowPlaying.top : statusLine.top
 
                 HomePage {
                     id: feedPage

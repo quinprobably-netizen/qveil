@@ -18,8 +18,6 @@ FocusScope {
     property string status
     property bool loading: false
     property bool noChannels: false
-    // How long positions are kept, in days.
-    readonly property int days: backend.config.resumeDays || 0
     // The video that leads: the one most recently left unfinished.
     readonly property var first: backend.resume.length > 0 ? backend.resume[0] : null
     // The shelves, by key: "latest", "resume" (what else was left
@@ -554,17 +552,6 @@ FocusScope {
                         marked: page.leadSelected && page.leadAction === 2
                         tip: qsTr("Forget where you stopped in this video")
                         onClicked: page.forget(lead.kept)
-                    }
-                    Text {
-                        objectName: "lead-kept"
-                        visible: !page.compact
-                        anchors.verticalCenter: parent.verticalCenter
-                        leftPadding: Style.u * 2
-                        text: qsTr("kept for %n days", "", page.days)
-                        textFormat: Text.PlainText
-                        color: Style.faint
-                        font.family: Style.font
-                        font.pixelSize: Style.small
                     }
                 }
             }

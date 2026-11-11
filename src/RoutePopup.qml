@@ -11,12 +11,13 @@ Popup {
     signal settingsRequested()
 
     // How tall what is in it may be, for the popup to fit the window.
-    // How much of the window's height lies above where it opens (the bar).
-    property real above: 0
+    // How much of the window's height is not its to take (the bar above it,
+    // and the line it opens over).
+    property real reserved: 0
     // The window's size, in the units it is drawn in.
     property real windowWidth: Overlay.overlay ? Overlay.overlay.width : 600
     property real windowHeight: Overlay.overlay ? Overlay.overlay.height : 600
-    readonly property real room: windowHeight - above - 2 * margins - 2 * padding
+    readonly property real room: windowHeight - reserved - 2 * margins - 2 * padding
     width: Math.min(440, windowWidth - 2 * margins)
     padding: Style.u * 5
     // Never over the window's edge, wherever it is opened from.

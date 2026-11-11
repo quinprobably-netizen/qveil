@@ -30,6 +30,7 @@
         <file alias="ErrorBar.qml">ErrorBar.qml</file>
         <file alias="Toast.qml">Toast.qml</file>
         <file alias="BusyLine.qml">BusyLine.qml</file>
+        <file alias="StatusLine.qml">StatusLine.qml</file>
         <file alias="Frost.qml">Frost.qml</file>
         <file alias="HomePage.qml">HomePage.qml</file>
         <file alias="FeedHead.qml">FeedHead.qml</file>

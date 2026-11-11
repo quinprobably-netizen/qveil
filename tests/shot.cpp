@@ -55,6 +55,7 @@ int main(int argc, char *argv[]) {
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: win.togglePip() }', win)"},
         {"help", "help.open()"},
         {"route", "route.open()"},
+        {"home-tor", "backend.setConfig({ route: 'tor' })"},
         {"theatre", "playListed(qsTr('Latest from your channels'), backend.feed.get(0), backend.feed, 0); watch.theatre = true"},
         {"history-on", "backend.setConfig({ history: true }); backend.loadHistory(); go('history')"},
         {"lens-edit", "go('lenses'); lensesPage.editLens()"},
@@ -108,7 +109,7 @@ int main(int argc, char *argv[]) {
             if (go.hasError())
                 std::fprintf(stderr, "%s\n", qPrintable(go.error().toString()));
         }
-        QTimer::singleShot(view == "pip" ? 8000 : view == "watch-ended" ? 9500 : view.startsWith("watch") ? 5000 : 2500, &app, [&] {
+        QTimer::singleShot(view == "pip" ? 8000 : view == "watch-ended" ? 9500 : view == "home-tor" ? 6000 : view.startsWith("watch") ? 5000 : 2500, &app, [&] {
             // The small window is a window of its own.
             QQuickWindow *shown = view == "pip" ? window->property("pipWindow").value<QQuickWindow *>() : window;
             const bool saved = shown && shown->grabWindow().save(out);
