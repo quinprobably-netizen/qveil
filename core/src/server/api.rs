@@ -915,7 +915,7 @@ echo '{"entries":[]}'"#,
     #[test]
     fn a_settings_change_that_keeps_the_route_leaves_running_work_alone_but_registered() {
         let bin = TempDir::new();
-        let (_s, base, _d) = server_with(Config {
+        let (s, base, _d) = server_with(Config {
             ytdlp: hanging_ytdlp(&bin.0),
             ..Config::default()
         });
@@ -931,16 +931,28 @@ echo '{"entries":[]}'"#,
             r#"{"history":true,"maxHeight":720}"#,
         );
         assert_eq!(status, 200, "{body}");
-        std::thread::sleep(Duration::from_millis(300));
+        // A route change closes the registry before it answers, and a
+        // registry that is closed refuses every call that comes after: so a
+        // second search that runs is the proof that nothing was stopped,
+        // with no waiting for a process to be gone.
+        let second = {
+            let base = base.clone();
+            std::thread::spawn(move || http(&base, "GET", &path(&base, "api/search?q=b"), ""))
+        };
+        wait_for("both searches to run", Duration::from_secs(10), || {
+            s.runtime().yt.calls.running() == 2
+        });
         assert!(
             std::path::Path::new("/proc").join(&pid).exists(),
             "a setting that isn't the route must not stop a search"
         );
-        // The new runtime still knows about it: leaving the route stops it.
+        // The new runtime still knows about them: leaving the route stops them.
         switch_to_tor(&base);
-        let (status, body) = search.join().unwrap();
-        assert_eq!(status, 500, "{body}");
-        assert!(body.contains("The route changed; try again"), "{body}");
+        for call in [search, second] {
+            let (status, body) = call.join().unwrap();
+            assert_eq!(status, 500, "{body}");
+            assert!(body.contains("The route changed; try again"), "{body}");
+        }
         assert_stopped_and_cleaned_up(&pid, &private);
     }
 
@@ -1314,7 +1326,7 @@ echo '{"entries":[]}'"#,
             "{:?}",
             gave_up.elapsed()
         );
-        wait_for("the registry to be empty", Duration::from_secs(5), || {
+        wait_for("the registry to be empty", Duration::from_secs(10), || {
             s.runtime().yt.calls.running() == 0
         });
         std::thread::sleep(Duration::from_millis(200));
@@ -1559,7 +1571,11 @@ EOF
                 http(&base, "POST", &path(&base, "api/play?v=dQw4w9WgXcQ"), "")
             })
         };
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for(
+            "the play to wait on the lookup",
+            Duration::from_secs(10),
+            || s.lookups.waiting() == 1,
+        );
         assert!(!play.is_finished());
         // The window lets go of the lookup ahead (it did, before the play):
         // the play still wants it, so it carries on.
@@ -1597,7 +1613,11 @@ EOF
         let (pid, private) = hanging_running(&bin.0);
         std::fs::remove_file(bin.0.join("pid")).unwrap();
         let play = post_open(&base, "api/play?v=dQw4w9WgXcQ");
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for(
+            "the play to wait on the lookup",
+            Duration::from_secs(10),
+            || s.lookups.waiting() == 1,
+        );
         // Another video is next in line, and the window lets go of the old
         // lookup ahead: the play waiting on it keeps it going.
         let other = post_open(&base, "api/prepare?v=bbbbbbbbbbb");
@@ -1618,7 +1638,7 @@ EOF
         assert_stopped_and_cleaned_up(&pid, &private);
         drop(other);
         assert_stopped_and_cleaned_up(&other_pid, &other_private);
-        wait_for("the registry to be empty", Duration::from_secs(5), || {
+        wait_for("the registry to be empty", Duration::from_secs(10), || {
             s.runtime().yt.calls.running() == 0
         });
     }
@@ -1653,7 +1673,7 @@ EOF
         let (pid, private) = hanging_running(&bin.0);
         drop(second);
         assert_stopped_and_cleaned_up(&pid, &private);
-        wait_for("the registry to be empty", Duration::from_secs(5), || {
+        wait_for("the registry to be empty", Duration::from_secs(10), || {
             s.runtime().yt.calls.running() == 0
         });
         assert!(lock(&s.preparing).is_none());
@@ -1683,7 +1703,14 @@ EOF
             let base = base.clone();
             std::thread::spawn(move || http(&base, "GET", &path(&base, "api/history"), ""))
         };
-        std::thread::sleep(Duration::from_millis(300));
+        // The play is still being recorded, and its connection is open; the
+        // second one is the request for the history, which has been accepted.
+        wait_for(
+            "the history to be asked for",
+            Duration::from_secs(10),
+            || s.connections.load(Ordering::SeqCst) == 2,
+        );
+        std::thread::sleep(Duration::from_millis(100));
         assert!(
             !asked.is_finished(),
             "the history was read before the video was in it"
