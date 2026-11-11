@@ -1761,7 +1761,13 @@ def main(argv=None):
         let started = Instant::now();
         yt.search("q", 5).unwrap();
         let took = started.elapsed();
-        assert_eq!(log(&dir.0).last().unwrap(), &("run".to_string(), spare));
+        // The spare ran it. (The one that replaces it may have started
+        // since, and logged its import after that.)
+        let runs: Vec<_> = log(&dir.0)
+            .into_iter()
+            .filter(|(w, _)| w == "run")
+            .collect();
+        assert_eq!(runs.last().unwrap(), &("run".to_string(), spare));
         let taken = call(&dir.0, spare);
         // The same arguments, and nothing to read on stdin.
         assert_eq!(argv_without_config(&taken), argv_without_config(&usual));
