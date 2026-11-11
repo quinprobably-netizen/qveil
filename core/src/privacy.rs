@@ -145,7 +145,7 @@ const DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Local data",
-        "Subscriptions, lenses, resume positions, the history, the topic feeds you hid and when the day's topic searches were made live in `~/.local/share/qveil`, the feed cache and what each lens and topic feed found in `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those).",
+        "Subscriptions, lenses, resume positions, the history, the topic feeds you hid and when recent topic searches were made live in `~/.local/share/qveil`, the feed cache and what each lens and topic feed found in `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those).",
     ),
 ];
 
@@ -206,7 +206,7 @@ const HISTORY_ON: &str =
     "On: kept only on this computer, in a file only you can read, until you clear it.";
 const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.";
 const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.";
-const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old. YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over.";
+const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old. YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
 const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
 const LENSES_SHORT: &str =
@@ -593,11 +593,12 @@ mod tests {
             "Turned off, what was found is deleted",
             "when the day's searches were made is kept until each is a day old",
             "turning it off and on again doesn't start the count over",
+            "each is deleted by the next time qveil starts after that",
         ] {
             assert!(on.contains(right), "{right:?} is missing from: {on}");
         }
         // Where that is kept is said with the rest of what is kept.
-        assert!(markdown().contains("when the day's topic searches were made live in"));
+        assert!(markdown().contains("when recent topic searches were made live in"));
     }
 
     /// The window's tests run against a stand-in engine, which has to say

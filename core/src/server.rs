@@ -118,6 +118,11 @@ impl Server {
         if let Err(e) = resume::purge(&paths, rt.cfg.resume_days, app::now()) {
             note!("qveil: couldn't tidy the remembered positions: {e:#}");
         }
+        // The same goes for when the day's topic searches were made, and,
+        // while topic feeds are off, for anything they found.
+        if let Err(e) = app::tidy_topics(&paths, rt.cfg.topic_feeds) {
+            note!("qveil: couldn't tidy the topic feeds' files: {e:#}");
+        }
         Arc::new(Self {
             runtime: RwLock::new(Arc::new(rt)),
             paths,

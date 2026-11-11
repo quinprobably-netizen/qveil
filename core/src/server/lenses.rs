@@ -1175,6 +1175,76 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         );
     }
 
+    /// The engine starting, with topic feeds on or off.
+    fn engine_starts(d: &TempDir, topic_feeds: bool) {
+        let cfg = Config {
+            topic_feeds,
+            ..Config::default()
+        };
+        let rt = Runtime::new(cfg, &d.paths(), None, false).unwrap();
+        drop(crate::server::Server::new(rt, d.paths()));
+    }
+
+    fn searched_at(d: &TempDir, at: Vec<i64>) {
+        let searched = crate::topics::Searched { at };
+        crate::store::save_compact(&d.paths().topic_searches(), &searched).unwrap();
+    }
+
+    fn searched(d: &TempDir) -> Vec<i64> {
+        crate::store::load::<crate::topics::Searched>(&d.paths().topic_searches())
+            .unwrap()
+            .at
+    }
+
+    #[test]
+    fn when_the_days_topic_searches_were_made_is_deleted_at_start_once_a_day_old() {
+        let d = TempDir::new();
+        let now = app::now();
+        let old = now - crate::topics::STALE - 60;
+        // Topic feeds were turned off; since then a day has gone by for one
+        // of the searches, and then the engine starts.
+        searched_at(&d, vec![old, now - 60]);
+        engine_starts(&d, false);
+        assert_eq!(searched(&d), [now - 60]);
+        // A day on for all of them: nothing is left, not even the file.
+        searched_at(&d, vec![old; 3]);
+        engine_starts(&d, false);
+        assert!(!d.paths().topic_searches().exists());
+        // The same while they are on.
+        searched_at(&d, vec![old; 3]);
+        engine_starts(&d, true);
+        assert!(!d.paths().topic_searches().exists());
+        // Starting with nothing to tidy leaves nothing behind.
+        let fresh = TempDir::new();
+        engine_starts(&fresh, false);
+        assert!(!fresh.paths().data.exists());
+    }
+
+    #[test]
+    fn turning_topic_feeds_off_deletes_the_searches_that_are_a_day_old() {
+        let d = TempDir::new();
+        let now = app::now();
+        searched_at(&d, vec![now - crate::topics::STALE - 60, now - 60]);
+        app::forget_topics(&d.paths()).unwrap();
+        assert_eq!(searched(&d), [now - 60]);
+        searched_at(&d, vec![now - crate::topics::STALE; 2]);
+        app::forget_topics(&d.paths()).unwrap();
+        assert!(!d.paths().topic_searches().exists());
+    }
+
+    #[test]
+    fn what_topic_feeds_found_is_deleted_at_start_while_they_are_off() {
+        let d = TempDir::new();
+        let cache = d.paths().topics_cache();
+        std::fs::create_dir_all(&d.paths().cache).unwrap();
+        // Left behind: a setting changed by hand, or a forget that failed.
+        std::fs::write(&cache, r#"{"groups":{}}"#).unwrap();
+        engine_starts(&d, true);
+        assert!(cache.exists());
+        engine_starts(&d, false);
+        assert!(!cache.exists());
+    }
+
     #[test]
     fn topic_feeds_are_off_before_what_they_found_is_deleted() {
         let (_bin, base, d) = rig();

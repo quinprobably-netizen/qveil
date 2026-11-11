@@ -380,11 +380,41 @@ fn load_topic_searches(paths: &Paths, now: i64) -> Result<topics::Searched> {
         }
         _ => store::load(&path)?,
     };
-    // Once moved over, or once a time is put right, it is written down.
-    if searched.settle(now) || (!searched.at.is_empty() && !path.exists()) {
+    let changed = searched.settle(now);
+    if searched.at.is_empty() {
+        // Nothing left of the day: nothing is kept, not even an empty list.
+        remove_if_there(&path)?;
+    } else if changed || !path.exists() {
+        // Once moved over, or once a time is put right or forgotten, it is
+        // written down.
         store::save_compact(&path, &searched)?;
     }
     Ok(searched)
+}
+
+fn remove_if_there(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("deleting {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// What the engine does with the topic feeds' files as it starts: the times
+/// of searches that are a day old are deleted, and while the setting is off
+/// so is what was found (left behind by a `forget_topics` that failed, or by
+/// a setting changed by hand). With neither file there it touches nothing.
+pub fn tidy_topics(paths: &Paths, on: bool) -> Result<()> {
+    let there = |p: std::path::PathBuf| std::fs::symlink_metadata(p).is_ok();
+    if !there(paths.topic_searches()) && !there(paths.topics_cache()) {
+        return Ok(());
+    }
+    if !on {
+        return forget_topics(paths);
+    }
+    let _lock = store::lock(paths)?;
+    load_topic_searches(paths, now()).map(|_| ())
 }
 
 /// How many more topic searches the day has room for.
@@ -623,14 +653,15 @@ pub fn hide_topic(paths: &Paths, id: &str) -> Result<()> {
 /// Forgets what the topic feeds found (when they are turned off). When the
 /// day's searches were sent is kept (`Paths::topic_searches`), until each is
 /// a day old: forgotten, turning them on again would start the count over.
-/// Call it once the setting is off for everything that is running, so that a
-/// refresh that was about to save asks `wanted` and finds it is not.
+/// Those that are a day old already go now. Call it once the setting is off
+/// for everything that is running, so that a refresh that was about to save
+/// asks `wanted` and finds it is not.
 pub fn forget_topics(paths: &Paths) -> Result<()> {
     let _lock = store::lock(paths)?;
-    match std::fs::remove_file(paths.topics_cache()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
-    }
+    // First, while an older version's times may still be in the results.
+    let settled = load_topic_searches(paths, now());
+    remove_if_there(&paths.topics_cache())?;
+    settled.map(|_| ())
 }
 
 #[derive(Serialize)]
