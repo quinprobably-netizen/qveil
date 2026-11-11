@@ -23,6 +23,9 @@ FocusScope {
     property real savedVolume: 80
     property alias mpv: mpv
     property string thumbs: "frosted"
+    // Set when the video is played from its start in place of a kept place:
+    // that place is forgotten once the first frame is up.
+    property bool forgetWhenStarted: false
     // The second it last started a video at (0 from the start), and the
     // second it was last sent to: what the window asked of the player.
     property real startedAt: 0
@@ -51,6 +54,7 @@ FocusScope {
             batch: video.batch || 0
         }
         note.shown = false
+        forgetWhenStarted = false
         startedAt = 0
         lastSeek = -1
         pending = true
@@ -90,6 +94,7 @@ FocusScope {
         active = false
         info = ({})
         note.shown = false
+        forgetWhenStarted = false
         if (was)
             closed()
     }
@@ -161,6 +166,12 @@ FocusScope {
                 surface.report()
         }
         onEndedChanged: if (ended) surface.report()
+        onStartedChanged: {
+            if (started && surface.forgetWhenStarted) {
+                surface.forgetWhenStarted = false
+                backend.forgetResume(surface.info.id)
+            }
+        }
     }
 
     // After a seek, once the keys have rested and the player has got

@@ -88,8 +88,9 @@ FocusScope {
         return ({})
     }
     signal activated(var video, var list, int index)
-    // The lead is picked up: `list` is what comes after it.
+    // The lead is picked up, or played from its start: `list` is what comes after it.
     signal resumed(var video, var list, int index)
+    signal restarted(var video, var list, int index)
     signal allRequested(string feed)
     signal channelRequested(string id)
     signal refreshRequested()
@@ -304,9 +305,9 @@ FocusScope {
         page.resumed(list.get(0), list, 0)
     }
     function startOver(kept) {
-        // The place is forgotten first, so that the video starts at its start.
-        backend.forgetResume(kept.id)
-        resume(kept)
+        // (The place is forgotten once the video has begun, not before: see Main.)
+        const list = afterLead(kept)
+        page.restarted(list.get(0), list, 0)
     }
 
     Component.onCompleted: rekey()

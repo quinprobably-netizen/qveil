@@ -67,6 +67,7 @@ FocusScope {
     signal shelfActivated(var video, var list, int index)
     signal channelRequested(string id)
     signal resumed(var video, var list, int index)
+    signal restarted(var video, var list, int index)
     signal shortsToggled(bool shown)
     signal refreshRequested()
     signal newLensRequested()
@@ -126,6 +127,7 @@ FocusScope {
         noChannels: page.noChannels
         onActivated: (video, list, index) => page.shelfActivated(video, list, index)
         onResumed: (video, list, index) => page.resumed(video, list, index)
+        onRestarted: (video, list, index) => page.restarted(video, list, index)
         onAllRequested: which => page.showAll(which)
         onChannelRequested: id => page.channelRequested(id)
         onRefreshRequested: page.refreshRequested()

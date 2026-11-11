@@ -465,7 +465,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(200, cfg)
         elif path == "api/play":
             v = q.get("v", "")
-            if v in ("bot_check", "tor_down", "proxy_refused", "rate_limited", "age_restricted", "route_changed"):
+            # QVEIL_STANDIN_PLAY_FAILS: video IDs that can't be opened, for the tests of what a failed opening leaves behind.
+            if v in ("bot_check", "tor_down", "proxy_refused", "rate_limited", "age_restricted", "route_changed") \
+                    or v in os.environ.get("QVEIL_STANDIN_PLAY_FAILS", "").split(","):
                 self.send(500, {"error": "The engine's words for " + v, "code": v})
                 return
             stream = base + "/s/x/v" if CLIP else ""

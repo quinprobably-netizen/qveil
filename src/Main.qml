@@ -258,6 +258,7 @@ ApplicationWindow {
     // The player opens at once, with what the card knows, while the engine
     // looks the video up. `list` and `index` say where it was opened from.
     function play(video, list, index) {
+        startingOver = ""
         if (list && list !== playedFrom) {
             const rows = []
             for (let i = 0; i < list.count; i++)
@@ -275,6 +276,15 @@ ApplicationWindow {
             watch.forceActiveFocus()
         }
         backend.play(video.id)
+    }
+
+    // The video that is being started over, by its ID: it plays from its
+    // start whatever place was kept for it, and that place is forgotten once
+    // the video has begun, not before (one that doesn't open keeps it).
+    property string startingOver: ""
+    function startOver(video, list, index) {
+        play(video, list, index)
+        startingOver = video.id
     }
 
     // Picture in picture: the video leaves the page for a small window of
@@ -423,10 +433,14 @@ ApplicationWindow {
             }
         }
         function onPlayReady(info) {
-            if (win.pip)
-                pipWindow.surface.open(info)
-            else
-                watch.open(info)
+            const surface = win.pip ? pipWindow.surface : watch.surface
+            if (info.id === win.startingOver) {
+                surface.forgetWhenStarted = true
+                surface.openAt(info, 0)
+            } else {
+                surface.open(info)
+            }
+            win.startingOver = ""
         }
         // A lens that was just added is shown, wherever it was added from.
         function onLensAdded(id) {
@@ -629,6 +643,7 @@ ApplicationWindow {
                     onShelfActivated: (video, list, index) => win.play(video, list, index)
                     onChannelRequested: id => win.openChannel(id)
                     onResumed: (video, list, index) => win.play(video, list, index)
+                    onRestarted: (video, list, index) => win.startOver(video, list, index)
                     onShortsToggled: shown => {
                         prefs.showShorts = shown
                         backend.refreshFeed(false, shown)

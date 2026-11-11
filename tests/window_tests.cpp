@@ -1314,7 +1314,8 @@ private slots:
         QTRY_COMPARE(surface->property("startedAt").toInt(), 845);
         QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000001"));
 
-        // Starting over forgets the place first, so the video starts at its start.
+        // Starting over plays the video from its start. The place is not forgotten
+        // until the video has begun (nothing plays here, so it stays: see below).
         // (Put away first: left while playing, it would go on in the small window.)
         QMetaObject::invokeMethod(app.item("watch"), "close");
         QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
@@ -1323,17 +1324,58 @@ private slots:
         QTest::qWait(100);
         QVERIFY2(app.item("lead")->mapToScene(QPointF(0, 0)).y() > 0, "the lead was scrolled away");
         app.click(app.item("lead-over"));
-        QTRY_COMPARE(app.asked("POST api/resume/rm"), 1);
         QTRY_VERIFY(surface->property("active").toBool() && !surface->property("pending").toBool());
         QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000001"));
         QCOMPARE(surface->property("startedAt").toInt(), 0);
+        QCOMPARE(app.asked("POST api/resume/rm"), 0);
+        QCOMPARE(app.backend->resume().first().toMap().value("id").toString(), QString("vid00000001"));
 
-        // The next unfinished video leads now, and can be forgotten where it stands.
+        // The next unfinished video leads when this one is forgotten, where it stands.
+        app.backend->forgetResume("vid00000001");
+        QMetaObject::invokeMethod(app.item("watch"), "close");
         QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
         QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Crossing the Pamir on a steel bike, part 3"));
         app.click(app.item("lead-forget"));
         QTRY_COMPARE(app.asked("POST api/resume/rm"), 2);
         QTRY_COMPARE(app.item("lead-title")->property("text").toString(), QString("Glaze tests: 36 tiles, one kiln load"));
+    }
+
+    void startingOverForgetsThePlaceOnceTheVideoHasBegun()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        app.click(app.item("lead-over"));
+        QQuickItem *surface = app.item("surface");
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mpv && mpv->property("started").toBool(), 15000);
+        QCOMPARE(surface->property("startedAt").toInt(), 0);
+        QCOMPARE(mpv->property("position").toDouble() < 10, true);
+        // It began, so the place is forgotten, once.
+        QTRY_COMPARE(app.asked("POST api/resume/rm"), 1);
+        QTRY_VERIFY(!app.backend->resume().first().toMap().value("id").toString().isEmpty()
+                    && app.backend->resume().first().toMap().value("id").toString() != "vid00000001");
+        QTest::qWait(300);
+        QCOMPARE(app.asked("POST api/resume/rm"), 1);
+    }
+
+    void aStartOverThatDoesNotOpenKeepsThePlace()
+    {
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_PLAY_FAILS", "vid00000001"}});
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QSignalSpy failed(app.backend.get(), &Backend::taskFailed);
+        app.click(app.item("lead-over"));
+        QTRY_COMPARE(failed.count(), 1);
+        QTRY_VERIFY(!app.item("surface")->property("active").toBool());
+        QCOMPARE(app.asked("POST api/resume/rm"), 0);
+        QCOMPARE(app.backend->resume().size(), 3);
+        // Still the lead, with its place.
+        QCOMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
     }
 
     void resumingPlaysWithTheUnfinishedVideosToFollow()
