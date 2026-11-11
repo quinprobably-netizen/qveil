@@ -657,8 +657,12 @@ pub fn hanging_ytdlp(dir: &std::path::Path) -> String {
     crate::store::testing::script(
         &dir.join("yt-dlp"),
         r#"d=$(dirname "$0")
-while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && dirname "$2" > "$d/private-dir"; shift; done
-echo $$ > "$d/pid"
+# Each is written whole or not at all (the process id last): a test may be reading them meanwhile.
+while [ $# -gt 0 ]; do
+  [ "$1" = --config-locations ] && dirname "$2" > "$d/private-dir.new" && mv "$d/private-dir.new" "$d/private-dir"
+  shift
+done
+echo $$ > "$d/pid.new" && mv "$d/pid.new" "$d/pid"
 exec sleep 60
 "#,
     )

@@ -62,8 +62,9 @@ check() {
   cd "$srcdir/$pkgname"
   export CARGO_NET_OFFLINE=true
   # The engine's tests only. The window's need a display server (they run
-  # offscreen in bin/test), which a package build shouldn't depend on.
-  cargo test --locked --manifest-path core/Cargo.toml
+  # offscreen in bin/test), which a package build shouldn't depend on. In the
+  # release profile, which build() just compiled the dependencies in.
+  cargo test --release --locked --manifest-path core/Cargo.toml
 }
 
 package() {

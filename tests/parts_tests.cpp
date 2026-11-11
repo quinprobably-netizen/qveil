@@ -204,8 +204,13 @@ private slots:
 
     void theTypefaceIsJetBrainsMonoWhereverItIsInstalled()
     {
-        if (!QFontDatabase::hasFamily(jetBrains))
+        if (!QFontDatabase::hasFamily(jetBrains)) {
+            // bin/test asks for it outside CI: a package that depends on the font
+            // should not have its typeface go untested because the font went.
+            if (qEnvironmentVariable("QVEIL_TEST_REQUIRE_FONT") == "1")
+                QFAIL("JetBrainsMono Nerd Font isn't installed here, and QVEIL_TEST_REQUIRE_FONT=1 asks for it");
             QSKIP("JetBrainsMono Nerd Font isn't installed here");
+        }
         Stage stage("Item {}");
         QVERIFY2(stage.item, qPrintable(stage.error));
         // Whatever the desktop's interface font is.

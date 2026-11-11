@@ -122,9 +122,10 @@ struct App {
         // What has only just appeared or moved is laid out with the next
         // frame; a click sent before that would go where the item was.
         // A page that is still filling moves what is on it; the click waits
-        // until the target has stood still for a moment.
+        // until the target has stood still for a moment (for as long as it
+        // takes: a machine that is busy draws its frames late).
         QPointF was(-1, -1);
-        for (int i = 0; i < 25; ++i) {
+        for (int i = 0; i < 125; ++i) {
             QTest::qWait(40);
             const QPointF now = target->mapToScene(QPointF(0, 0));
             if (now == was)
@@ -1060,7 +1061,8 @@ private slots:
 
         // The order is two plain words, and the note is near them: on their line
         // at the far end where it fits, else under them. In JetBrains Mono the
-        // sheet's 384 pixels hold the words and the note's 36 letters only one above the other.
+        // sheet's 384 pixels hold the words and the note's 36 letters only one above the other,
+        // so with it installed that is the one layout; with another typeface either is.
         const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
         QQuickItem *top = app.item("comments-top"), *newest = app.item("comments-new"), *note = app.item("comments-note");
         QVERIFY(top->isVisible() && newest->isVisible() && note->isVisible());
@@ -1071,13 +1073,17 @@ private slots:
         QCOMPARE(top->property("color").value<QColor>().alpha(), 0);
         QQuickItem *sheet = app.item("sheet");
         QVERIFY(box(note).right() <= box(sheet).right());
-        if (qAbs(box(note).center().y() - box(top).center().y()) <= 2) {
+        const bool beside = qAbs(box(note).center().y() - box(top).center().y()) <= 2;
+        if (QFontDatabase::hasFamily("JetBrainsMono Nerd Font"))
+            QVERIFY2(!beside, "the note is on the words' line, which JetBrains Mono's width has no room for");
+        else
+            qInfo("JetBrainsMono Nerd Font isn't installed here: the note is %s the words, which either layout passes", beside ? "beside" : "under");
+        if (beside) {
             QVERIFY(box(note).left() >= box(newest).right());
             QVERIFY(box(note).center().x() > box(sheet).center().x());
         } else {
             QVERIFY2(box(note).top() >= box(top).bottom() - 1, "the note is under the words");
             QVERIFY(box(note).left() >= box(sheet).left() && box(note).left() <= box(top).left() + 12);
-            QVERIFY(QFontDatabase::hasFamily("JetBrainsMono Nerd Font"));
         }
 
         // Pressing it shows the engine's whole sentence under, and again hides it.
@@ -1297,7 +1303,7 @@ private slots:
         const auto playing = [](App &app) { return app.item("surface")->property("info").toMap().value("id").toString(); };
         {
             // From a list: Replay beside a primary Next, with its key, and nothing is started.
-            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_NO_RANGES", "1"}});
             READY(app);
             QMetaObject::invokeMethod(app.window, "playListed", Q_ARG(QVariant, QString("Latest from your channels")),
                                       Q_ARG(QVariant, app.backend->feed()->get(0)), Q_ARG(QVariant, QVariant::fromValue<QObject *>(app.backend->feed())),
@@ -1331,7 +1337,7 @@ private slots:
         }
         {
             // With no list, or at the end of it: Replay alone, filled, as it was.
-            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_NO_RANGES", "1"}});
             READY(app);
             app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
             playToTheEnd(app);
@@ -1483,7 +1489,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && !surface->property("pending").toBool(), 15000);
         QVERIFY(app.window->property("watching").toBool());
         QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000002"));
-        // (What the window asked of the player: the stand-in's stream can't be seeked, so how far it gets is its own.)
+        // (What the window asked of the player: it starts from where the video was, give or take what the player's seek lands on.)
         const double at = surface->property("startedAt").toDouble();
         QVERIFY2(at >= 38 && at < 100, qPrintable(QString::number(at)));
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
@@ -1532,11 +1538,12 @@ private slots:
         QQuickItem *main = app.item("surface");
         QObject *mainMpv = main->property("mpv").value<QObject *>();
         QTRY_VERIFY_WITH_TIMEOUT(mainMpv && mainMpv->property("started").toBool(), 15000);
+        const int notedBeforeSeek = app.asked("POST api/resume");
         QMetaObject::invokeMethod(main, "seekTo", Q_ARG(QVariant, 40));
         QTRY_VERIFY_WITH_TIMEOUT(mainMpv->property("position").toDouble() >= 40, 10000);
         QTRY_VERIFY(!mainMpv->property("buffering").toBool());
-        // (Where a seek got to is told once it has rested.)
-        QTest::qWait(1000);
+        // (Where a seek got to is told once it has rested: wait for that note, so none is left to come in under the checks below.)
+        QTRY_VERIFY_WITH_TIMEOUT(app.asked("POST api/resume") > notedBeforeSeek, 10000);
         // What opening the video asks of the engine: a lookup, and its stream.
         const int looked = app.asked("POST api/play"), streamed = app.asked("GET s/");
         QVERIFY(streamed >= 1);
@@ -1629,7 +1636,7 @@ private slots:
         // Home: the shelf's last action ends `pad` past the lead above it.
         QQuickItem *refresh = nullptr;
         QTRY_VERIFY((refresh = app.item("shelf-refresh")) && refresh->isVisible());
-        QCOMPARE(box(refresh).right(), box(app.item("lead")).right() + pad);
+        QTRY_COMPARE(box(refresh).right(), box(app.item("lead")).right() + pad);
 
         // A search: "Keep as a lens" ends `pad` past the rule under the heading.
         QMetaObject::invokeMethod(app.item("search"), "edit");
@@ -1645,7 +1652,7 @@ private slots:
         QTRY_COMPARE(app.page(), QString("lenses"));
         QQuickItem *del = nullptr;
         QTRY_VERIFY((del = app.item("lens-delete")) && del->isVisible());
-        QCOMPARE(box(del).right(), qreal(1280 - 24) + pad);
+        QTRY_COMPARE(box(del).right(), qreal(1280 - 24) + pad);
     }
 
     void theChannelsPaneHeadingStandsOverItsFirstPicture()
@@ -2305,7 +2312,7 @@ private slots:
         QCOMPARE(home->property("row").toInt(), 0);
         for (int i = 0; i < 4; ++i)
             QTest::keyClick(app.window, Qt::Key_Left);
-        QCOMPARE(home->property("column").toInt(), 0);
+        QTRY_COMPARE(home->property("column").toInt(), 0);
     }
 
     void withNothingKeptHomeStartsWithTheLatest()

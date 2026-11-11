@@ -309,6 +309,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
+    def stream(self):
+        """The clip, whole or as the `Range: bytes=a-[b]` asks (as the real stream is), so a player can seek in it."""
+        size = os.path.getsize(CLIP)
+        first, last, code = 0, size - 1, 200
+        # QVEIL_STANDIN_NO_RANGES: a stream that can't be seeked in, for the test of what the
+        # window shows at the end of a video (a player that can seek goes back to the last frame
+        # it dropped, and the video is then not at its end until it plays on).
+        ranged = os.environ.get("QVEIL_STANDIN_NO_RANGES") != "1"
+        asked = self.headers.get("Range", "") if ranged else ""
+        if asked.startswith("bytes=") and "," not in asked:
+            a, _, b = asked[len("bytes="):].partition("-")
+            if a.isdigit() and (b.isdigit() or not b):
+                first, last, code = int(a), min(int(b), size - 1) if b else size - 1, 206
+        # Only here is it HTTP/1.1 (the rest are served as 1.0), and each answer closes its connection.
+        self.protocol_version = "HTTP/1.1"
+        if code == 206 and (first >= size or first > last):
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % size)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+        self.send_response(code)
+        self.send_header("Content-Type", "video/x-matroska")
+        if ranged:
+            self.send_header("Accept-Ranges", "bytes")
+        if code == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (first, last, size))
+        self.send_header("Content-Length", str(last - first + 1))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        with open(CLIP, "rb") as f:
+            f.seek(first)
+            left = last - first + 1
+            try:
+                while left > 0 and (chunk := f.read(min(65536, left))):
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+            except OSError:
+                pass
+
     def do_GET(self):
         path, q = self.parts()
         base = "http://%s/t" % self.headers.get("Host", "127.0.0.1")
@@ -445,17 +486,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif path.startswith("s/") and CLIP:
-            size = os.path.getsize(CLIP)
-            self.send_response(200)
-            self.send_header("Content-Type", "video/x-matroska")
-            self.send_header("Content-Length", str(size))
-            self.end_headers()
-            with open(CLIP, "rb") as f:
-                try:
-                    while chunk := f.read(65536):
-                        self.wfile.write(chunk)
-                except OSError:
-                    pass
+            self.stream()
         else:
             self.send(404, {"error": "not found", "code": "other"})
 
@@ -522,19 +553,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "api/resume":
             # For the tests of a window that quits while the engine is not answering.
             time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_RESUME", "0")))
-            state["resume"] = [r for r in state["resume"] if r["id"] != body.get("v")]
+            # As the engine judges it: with resume off nothing is stored, a
+            # position it can't judge changes nothing, and any other one replaces
+            # what was kept for the video (or, if it isn't worth keeping, removes it).
+            days = state["config"]["resumeDays"]
             pos, dur = int(body.get("pos", 0)), int(body.get("dur", 0))
+            if days == 0:
+                self.send(200, {"noted": "off"})
+                return
             if dur <= 0 or pos > dur:
-                noted = "unknown"
-            elif pos < 30:
+                self.send(200, {"noted": "unknown"})
+                return
+            state["resume"] = [r for r in state["resume"] if r["id"] != body.get("v")]
+            if pos < 30:
                 noted = "too_early"
-            elif pos + 30 >= dur:
+            elif pos + 30 >= dur or pos * 100 >= dur * 95:
                 noted = "finished"
             else:
                 noted = "kept"
                 state["resume"].insert(0, {"id": body.get("v"), "pos": pos, "dur": dur, "at": NOW,
                                            "title": body.get("title", ""), "channel": body.get("channel"),
-                                           "expires": NOW + 7 * DAY})
+                                           "expires": NOW + days * DAY})
             self.send(200, {"noted": noted})
         elif path == "api/topics/hide":
             state["topics"]["hidden"].append(q.get("id", ""))

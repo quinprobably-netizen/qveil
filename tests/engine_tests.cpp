@@ -72,11 +72,6 @@ public:
         return QTest::qWaitFor([this] { return backend->ready() && backend->config().value("route") == "proxy"; }, 20000);
     }
 
-    // Whether this engine speaks the contract of the engine that sends its own
-    // privacy text, codes with its errors, and streams and joins refreshes. The
-    // tests of those things need it, and skip on an older one.
-    bool modern() const { return backend->config().contains("privacy"); }
-
     Backend &window() { return *backend; }
 
     // The engine's address, without the trailing slash.
@@ -387,8 +382,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that cancels a lookup when the window hangs up");
         Backend &window = rig.window();
         QVERIFY(rig.steer("resolve-delay", "2"));
 
@@ -416,8 +409,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that streams a refresh's progress");
         Backend &window = rig.window();
         QVERIFY(rig.steer("channel-delay", "0.3"));
 
@@ -449,8 +440,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that streams a refresh's progress");
         Backend &window = rig.window();
         window.setIdleTimeout(1000);
         QVERIFY(rig.steer("channel-delay", "0.6"));
@@ -475,8 +464,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that runs one refresh for everyone who asks");
         Backend &window = rig.window();
         QVERIFY(rig.steer("channel-delay", "0.5"));
 
@@ -499,8 +486,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that sends a code with its errors");
         Backend &window = rig.window();
 
         struct Case {
@@ -556,8 +541,6 @@ private slots:
         if (Rig::core().isEmpty())
             QSKIP("build/qveil-core isn't built; bin/build builds it");
         QVERIFY(rig.start());
-        if (!rig.modern())
-            QSKIP("needs the engine that sends a code with its errors");
         Backend &window = rig.window();
         QVERIFY(rig.steer("search-delay", "3"));
         QSignalSpy failed(&window, &Backend::taskFailed);
@@ -752,10 +735,17 @@ private slots:
         QVERIFY(pages.value("comments").toString().contains("only when you open them"));
         QVERIFY(pages.value("lenses").toString().contains("one search per topic"));
         QCOMPARE(rig.window().config().value("resumeDays").toInt(), 7);
-        // An engine that sends none of them leaves them empty, not missing.
-        const QVariantMap none = Backend::privacyOf({}).value("pages").toMap();
-        for (const char *key : {"resume", "comments", "lenses"})
-            QVERIFY(none.contains(key) && none.value(key).toString().isEmpty());
+        // Every line the engine sends is one the window passes on: a key the
+        // engine gains fails here until privacyOf lists it, so it never goes
+        // unshown.
+        const QVariantMap sent = rig.window().config().value("privacy").toMap();
+        const QVariantMap shown = Backend::privacyOf(rig.window().config());
+        for (const char *group : {"pages", "routes"}) {
+            const QVariantMap raw = sent.value(group).toMap(), passed = shown.value(group).toMap();
+            QVERIFY2(!raw.isEmpty(), group);
+            for (auto it = raw.cbegin(); it != raw.cend(); ++it)
+                QVERIFY2(passed.contains(it.key()), qPrintable(QString("%1.%2 is sent by the engine but not passed on").arg(group, it.key())));
+        }
     }
 };
 
