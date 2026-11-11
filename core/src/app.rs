@@ -239,6 +239,23 @@ fn search_topics(
     wanted: &dyn Fn() -> bool,
 ) -> Result<Vec<Ranked>> {
     reading.check()?;
+    // What the ranking needs from this machine is read first: if it can't
+    // be, the searches would be sent for nothing.
+    let subscribed: HashSet<String> = load_subs(paths)?
+        .channels
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    // What was watched is only known when the history is kept.
+    let watched: HashSet<String> = if rt.cfg.history {
+        load_history(paths)?
+            .watched
+            .into_iter()
+            .map(|w| w.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let total = reading.topics.len();
     progress(0, total);
     // Where YouTube has a filter that contains a rule, it does the first
@@ -274,21 +291,6 @@ fn search_topics(
         }
         progress(topic + 1, total);
     }
-    let subscribed: HashSet<String> = load_subs(paths)?
-        .channels
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
-    // What was watched is only known when the history is kept.
-    let watched: HashSet<String> = if rt.cfg.history {
-        load_history(paths)?
-            .watched
-            .into_iter()
-            .map(|w| w.id)
-            .collect()
-    } else {
-        HashSet::new()
-    };
     Ok(rank::rank(
         reading,
         found,

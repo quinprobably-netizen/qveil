@@ -414,6 +414,23 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
     }
 
     #[test]
+    fn a_lens_whose_ranking_cannot_be_done_sends_no_search() {
+        let (bin, base, d) = rig();
+        let id = add(&base, "bread, sourdough")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // What is followed can't be read, so nothing found could be ranked:
+        // the searches would be sent for nothing.
+        let subs = d.paths().subscriptions();
+        std::fs::create_dir_all(subs.parent().unwrap()).unwrap();
+        std::fs::write(&subs, "{ not json").unwrap();
+        let (status, v) = json(&base, "GET", &format!("api/lens?id={id}&refresh=1"), "");
+        assert_eq!(status, 500, "{v}");
+        assert!(asked(&bin).is_empty(), "{:?}", asked(&bin));
+    }
+
+    #[test]
     fn lenses_are_changed_and_removed_and_a_bad_one_is_refused() {
         let (_bin, base, _d) = rig();
         let id = add(&base, "bread")["id"].as_str().unwrap().to_string();
