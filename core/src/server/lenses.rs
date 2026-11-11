@@ -12,7 +12,7 @@ use crate::lens::read::{Reading, read, read_search};
 use crate::lens::{self, Lens};
 use crate::store::Paths;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -54,6 +54,61 @@ fn entry(paths: &Paths, lens: &Lens, now: i64) -> Result<Value> {
 
 fn write_line(out: &mut TcpStream, line: &Value) -> std::io::Result<()> {
     out.write_all(format!("{line}\n").as_bytes())
+}
+
+/// Answers with what `run` comes to, which it is given a way to report its
+/// progress to. With `stream` the reply is lines: `{"progress":{"done":N,
+/// "total":M}}` as it goes, and last `{"result": …}` or `{"error": …,
+/// "code": …}`. Without it, the result is the whole reply and progress isn't
+/// sent. A client that has hung up (`watch`) is sent nothing more.
+fn answer_as_it_goes<T: Serialize>(
+    out: &mut TcpStream,
+    watch: &Watch,
+    stream: bool,
+    run: impl FnOnce(&dyn Fn(usize, usize)) -> Result<T>,
+) -> Result<()> {
+    let out = RefCell::new(out);
+    let started = Cell::new(false);
+    let say = |line: Value| {
+        let mut out = out.borrow_mut();
+        if !started.replace(true) && out.write_all(NDJSON_HEAD.as_bytes()).is_err() {
+            return;
+        }
+        // A client that is gone is noticed by `watch`.
+        let _ = write_line(&mut out, &line);
+    };
+    let progress = |done: usize, total: usize| {
+        if stream {
+            say(json!({ "progress": { "done": done, "total": total } }));
+        }
+    };
+    let result = run(&progress);
+    if watch.gone() {
+        return Ok(());
+    }
+    match (stream, result) {
+        (true, Ok(found)) => say(json!({ "result": found })),
+        (true, Err(e)) => say(errors::body(&format!("{e:#}"))),
+        (false, Ok(found)) => {
+            let body = json!(found).to_string();
+            return respond(
+                &mut out.borrow_mut(),
+                200,
+                "application/json",
+                body.as_bytes(),
+            );
+        }
+        (false, Err(e)) => {
+            let body = errors::body(&format!("{e:#}")).to_string();
+            return respond(
+                &mut out.borrow_mut(),
+                500,
+                "application/json",
+                body.as_bytes(),
+            );
+        }
+    }
+    Ok(())
 }
 
 impl Server {
@@ -120,49 +175,11 @@ impl Server {
     ) -> Result<()> {
         let rt = self.runtime();
         let watch = Watch::new(out);
-        let stream = req.flag("stream");
-        let out = RefCell::new(out);
-        let started = Cell::new(false);
-        let say = |line: Value| {
-            let mut out = out.borrow_mut();
-            if !started.replace(true) && out.write_all(NDJSON_HEAD.as_bytes()).is_err() {
-                return;
-            }
-            let _ = write_line(&mut out, &line);
-        };
-        let progress = |done: usize, total: usize| {
-            if stream {
-                say(json!({ "progress": { "done": done, "total": total } }));
-            }
-        };
         // Also while the setting is still on: turned off, it stops at once.
         let wanted = || !watch.gone() && self.still_on(&rt) && self.runtime().cfg.topic_feeds;
-        let result = self.guarded(&rt, app::topics(&rt, &self.paths, true, &progress, &wanted));
-        if watch.gone() {
-            return Ok(());
-        }
-        match (stream, result) {
-            (true, Ok(found)) => say(json!({ "result": found })),
-            (true, Err(e)) => say(errors::body(&format!("{e:#}"))),
-            (false, Ok(found)) => {
-                return respond(
-                    &mut out.borrow_mut(),
-                    200,
-                    "application/json",
-                    json!(found).to_string().as_bytes(),
-                );
-            }
-            (false, Err(e)) => {
-                let body = errors::body(&format!("{e:#}")).to_string();
-                return respond(
-                    &mut out.borrow_mut(),
-                    500,
-                    "application/json",
-                    body.as_bytes(),
-                );
-            }
-        }
-        Ok(())
+        answer_as_it_goes(out, &watch, req.flag("stream"), |progress| {
+            self.guarded(&rt, app::topics(&rt, &self.paths, true, progress, &wanted))
+        })
     }
 
     /// `GET api/lens?id=…&refresh=0|1&force=0|1`: the lens and its results.
@@ -172,7 +189,6 @@ impl Server {
     pub(super) fn lens(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let rt = self.runtime();
         let watch = Watch::new(out);
-        let stream = req.flag("stream");
         let refresh = if req.flag("force") {
             LensRefresh::Force
         } else if req.flag("refresh") {
@@ -180,52 +196,13 @@ impl Server {
         } else {
             LensRefresh::Off
         };
-        let out = RefCell::new(out);
-        let started = Cell::new(false);
-        let say = |line: Value| {
-            let mut out = out.borrow_mut();
-            if !started.replace(true) && out.write_all(NDJSON_HEAD.as_bytes()).is_err() {
-                return;
-            }
-            // A client that is gone is noticed by `watch`.
-            let _ = write_line(&mut out, &line);
-        };
-        let progress = |done: usize, total: usize| {
-            if stream {
-                say(json!({ "progress": { "done": done, "total": total } }));
-            }
-        };
         let wanted = || !watch.gone() && self.still_on(&rt);
-        let result = req
-            .param("id")
-            .and_then(|id| app::lens(&rt, &self.paths, id, refresh, &progress, &wanted));
-        let result = self.guarded(&rt, result);
-        if watch.gone() {
-            return Ok(());
-        }
-        match (stream, result) {
-            (true, Ok(found)) => say(json!({ "result": found })),
-            (true, Err(e)) => say(errors::body(&format!("{e:#}"))),
-            (false, Ok(found)) => {
-                let body = json!(found).to_string();
-                return respond(
-                    &mut out.borrow_mut(),
-                    200,
-                    "application/json",
-                    body.as_bytes(),
-                );
-            }
-            (false, Err(e)) => {
-                let body = errors::body(&format!("{e:#}")).to_string();
-                return respond(
-                    &mut out.borrow_mut(),
-                    500,
-                    "application/json",
-                    body.as_bytes(),
-                );
-            }
-        }
-        Ok(())
+        answer_as_it_goes(out, &watch, req.flag("stream"), |progress| {
+            let result = req
+                .param("id")
+                .and_then(|id| app::lens(&rt, &self.paths, id, refresh, progress, &wanted));
+            self.guarded(&rt, result)
+        })
     }
 
     /// A search whose query has rules: `api/search`, with or without
