@@ -248,6 +248,11 @@ fn search_topics(
     for (topic, query) in reading.topics.iter().enumerate() {
         let mut search = |sp: Option<&str>| {
             charge()?;
+            // Counting it may have waited for the lock, while the answer
+            // stopped being wanted: then it stays counted, and isn't sent.
+            if !wanted() {
+                bail!(crate::ytdlp::CANCELLED);
+            }
             let mut rank = 0;
             rt.yt.search_each(query, per_topic, sp, &mut |video| {
                 found.push(Found { video, topic, rank });

@@ -1113,6 +1113,42 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
     }
 
     #[test]
+    fn a_search_counted_while_topic_feeds_were_turned_off_is_not_sent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let rt = topics_at(&bin, &d);
+        let paths = d.paths();
+        let on = AtomicBool::new(true);
+        let taken = AtomicBool::new(false);
+        let (give, held) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let refresh = s.spawn(|| {
+                // As the first group begins, someone else takes the lock, so
+                // that counting its first search has to wait.
+                let progress = |done: usize, _| {
+                    if done == 0 && !taken.swap(true, Ordering::SeqCst) {
+                        give.send(crate::store::lock(&paths).unwrap()).unwrap();
+                    }
+                };
+                let wanted = || on.load(Ordering::SeqCst);
+                app::topics(&rt, &paths, true, &progress, &wanted).map(|_| ())
+            });
+            let lock = held.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            // Turned off while it waits: off, then forgotten.
+            on.store(false, Ordering::SeqCst);
+            let _ = std::fs::remove_file(paths.topics_cache());
+            drop(lock);
+            assert!(refresh.join().unwrap().is_err());
+        });
+        assert!(
+            asked(&bin).is_empty(),
+            "sent after it was turned off: {:?}",
+            asked(&bin)
+        );
+    }
+
+    #[test]
     fn topic_feeds_are_off_before_what_they_found_is_deleted() {
         let (_bin, base, d) = rig();
         follow_some_channels(&d);
