@@ -4,7 +4,6 @@
 use super::http::{NDJSON_HEAD, Request, Watch, respond};
 use super::{MAX_SEARCH, Server};
 use crate::app::{self, Runtime};
-use crate::config::Config;
 use crate::errors;
 use crate::ids;
 use crate::inflight::Why;
@@ -336,7 +335,7 @@ impl Server {
         // One change at a time: each reads the current settings, edits them and saves.
         let _one_at_a_time = lock(&self.settings);
         let rt = self.runtime();
-        let mut cfg: Config = toml::from_str(&toml::to_string(&rt.cfg)?)?;
+        let mut cfg = rt.cfg.clone();
         match p.route.as_deref() {
             None => {}
             Some("direct") => cfg.proxy = None,
@@ -1169,19 +1168,19 @@ echo '{"entries":[]}'"#,
     }
 
     #[test]
-    fn the_settings_say_which_keys_of_the_file_were_left_out() {
-        let (_s, base, _d) = server_with(Config {
-            ignored: vec!["something_newer".into()],
-            ..Config::default()
-        });
+    fn the_settings_say_which_keys_of_the_file_were_left_out_and_keep_them_in_it() {
+        let scratch = TempDir::new();
+        let file = scratch.0.join("config.toml");
+        std::fs::write(&file, "something_newer = 3\nlater = [\"a\", \"b\"]\n").unwrap();
+        let (s, base, _d) = server_with(Config::load(&file).unwrap());
         let get = || {
             let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
             assert_eq!(status, 200, "{body}");
             serde_json::from_str::<Value>(&body).unwrap()
         };
-        assert_eq!(get()["ignoredKeys"], json!(["something_newer"]));
-        // A change saves the file with only the keys this version knows, so
-        // after it nothing is being left out any more.
+        assert_eq!(get()["ignoredKeys"], json!(["later", "something_newer"]));
+        // A change saves the file, and with it the keys this version has no
+        // setting for, as they were: a newer qveil needs them.
         let (status, _) = http(
             &base,
             "POST",
@@ -1189,7 +1188,19 @@ echo '{"entries":[]}'"#,
             r#"{"history":true}"#,
         );
         assert_eq!(status, 200);
-        assert_eq!(get()["ignoredKeys"], json!([]));
+        assert_eq!(get()["ignoredKeys"], json!(["later", "something_newer"]));
+        let saved: toml::Table = std::fs::read_to_string(&s.paths.config)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(saved["something_newer"].as_integer(), Some(3));
+        assert_eq!(saved["later"].as_array().unwrap().len(), 2);
+        assert_eq!(saved["history"].as_bool(), Some(true));
+        // Another change, over a route that rebuilds everything, keeps them too.
+        switch_to_tor(&base);
+        let again = Config::load(&s.paths.config).unwrap();
+        assert_eq!(again.ignored, ["later", "something_newer"]);
+        assert_eq!(again.proxy.as_deref(), Some(TOR_PROXY));
     }
 
     #[test]
