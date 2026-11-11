@@ -653,20 +653,24 @@ mod tests {
             .header("range", "bytes=0-")
             .send()
             .unwrap();
-        let mut last = 0;
-        loop {
-            std::thread::sleep(Duration::from_millis(200));
-            let now = up.sent();
-            if now == last {
-                break;
-            }
-            last = now;
+        // It gets that far however slow the sender is (10 s is far more
+        // than it takes)...
+        let started = std::time::Instant::now();
+        while up.sent() < STREAM_WINDOW as usize {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{} KiB let through",
+                up.sent() >> 10
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
+        // ...and no further, with nothing read.
+        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(
-            last,
+            up.sent(),
             STREAM_WINDOW as usize,
             "{} KiB let through",
-            last >> 10
+            up.sent() >> 10
         );
     }
 
