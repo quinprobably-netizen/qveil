@@ -58,6 +58,9 @@ pub struct Net {
     /// The relay's idle timeout, when not `RELAY_IDLE_TIMEOUT`. Only tests
     /// set it, to see one run out in less than a minute.
     relay_idle: Option<Duration>,
+    /// A root certificate (PEM) trusted on top of the usual ones. Only
+    /// tests set it, for a local stand-in that speaks TLS.
+    trusted: Option<&'static [u8]>,
 }
 
 impl Net {
@@ -95,6 +98,7 @@ impl Net {
             allow_http: false,
             h2c: false,
             relay_idle: None,
+            trusted: None,
         })
     }
 
@@ -110,6 +114,14 @@ impl Net {
     pub fn speaking_h2c(mut self) -> Self {
         self.allow_http = true;
         self.h2c = true;
+        self
+    }
+
+    /// The same route, trusting `root` (PEM) as well, for a local upstream
+    /// over TLS. Nothing else changes: plain http is still refused.
+    #[cfg(test)]
+    pub fn trusting(mut self, root: &'static [u8]) -> Self {
+        self.trusted = Some(root);
         self
     }
 
@@ -257,6 +269,9 @@ impl Net {
             .no_proxy();
         if self.h2c {
             b = b.http2_prior_knowledge();
+        }
+        if let Some(root) = self.trusted {
+            b = b.add_root_certificate(reqwest::Certificate::from_pem(root)?);
         }
         if let Some(p) = self.proxy_url() {
             b = b.proxy(reqwest::Proxy::all(&p).context("invalid proxy URL")?);
@@ -750,6 +765,26 @@ mod tests {
         // back yet; never more.)
         let reused = served.lock().unwrap().iter().filter(|&&n| n > 1).count();
         assert!(reused <= POOLED_PER_HOST, "{reused} reused");
+    }
+
+    #[test]
+    fn over_tls_the_production_clients_agree_on_http2() {
+        use crate::h2up::{TEST_ROOT, big_bytes_h2};
+        let up = H2Upstream::start_tls();
+        // What production builds, with only the stand-in's root added: no
+        // plain http, no h2 without asking. ALPN has to pick it.
+        let net = Net::new(None, true).unwrap().trusting(TEST_ROOT);
+        for client in [net.client().unwrap(), net.relay_client().unwrap()] {
+            let resp = client
+                .get(up.url("/big?size=5000"))
+                .header("range", "bytes=10-19")
+                .send()
+                .unwrap();
+            assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+            assert_eq!(resp.status(), 206);
+            assert!(resp.bytes().unwrap() == big_bytes_h2(10, 20));
+        }
+        assert!(up.url("/").starts_with("https://127.0.0.1:"));
     }
 
     #[test]

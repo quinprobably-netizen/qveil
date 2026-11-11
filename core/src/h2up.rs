@@ -7,6 +7,12 @@
 //! `i % 251`, Range requests answered as ranges), with `size=` and `pace=`
 //! (ms between 16 KiB frames) in the query, and `ttfb=` (ms before the
 //! answer). `accept_delay` stands in for what a new connection costs over Tor.
+//!
+//! `start_tls` serves the same over TLS instead, agreeing on `h2` by ALPN as
+//! googlevideo does, so a test can check that a client built as in
+//! production gets there on its own. Its certificate (for 127.0.0.1) and
+//! key are made for these tests only, and signed by `TEST_ROOT`, which only
+//! a client built with `Net::trusting` trusts.
 
 use bytes::Bytes;
 use std::future::poll_fn;
@@ -36,6 +42,29 @@ pub struct Stats {
 pub struct H2Upstream {
     pub addr: SocketAddr,
     pub stats: Arc<Stats>,
+    tls: bool,
+}
+
+/// The root that signed the TLS stand-in's certificate.
+pub const TEST_ROOT: &[u8] = include_bytes!("testdata/ca.pem");
+const TEST_CERT: &[u8] = include_bytes!("testdata/upstream.pem");
+const TEST_KEY: &[u8] = include_bytes!("testdata/upstream.key");
+
+/// Offers `h2` and `http/1.1`, as googlevideo does.
+fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs = vec![CertificateDer::from_pem_slice(TEST_CERT).unwrap()];
+    let key = PrivateKeyDer::from_pem_slice(TEST_KEY).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
 }
 
 impl H2Upstream {
@@ -45,6 +74,16 @@ impl H2Upstream {
 
     /// Each new connection is accepted only after `accept_delay`.
     pub fn start_with(accept_delay: Duration) -> Self {
+        Self::launch(accept_delay, None)
+    }
+
+    /// Over TLS, with `h2` agreed on by ALPN.
+    pub fn start_tls() -> Self {
+        Self::launch(Duration::ZERO, Some(tls_acceptor()))
+    }
+
+    fn launch(accept_delay: Duration, tls: Option<tokio_rustls::TlsAcceptor>) -> Self {
+        let over_tls = tls.is_some();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -60,18 +99,31 @@ impl H2Upstream {
                 while let Ok((sock, _)) = listener.accept().await {
                     seen.connections.fetch_add(1, Ordering::SeqCst);
                     let stats = Arc::clone(&seen);
+                    let tls = tls.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(accept_delay).await;
-                        serve(sock, stats).await;
+                        match tls {
+                            None => serve(sock, stats).await,
+                            Some(tls) => {
+                                if let Ok(sock) = tls.accept(sock).await {
+                                    serve(sock, stats).await;
+                                }
+                            }
+                        }
                     });
                 }
             });
         });
-        H2Upstream { addr, stats }
+        H2Upstream {
+            addr,
+            stats,
+            tls: over_tls,
+        }
     }
 
     pub fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.addr)
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://{}{path}", self.addr)
     }
 
     pub fn connections(&self) -> usize {
@@ -96,7 +148,10 @@ pub fn big_bytes_h2(from: u64, to: u64) -> Vec<u8> {
     (from..to).map(|i| (i % 251) as u8).collect()
 }
 
-async fn serve(sock: tokio::net::TcpStream, stats: Arc<Stats>) {
+async fn serve<S>(sock: S, stats: Arc<Stats>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let Ok(mut conn) = h2::server::handshake(sock).await else {
         return;
     };
