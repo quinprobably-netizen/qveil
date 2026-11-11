@@ -1040,6 +1040,80 @@ private slots:
         QTRY_VERIFY(app.items("next-entry").size() >= 2);
     }
 
+    // Once a video has ended: Replay, and the next in its list; nothing starts by itself.
+    void onceItHasEndedTheVideoOffersReplayAndTheNextInItsList()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        const auto playToTheEnd = [](App &app) {
+            QQuickItem *surface = app.item("surface");
+            QObject *mpv = surface->property("mpv").value<QObject *>();
+            QTRY_VERIFY_WITH_TIMEOUT(mpv && mpv->property("started").toBool(), 15000);
+            QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 119.5));
+            QTRY_VERIFY_WITH_TIMEOUT(mpv->property("ended").toBool(), 20000);
+        };
+        const auto playing = [](App &app) { return app.item("surface")->property("info").toMap().value("id").toString(); };
+        {
+            // From a list: Replay beside a primary Next, with its key, and nothing is started.
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+            READY(app);
+            QMetaObject::invokeMethod(app.window, "playListed", Q_ARG(QVariant, QString("Latest from your channels")),
+                                      Q_ARG(QVariant, app.backend->feed()->get(0)), Q_ARG(QVariant, QVariant::fromValue<QObject *>(app.backend->feed())),
+                                      Q_ARG(QVariant, 0));
+            QTRY_COMPARE(playing(app), QString("vid00000001"));
+            QVERIFY(!app.item("ended")->isVisible());
+            QVERIFY(!app.item("ended-next")->isVisible());
+            playToTheEnd(app);
+            QTRY_VERIFY(app.item("ended")->isVisible());
+            QVERIFY(app.item("ended-replay")->isVisible() && app.item("ended-next")->isVisible());
+            QCOMPARE(app.item("ended-next")->property("text").toString(), QString("Next: A dovetail box with four hand tools"));
+            QVERIFY(app.item("ended-next")->property("primary").toBool());
+            QVERIFY(!app.item("ended-replay")->property("primary").toBool());
+            // Over the picture, with the keys' hint after it.
+            const QRectF at = app.item("ended-next")->mapRectToScene(QRectF(0, 0, app.item("ended-next")->width(), app.item("ended-next")->height()));
+            const QRectF picture = app.item("surface")->mapRectToScene(QRectF(0, 0, app.item("surface")->width(), app.item("surface")->height()));
+            QVERIFY(picture.contains(at));
+            QVERIFY(app.item("ended-replay")->mapToScene(QPointF(0, 0)).x() < at.left());
+            // Nothing plays by itself.
+            QTest::qWait(1500);
+            QCOMPARE(playing(app), QString("vid00000001"));
+            QVERIFY(app.item("ended-next")->isVisible());
+            // The button goes on to it; so does N.
+            app.click(app.item("ended-next"));
+            QTRY_COMPARE(playing(app), QString("vid00000002"));
+            QVERIFY(!app.item("ended-next")->isVisible());
+            playToTheEnd(app);
+            QTRY_VERIFY(app.item("ended-next")->isVisible());
+            QTest::keyClick(app.window, Qt::Key_N);
+            QTRY_COMPARE(playing(app), QString("vid00000003"));
+        }
+        {
+            // With no list, or at the end of it: Replay alone, filled, as it was.
+            App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+            READY(app);
+            app.play({{"id", "vid00000002"}, {"title", "A dovetail box with four hand tools"}});
+            playToTheEnd(app);
+            QTRY_VERIFY(app.item("ended-replay")->isVisible());
+            QVERIFY(!app.item("ended-next")->isVisible());
+            QVERIFY(app.item("ended-replay")->property("filled").toBool());
+            QCOMPARE(app.item("ended")->property("color").value<QColor>().alpha(), 0);
+            // Replay starts it again.
+            QObject *mpv = app.item("surface")->property("mpv").value<QObject *>();
+            app.click(app.item("ended-replay"));
+            QTRY_VERIFY(!mpv->property("ended").toBool());
+            // The last in a list has no next either.
+            QMetaObject::invokeMethod(app.window, "playListed", Q_ARG(QVariant, QString("Latest from your channels")),
+                                      Q_ARG(QVariant, app.backend->feed()->get(11)), Q_ARG(QVariant, QVariant::fromValue<QObject *>(app.backend->feed())),
+                                      Q_ARG(QVariant, 11));
+            QTRY_COMPARE(playing(app), app.backend->feed()->get(11).value("id").toString());
+            playToTheEnd(app);
+            QTRY_VERIFY(app.item("ended-replay")->isVisible());
+            QVERIFY(!app.item("ended-next")->isVisible());
+        }
+    }
+
     void leavingAPlayingVideoHandsItToTheSmallWindow()
     {
         App app;

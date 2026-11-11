@@ -59,6 +59,9 @@ int main(int argc, char *argv[]) {
         {"history-on", "backend.setConfig({ history: true }); backend.loadHistory(); go('history')"},
         {"lens-edit", "go('lenses'); lensesPage.editLens()"},
         {"sort", "feedPage.openSort()"},
+        // A clip of a minute, played to its last moments.
+        {"watch-ended", "playListed(qsTr('Latest from your channels'), backend.feed.get(0), backend.feed, 0); "
+                "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: watch.surface.mpv.seek(59.8, false) }', win)"},
         {"watch-comments", "play(backend.feed.get(0)); watch.enterSheet('comments')"},
     };
     if (!views.contains(view)) {
@@ -105,7 +108,7 @@ int main(int argc, char *argv[]) {
             if (go.hasError())
                 std::fprintf(stderr, "%s\n", qPrintable(go.error().toString()));
         }
-        QTimer::singleShot(view == "pip" ? 8000 : view.startsWith("watch") ? 5000 : 2500, &app, [&] {
+        QTimer::singleShot(view == "pip" ? 8000 : view == "watch-ended" ? 9500 : view.startsWith("watch") ? 5000 : 2500, &app, [&] {
             // The small window is a window of its own.
             QQuickWindow *shown = view == "pip" ? window->property("pipWindow").value<QQuickWindow *>() : window;
             const bool saved = shown && shown->grabWindow().save(out);

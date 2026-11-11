@@ -283,6 +283,8 @@ FocusScope {
             hold: page.hold
             savedVolume: page.savedVolume
             onSavedVolumeChanged: page.savedVolume = savedVolume
+            nextVideo: page.list && page.index >= 0 && page.index + 1 < page.list.count ? page.list.get(page.index + 1) : null
+            onNextRequested: page.playNext()
             onClosed: page.closed()
             onPipRequested: page.pipRequested()
             onTheatreToggled: page.theatre = !page.theatre

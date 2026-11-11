@@ -297,13 +297,64 @@ FocusScope {
         }
     }
 
-    Act {
+    // Once it has ended: Replay, and when a list goes on from here, the way on
+    // to the next in it. (Nothing starts by itself.)
+    // What comes after this video in its list, or null.
+    property var nextVideo: null
+    signal nextRequested()
+    Rectangle {
+        id: ended
+        objectName: "ended"
+        readonly property bool hasNext: !!surface.nextVideo && !surface.compact
         anchors.centerIn: parent
-        visible: mpv.ended
-        text: qsTr("Replay")
-        glyph: "qrc:/icons/replay.svg"
-        filled: true
-        onClicked: mpv.togglePause()
+        // (Not over the next video while it is being looked up: the player still has the last one's end.)
+        visible: mpv.ended && !surface.pending
+        width: endRow.implicitWidth + (hasNext ? Style.u * 4 : 0)
+        height: endRow.implicitHeight + (hasNext ? Style.u * 4 : 0)
+        radius: Style.radius
+        color: hasNext ? Style.scrim : "transparent"
+        Row {
+            id: endRow
+            anchors.centerIn: parent
+            spacing: Style.u * 2
+            Act {
+                objectName: "ended-replay"
+                text: qsTr("Replay")
+                glyph: "qrc:/icons/replay.svg"
+                filled: !ended.hasNext
+                onClicked: mpv.togglePause()
+            }
+            Act {
+                id: nextAct
+                objectName: "ended-next"
+                readonly property string title: surface.nextVideo ? surface.nextVideo.title || "" : ""
+                visible: ended.hasNext
+                glyph: "qrc:/icons/next.svg"
+                primary: true
+                // (A long title is cut to what fits: the button is not wider than half the picture.)
+                text: qsTr("Next: %1").arg(nextFits.elidedText)
+                TextMetrics {
+                    id: nextFits
+                    font.family: Style.font
+                    font.pixelSize: Style.body
+                    font.weight: Style.strong
+                    elide: Qt.ElideRight
+                    elideWidth: Math.min(360, surface.width * 0.45)
+                    text: nextAct.title
+                }
+                onClicked: surface.nextRequested()
+            }
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: ended.hasNext
+                text: "N"
+                textFormat: Text.PlainText
+                color: Style.faint
+                font.family: Style.font
+                font.pixelSize: Style.small
+                rightPadding: Style.u * 2
+            }
+        }
     }
 
     Rectangle {
