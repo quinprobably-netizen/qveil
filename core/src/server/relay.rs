@@ -2,7 +2,7 @@
 //! URL that yt-dlp resolved, over the route the video was opened on.
 
 use super::Server;
-use super::http::{Request, respond};
+use super::http::{Request, Watch, respond};
 use super::warm::{Head, Meta, Warm};
 use crate::errors::friendly;
 use crate::ids::VideoRef;
@@ -12,7 +12,8 @@ use anyhow::{Result, bail};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use reqwest::{Method, StatusCode};
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +55,9 @@ pub(super) const SPARE_WITHIN: Duration = Duration::from_secs(3);
 const POOLED_FOR: Duration = Duration::from_secs(30);
 /// How often a relay waiting on the other side of `Ahead` looks at the cancel flag.
 const AHEAD_POLL: Duration = Duration::from_millis(250);
+/// How long a resolve again that failed is the answer for the requests on
+/// the same resolve, instead of trying again (see `Server::resolve_again`).
+const FAILED_FOR: Duration = Duration::from_secs(10);
 /// How often a session may put a new client, or a new lookup, in place of
 /// one that stalled (see `Server::recover`). A route that keeps stalling
 /// ends its streams instead of costing an identity every time.
@@ -84,6 +88,9 @@ pub(super) struct Session {
     pub(super) spare: Mutex<Spare>,
     /// When a stalled client was last replaced (see `Server::recover`).
     recovered: Mutex<Option<Instant>>,
+    /// The last resolve again that failed: the generation it was for, when,
+    /// and why (see `Server::resolve_again`).
+    failed: Mutex<Option<(u32, Instant, String)>>,
 }
 
 impl Session {
@@ -99,7 +106,34 @@ impl Session {
             clients: Mutex::new(Vec::new()),
             spare: Mutex::default(),
             recovered: Mutex::new(None),
+            failed: Mutex::new(None),
         }
+    }
+
+    /// Whether nobody waits for what this session is doing any more: it was
+    /// cancelled, or players were seen waiting (by `seen`, asked again and
+    /// again from one thread) and every one of them has gone, hung up or
+    /// served. Before the first player, the warm-up is what waits.
+    fn nobody_waits(&self, seen: &RefCell<Players>) -> bool {
+        if self.cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        let clients = lock(&self.clients);
+        let seen = &mut *seen.borrow_mut();
+        // A `Watch` holds the number of its player's socket, which is only
+        // good while that player is attached (and its socket in `clients`).
+        seen.watches
+            .retain(|id, _| clients.iter().any(|(c, _)| c == id));
+        let mut waiting = false;
+        for (id, client) in clients.iter() {
+            seen.any = true;
+            let watch = seen
+                .watches
+                .entry(*id)
+                .or_insert_with(|| Watch::new(client));
+            waiting |= !watch.gone();
+        }
+        seen.any && !waiting
     }
 
     /// Whether a stalled client may be replaced now, at most once every
@@ -184,6 +218,14 @@ impl Session {
         lock(&self.clients).push((id, client.try_clone()?));
         Ok(Attached { session: self, id })
     }
+}
+
+/// The players a session's work has seen waiting for it (see
+/// `Session::nobody_waits`).
+#[derive(Default)]
+struct Players {
+    watches: HashMap<u64, Watch>,
+    any: bool,
 }
 
 /// A session's spare connection (see `Session::keep_spare`).
@@ -652,7 +694,11 @@ impl Server {
         self.resolve_again(s, seen)
     }
 
-    /// `refresh`, once its lock is held and nobody else has.
+    /// `refresh`, once its lock is held and nobody else has. One that
+    /// failed is not tried again for `seen` within `FAILED_FOR`: requests
+    /// that got a 403 together would otherwise each run yt-dlp in turn,
+    /// one after the other, to fail the same way. It is stopped (and isn't
+    /// taken for a failure) once nobody waits for it.
     fn resolve_again(&self, s: &Session, seen: u32) -> Result<Live> {
         let rt = self.runtime();
         if !rt.net.same_route(&s.route) {
@@ -660,8 +706,24 @@ impl Server {
             // it again would send a request over the route they left.
             bail!("The route changed; open the video again");
         }
+        if let Some((generation, at, why)) = &*lock(&s.failed)
+            && *generation == seen
+            && at.elapsed() < FAILED_FOR
+        {
+            bail!("{why}");
+        }
         let yt = rt.pinned_ytdlp();
-        let streams = yt.resolve(&s.source.watch_url(), &s.format)?;
+        let players = RefCell::default();
+        let gone = || s.nobody_waits(&players);
+        let streams = match yt.resolve_until(&s.source.watch_url(), &s.format, &gone) {
+            Ok(streams) => streams,
+            Err(e) => {
+                if !gone() {
+                    *lock(&s.failed) = Some((seen, Instant::now(), format!("{e:#}")));
+                }
+                return Err(e);
+            }
+        };
         let fresh = Live {
             generation: seen + 1,
             dial: 0,
@@ -1328,7 +1390,7 @@ mod tests {
     use crate::server::testkit::*;
     use crate::store::testing::TempDir;
     use crate::util::lock;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
     fn session_for(rt: &Runtime, url: String) -> Session {
@@ -1679,6 +1741,135 @@ mod tests {
         let (status, _, body) = fetch(&base, "GET", rel(&base, &info.video), &[]);
         assert_eq!((status, body.as_slice()), (403, &b"denied"[..]));
         assert_eq!(runs(&bin.0), 2, "no resolve loop");
+    }
+
+    /// A yt-dlp that answers like `fake_ytdlp` the first time, and runs
+    /// `later` (shell) every time after that, with its run number in `$n`.
+    fn ytdlp_then(dir: &std::path::Path, url: &str, later: &str) -> String {
+        let script = r#"d=$(dirname "$0")
+n=$(cat "$d/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo $n > "$d/runs.new" && mv "$d/runs.new" "$d/runs"
+if [ $n -gt 1 ]; then
+@LATER@
+fi
+cat <<EOF
+{"title":"T","requested_formats":[
+ {"url":"@URL@$n","protocol":"https","vcodec":"avc1"},
+ {"url":"@URL@$n","protocol":"https","vcodec":"none"}]}
+EOF
+"#
+        .replace("@LATER@", later)
+        .replace("@URL@", url);
+        crate::store::testing::script(&dir.join("yt-dlp"), &script)
+    }
+
+    #[test]
+    fn requests_that_403_together_after_a_failed_resolve_share_its_failure() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        // The resolve after the 403 takes a moment and fails.
+        let later = "sleep 1; echo 'ERROR: [youtube] boom' >&2; exit 1";
+        let ytdlp = ytdlp_then(&bin.0, &up.url("/video?gen="), later);
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        // Video and audio, and mpv asking for the video again.
+        let streams = [
+            info.video.clone(),
+            info.audio.clone().unwrap(),
+            info.video.clone(),
+        ];
+        let players: Vec<_> = streams
+            .into_iter()
+            .map(|url| {
+                let base = base.clone();
+                std::thread::spawn(move || fetch(&base, "GET", rel(&base, &url), &[]))
+            })
+            .collect();
+        for p in players {
+            let (status, _, body) = p.join().unwrap();
+            assert_eq!(status, 502, "{}", String::from_utf8_lossy(&body));
+        }
+        // A request that comes a moment later gets it too.
+        assert_eq!(fetch(&base, "GET", rel(&base, &info.video), &[]).0, 502);
+        assert_eq!(runs(&bin.0), 2, "one resolve again between them");
+    }
+
+    /// The process id that `ytdlp_then`'s hanging run recorded, once it has.
+    fn hung_pid(dir: &std::path::Path) -> String {
+        let mut pid = String::new();
+        wait_for("yt-dlp to hang", Duration::from_secs(10), || {
+            pid = std::fs::read_to_string(dir.join("pid")).unwrap_or_default();
+            pid.ends_with('\n')
+        });
+        pid.trim().to_string()
+    }
+
+    const HANG: &str = "echo $$ > \"$d/pid.new\" && mv \"$d/pid.new\" \"$d/pid\"; exec sleep 60";
+
+    fn gone(pid: &str) {
+        wait_for("yt-dlp to be stopped", Duration::from_secs(5), || {
+            !std::path::Path::new("/proc").join(pid).exists()
+        });
+    }
+
+    #[test]
+    fn a_resolve_again_is_stopped_when_the_player_hangs_up() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        let ytdlp = ytdlp_then(&bin.0, &up.url("/video?gen="), HANG);
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        let mut player = TcpStream::connect(addr(&base)).unwrap();
+        write!(
+            player,
+            "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
+            path(&base, rel(&base, &info.video))
+        )
+        .unwrap();
+        let pid = hung_pid(&bin.0);
+        drop(player);
+        gone(&pid);
+    }
+
+    #[test]
+    fn a_resolve_again_is_stopped_when_the_session_ends() {
+        let up = Upstream::start();
+        let bin = TempDir::new();
+        let ytdlp = ytdlp_then(&bin.0, &up.url("/video?gen="), HANG);
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let info = s.open(&test_video()).unwrap();
+        let mut player = TcpStream::connect(addr(&base)).unwrap();
+        player
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            player,
+            "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
+            path(&base, rel(&base, &info.video))
+        )
+        .unwrap();
+        let pid = hung_pid(&bin.0);
+        let sid = rel(&base, &info.video)
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .to_string();
+        s.session(&sid).unwrap().cancel();
+        gone(&pid);
+        // Its player is let go, without a byte of the stream.
+        let mut got = Vec::new();
+        let _ = player.read_to_end(&mut got);
+        assert!(!got.starts_with(b"HTTP/1.1 2"), "{got:?}");
     }
 
     #[test]
