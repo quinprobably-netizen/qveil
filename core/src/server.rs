@@ -496,8 +496,13 @@ impl Server {
 
     /// Serves one connection on its own thread. Until it has shown the token
     /// it only counts against the pool of unverified connections, whose
-    /// oldest member is closed to make room for a newcomer.
+    /// oldest member is closed to make room for a newcomer. A connection
+    /// from another user's process is closed at once (see `from_our_user`).
     fn accept(self: &Arc<Self>, conn: TcpStream) {
+        if !http::from_our_user(&conn) {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+            return;
+        }
         let Ok(pending) = Pending::admit(&self.unverified, &conn) else {
             return;
         };
