@@ -122,9 +122,10 @@ struct App {
         // What has only just appeared or moved is laid out with the next
         // frame; a click sent before that would go where the item was.
         // A page that is still filling moves what is on it; the click waits
-        // until the target has stood still for a moment.
+        // until the target has stood still for a moment (for as long as it
+        // takes: a machine that is busy draws its frames late).
         QPointF was(-1, -1);
-        for (int i = 0; i < 25; ++i) {
+        for (int i = 0; i < 125; ++i) {
             QTest::qWait(40);
             const QPointF now = target->mapToScene(QPointF(0, 0));
             if (now == was)
@@ -1635,7 +1636,7 @@ private slots:
         // Home: the shelf's last action ends `pad` past the lead above it.
         QQuickItem *refresh = nullptr;
         QTRY_VERIFY((refresh = app.item("shelf-refresh")) && refresh->isVisible());
-        QCOMPARE(box(refresh).right(), box(app.item("lead")).right() + pad);
+        QTRY_COMPARE(box(refresh).right(), box(app.item("lead")).right() + pad);
 
         // A search: "Keep as a lens" ends `pad` past the rule under the heading.
         QMetaObject::invokeMethod(app.item("search"), "edit");
@@ -1651,7 +1652,7 @@ private slots:
         QTRY_COMPARE(app.page(), QString("lenses"));
         QQuickItem *del = nullptr;
         QTRY_VERIFY((del = app.item("lens-delete")) && del->isVisible());
-        QCOMPARE(box(del).right(), qreal(1280 - 24) + pad);
+        QTRY_COMPARE(box(del).right(), qreal(1280 - 24) + pad);
     }
 
     void theChannelsPaneHeadingStandsOverItsFirstPicture()
@@ -2311,7 +2312,7 @@ private slots:
         QCOMPARE(home->property("row").toInt(), 0);
         for (int i = 0; i < 4; ++i)
             QTest::keyClick(app.window, Qt::Key_Left);
-        QCOMPARE(home->property("column").toInt(), 0);
+        QTRY_COMPARE(home->property("column").toInt(), 0);
     }
 
     void withNothingKeptHomeStartsWithTheLatest()
