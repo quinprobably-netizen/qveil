@@ -75,7 +75,7 @@ pub struct Ytdlp {
     pub calls: Arc<Inflight>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Streams {
     pub title: String,
     pub channel: Option<String>,

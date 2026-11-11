@@ -72,7 +72,7 @@ impl Kind {
     /// part of the story that depends on it.
     fn route_points(self) -> Vec<&'static str> {
         let relink = "A video that outlives its circuit is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.";
-        let isolated = "Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page.";
+        let isolated = "Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page, and a video played again within nine minutes is played from the same lookup on the same set.";
         match self {
             Kind::Direct => {
                 vec!["YouTube sees your IP address with every request, which links them all."]
@@ -121,7 +121,7 @@ const DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Switching routes",
-        "Switching routes ends the streams playing on the old route, kills the searches, lookups and refreshes still running on it (they answer \"The route changed; try again\"), and drops thumbnails and feeds that were still on their way.",
+        "Switching routes ends the streams playing on the old route, kills the searches, lookups and refreshes still running on it (they answer \"The route changed; try again\"), drops thumbnails and feeds that were still on their way, and forgets the lookups kept for playing a video again (they are kept in memory, until their stream URLs are about to expire, and over a SOCKS proxy for nine minutes at most; clearing the history forgets them too).",
     ),
     (
         "Account and cookies",

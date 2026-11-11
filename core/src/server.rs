@@ -15,6 +15,7 @@
 //! - `jobs`: the feed refresh, one at a time, that requests can join.
 //! - `thumbs`: thumbnails, fetched a page at a time.
 //! - `relay`: the video relay, chunked and Range-forwarding.
+//! - `lookups`: the lookups of the videos played lately, to play them again.
 //! - `warm`: the start and end of a video's streams, fetched when it is opened.
 
 mod api;
@@ -22,6 +23,7 @@ mod comments;
 mod http;
 mod jobs;
 mod lenses;
+mod lookups;
 mod relay;
 #[cfg(test)]
 mod testkit;
@@ -36,6 +38,7 @@ use crate::resume;
 use crate::store::Paths;
 use crate::util::{lock, random_hex};
 use crate::video::Chapter;
+use crate::ytdlp::Streams;
 use anyhow::{Context, Result, bail};
 use http::{
     ACCEPT_BACKOFF, Deadline, Pending, REQUEST_LINE_TIMEOUT, REQUEST_TIMEOUT, Reject, Slot,
@@ -74,6 +77,8 @@ pub struct Server {
     /// when it is opened (see `warm`). Always on, except in the tests that
     /// count every request the upstream gets.
     warming: AtomicBool,
+    /// The lookups of the videos played lately (see `lookups`).
+    lookups: lookups::Lookups,
 }
 
 #[derive(Serialize)]
@@ -144,6 +149,7 @@ impl Server {
             connections: Arc::new(AtomicUsize::new(0)),
             unverified: Arc::new(Unverified::default()),
             warming: AtomicBool::new(true),
+            lookups: lookups::Lookups::default(),
         })
     }
 
@@ -224,24 +230,30 @@ impl Server {
     fn open_until(self: &Arc<Self>, v: &VideoRef, abort: &dyn Fn() -> bool) -> Result<Opened> {
         let base = self.listen()?;
         let rt = self.runtime();
-        let yt = rt.pinned_ytdlp();
         let format = rt.cfg.format();
-        let s = yt.resolve_until(&v.watch_url(), &format, abort)?;
+        // A video played again a little later is played from the same lookup.
+        let (s, live, fresh) = match self.lookups.get(&v.id, &format, &rt.net) {
+            Some((s, live)) => (s, live, false),
+            None => {
+                let yt = rt.pinned_ytdlp();
+                let s = yt.resolve_until(&v.watch_url(), &format, abort)?;
+                let live = Live {
+                    generation: 0,
+                    video: s.video.clone(),
+                    audio: s.audio.clone(),
+                    headers: s.headers.clone(),
+                    client: yt.net.relay_client()?,
+                };
+                (s, live, true)
+            }
+        };
         let has_audio = s.audio.is_some();
         let (video_size, audio_size) = (s.video_size, s.audio_size);
-        let session = Session::new(
-            v.clone(),
-            format,
-            rt.net.clone(),
-            Live {
-                generation: 0,
-                video: s.video,
-                audio: s.audio,
-                headers: s.headers,
-                client: yt.net.relay_client()?,
-            },
-        );
+        let session = Session::new(v.clone(), format.clone(), rt.net.clone(), live.clone());
         let sid = self.register(&rt, session)?;
+        if fresh {
+            self.keep_lookup(&rt, &v.id, &format, &s, &live);
+        }
         // What mpv will ask for first is fetched while the answer travels
         // and mpv starts.
         let session = self.session(&sid);
@@ -328,6 +340,17 @@ impl Server {
             }
         }
         Ok(sid)
+    }
+
+    /// Keeps a lookup made on `rt`'s route for playing the video again,
+    /// unless the route has changed since. Under the sessions lock, like
+    /// `register`, so that it can't slip in after `update_config` has
+    /// cleared the lookups of the old route.
+    fn keep_lookup(&self, rt: &Runtime, id: &str, format: &str, s: &Streams, live: &Live) {
+        let _sessions = lock(&self.sessions);
+        if self.still_on(rt) {
+            self.lookups.put(id, format, &rt.net, s, live);
+        }
     }
 
     fn session(&self, sid: &str) -> Option<Arc<Session>> {

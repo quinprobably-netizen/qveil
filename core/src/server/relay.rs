@@ -372,6 +372,8 @@ impl Server {
             client: yt.net.relay_client()?,
         };
         *lock(&s.live) = fresh.clone();
+        // A lookup kept for playing it again has stopped working too.
+        self.lookups.forget(&s.source.id);
         Ok(fresh)
     }
 }

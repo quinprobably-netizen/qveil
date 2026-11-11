@@ -149,6 +149,8 @@ impl Server {
             }
             ("POST", ["api", "history", "clear"]) => {
                 app::clear_history(paths)?;
+                // They say what was watched lately, too.
+                self.lookups.clear();
                 json!({})
             }
             ("GET", ["api", "read"]) => self.read_json(req),
@@ -307,6 +309,8 @@ impl Server {
             for (_, session) in sessions.drain(..) {
                 session.cancel();
             }
+            // Their URLs only work from the old route's addresses.
+            self.lookups.clear();
             drop(sessions);
             // The identities of the pages of thumbnails belong to the old route too.
             self.thumbs.forget_batches();
