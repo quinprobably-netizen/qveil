@@ -362,11 +362,21 @@ mod tests {
     #[test]
     fn the_head_reaches_the_player_as_it_arrives_not_once_it_is_all_in() {
         let up = Upstream::start();
-        // A round trip of 300 ms and then about 400 KB/s, as over Tor: the
-        // whole video head takes more than two seconds to come.
+        // A round trip of 300 ms and then about 160 KB/s, as over a slow Tor
+        // circuit: the whole video head takes more than six seconds to come,
+        // and the audio's more than a second.
         let (s, base, _d, _bin) =
-            warm_server(&up, &format!("/big?size={SIZE}&ttfb=300&pace=40&run="));
+            warm_server(&up, &format!("/big?size={SIZE}&ttfb=300&pace=100&run="));
         let info = s.open(&test_video()).unwrap();
+        // mpv opens the audio while the video is opening, so each is timed
+        // from its own request, made right after the open.
+        let audio = {
+            let (base, audio) = (base.clone(), info.audio.clone().unwrap());
+            std::thread::spawn(move || {
+                let (head, took, _, a) = first_byte(&base, rel(&base, &audio), "bytes=0-");
+                (head, took, a)
+            })
+        };
         let (head, took, mut body, mut c) = first_byte(&base, rel(&base, &info.video), "bytes=0-");
         eprintln!("first byte of the video after {took:?}");
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
@@ -375,25 +385,32 @@ mod tests {
             "{head}"
         );
         assert!(took < Duration::from_millis(900), "{took:?}");
+        let (head, took, _a) = audio.join().unwrap();
+        eprintln!("first byte of the audio after {took:?}");
+        assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+        assert!(took < Duration::from_millis(900), "{took:?}");
         read_up_to(&mut c, &mut body, 200_000);
         assert!(body[..200_000] == big_bytes(0, 200_000), "the bytes differ");
-        let (_, took, _, _a) = first_byte(
-            &base,
-            rel(&base, info.audio.as_deref().unwrap()),
-            "bytes=0-",
-        );
-        eprintln!("first byte of the audio after {took:?}");
-        assert!(took < Duration::from_millis(900), "{took:?}");
-        // Both came from the requests made at open, and nothing else was
-        // asked for meanwhile: no second request for the start, and no tails.
-        let mut asked = ranges(&up);
-        asked.sort();
-        assert_eq!(
-            asked,
-            [
-                format!("bytes=0-{}", HEAD - 1),
-                format!("bytes=0-{}", AUDIO_HEAD - 1)
-            ]
+        // Both came from the requests made at open: the start was asked for
+        // once for each stream, and no tail was asked for. (What follows a
+        // head that the player has had all of may be on its way already.)
+        let asked = ranges(&up);
+        let heads = [
+            format!("bytes=0-{}", HEAD - 1),
+            format!("bytes=0-{}", AUDIO_HEAD - 1),
+        ];
+        for h in &heads {
+            assert_eq!(asked.iter().filter(|r| *r == h).count(), 1, "{asked:?}");
+        }
+        let follow_ons = [
+            format!("bytes={HEAD}-{}", SIZE - 1),
+            format!("bytes={AUDIO_HEAD}-{}", SIZE - 1),
+        ];
+        assert!(
+            asked
+                .iter()
+                .all(|r| heads.contains(r) || follow_ons.contains(r)),
+            "{asked:?}"
         );
     }
 
