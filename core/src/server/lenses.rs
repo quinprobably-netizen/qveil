@@ -271,6 +271,7 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+    use crate::app::{self, Runtime};
     use crate::config::Config;
     use crate::server::testkit::*;
     use crate::store::testing::{TempDir, script};
@@ -909,22 +910,224 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         topics_on(&base);
         // Twelve searches were already made in the last day (for groups that are gone).
         let now = crate::app::now();
-        let spent = crate::topics::Results {
-            groups: Default::default(),
-            searched: vec![now - 60; 12],
+        let spent = crate::topics::Searched {
+            at: vec![now - 60; 12],
         };
-        crate::store::save_compact(&d.paths().topics_cache(), &spent).unwrap();
+        crate::store::save_compact(&d.paths().topic_searches(), &spent).unwrap();
         let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(status, 200, "{v}");
         assert!(asked(&bin).is_empty(), "{:?}", asked(&bin));
         assert_eq!(v["groups"][0]["videos"], serde_json::json!([]));
+        // Said once, for all the groups it held back.
+        let errors = v["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{v}");
+        assert!(
+            errors[0].as_str().unwrap().contains("twelve searches"),
+            "{v}"
+        );
         // A day on, there is a budget again.
-        let old = crate::topics::Results {
-            groups: Default::default(),
-            searched: vec![now - 25 * 3600; 12],
+        let old = crate::topics::Searched {
+            at: vec![now - 25 * 3600; 12],
         };
-        crate::store::save_compact(&d.paths().topics_cache(), &old).unwrap();
+        crate::store::save_compact(&d.paths().topic_searches(), &old).unwrap();
         json(&base, "GET", "api/topics?refresh=1", "");
         assert!(!asked(&bin).is_empty());
+        // What is noted is when each was sent, and nothing else, in a file only
+        // you can read.
+        use std::os::unix::fs::PermissionsExt;
+        let file = d.paths().topic_searches();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let kept: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(kept.as_object().unwrap().len(), 1, "{kept}");
+        assert_eq!(kept["at"].as_array().unwrap().len(), asked(&bin).len());
+    }
+
+    /// Topic feeds on, outside the server: for driving `app::topics` directly.
+    fn topics_at(bin: &TempDir, d: &TempDir) -> Runtime {
+        follow_some_channels(d);
+        let cfg = Config {
+            ytdlp: searching_ytdlp(&bin.0),
+            topic_feeds: true,
+            ..Config::default()
+        };
+        Runtime::new(cfg, &d.paths(), None, false).unwrap()
+    }
+
+    /// How many searches the groups of `follow_some_channels` make in all.
+    fn all_searches(rt: &Runtime, d: &TempDir) -> usize {
+        app::topics(rt, &d.paths(), false, &|_, _| {}, &|| true)
+            .unwrap()
+            .groups
+            .iter()
+            .map(|g| g.group.searches.len())
+            .sum()
+    }
+
+    #[test]
+    fn a_refresh_cut_off_in_the_middle_of_a_group_has_counted_what_it_sent() {
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let rt = topics_at(&bin, &d);
+        // Each refresh is stopped during its first search (the window went
+        // away, say): the search had gone out all the same.
+        for _ in 0..20 {
+            let before = asked(&bin).len();
+            let wanted = || asked(&bin).len() == before;
+            let r = app::topics(&rt, &d.paths(), true, &|_, _| {}, &wanted);
+            assert!(r.is_err() || asked(&bin).len() == before);
+        }
+        assert_eq!(
+            asked(&bin).len(),
+            crate::topics::BUDGET,
+            "{:?}",
+            asked(&bin)
+        );
+    }
+
+    #[test]
+    fn turning_topic_feeds_off_and_on_does_not_start_the_day_over() {
+        let (bin, base, d) = rig();
+        follow_some_channels(&d);
+        // (Each round's refresh would send all of the groups' searches.)
+        for _ in 0..6 {
+            topics_on(&base);
+            let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
+            assert_eq!(status, 200, "{v}");
+            json(&base, "POST", "api/config", r#"{"topicFeeds":false}"#);
+        }
+        assert!(
+            asked(&bin).len() <= crate::topics::BUDGET,
+            "{}: {:?}",
+            asked(&bin).len(),
+            asked(&bin)
+        );
+    }
+
+    #[test]
+    fn two_refreshes_at_once_search_for_each_group_once_and_keep_to_the_budget() {
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let rt = topics_at(&bin, &d);
+        let all = all_searches(&rt, &d);
+        assert!((2..crate::topics::BUDGET).contains(&all), "{all}");
+        // An older version kept the day's searches in the cache: there were
+        // already some today.
+        let earlier = crate::topics::BUDGET - all;
+        let now = app::now();
+        std::fs::create_dir_all(&d.paths().cache).unwrap();
+        std::fs::write(
+            d.paths().topics_cache(),
+            format!(
+                r#"{{"groups":{{}},"searched":{:?}}}"#,
+                vec![now - 60; earlier]
+            ),
+        )
+        .unwrap();
+        std::fs::write(bin.0.join("delay"), "0.2").unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| app::topics(&rt, &d.paths(), true, &|_, _| {}, &|| true).unwrap());
+            }
+        });
+        let sent = asked(&bin);
+        let mut once = sent.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(once.len(), sent.len(), "a search was sent twice: {sent:?}");
+        assert!(sent.len() + earlier <= crate::topics::BUDGET, "{sent:?}");
+    }
+
+    #[test]
+    fn a_refresh_with_no_connection_counts_only_the_searches_it_tried() {
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let rt = topics_at(&bin, &d);
+        // Every search fails: a group stops at its first.
+        std::fs::write(bin.0.join("failfor"), "ytsearch").unwrap();
+        for n in 1..=5 {
+            let r = app::topics(&rt, &d.paths(), true, &|_, _| {}, &|| true).unwrap();
+            assert_eq!(r.errors.len(), 2, "{:?} {:?}", r.errors, asked(&bin));
+            assert_eq!(asked(&bin).len(), 2 * n, "{:?}", asked(&bin));
+        }
+    }
+
+    #[test]
+    fn results_dated_in_the_future_are_due() {
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let rt = topics_at(&bin, &d);
+        let all = all_searches(&rt, &d);
+        app::topics(&rt, &d.paths(), true, &|_, _| {}, &|| true).unwrap();
+        assert_eq!(asked(&bin).len(), all);
+        // The clock was set back since: what was found seems to be from next week.
+        let mut kept: crate::topics::Results =
+            crate::store::load(&d.paths().topics_cache()).unwrap();
+        for found in kept.groups.values_mut() {
+            found.fetched_at = app::now() + 7 * 24 * 3600;
+        }
+        crate::store::save_compact(&d.paths().topics_cache(), &kept).unwrap();
+        app::topics(&rt, &d.paths(), true, &|_, _| {}, &|| true).unwrap();
+        assert_eq!(asked(&bin).len(), 2 * all);
+    }
+
+    #[test]
+    fn an_unreadable_count_of_the_days_searches_means_no_searches() {
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let rt = topics_at(&bin, &d);
+        std::fs::create_dir_all(&d.paths().data).unwrap();
+        std::fs::write(d.paths().data.join("topic-searches.json"), "{cut sh").unwrap();
+        let r = app::topics(&rt, &d.paths(), true, &|_, _| {}, &|| true).unwrap();
+        assert!(asked(&bin).is_empty(), "{:?}", asked(&bin));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(r.errors[0].contains("can't be read"), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn a_refresh_that_waits_for_the_lock_while_topic_feeds_are_turned_off_saves_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let rt = topics_at(&bin, &d);
+        let paths = d.paths();
+        let listed = app::topics(&rt, &paths, false, &|_, _| {}, &|| true).unwrap();
+        let first = listed.groups[0].group.searches.len();
+        let on = AtomicBool::new(true);
+        let (give, held) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let refresh = s.spawn(|| {
+                // Once the first group's searches are back, someone else
+                // takes the lock before the refresh can save them.
+                let progress = |done: usize, _| {
+                    if done == first {
+                        give.send(crate::store::lock(&paths).unwrap()).unwrap();
+                    }
+                };
+                let wanted = || on.load(Ordering::SeqCst);
+                app::topics(&rt, &paths, true, &progress, &wanted).map(|_| ())
+            });
+            let lock = held.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            // What turning it off does, in its order: off, then forgotten.
+            on.store(false, Ordering::SeqCst);
+            let _ = std::fs::remove_file(paths.topics_cache());
+            drop(lock);
+            assert!(refresh.join().unwrap().is_err());
+        });
+        assert!(!paths.topics_cache().exists(), "found after it was deleted");
+    }
+
+    #[test]
+    fn topic_feeds_are_off_before_what_they_found_is_deleted() {
+        let (_bin, base, d) = rig();
+        follow_some_channels(&d);
+        topics_on(&base);
+        // The store is busy (a refresh is saving, say).
+        let lock = crate::store::lock(&d.paths()).unwrap();
+        let off = {
+            let base = base.clone();
+            std::thread::spawn(move || json(&base, "POST", "api/config", r#"{"topicFeeds":false}"#))
+        };
+        // Already off for everything that asks, while the deleting waits its turn.
+        wait_for("topic feeds to be off", Duration::from_secs(5), || {
+            json(&base, "GET", "api/config", "").1["topicFeeds"] == false
+        });
+        drop(lock);
+        assert_eq!(off.join().unwrap().0, 200);
     }
 }

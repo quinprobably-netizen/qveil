@@ -176,7 +176,15 @@ pub fn lens(
         LensRefresh::Force => true,
     };
     let stored = if due {
-        let videos = search_topics(rt, paths, &reading, lens::PER_TOPIC, progress, wanted)?;
+        let videos = search_topics(
+            rt,
+            paths,
+            &reading,
+            lens::PER_TOPIC,
+            progress,
+            &|| Ok(()),
+            wanted,
+        )?;
         let fresh = Cached {
             fetched_at: at,
             videos,
@@ -214,17 +222,20 @@ pub fn smart_search(
     limit: usize,
     wanted: &dyn Fn() -> bool,
 ) -> Result<Vec<Ranked>> {
-    search_topics(rt, paths, reading, limit, &|_, _| {}, wanted)
+    search_topics(rt, paths, reading, limit, &|_, _| {}, &|| Ok(()), wanted)
 }
 
 /// One search per topic, one after the other, then the ranking. The searches
 /// are all that leaves the machine: the rules and the order are applied here.
+/// `charge` is called before each search is sent, and an error from it stops
+/// the searching there.
 fn search_topics(
     rt: &Runtime,
     paths: &Paths,
     reading: &Reading,
     per_topic: usize,
     progress: &dyn Fn(usize, usize),
+    charge: &dyn Fn() -> Result<()>,
     wanted: &dyn Fn() -> bool,
 ) -> Result<Vec<Ranked>> {
     reading.check()?;
@@ -236,6 +247,7 @@ fn search_topics(
     let mut found = Vec::new();
     for (topic, query) in reading.topics.iter().enumerate() {
         let mut search = |sp: Option<&str>| {
+            charge()?;
             let mut rank = 0;
             rt.yt.search_each(query, per_topic, sp, &mut |video| {
                 found.push(Found { video, topic, rank });
@@ -334,16 +346,72 @@ fn topic_groups(paths: &Paths) -> Result<(Vec<topics::Group>, HashSet<String>)> 
     Ok((groups, subs.channels.into_iter().map(|c| c.id).collect()))
 }
 
+/// One topic feed refresh at a time in this process: a second one waits for
+/// the first, then finds fresh what that one found, so that no group is
+/// searched for twice.
+static TOPICS_REFRESH: Mutex<()> = Mutex::new(());
+
+/// What a refresh says when the day's searches are used up.
+const TOPICS_SPENT: &str = "The topic feeds have made their twelve searches of the last day; what is due is searched for once the oldest of them is a day old.";
+
+/// What a refresh says when the day's searches can't be counted.
+fn topics_uncounted(e: &anyhow::Error) -> String {
+    format!(
+        "No more topic searches are made while the count of the last day's searches can't be read ({e:#})."
+    )
+}
+
+/// The topic searches of the last day, `settle`d, under the store lock. A
+/// file that can't be read is an error, not an empty day: it could only make
+/// for more searches than the budget. An older version kept the times in the
+/// results cache; they are taken from there the first time.
+fn load_topic_searches(paths: &Paths, now: i64) -> Result<topics::Searched> {
+    let path = paths.topic_searches();
+    let mut searched: topics::Searched = match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let old: topics::Results = store::load_cache(&paths.topics_cache())?;
+            topics::Searched { at: old.searched }
+        }
+        _ => store::load(&path)?,
+    };
+    // Once moved over, or once a time is put right, it is written down.
+    if searched.settle(now) || (!searched.at.is_empty() && !path.exists()) {
+        store::save_compact(&path, &searched)?;
+    }
+    Ok(searched)
+}
+
+/// How many more topic searches the day has room for.
+fn topic_searches_left(paths: &Paths) -> Result<usize> {
+    let _lock = store::lock(paths)?;
+    Ok(load_topic_searches(paths, now())?.left())
+}
+
+/// Notes one topic search, before it is sent. False, and nothing is noted,
+/// when the day's are used up.
+fn charge_topic_search(paths: &Paths) -> Result<bool> {
+    let _lock = store::lock(paths)?;
+    let at = now();
+    let mut searched = load_topic_searches(paths, at)?;
+    if !searched.take(at) {
+        return Ok(false);
+    }
+    store::save_compact(&paths.topic_searches(), &searched)?;
+    Ok(true)
+}
+
 /// The topic feeds. While the setting is off this reads nothing and asks
 /// nobody. On, the groups are worked out from what is on this machine; with
 /// `refresh`, a group whose results are missing or a day old is searched for
 /// again, one search per phrase, while the day's budget of searches lasts
-/// (`topics::BUDGET`, whatever the groups are). A group whose search fails is
-/// left as it was and named in `errors`; the others are still searched for.
-/// Videos from channels that are followed are left out. `wanted` is asked
-/// before each group and between searches: once it says no (the client is
-/// gone, the route was left, or the setting was turned off), nothing more is
-/// searched for or saved.
+/// (`topics::BUDGET`, whatever the groups are). Each search is counted before
+/// it is sent, so one that is cut off or fails counts too; a group the budget
+/// has no room for is not begun. A group whose search fails is left as it was
+/// and named in `errors`; the others are still searched for. Videos from
+/// channels that are followed are left out. `wanted` is asked before each
+/// group, between searches and once more before saving, under the lock: once
+/// it says no (the client is gone, the route was left, or the setting was
+/// turned off), nothing more is searched for or saved.
 pub fn topics(
     rt: &Runtime,
     paths: &Paths,
@@ -370,34 +438,65 @@ pub fn topics(
     let mut results: topics::Results = store::load_cache(&paths.topics_cache())?;
     let mut errors = Vec::new();
     if refresh {
+        let _one_at_a_time = lock(&TOPICS_REFRESH);
+        if !wanted() {
+            bail!(crate::ytdlp::CANCELLED);
+        }
+        // What a refresh that this one waited for found.
+        results = store::load_cache(&paths.topics_cache())?;
         let at = now();
         let due: Vec<&topics::Group> = groups
             .iter()
-            .filter(|group| {
-                results
-                    .groups
-                    .get(&group.key())
-                    .is_none_or(|c| at - c.fetched_at >= topics::STALE)
-            })
+            .filter(|group| topics::due(results.groups.get(&group.key()), at))
             .collect();
         // How far it is, counted in searches, over all the groups that are due.
         let total: usize = due.iter().map(|g| g.searches.len()).sum();
         let mut before = 0;
+        // Why groups were not searched for, said once however many there are.
+        let mut held_back: Option<String> = None;
         for group in due {
             let so_far = before;
             before += group.searches.len();
             if !wanted() {
                 bail!(crate::ytdlp::CANCELLED);
             }
-            // It may have been hidden since this began, and the day has a budget.
-            let hidden: topics::Hidden = store::load(&paths.topics())?;
-            if hidden.hides(group) || !results.allows(group.searches.len(), now()) {
-                continue;
+            // Since this began it may have been hidden, or found by another
+            // process; and the day has a budget, which a group must fit in.
+            {
+                let _lock = store::lock(paths)?;
+                let hidden: topics::Hidden = store::load(&paths.topics())?;
+                let kept: topics::Results = store::load_cache(&paths.topics_cache())?;
+                if hidden.hides(group) || !topics::due(kept.groups.get(&group.key()), now()) {
+                    continue;
+                }
+            }
+            match topic_searches_left(paths) {
+                Err(e) => {
+                    held_back = Some(topics_uncounted(&e));
+                    break;
+                }
+                Ok(left) if left < group.searches.len() => {
+                    held_back.get_or_insert_with(|| TOPICS_SPENT.into());
+                    continue;
+                }
+                Ok(_) => {}
             }
             let reading = Reading {
                 topics: group.searches.clone(),
                 subs: crate::lens::read::Subs::Exclude,
                 ..Reading::default()
+            };
+            // Each search is counted before it is sent, so what is sent is
+            // counted, however this ends.
+            let refused: std::cell::RefCell<Option<String>> = Default::default();
+            let charge = || -> Result<()> {
+                let why = match charge_topic_search(paths) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => TOPICS_SPENT.to_string(),
+                    Err(e) => topics_uncounted(&e),
+                };
+                *refused.borrow_mut() = Some(why.clone());
+                bail!(why)
             };
             let found = search_topics(
                 rt,
@@ -405,15 +504,25 @@ pub fn topics(
                 &reading,
                 topics::PER_SEARCH,
                 &|done, _| progress(so_far + done, total),
+                &charge,
                 wanted,
             );
             if !wanted() {
                 bail!(crate::ytdlp::CANCELLED);
             }
-            // The searches were made, whatever came of them.
+            if let Some(why) = refused.take() {
+                // Cut short by the budget (another process spent it), so
+                // there is nothing to keep.
+                held_back = Some(why);
+                continue;
+            }
             let _lock = store::lock(paths)?;
+            // Asked again now that it is this one's turn: the setting may have
+            // been turned off while it waited, and what was found deleted.
+            if !wanted() {
+                bail!(crate::ytdlp::CANCELLED);
+            }
             let mut kept: topics::Results = store::load_cache(&paths.topics_cache())?;
-            kept.spent(group.searches.len(), now());
             match found {
                 Ok(videos) => {
                     kept.groups.insert(
@@ -426,15 +535,16 @@ pub fn topics(
                 }
                 Err(e) => errors.push(format!("{}: {e:#}", group.label)),
             }
-            // What there is no group for any more goes once it is a day old:
+            // What there is no group for any more goes once it is due again:
             // a group that comes back sooner has not been searched for twice.
             let now_at = now();
             kept.groups.retain(|key, found| {
-                groups.iter().any(|g| g.key() == *key) || now_at - found.fetched_at < topics::STALE
+                groups.iter().any(|g| g.key() == *key) || !topics::due(Some(found), now_at)
             });
             store::save_compact(&paths.topics_cache(), &kept)?;
-            results = kept;
         }
+        errors.extend(held_back);
+        results = store::load_cache(&paths.topics_cache())?;
     }
     // Asked again: one may have been hidden while this ran.
     let groups = shown(&store::load(&paths.topics())?);
@@ -493,7 +603,11 @@ pub fn hide_topic(paths: &Paths, id: &str) -> Result<()> {
     store::save(&paths.topics(), &hidden)
 }
 
-/// Forgets what the topic feeds found (when they are turned off).
+/// Forgets what the topic feeds found (when they are turned off). When the
+/// day's searches were sent is kept (`Paths::topic_searches`), until each is
+/// a day old: forgotten, turning them on again would start the count over.
+/// Call it once the setting is off for everything that is running, so that a
+/// refresh that was about to save asks `wanted` and finds it is not.
 pub fn forget_topics(paths: &Paths) -> Result<()> {
     let _lock = store::lock(paths)?;
     match std::fs::remove_file(paths.topics_cache()) {

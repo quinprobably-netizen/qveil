@@ -76,6 +76,11 @@ impl Paths {
     pub fn topics_cache(&self) -> PathBuf {
         self.cache.join("topics.json")
     }
+    /// When the topic feeds' searches of the last day were sent (see
+    /// `topics::Searched`). Data, not cache: it outlives what they found.
+    pub fn topic_searches(&self) -> PathBuf {
+        self.data.join("topic-searches.json")
+    }
     pub fn feed_cache(&self) -> PathBuf {
         self.cache.join("feed.json")
     }

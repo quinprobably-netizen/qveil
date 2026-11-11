@@ -68,27 +68,60 @@ impl Hidden {
     }
 }
 
-/// What the searches last found, by what was searched for (`Group::key`),
-/// and when each search of the last day was made.
+/// What the searches last found, by what was searched for (`Group::key`).
 #[derive(Default, Serialize, Deserialize)]
 pub struct Results {
     #[serde(default)]
     pub groups: HashMap<String, crate::lens::Cached>,
-    #[serde(default)]
+    /// When the day's searches were made, as an older version kept them,
+    /// here: read once into `Searched`, and never written again.
+    #[serde(default, skip_serializing)]
     pub searched: Vec<i64>,
 }
 
-impl Results {
-    /// Whether `n` more searches fit in the day that ends at `now`.
-    pub fn allows(&self, n: usize, now: i64) -> bool {
-        let spent = self.searched.iter().filter(|t| now - **t < STALE).count();
-        spent + n <= BUDGET
+/// Whether a group whose searches found `found` is to be searched for again
+/// at `now`: nothing was found, or it is a day old. Found "later" than now
+/// means the clock was set back since, and its age is not known: it is due.
+pub fn due(found: Option<&crate::lens::Cached>, now: i64) -> bool {
+    found.is_none_or(|c| c.fetched_at > now || now - c.fetched_at >= STALE)
+}
+
+/// When each of the last day's searches was sent. Kept apart from what they
+/// found, in the data directory, and not deleted when topic feeds are turned
+/// off, so that turning them off and on again doesn't give the day a new
+/// budget. A search is noted before it is sent.
+#[derive(Default, Serialize, Deserialize)]
+pub struct Searched {
+    #[serde(default)]
+    pub at: Vec<i64>,
+}
+
+impl Searched {
+    /// Forgets the searches that are a day old at `now`. A time later than
+    /// `now` (the clock was set back) counts as `now`: kept as it was, it
+    /// would count for more than a day. Says whether anything changed.
+    pub fn settle(&mut self, now: i64) -> bool {
+        let before = self.at.clone();
+        for t in &mut self.at {
+            *t = (*t).min(now);
+        }
+        self.at.retain(|t| now - *t < STALE);
+        self.at != before
     }
 
-    /// Notes `n` searches made at `now`, and forgets those older than a day.
-    pub fn spent(&mut self, n: usize, now: i64) {
-        self.searched.retain(|t| now - *t < STALE);
-        self.searched.extend(std::iter::repeat_n(now, n));
+    /// How many more searches fit in the day, once `settle`d.
+    pub fn left(&self) -> usize {
+        BUDGET.saturating_sub(self.at.len())
+    }
+
+    /// Notes one search sent at `now`, if the day has room for it.
+    pub fn take(&mut self, now: i64) -> bool {
+        self.settle(now);
+        if self.left() == 0 {
+            return false;
+        }
+        self.at.push(now);
+        true
     }
 }
 
@@ -498,15 +531,48 @@ mod tests {
     #[test]
     fn a_day_allows_twelve_searches() {
         let now = 1_000_000;
-        let mut results = Results::default();
-        assert!(results.allows(3, now));
-        results.searched = vec![now - 10; 10];
-        assert!(results.allows(2, now));
-        assert!(!results.allows(3, now));
-        // What is older than a day no longer counts.
-        results.searched = vec![now - STALE - 1; 12];
-        assert!(results.allows(3, now));
-        results.spent(3, now);
-        assert_eq!(results.searched, vec![now; 3]);
+        let mut searched = Searched::default();
+        assert_eq!(searched.left(), BUDGET);
+        searched.at = vec![now - 10; 10];
+        assert!(searched.take(now) && searched.take(now));
+        assert!(!searched.take(now));
+        assert_eq!(searched.at.len(), 12);
+        // What is a day old no longer counts.
+        searched.at = vec![now - STALE; 12];
+        assert!(searched.take(now));
+        assert_eq!(searched.at, [now]);
+    }
+
+    #[test]
+    fn a_search_from_the_future_counts_as_now_and_not_for_ever() {
+        let now = 1_000_000;
+        let week = 7 * 24 * 3600;
+        let mut searched = Searched {
+            at: vec![now + week; 12],
+        };
+        assert!(searched.settle(now));
+        assert_eq!(searched.at, vec![now; 12]);
+        assert!(!searched.take(now + STALE - 1));
+        // A day on, by the clock as it is now, they are a day old.
+        assert!(searched.take(now + STALE));
+        assert_eq!(searched.at, [now + STALE]);
+        assert!(!searched.settle(now + STALE));
+    }
+
+    #[test]
+    fn results_from_the_future_are_due() {
+        let found = |fetched_at| crate::lens::Cached {
+            fetched_at,
+            videos: Vec::new(),
+        };
+        let now = 1_000_000;
+        assert!(due(None, now));
+        assert!(!due(Some(&found(now - 60)), now));
+        assert!(due(Some(&found(now - STALE)), now));
+        assert!(due(Some(&found(now + 60)), now));
+        // What an older version kept beside them is read, and not written back.
+        let old: Results = serde_json::from_str(r#"{"groups":{},"searched":[5,6]}"#).unwrap();
+        assert_eq!(old.searched, [5, 6]);
+        assert_eq!(serde_json::to_string(&old).unwrap(), r#"{"groups":{}}"#);
     }
 }

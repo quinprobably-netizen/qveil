@@ -279,14 +279,11 @@ impl Server {
         next.cfg.save(&self.paths.config)?;
         // Off means forgotten, not just no longer offered. A shorter time
         // takes what is now too old with it.
-        // Turned off, what the topic feeds found is not kept.
-        if rt.cfg.topic_feeds && !next.cfg.topic_feeds {
-            app::forget_topics(&self.paths)?;
-        }
         if next.cfg.resume_days != rt.cfg.resume_days {
             resume::purge(&self.paths, next.cfg.resume_days, app::now())?;
         }
         let route_changed = !next.net.same_route(&rt.net);
+        let topics_off = rt.cfg.topic_feeds && !next.cfg.topic_feeds;
         if !route_changed {
             // The same route keeps its running calls (and the registry that
             // can still stop them at exit); a new route starts with none.
@@ -311,6 +308,14 @@ impl Server {
             // try again. Closed after the swap, so what starts from now on
             // belongs to the new route.
             rt.yt.calls.close(Why::RouteChanged);
+        } else {
+            drop(sessions);
+        }
+        // Turned off, what the topic feeds found is not kept. Deleted after
+        // the swap: a refresh that is running sees the setting off before it
+        // can save, so nothing it found is put back afterwards.
+        if topics_off {
+            app::forget_topics(&self.paths)?;
         }
         Ok(())
     }
