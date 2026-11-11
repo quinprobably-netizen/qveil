@@ -91,8 +91,9 @@ impl Server {
     /// next (the next one in the list, near the end of this one), so that
     /// playing it needs no lookup of its own (see `lookups`). Only while
     /// that is turned on. One at a time: a new one ends the one before, and
-    /// the window hanging up (it moved on to another video) ends it too.
-    /// Nothing is added to the history: nothing was watched.
+    /// the window hanging up (it moved on to another video) ends it too,
+    /// unless a play of the same video is waiting on it (see
+    /// `lookups::Running`). Nothing is added to the history: nothing was watched.
     pub(super) fn prepare_next(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let watch = Watch::new(out);
         let rt = self.runtime();
@@ -111,7 +112,14 @@ impl Server {
             if let Some(before) = lock(&self.preparing).replace(Arc::clone(&mine)) {
                 before.store(true, Ordering::Release);
             }
-            let given_up = || mine.load(Ordering::Acquire) || watch.gone();
+            // A play of this video while it runs waits for it (see
+            // `lookups::Running`), and keeps it going after this gives up.
+            let running = self.lookups.begin(&v.id, &format, &rt.net);
+            let given_up = || {
+                running
+                    .run
+                    .give_up(mine.load(Ordering::Acquire) || watch.gone())
+            };
             let done = self.look_up(&rt, &v, &format, &given_up);
             {
                 let mut preparing = lock(&self.preparing);
@@ -119,8 +127,16 @@ impl Server {
                     *preparing = None;
                 }
             }
-            let (s, live) = self.guarded(&rt, done)?;
-            self.keep_lookup(&rt, &v.id, &format, &s, &live);
+            let done = self.guarded(&rt, done);
+            // Kept before the plays waiting on it are told, and before it is
+            // no longer found running, so that a play that comes in between
+            // finds one or the other.
+            if let Ok((s, live)) = &done {
+                self.keep_lookup(&rt, &v.id, &format, s, live);
+            }
+            running.finish(&done);
+            drop(running);
+            done?;
             Ok(true)
         });
         match prepared {
@@ -1204,6 +1220,122 @@ echo '{"entries":[]}'"#,
         assert_eq!(status, 200, "{body}");
         assert_eq!(runs(&bin.0), 1);
         assert_eq!(app::load_history(&s.paths).unwrap().watched.len(), 1);
+    }
+
+    /// A yt-dlp that counts its runs like `fake_ytdlp`, and answers only
+    /// once a file `go` is next to it: a lookup that takes as long as the
+    /// test wants.
+    fn gated_ytdlp(dir: &std::path::Path, url: &str) -> String {
+        let script = r#"d=$(dirname "$0")
+n=$(cat "$d/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo $n > "$d/runs"
+while [ ! -e "$d/go" ]; do sleep 0.02; done
+cat <<EOF
+{"title":"T","requested_formats":[
+ {"url":"@URL@$n","protocol":"https","vcodec":"avc1"},
+ {"url":"@URL@$n","protocol":"https","vcodec":"none"}]}
+EOF
+"#
+        .replace("@URL@", url);
+        crate::store::testing::script(&dir.join("yt-dlp"), &script)
+    }
+
+    /// Sends a POST to `rest` and leaves the connection open, for the
+    /// caller to read the reply from or to hang up.
+    fn post_open(base: &str, rest: &str) -> TcpStream {
+        let mut c = TcpStream::connect(addr(base)).unwrap();
+        write!(
+            c,
+            "POST {} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+            path(base, rest)
+        )
+        .unwrap();
+        c
+    }
+
+    #[test]
+    fn playing_the_video_that_is_being_got_ready_waits_for_that_lookup() {
+        let bin = TempDir::new();
+        let ytdlp = gated_ytdlp(&bin.0, "https://gv.test/v?expire=99999999999&n=");
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            prepare_next: true,
+            ..Config::default()
+        });
+        let prepare = post_open(&base, "api/prepare?v=dQw4w9WgXcQ");
+        wait_for("the lookup ahead to start", Duration::from_secs(10), || {
+            runs(&bin.0) == 1
+        });
+        // N, while the lookup ahead is still running.
+        let play = {
+            let base = base.clone();
+            std::thread::spawn(move || {
+                http(&base, "POST", &path(&base, "api/play?v=dQw4w9WgXcQ"), "")
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!play.is_finished());
+        // The window lets go of the lookup ahead (it did, before the play):
+        // the play still wants it, so it carries on.
+        drop(prepare);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(s.runtime().yt.calls.running(), 1, "the lookup was stopped");
+        std::fs::write(bin.0.join("go"), "").unwrap();
+        let (status, body) = play.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        let info: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["title"], "T");
+        assert_eq!(runs(&bin.0), 1, "the play looked it up again");
+        // Its session plays what that lookup found.
+        let sid = rel(&base, info["video"].as_str().unwrap())
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .to_string();
+        assert!(lock(&s.session(&sid).unwrap().live).video.ends_with("&n=1"));
+        // And it is kept for playing it again, as a lookup ahead always was.
+        let (status, _) = http(&base, "POST", &path(&base, "api/play?v=dQw4w9WgXcQ"), "");
+        assert_eq!(status, 200);
+        assert_eq!(runs(&bin.0), 1);
+    }
+
+    #[test]
+    fn a_lookup_ahead_ends_once_neither_it_nor_a_play_waiting_on_it_is_wanted() {
+        let bin = TempDir::new();
+        let (s, base, _d) = server_with(Config {
+            ytdlp: hanging_ytdlp(&bin.0),
+            prepare_next: true,
+            ..Config::default()
+        });
+        let prepare = post_open(&base, "api/prepare?v=dQw4w9WgXcQ");
+        let (pid, private) = hanging_running(&bin.0);
+        std::fs::remove_file(bin.0.join("pid")).unwrap();
+        let play = post_open(&base, "api/play?v=dQw4w9WgXcQ");
+        std::thread::sleep(Duration::from_millis(300));
+        // Another video is next in line, and the window lets go of the old
+        // lookup ahead: the play waiting on it keeps it going.
+        let other = post_open(&base, "api/prepare?v=bbbbbbbbbbb");
+        drop(prepare);
+        let (other_pid, other_private) = hanging_running(&bin.0);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            std::path::Path::new("/proc").join(&pid).exists(),
+            "the lookup was stopped"
+        );
+        assert_eq!(
+            s.runtime().yt.calls.running(),
+            2,
+            "the play ran a lookup of its own"
+        );
+        // The play gives up too: nobody wants it any more.
+        drop(play);
+        assert_stopped_and_cleaned_up(&pid, &private);
+        drop(other);
+        assert_stopped_and_cleaned_up(&other_pid, &other_private);
+        wait_for("the registry to be empty", Duration::from_secs(5), || {
+            s.runtime().yt.calls.running() == 0
+        });
     }
 
     #[test]

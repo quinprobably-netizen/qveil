@@ -3799,6 +3799,72 @@ private slots:
         QCOMPARE(app.asked("POST api/prepare"), 1);
     }
 
+    // A clip shorter than the 30 s before the end in which the next video is
+    // got ready: as soon as it is playing, it is near its end. Empty when
+    // there is no ffmpeg to make it.
+    static QString shortClip(const QTemporaryDir &dir)
+    {
+        const QString clip = dir.filePath("clip.mkv");
+        QProcess make;
+        make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=d=20:s=160x90:r=5", "-f", "lavfi", "-i", "anullsrc",
+                              "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", clip});
+        return make.waitForFinished(60000) && make.exitCode() == 0 && QFile::exists(clip) ? clip : QString();
+    }
+
+    void nextWhileTheNextVideoIsBeingGotReadyKeepsThatLookup()
+    {
+        QTemporaryDir dir;
+        const QString clip = shortClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}, {"QVEIL_STANDIN_SLOW_PREPARE", "3"}});
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        app.backend->setConfig({{"prepareNext", true}});
+        QTRY_VERIFY(app.backend->config().value("prepareNext").toBool());
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        const QString next = app.backend->feed()->get(1).value("id").toString();
+        QTRY_COMPARE_WITH_TIMEOUT(app.asked("POST api/prepare?v=" + next), 1, 15000);
+        QVERIFY(app.backend->busy().contains("prepare"));
+        // N while it is still being looked up: the lookup is the play's now,
+        // and is not hung up on.
+        QMetaObject::invokeMethod(app.item("watch"), "playNext");
+        QTRY_COMPARE(app.asked("POST api/play?v=" + next), 1);
+        QTest::qWait(300);
+        QVERIFY(app.backend->busy().contains("prepare"));
+        QTRY_VERIFY_WITH_TIMEOUT(!app.backend->busy().contains("prepare"), 6000);
+    }
+
+    void inPictureInPictureAndAfterARouteChangeTheNextVideoIsGotReadyToo()
+    {
+        QTemporaryDir dir;
+        const QString clip = shortClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        app.backend->setConfig({{"prepareNext", true}});
+        QTRY_VERIFY(app.backend->config().value("prepareNext").toBool());
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        const QString second = app.backend->feed()->get(1).value("id").toString(), third = app.backend->feed()->get(2).value("id").toString();
+        QTRY_COMPARE_WITH_TIMEOUT(app.asked("POST api/prepare?v=" + second), 1, 15000);
+        // In the small window, the next one plays there, and the one after it is got ready.
+        QMetaObject::invokeMethod(app.window, "togglePip");
+        QTRY_VERIFY(app.pip()->isVisible());
+        QMetaObject::invokeMethod(app.item("watch"), "playNext");
+        QTRY_COMPARE(app.inPip("pip-surface")->property("info").toMap().value("id").toString(), second);
+        QTRY_COMPARE_WITH_TIMEOUT(app.asked("POST api/prepare?v=" + third), 1, 15000);
+        // A new route: what was got ready went with the old one, so it is got ready again.
+        app.backend->setConfig({{"route", "tor"}});
+        QTRY_COMPARE_WITH_TIMEOUT(app.asked("POST api/prepare?v=" + third), 2, 15000);
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/prepare?v=" + third), 2);
+        app.pip()->close();
+    }
+
     // --- The window adapts to its size. ---
 
     void aShelfShowsWholeCardsAndTheLatestFillTheWindow()

@@ -260,8 +260,17 @@ impl Server {
         let base = self.listen()?;
         let rt = self.runtime();
         let format = rt.cfg.format();
+        // The video that is being looked up ahead (the next in the list) is
+        // played from that lookup once it is done, instead of from a lookup
+        // that starts from zero. Asked before the kept lookups: one that
+        // finishes meanwhile is kept before it stops being found here.
+        let ahead = match self.lookups.join(&v.id, &format, &rt.net, abort) {
+            Some(done) => Some(self.guarded(&rt, done)?),
+            None => None,
+        };
         // A video played again a little later is played from the same lookup.
-        let (s, live, fresh) = match self.lookups.get(&v.id, &format, &rt.net) {
+        let kept = ahead.or_else(|| self.lookups.get(&v.id, &format, &rt.net));
+        let (s, live, fresh) = match kept {
             Some((s, live)) => (s, live, false),
             None => {
                 let (s, live) = self.look_up(&rt, v, &format, abort)?;

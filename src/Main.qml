@@ -826,6 +826,7 @@ ApplicationWindow {
                     visible: active
                     list: win.playList
                     index: win.playIndex
+                    playing: win.player
                     from: win.playOrigin
                     thumbs: win.thumbs
                     full: win.fullscreen

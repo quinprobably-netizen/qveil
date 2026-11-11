@@ -483,6 +483,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "api/prepare":
             # Getting the next video ready: only while that is on, as the engine does.
             if state["config"]["prepareNext"]:
+                # QVEIL_STANDIN_SLOW_PREPARE: seconds the lookup ahead takes.
+                time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_PREPARE", "0")))
                 self.send(200, {"lookedUp": True})
             else:
                 self.send(403, {"error": "getting the next video ready is off", "code": "other"})

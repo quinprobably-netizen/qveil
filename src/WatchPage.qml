@@ -22,6 +22,9 @@ FocusScope {
     property bool hold: false
     // Whether the video has left for the small window.
     property bool away: false
+    // The surface that plays the video: this page's own, or the small
+    // window's in picture in picture.
+    property var playing: null
     readonly property alias surface: surface
     readonly property alias sheet: sheet
     readonly property bool active: surface.active
@@ -59,7 +62,7 @@ FocusScope {
         backend.closeComments()
         expanded = false
         sheet.current = "next"
-        ahead.reset()
+        ahead.reset(video.id)
         surface.prepare(video)
         flick.contentY = 0
     }
@@ -322,25 +325,42 @@ FocusScope {
 
     // "Get the next video ready": in the last 30 seconds of a video played
     // from a list, the next one in it is looked up once, so that Next plays
-    // it at once. Only the clock starts it, never pointing at a card.
+    // it at once. Only the clock starts it, never pointing at a card. The
+    // clock is that of whichever surface plays the video: in picture in
+    // picture, the small window's.
     QtObject {
         id: ahead
         readonly property var next: page.list && page.index >= 0 && page.index + 1 < page.list.count
             ? page.list.get(page.index + 1) : null
+        readonly property var clock: page.playing || surface
         readonly property bool due: !!backend.config.prepareNext && !!next && !!next.id
-            && surface.length > 0 && surface.length - surface.mpv.position <= 30
+            && clock.length > 0 && clock.length - clock.mpv.position <= 30
         // The video that was asked for, so it is asked for once.
         property string asked: ""
-        onDueChanged: {
+        onDueChanged: consider()
+        function consider() {
             if (due && next.id !== asked) {
                 asked = next.id
                 backend.prepare(asked)
             }
         }
-        function reset() {
-            if (asked !== "")
+        // A new video is being opened. The lookup of the one that was asked
+        // for is let go of, unless that is the video: the engine plays it
+        // from that lookup, once it is done.
+        function reset(opening) {
+            if (asked !== "" && asked !== opening)
                 backend.cancelPrepare()
             asked = ""
+        }
+    }
+    Connections {
+        target: backend
+        // What was got ready went with the old route (the engine ended it),
+        // so the next video is asked for again, on the new one. Once the
+        // window has reopened what plays, which can reset it too.
+        function onRouteChanged() {
+            ahead.asked = ""
+            Qt.callLater(ahead.consider)
         }
     }
 
