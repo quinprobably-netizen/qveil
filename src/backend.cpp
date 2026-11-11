@@ -364,16 +364,28 @@ void Backend::adoptConfig(const QVariantMap &next, bool routeSet) {
 
 void Backend::setConfig(const QVariantMap &patch) {
     // A task of its own: a read of the settings meanwhile must not drop this
-    // answer, and with it the notice and the kept positions' reload.
+    // answer, and with it the notice and the kept positions' reload. A read
+    // still on its way may have been answered before this save; this answer
+    // is newer.
+    supersede("config");
+    const quint64 n = ++m_configWrites;
     write("api/config", {}, QJsonDocument(QJsonObject::fromVariantMap(patch)).toJson(QJsonDocument::Compact),
-          "config-write", [this, patch](const QJsonValue &v) {
+          "config-write", [this, patch, n](const QJsonValue &v) {
               const QVariantMap next = v.toObject().toVariantMap();
               // The engine reports a saved proxy redacted, so a different
               // string than the one it reported is a new address, even if it
               // redacts to the same text (a changed password).
               const bool newProxy = next.value("route").toString() == "proxy" && patch.contains("proxy")
                                     && patch.value("proxy").toString() != m_config.value("proxy").toString();
-              adoptConfig(next, newProxy);
+              // An older save answering after a newer one would put back what
+              // that changed. Its new proxy still moved the route.
+              if (n > m_configShown) {
+                  m_configShown = n;
+                  adoptConfig(next, newProxy);
+              } else if (newProxy) {
+                  supersede("play");
+                  emit routeChanged();
+              }
               // Fewer days, or none, takes kept positions with it.
               if (patch.contains("resumeDays"))
                   loadResume();
@@ -684,6 +696,8 @@ void Backend::loadHistory() {
 }
 
 void Backend::clearHistory() {
+    // A read still on its way may have been answered before the clearing.
+    supersede("history");
     write("api/history/clear", {}, {}, "history-write", [this](const QJsonValue &) {
         m_history.clear();
         emit historyChanged();

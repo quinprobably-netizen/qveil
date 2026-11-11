@@ -345,6 +345,9 @@ private:
     QString m_fatal;
     // The Shorts choice of the last feed request, for reloading after a restart.
     bool m_shorts = false;
+    // Counts the settings saved, and which of them the settings shown came
+    // from, so that an older save answering after a newer one is not shown.
+    quint64 m_configWrites = 0, m_configShown = 0;
 
     QVariantMap m_config;
     VideoModel *m_feed = new VideoModel(this);

@@ -1236,6 +1236,46 @@ private slots:
         QCOMPARE(notices.at(1).at(0).toString(), QString("History cleared"));
     }
 
+    void theLastSettingSavedIsTheOneShownWhateverOrderTheAnswersComeIn()
+    {
+        // The first of two quick saves is slow to answer (0.6 s), so its
+        // answer comes last. What the window shows is what was saved last,
+        // and each save still says so.
+        QTemporaryDir dir;
+        const QString fake = engine(dir, R"PY(import http.server,json,time
+state={'route':'direct','maxHeight':1080}
+class H(http.server.BaseHTTPRequestHandler):
+  protocol_version='HTTP/1.0'
+  def send(s,body):
+    b=json.dumps(body).encode()
+    s.send_response(200);s.send_header('Content-Length',str(len(b)));s.end_headers();s.wfile.write(b)
+  def do_GET(s):
+    path=s.path.split('?')[0]
+    if path.endswith('/api/config'): s.send(state)
+    elif path.endswith('/api/feed'): s.send({'channels':0,'entries':[]})
+    elif path.endswith('/api/subs') or path.endswith('/api/history') or path.endswith('/api/resume'): s.send([])
+    else: s.send({})
+  def do_POST(s):
+    patch=json.loads(s.rfile.read(int(s.headers.get('Content-Length') or 0)) or b'{}')
+    state.update(patch);now=dict(state)
+    if patch.get('maxHeight')==720: time.sleep(0.6)
+    s.send(now)
+  def log_message(s,*a): pass
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)
+print(json.dumps({'base':'http://127.0.0.1:%d/t'%srv.server_port}),flush=True)
+srv.serve_forever()
+)PY");
+        Backend backend(QProcessEnvironment::systemEnvironment(), fake);
+        backend.start();
+        QTRY_VERIFY_WITH_TIMEOUT(backend.ready() && !backend.config().isEmpty(), 5000);
+        QSignalSpy notices(&backend, &Backend::notice);
+        backend.setConfig({{"maxHeight", 720}});
+        QTest::qWait(100);
+        backend.setConfig({{"maxHeight", 1440}});
+        QTRY_COMPARE_WITH_TIMEOUT(notices.size(), 2, 5000);
+        QCOMPARE(backend.config().value("maxHeight").toInt(), 1440);
+    }
+
     void anEditedLensShowsNoneOfWhatItsOldWordsFound()
     {
         // The lens's refresh takes 1.5 s; what it found for its old words
