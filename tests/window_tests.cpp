@@ -748,7 +748,7 @@ private slots:
         QVERIFY2(app.backend->error().isEmpty(), qPrintable(app.backend->error()));
     }
 
-    void theCommentsNoteIsTheEnginesOwnSentenceAndNoneIsSaidPlainly()
+    void theCommentsNoteIsTheEnginesShortSentenceBesideTheOrderAndNoneIsSaidPlainly()
     {
         App app;
         READY(app);
@@ -756,10 +756,35 @@ private slots:
         app.click(app.item("tab-comments"));
         QTRY_VERIFY(app.item("comments-empty")->isVisible());
         QCOMPARE(app.item("comments-empty")->property("text").toString(), QString("No comments here, or they are turned off."));
-        QCOMPARE(app.item("comments-note")->property("text").toString(),
-                 app.backend->privacy().value("pages").toMap().value("comments").toString());
-        QVERIFY(!app.item("comments-note")->property("text").toString().isEmpty());
+        const QVariantMap pages = app.backend->privacy().value("pages").toMap();
+        // The engine's short sentence, word for word, and all of what it says a press away.
+        QCOMPARE(pages.value("comments_short").toString(), QString("Loaded on demand, one extra request."));
+        QCOMPARE(app.item("comments-note")->property("text").toString(), pages.value("comments_short").toString());
+        QVERIFY(!app.item("comments-note-all")->isVisible());
         QVERIFY(app.items("comment").isEmpty());
+
+        // The order is two plain words, and the note is on their line, at the far end.
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        QQuickItem *top = app.item("comments-top"), *newest = app.item("comments-new"), *note = app.item("comments-note");
+        QVERIFY(top->isVisible() && newest->isVisible() && note->isVisible());
+        for (QQuickItem *word : {top, newest})
+            QVERIFY(word->property("plain").toBool());
+        QVERIFY(top->property("current").toBool());
+        // (No fill under the current one, as the other text tabs have none.)
+        QCOMPARE(top->property("color").value<QColor>().alpha(), 0);
+        QVERIFY2(qAbs(box(note).center().y() - box(top).center().y()) <= 2, "the note is on the words' line");
+        QVERIFY(box(note).left() >= box(newest).right());
+        QQuickItem *sheet = app.item("sheet");
+        QVERIFY(box(note).right() <= box(sheet).right());
+        QVERIFY(box(note).center().x() > box(sheet).center().x());
+
+        // Pressing it shows the engine's whole sentence under, and again hides it.
+        app.click(note);
+        QTRY_VERIFY(app.item("comments-note-all")->isVisible());
+        QCOMPARE(app.item("comments-note-all")->property("text").toString(), pages.value("comments").toString());
+        QTRY_VERIFY(box(app.item("comments-note-all")).top() >= box(note).bottom() - 1);
+        app.click(note);
+        QTRY_VERIFY(!app.item("comments-note-all")->isVisible());
     }
 
     void aLensIsWrittenReadSavedAndShown()
@@ -822,6 +847,29 @@ private slots:
         app.click(del);
         QCOMPARE(del->property("text").toString(), QString("Delete?"));
         QCOMPARE(app.items("lens-row").size(), 2);
+
+        // The order is two plain words, and the note is on their line, at the far end.
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        QQuickItem *top = app.item("comments-top"), *newest = app.item("comments-new"), *note = app.item("comments-note");
+        QVERIFY(top->isVisible() && newest->isVisible() && note->isVisible());
+        for (QQuickItem *word : {top, newest})
+            QVERIFY(word->property("plain").toBool());
+        QVERIFY(top->property("current").toBool());
+        // (No fill under the current one, as the other text tabs have none.)
+        QCOMPARE(top->property("color").value<QColor>().alpha(), 0);
+        QVERIFY2(qAbs(box(note).center().y() - box(top).center().y()) <= 2, "the note is on the words' line");
+        QVERIFY(box(note).left() >= box(newest).right());
+        QQuickItem *sheet = app.item("sheet");
+        QVERIFY(box(note).right() <= box(sheet).right());
+        QVERIFY(box(note).center().x() > box(sheet).center().x());
+
+        // Pressing it shows the engine's whole sentence under, and again hides it.
+        app.click(note);
+        QTRY_VERIFY(app.item("comments-note-all")->isVisible());
+        QCOMPARE(app.item("comments-note-all")->property("text").toString(), pages.value("comments").toString());
+        QVERIFY(box(app.item("comments-note-all")).top() >= box(note).bottom() - 1);
+        app.click(note);
+        QTRY_VERIFY(!app.item("comments-note-all")->isVisible());
         QTRY_VERIFY(app.item("lens-cancel")->isVisible());
         app.click(app.item("lens-cancel"));
         QTRY_COMPARE(del->property("text").toString(), QString("Delete"));

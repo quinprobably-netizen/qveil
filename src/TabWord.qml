@@ -12,6 +12,9 @@ Rectangle {
     // A tab (which page of something is showing) is marked by a line under
     // it; a choice among settings keeps the selected fill.
     property bool underlined: false
+    // A word with no mark of its own: the current one is told by its heavier
+    // type alone (the order comments are in).
+    property bool plain: false
     // The widest it may be: a word that needs more is cut short, with an ellipsis.
     property real limit: Infinity
     readonly property bool cut: label.truncated
@@ -23,7 +26,7 @@ Rectangle {
     implicitWidth: Math.min(limit, label.implicitWidth + around)
     implicitHeight: Style.control
     radius: Style.radius
-    color: current && !underlined ? Style.sel : hot ? Style.hover : "transparent"
+    color: current && !underlined && !plain ? Style.sel : hot ? Style.hover : "transparent"
     activeFocusOnTab: true
     Behavior on color { ColorAnimation { duration: Style.quick } }
 

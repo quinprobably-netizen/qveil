@@ -103,6 +103,7 @@ PRIVACY = {
               "topics_on": None,  # TOPICS_ON, below
               "resume": "On: qveil remembers where you stopped in an unfinished video for 7 days.",
               "comments": "Fetched only when you open them, as one more lookup of that video.",
+              "comments_short": None,  # COMMENTS_SHORT, below
               "lenses": "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.",
               "lenses_short": None},  # LENSES_SHORT, below
 }
@@ -137,6 +138,8 @@ TOPICS_ON = "On: qveil groups the channels you follow by the words that keep com
 PRIVACY["pages"]["topics_on"] = TOPICS_ON
 LENSES_SHORT = "A refresh sends each topic to YouTube as a search of its own, sometimes twice."
 PRIVACY["pages"]["lenses_short"] = LENSES_SHORT
+COMMENTS_SHORT = "Loaded on demand, one extra request."
+PRIVACY["pages"]["comments_short"] = COMMENTS_SHORT
 # QVEIL_STANDIN_TOPICS=fetched: they were searched for on an earlier day.
 state["topics"] = {"fetched": os.environ.get("QVEIL_STANDIN_TOPICS") == "fetched", "hidden": [], "new": set()}
 

@@ -182,6 +182,9 @@ pub struct Pages {
     /// For the number of days that is set, so it is not a fixed text.
     pub resume: String,
     pub comments: &'static str,
+    /// One sentence about comments, true on its own, for beside the order
+    /// they are in, where `comments` is too long to show.
+    pub comments_short: &'static str,
     pub lenses: &'static str,
     /// One sentence about lenses, true on its own, for where `lenses` is
     /// too long to show.
@@ -205,6 +208,7 @@ const HISTORY_OFF: &str = "Off: qveil keeps no history. Where you stopped in unf
 const HISTORY_ON: &str =
     "On: kept only on this computer, in a file only you can read, until you clear it.";
 const COMMENTS: &str = "Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.";
+const COMMENTS_SHORT: &str = "Loaded on demand, one extra request.";
 const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.";
 const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
@@ -250,6 +254,7 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
             history_on: HISTORY_ON,
             resume: resume(cfg.resume_days),
             comments: COMMENTS,
+            comments_short: COMMENTS_SHORT,
             lenses: LENSES,
             lenses_short: LENSES_SHORT,
             topics: if cfg.topic_feeds {
@@ -317,6 +322,7 @@ pub fn markdown() -> String {
         ("Lenses", LENSES),
         ("Lenses, in short", LENSES_SHORT),
         ("Comments", COMMENTS),
+        ("Comments, in short", COMMENTS_SHORT),
         ("History, off", HISTORY_OFF),
         ("History, on", HISTORY_ON),
         ("Resume, on", resume_on.as_str()),
@@ -517,6 +523,7 @@ mod tests {
             keys(&v["pages"]),
             [
                 "comments",
+                "comments_short",
                 "history_off",
                 "history_on",
                 "lenses",
@@ -535,9 +542,11 @@ mod tests {
         // One sentence for a tooltip, and one for under a lens.
         let summary = v["summary"].as_str().unwrap();
         assert_eq!(summary.matches(". ").count(), 0, "{summary}");
-        let short = v["pages"]["lenses_short"].as_str().unwrap();
-        assert_eq!(short.matches(". ").count(), 0, "{short}");
-        assert!(short.ends_with('.') && short.len() < 100, "{short}");
+        for key in ["lenses_short", "comments_short"] {
+            let short = v["pages"][key].as_str().unwrap();
+            assert_eq!(short.matches(". ").count(), 0, "{short}");
+            assert!(short.ends_with('.') && short.len() < 100, "{short}");
+        }
         assert_eq!(
             json!(describe(&net(None), &Config::default()).routes)["direct"],
             "YouTube sees your IP address."
@@ -584,6 +593,17 @@ mod tests {
     }
 
     #[test]
+    fn the_short_line_about_comments_is_true_on_its_own() {
+        let pages = describe(&net(None), &Config::default()).pages;
+        let short = pages.comments_short;
+        // They cost a request of their own, and only when asked for.
+        assert!(short.contains("on demand"), "{short}");
+        assert!(short.contains("one extra request"), "{short}");
+        assert!(pages.comments.contains("only when you open them"));
+        assert!(markdown().contains(&format!("- **Comments, in short.** {short}\n")));
+    }
+
+    #[test]
     fn topic_feeds_say_how_the_day_is_counted() {
         let on = describe(&net(None), &Config::default()).pages.topics_on;
         for right in [
@@ -617,6 +637,7 @@ mod tests {
             ("TOPICS_ON", TOPICS_ON),
             ("TOPICS_OFF", TOPICS_OFF),
             ("LENSES_SHORT", LENSES_SHORT),
+            ("COMMENTS_SHORT", COMMENTS_SHORT),
         ] {
             assert!(
                 standin.contains(&format!("{name} = \"{text}\"")),

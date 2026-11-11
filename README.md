@@ -103,6 +103,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - **Lenses.** A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.
 - **Lenses, in short.** A refresh sends each topic to YouTube as a search of its own, sometimes twice.
 - **Comments.** Fetched only when you open them, as one more lookup of that video. Commenters' pictures are never fetched.
+- **Comments, in short.** Loaded on demand, one extra request.
 - **History, off.** Off: qveil keeps no history. Where you stopped in unfinished videos is remembered separately, while resume is on.
 - **History, on.** On: kept only on this computer, in a file only you can read, until you clear it.
 - **Resume, on.** On: qveil remembers where you stopped in an unfinished video for 7 days, in a file only you can read. After that it is no longer offered, and it is deleted the next time qveil starts or saves a position. A finished video is forgotten at once.

@@ -14,6 +14,8 @@ Item {
     property string sort: "top"
     property int n: 40
     property bool replies: false
+    // Whether all of what the engine says about fetching them is showing.
+    property bool telling: false
     // The engine's answer, when it is for this video.
     readonly property var answer: backend.comments.video === video ? backend.comments : ({})
     readonly property var items: answer.items || []
@@ -69,12 +71,69 @@ Item {
             width: flick.width
             spacing: 0
 
-            // What fetching them means, in the engine's words.
+            // The order they are in, and beside it what fetching them costs.
+            Item {
+                id: order
+                width: parent.width
+                // Where there is room for the note beside the words; where
+                // there is not, it stands under them.
+                readonly property bool beside: width - sorts.width - note.implicitWidth - Style.u * 5 >= 0
+                height: sorts.height + (beside || !note.visible ? 0 : note.implicitHeight + Style.u)
+                Row {
+                    id: sorts
+                    x: Style.u
+                    spacing: 2
+                    TabWord {
+                        objectName: "comments-top"
+                        plain: true
+                        text: qsTr("Top")
+                        current: tab.sort === "top"
+                        onClicked: {
+                            tab.sort = "top"
+                            tab.load()
+                        }
+                    }
+                    TabWord {
+                        objectName: "comments-new"
+                        plain: true
+                        text: qsTr("Newest")
+                        current: tab.sort === "new"
+                        onClicked: {
+                            tab.sort = "new"
+                            tab.load()
+                        }
+                    }
+                }
+                // What fetching them means: the engine's short sentence, and
+                // all of what it says a press away, in place.
+                Text {
+                    id: note
+                    objectName: "comments-note"
+                    x: order.beside ? order.width - width - Style.u * 3 : Style.u * 3
+                    y: order.beside ? Math.round((sorts.height - height) / 2) : sorts.height
+                    visible: text !== ""
+                    text: backend.privacy.pages.comments_short || ""
+                    textFormat: Text.PlainText
+                    color: noteArea.containsMouse ? Style.dim : Style.faint
+                    font.family: Style.font
+                    font.pixelSize: Style.caption
+                    MouseArea {
+                        id: noteArea
+                        anchors.fill: parent
+                        anchors.margins: -4
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: tab.telling = !tab.telling
+                    }
+                }
+            }
+            // The whole of it, in the engine's words.
             Text {
-                objectName: "comments-note"
+                objectName: "comments-note-all"
                 x: Style.u * 3
                 width: parent.width - Style.u * 6
-                visible: text !== ""
+                visible: tab.telling && text !== ""
+                topPadding: Style.u
                 bottomPadding: Style.u * 2
                 text: backend.privacy.pages.comments || ""
                 textFormat: Text.PlainText
@@ -82,28 +141,6 @@ Item {
                 color: Style.faint
                 font.family: Style.font
                 font.pixelSize: Style.caption
-            }
-            Row {
-                x: Style.u
-                spacing: 2
-                TabWord {
-                    objectName: "comments-top"
-                    text: qsTr("Top")
-                    current: tab.sort === "top"
-                    onClicked: {
-                        tab.sort = "top"
-                        tab.load()
-                    }
-                }
-                TabWord {
-                    objectName: "comments-new"
-                    text: qsTr("Newest")
-                    current: tab.sort === "new"
-                    onClicked: {
-                        tab.sort = "new"
-                        tab.load()
-                    }
-                }
             }
             BusyLine {
                 width: parent.width
