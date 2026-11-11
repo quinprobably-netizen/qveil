@@ -32,6 +32,8 @@ mod comments;
 mod config;
 mod errors;
 mod feed;
+#[cfg(test)]
+mod h2up;
 mod ids;
 mod inflight;
 mod lens;
@@ -44,6 +46,7 @@ mod proc;
 mod resume;
 mod server;
 mod signals;
+mod spare;
 mod store;
 mod subs;
 mod topics;
@@ -531,6 +534,8 @@ fn run() -> Result<()> {
 
 fn serve(server: &Arc<Server>) -> Result<()> {
     let base = server.listen()?;
+    // The window's first search or video needn't wait for Python to start.
+    server.runtime().yt.keep_spare();
     outln!("{}", serde_json::json!({ "base": base }));
     flush()?;
     // The app holds our stdin; when it exits, for any reason, so do we. Its

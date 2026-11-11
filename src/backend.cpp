@@ -140,7 +140,7 @@ QVariantMap Backend::privacyOf(const QVariantMap &config) {
     const QVariantMap sentRoutes = sent.value("routes").toMap(), sentPages = sent.value("pages").toMap();
     for (const char *key : {"direct", "tor", "proxy"})
         routes.insert(key, text(sentRoutes, key));
-    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "comments_short", "lenses", "lenses_short", "topics", "topics_on", "topics_off"})
+    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "comments_short", "lenses", "lenses_short", "topics", "topics_on", "topics_off", "prepare_on", "prepare_off", "keep_thumbs_on", "keep_thumbs_off"})
         pages.insert(key, text(sentPages, key));
     QStringList points;
     for (const QVariant &point : sent.value("points").toList())
@@ -276,7 +276,7 @@ void Backend::refuse(const QString &task) {
 }
 
 bool Backend::newestOnly(const QString &task) {
-    static const QSet<QString> tasks{"search", "channel", "play", "feed", "feed-cache", "comments", "lens", "read"};
+    static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "lens", "read"};
     return tasks.contains(task);
 }
 
@@ -322,6 +322,10 @@ void Backend::call(const QByteArray &verb, const QString &path, const QUrlQuery 
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const QJsonDocument doc = QJsonDocument::fromJson(data);
         if (status != 200) {
+            // A video got ready ahead of time is a nicety: if that fails,
+            // playing it looks it up as usual, and says so if that fails too.
+            if (task == "prepare")
+                return;
             const QJsonObject body = doc.object();
             fail(body.value("error").toString(), body.value("code").toString(), failure(reply));
             if (m_latest.value(task) == id)
@@ -696,6 +700,14 @@ void Backend::play(const QString &video) {
 }
 
 void Backend::cancelPlay() { supersede("play"); }
+
+void Backend::prepare(const QString &video) {
+    QUrlQuery q;
+    q.addQueryItem("v", video);
+    call("POST", "api/prepare", q, {}, "prepare", [](const QJsonValue &) {});
+}
+
+void Backend::cancelPrepare() { supersede("prepare"); }
 
 void Backend::loadResume() {
     call("GET", "api/resume", {}, {}, "resume", [this](const QJsonValue &v) {

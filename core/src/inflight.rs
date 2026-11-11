@@ -9,11 +9,13 @@
 //! when the route changes, so that nothing more can start on it either.
 
 use crate::proc::{self, Group};
+use crate::spare::{self, Launch};
 use crate::util::lock as locked;
-use std::io;
+use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// What the API says to a request whose work was cut off by a route change.
@@ -55,8 +57,13 @@ pub enum StartError {
 /// both, which is why the child is behind a lock that is never held while waiting.
 pub struct Proc {
     child: Mutex<Group>,
-    /// Where its private files are, which `close` removes when the engine is exiting.
-    dir: PathBuf,
+    /// Becomes readable when the process ends (a pidfd), so that waiting for
+    /// that needs neither the lock nor a poll. `None` where the kernel has no
+    /// pidfds; waiting then polls.
+    exit: Option<OwnedFd>,
+    /// Where its private files are, which `close` removes when the engine is
+    /// exiting. A spare has none until a call takes it.
+    dir: OnceLock<PathBuf>,
     /// Set (once) by the registry when it stopped the process, so its owner
     /// can tell that apart from the process failing or finishing by itself.
     stopped: OnceLock<Why>,
@@ -72,9 +79,30 @@ impl Proc {
         locked(&self.child).try_wait()
     }
 
-    /// Waits for it to end, polling so that `kill` can take the lock in
-    /// between (a blocking `wait` would hold it until the process ended on
-    /// its own). `None` if it is still there after `limit`.
+    /// Waits up to `limit` for the process to end, without the lock (so that
+    /// `kill` can take it meanwhile) and without reaping it. True once it
+    /// has ended: `try_wait` then has its status.
+    pub fn wait_exit(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        if let Some(fd) = &self.exit {
+            // On an error, it falls back to polling for what is left of the time.
+            if let Ok(ended) = proc::wait_readable(fd, limit) {
+                return ended;
+            }
+        }
+        loop {
+            if !matches!(self.try_wait(), Ok(None)) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL.min(deadline - now));
+        }
+    }
+
+    /// Waits for it to end. `None` if it is still there after `limit`.
     fn wait_up_to(&self, limit: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + limit;
         loop {
@@ -82,9 +110,13 @@ impl Proc {
                 Ok(Some(status)) => return Some(status),
                 // Nothing more to wait for.
                 Err(_) => return None,
-                Ok(None) if Instant::now() >= deadline => return None,
-                Ok(None) => std::thread::sleep(POLL),
+                Ok(None) => {}
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            self.wait_exit(deadline - now);
         }
     }
 
@@ -104,6 +136,31 @@ impl Proc {
 #[derive(Default)]
 pub struct Inflight {
     state: Mutex<State>,
+    /// The spare yt-dlp of this route (see `spare`).
+    spares: Mutex<Spares>,
+    /// Wakes the thread that starts the spares.
+    spares_changed: Condvar,
+}
+
+#[derive(Default)]
+struct Spares {
+    /// What to keep a spare of, once a call has asked for one.
+    want: Option<Launch>,
+    /// The spare, once it has started and imported yt-dlp.
+    ready: Option<Ready>,
+    /// Whether the thread that starts them is running.
+    keeper: bool,
+    /// Set when a spare failed to start: there are no more, and calls start
+    /// the usual way.
+    broken: bool,
+}
+
+/// A spare that is waiting for its arguments. Its process is in
+/// `State::running` like any other, so that a close stops it, and dropping
+/// it ends the process.
+struct Ready {
+    launch: Launch,
+    run: Run,
 }
 
 #[derive(Default)]
@@ -120,16 +177,27 @@ impl Inflight {
     /// the spawn happen under one lock, so a process either starts before
     /// `close` and is stopped by it, or doesn't start at all.
     pub fn start(self: &Arc<Self>, cmd: &mut Command, dir: &Path) -> Result<Run, StartError> {
+        let run = self.spawn(cmd)?;
+        let _ = run.proc.dir.set(dir.to_path_buf());
+        Ok(run)
+    }
+
+    /// `start`, without a directory yet.
+    fn spawn(self: &Arc<Self>, cmd: &mut Command) -> Result<Run, StartError> {
         let mut state = locked(&self.state);
         if let Some(why) = state.closed {
             return Err(StartError::Closed(why));
         }
         let mut child = proc::spawn(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
             .map_err(StartError::Spawn)?;
-        let (stdout, stderr) = (child.take_stdout(), child.take_stderr());
+        let (stdin, stdout, stderr) =
+            (child.take_stdin(), child.take_stdout(), child.take_stderr());
+        // While the child is unreaped its id is its own, so this is the right process.
+        let exit = proc::pidfd(child.pid());
         let proc = Arc::new(Proc {
             child: Mutex::new(child),
-            dir: dir.to_path_buf(),
+            exit,
+            dir: OnceLock::new(),
             stopped: OnceLock::new(),
         });
         let id = state.next;
@@ -139,9 +207,119 @@ impl Inflight {
             proc,
             calls: Arc::clone(self),
             id,
+            stdin,
             stdout,
             stderr,
         })
+    }
+
+    /// Asks for a spare of `launch` to be kept from now on, if there isn't
+    /// one. A spare of anything else is let go.
+    pub fn want_spare(self: &Arc<Self>, launch: &Launch) {
+        let mut sp = locked(&self.spares);
+        if sp.broken || (sp.want.as_ref() == Some(launch) && sp.keeper) {
+            return;
+        }
+        if sp.want.as_ref() != Some(launch) {
+            sp.want = Some(launch.clone());
+            sp.ready = None;
+        }
+        if !sp.keeper {
+            let calls = Arc::clone(self);
+            match std::thread::Builder::new().spawn(move || calls.keep_spares()) {
+                Ok(_) => sp.keeper = true,
+                Err(_) => sp.broken = true,
+            }
+        }
+        self.spares_changed.notify_all();
+    }
+
+    /// Whether a spare is ready to take a call.
+    #[cfg(test)]
+    pub fn spare_ready(&self) -> bool {
+        locked(&self.spares).ready.is_some()
+    }
+
+    /// What a spare is kept of, if anything.
+    pub fn spare_wanted(&self) -> Option<Launch> {
+        locked(&self.spares).want.clone()
+    }
+
+    /// Hands `line` (the call's arguments, see `spare::args_line`) to the
+    /// spare of `launch`, if there is one ready, and returns it as the
+    /// call's process. `None` if there is none, and the call is to be
+    /// started the usual way.
+    pub fn claim_spare(self: &Arc<Self>, launch: &Launch, line: &str, dir: &Path) -> Option<Run> {
+        let ready = {
+            let mut sp = locked(&self.spares);
+            if sp.ready.as_ref()?.launch != *launch {
+                return None;
+            }
+            let ready = sp.ready.take();
+            // The keeper starts the next one.
+            self.spares_changed.notify_all();
+            ready?
+        };
+        let mut run = ready.run;
+        // One that has died is dropped, and so killed and reaped. A close
+        // after this point stops it like any running call.
+        if !matches!(run.try_wait(), Ok(None)) || locked(&self.state).closed.is_some() {
+            return None;
+        }
+        let _ = run.proc.dir.set(dir.to_path_buf());
+        // Closed after the line, so that nothing else can reach it.
+        let mut stdin = run.stdin.take()?;
+        stdin.write_all(line.as_bytes()).ok()?;
+        drop(stdin);
+        Some(run)
+    }
+
+    /// The thread that starts the spares. Started by the first `want_spare`,
+    /// it is the thread that spawns them, and must outlive them: a child is
+    /// killed when the *thread* that started it ends (see `proc::Group`). So
+    /// it ends only once the registry is closed and they have all ended.
+    fn keep_spares(self: Arc<Self>) {
+        let mut started: Vec<Arc<Proc>> = Vec::new();
+        loop {
+            let launch = {
+                let mut sp = locked(&self.spares);
+                loop {
+                    if locked(&self.state).closed.is_some() || sp.broken {
+                        break None;
+                    }
+                    if sp.ready.is_none()
+                        && let Some(want) = &sp.want
+                    {
+                        break Some(want.clone());
+                    }
+                    sp = match self.spares_changed.wait_timeout(sp, Duration::from_secs(1)) {
+                        Ok((sp, _)) => sp,
+                        Err(e) => e.into_inner().0,
+                    };
+                }
+            };
+            let Some(launch) = launch else { break };
+            started.retain(|p| !p.wait_exit(Duration::ZERO));
+            let Ok(mut run) = self.spawn(&mut launch.command()) else {
+                locked(&self.spares).broken = true;
+                break;
+            };
+            started.push(Arc::clone(&run.proc));
+            if !ready(&mut run) {
+                locked(&self.spares).broken = true;
+                break;
+            }
+            let mut sp = locked(&self.spares);
+            if sp.want.as_ref() == Some(&launch) && sp.ready.is_none() {
+                sp.ready = Some(Ready { launch, run });
+            }
+        }
+        let gone = locked(&self.spares).ready.take();
+        drop(gone);
+        for p in started {
+            while !p.wait_exit(Duration::from_secs(60)) {}
+        }
+        locked(&self.spares).keeper = false;
     }
 
     /// Stops every running process and refuses new ones. For `Why::Exiting`
@@ -155,6 +333,8 @@ impl Inflight {
             state.closed.get_or_insert(why);
             state.running.iter().map(|(_, p)| Arc::clone(p)).collect()
         };
+        // The spare's keeper lets it go and ends.
+        self.spares_changed.notify_all();
         for p in &procs {
             p.stop(why);
         }
@@ -162,7 +342,9 @@ impl Inflight {
             for p in &procs {
                 p.wait_up_to(REAP);
                 // Doesn't follow symbolic links; a replaced directory is just unlinked.
-                let _ = std::fs::remove_dir_all(&p.dir);
+                if let Some(dir) = p.dir.get() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
             }
         }
     }
@@ -179,6 +361,7 @@ pub struct Run {
     proc: Arc<Proc>,
     calls: Arc<Inflight>,
     id: u64,
+    stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
 }
@@ -204,8 +387,13 @@ impl Run {
             if let Some(status) = self.proc.try_wait()? {
                 return Ok(status);
             }
-            std::thread::sleep(POLL);
+            self.proc.wait_exit(Duration::from_secs(60));
         }
+    }
+
+    /// See `Proc::wait_exit`.
+    pub fn wait_exit(&self, limit: Duration) -> bool {
+        self.proc.wait_exit(limit)
     }
 
     /// Set when the registry killed the process while it was running (a route
@@ -214,6 +402,26 @@ impl Run {
     pub fn stopped(&self) -> Option<Why> {
         self.proc.stopped.get().copied()
     }
+}
+
+/// Waits until a spare that was just started has imported yt-dlp and says
+/// so. False if it ended first, or said anything else.
+fn ready(run: &mut Run) -> bool {
+    let Some(stderr) = run.stderr.as_mut() else {
+        return false;
+    };
+    let mut said = Vec::new();
+    let mut byte = [0u8];
+    // Byte by byte, so that nothing after the line is taken from the call
+    // that gets the pipe.
+    while said.len() < spare::READY.len() && !said.ends_with(b"\n") {
+        match stderr.read(&mut byte) {
+            Ok(1) => said.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            _ => return false,
+        }
+    }
+    said == spare::READY
 }
 
 impl Drop for Run {
@@ -301,6 +509,44 @@ mod tests {
         // Its result was in before the route changed; only what was still
         // running is cut off (the API's own check covers a late reply).
         assert_eq!(run.stopped(), None);
+    }
+
+    #[test]
+    fn waiting_for_the_end_wakes_up_as_it_ends_and_leaves_reaping_to_the_owner() {
+        let dir = TempDir::new();
+        let calls = Arc::new(Inflight::default());
+        let mut short = Command::new("sleep");
+        short.arg("0.3").stdin(Stdio::null());
+        let run = calls.start(&mut short, &dir.0).unwrap();
+        let started = Instant::now();
+        assert!(run.wait_exit(Duration::from_secs(5)));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(250) && took < Duration::from_millis(300 + 50),
+            "{took:?}"
+        );
+        // Not reaped by the wait: the status is still there for the owner.
+        assert!(run.try_wait().unwrap().unwrap().success());
+
+        // One that goes on running is waited for no longer than asked.
+        let run = calls.start(&mut sleeper(&dir), &dir.0).unwrap();
+        let started = Instant::now();
+        assert!(!run.wait_exit(Duration::from_millis(100)));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(100) && took < Duration::from_secs(1),
+            "{took:?}"
+        );
+        // And a kill from elsewhere ends the wait at once.
+        let handle = run.handle();
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            handle.kill();
+        });
+        let started = Instant::now();
+        assert!(run.wait_exit(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        killer.join().unwrap();
     }
 
     #[test]

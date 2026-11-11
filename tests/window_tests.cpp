@@ -2166,6 +2166,7 @@ private slots:
         const QList<std::tuple<QString, QString, QString>> rows{
             {"privacy", "set-route", "route-tor"},     {"privacy", "set-history", "history-on"},
             {"privacy", "set-resume", "resume-7"},     {"playback", "set-quality", "quality-1080"},
+            {"playback", "set-prepare", "prepare-off"}, {"home", "set-keep-thumbs", "keep-thumbs-off"},
             {"home", "set-thumbs", "thumbs-clear"},    {"home", "set-shorts", "shorts-hidden"}};
         qreal left = -1, right = -1;
         for (const auto &[category, rowName, controlName] : rows) {
@@ -3597,6 +3598,81 @@ private slots:
         app.click(app.item("topics-on"));
         QTRY_VERIFY(app.backend->config().value("topicFeeds").toBool());
         QTRY_VERIFY(!would->isVisible());
+    }
+
+    void gettingTheNextVideoReadyIsOffUntilTurnedOnAndSaysWhatItCosts()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-playback"));
+        const QVariantMap pages = app.backend->privacy().value("pages").toMap();
+        QVERIFY(pages.value("prepare_on").toString().contains("never watch"));
+        QVERIFY(!app.backend->config().value("prepareNext").toBool());
+        QCOMPARE(app.item("set-prepare-note")->property("text").toString(), pages.value("prepare_off").toString());
+        QQuickItem *would = app.item("set-prepare-would");
+        QVERIFY(would && would->isVisible());
+        QCOMPARE(would->property("text").toString(), pages.value("prepare_on").toString());
+        app.click(app.item("prepare-on"));
+        QTRY_VERIFY(app.backend->config().value("prepareNext").toBool());
+        QTRY_VERIFY(!would->isVisible());
+        QCOMPARE(app.item("set-prepare-note")->property("text").toString(), pages.value("prepare_on").toString());
+    }
+
+    void keepingThumbnailsOnDiskIsOffUntilTurnedOnAndSaysWhatItKeeps()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-home"));
+        const QVariantMap pages = app.backend->privacy().value("pages").toMap();
+        QVERIFY(pages.value("keep_thumbs_on").toString().contains("record"));
+        QVERIFY(!app.backend->config().value("keepThumbnails").toBool());
+        QCOMPARE(app.item("set-keep-thumbs-note")->property("text").toString(), pages.value("keep_thumbs_off").toString());
+        QQuickItem *would = app.item("set-keep-thumbs-would");
+        QVERIFY(would && would->isVisible());
+        QCOMPARE(would->property("text").toString(), pages.value("keep_thumbs_on").toString());
+        app.click(app.item("keep-thumbs-on"));
+        QTRY_VERIFY(app.backend->config().value("keepThumbnails").toBool());
+        QTRY_VERIFY(!would->isVisible());
+        app.click(app.item("keep-thumbs-off"));
+        QTRY_VERIFY(!app.backend->config().value("keepThumbnails").toBool());
+    }
+
+    void nearTheEndTheNextVideoInTheListIsGotReadyOnce()
+    {
+        // A clip shorter than 30 s: as soon as it is playing, it is near its end.
+        QTemporaryDir dir;
+        const QString clip = dir.filePath("clip.mkv");
+        QProcess make;
+        make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=d=20:s=160x90:r=5", "-f", "lavfi", "-i", "anullsrc",
+                              "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", clip});
+        if (!make.waitForFinished(60000) || make.exitCode() != 0 || !QFile::exists(clip))
+            QSKIP("ffmpeg couldn't make a clip to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_CLIP", clip}});
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QObject *mpv = app.item("surface")->property("mpv").value<QObject *>();
+        QVERIFY(mpv);
+        // Off: nothing is looked up ahead.
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("duration").toDouble() > 0, 15000);
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/prepare"), 0);
+        // On: the next one in the list, and only once.
+        app.backend->setConfig({{"prepareNext", true}});
+        const QString next = app.backend->feed()->get(1).value("id").toString();
+        QVERIFY(!next.isEmpty());
+        QTRY_COMPARE(app.asked("POST api/prepare?v=" + next), 1);
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/prepare"), 1);
+        // Without a list nothing comes next, so nothing is got ready.
+        app.play({{"id", "vid00000004"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("duration").toDouble() > 0, 15000);
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/prepare"), 1);
     }
 
     // --- The window adapts to its size. ---

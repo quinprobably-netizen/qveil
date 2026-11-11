@@ -30,12 +30,24 @@ resume_days = 7
 # are about, so it is off until you turn it on.
 topic_feeds = false
 
+# Get the next video ready: in the last 30 seconds of a video played from a
+# list, look up the next one in it, so that it starts at once. YouTube sees
+# that lookup even if you never watch the video, so it is off until you turn
+# it on.
+prepare_next = false
+
 # Show thumbnails. They are fetched through the same route as everything else.
 # With Tor isolation each one gets its own circuit, so separate requests can't
 # be linked by IP address. A refresh is still a burst of requests for exactly
 # the videos your channels uploaded, though, so timing and the set of IDs can
 # still tie them together.
 thumbnails = true
+
+# Keep the thumbnails that were fetched on disk (in ~/.cache/qveil/thumbs, at
+# most 64 MiB, the least recently shown going first), so that they aren't
+# fetched again. They are a record of the pictures you were shown, so it is
+# off until you turn it on; turning it off deletes them.
+keep_thumbnails = false
 
 # Channel feeds fetched at once.
 feed_workers = 4

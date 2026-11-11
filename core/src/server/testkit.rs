@@ -38,8 +38,19 @@ pub fn server_tuned(
     rt.yt.net = rt.net.clone();
     tune(&mut rt);
     let s = Server::new(rt, paths);
+    // Most tests count what the upstream is asked; the ones about warming
+    // turn it back on.
+    s.warming.store(false, Ordering::Relaxed);
     let base = s.listen().unwrap();
     (s, base, dir)
+}
+
+/// A server whose clients speak HTTP/2 to a local upstream (see `h2up`).
+pub fn server_h2c() -> (Arc<Server>, String, TempDir) {
+    server_tuned(Config::default(), |rt| {
+        rt.net = rt.net.clone().speaking_h2c();
+        rt.yt.net = rt.net.clone();
+    })
 }
 
 pub fn addr(base: &str) -> &str {

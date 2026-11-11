@@ -12,6 +12,7 @@ use crate::ids;
 use crate::inflight::{Inflight, Run, StartError};
 use crate::net::{Net, USER_AGENT};
 use crate::private::PrivateDir;
+use crate::spare;
 use crate::video::{Chapter, Video};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
@@ -32,6 +33,9 @@ const RESOLVE: Duration = Duration::from_secs(90);
 const COMMENTS: Duration = Duration::from_secs(120);
 /// How many replies are asked for under each comment, when they are.
 const REPLIES_EACH: usize = 3;
+/// How often a running call asks whether it is still wanted. The window
+/// hanging up is only looked for this often anyway (`http::WATCH_EVERY`).
+const ABORT_EVERY: Duration = Duration::from_millis(100);
 /// yt-dlp's own limit for one connection. The deadlines above bound the whole
 /// call, and this keeps a single dead connection from using up all of it.
 const SOCKET_TIMEOUT: &str = "20";
@@ -75,7 +79,7 @@ pub struct Ytdlp {
     pub calls: Arc<Inflight>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Streams {
     pub title: String,
     pub channel: Option<String>,
@@ -83,6 +87,9 @@ pub struct Streams {
     pub duration: Option<u64>,
     pub video: String,
     pub audio: Option<String>,
+    /// How long each stream is, when YouTube says so exactly (it usually does).
+    pub video_size: Option<u64>,
+    pub audio_size: Option<u64>,
     pub headers: Vec<(String, String)>,
     /// What the page says about the video. All of it comes with the lookup
     /// that finds the streams, so showing it costs no request.
@@ -129,9 +136,23 @@ impl Ytdlp {
         c
     }
 
+    /// Keeps a spare yt-dlp ready for the calls on this route from now on,
+    /// where yt-dlp can be run that way (see `spare`).
+    pub fn keep_spare(&self) {
+        if let Some(launch) = spare::launch_for(&self.bin) {
+            self.calls.want_spare(&launch);
+        }
+    }
+
     /// Starts `cmd` through the registry, which refuses once the route it
-    /// belongs to has been left.
+    /// belongs to has been left. The spare takes it, if there is one.
     fn start(&self, cmd: &mut Command, call: &Call) -> Result<Run> {
+        if let Some(launch) = spare::launch_for(&self.bin)
+            && let Some(line) = spare::args_line(cmd)
+            && let Some(run) = self.calls.claim_spare(&launch, &line, call.dir.path())
+        {
+            return Ok(run);
+        }
         self.calls.start(cmd, call.dir.path()).map_err(|e| match e {
             StartError::Closed(why) => anyhow!(why.message()),
             StartError::Spawn(e) => anyhow::Error::new(e)
@@ -143,9 +164,10 @@ impl Ytdlp {
     /// returns `None`. The output is read on separate threads, so a child that
     /// fills a pipe isn't left waiting for us. An error if the registry
     /// stopped it, because what it printed belongs to a route that was left.
-    /// `abort` is asked every few milliseconds while the child runs, and when
+    /// `abort` is asked every `ABORT_EVERY` while the child runs, and when
     /// it says yes the child is killed (with everything it started) and the
-    /// call ends with `CANCELLED`.
+    /// call ends with `CANCELLED`. In between, this waits for the child to
+    /// end and wakes up the moment it does.
     fn output_within(
         &self,
         cmd: &mut Command,
@@ -172,7 +194,11 @@ impl Ytdlp {
                     None => Ok(None),
                 };
             }
-            std::thread::sleep(Duration::from_millis(20));
+            run.wait_exit(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(ABORT_EVERY),
+            );
         };
         if let Some(why) = run.stopped() {
             bail!(why.message());
@@ -570,11 +596,8 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
         .find(is_video)
         .or(formats.first().copied())
         .context("no playable format")?;
-    let audio = formats
-        .iter()
-        .find(|f| !is_video(f))
-        .and_then(|f| f["url"].as_str())
-        .map(String::from);
+    let audio_fmt = formats.iter().find(|f| !is_video(f));
+    let audio = audio_fmt.and_then(|f| f["url"].as_str()).map(String::from);
     // yt-dlp attaches the cookies of its in-memory jar that match the URL.
     // None of YouTube's is meant for a googlevideo host, but the relay
     // promises to send no cookies, so that doesn't rest on yt-dlp's jar.
@@ -596,7 +619,11 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
             .as_str()
             .context("format has no URL")?
             .into(),
+        audio_size: audio
+            .as_ref()
+            .and(audio_fmt.and_then(|f| f["filesize"].as_u64())),
         audio,
+        video_size: video_fmt["filesize"].as_u64(),
         headers,
         description: str_field(v, &["description"])
             .map(|d| d.chars().take(DESCRIPTION_MAX).collect()),
@@ -684,6 +711,7 @@ mod tests {
             ("https://gv.test/v", Some("https://gv.test/a"))
         );
         assert_eq!(s.headers, [("User-Agent".to_string(), "x".to_string())]);
+        assert_eq!((s.video_size, s.audio_size), (None, None));
         // A cookie yt-dlp would send is not relayed, whatever the case it is spelled in.
         let s = resolved(
             r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","http_headers":{"User-Agent":"x","Cookie":"a=b","cookie":"c=d"}}"#,
@@ -696,6 +724,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!((s.video.as_str(), s.audio), ("https://gv.test/c", None));
+    }
+
+    #[test]
+    fn exact_sizes_come_with_the_streams_and_estimates_do_not() {
+        let s = resolved(
+            r#"{"requested_formats":[
+                {"url":"https://gv.test/v","protocol":"https","vcodec":"av01","filesize":123456},
+                {"url":"https://gv.test/a","protocol":"https","vcodec":"none","filesize":789}]}"#,
+        )
+        .unwrap();
+        assert_eq!((s.video_size, s.audio_size), (Some(123456), Some(789)));
+        let s = resolved(
+            r#"{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","filesize_approx":5}"#,
+        )
+        .unwrap();
+        assert_eq!((s.video_size, s.audio_size), (None, None));
     }
 
     #[test]
@@ -1056,10 +1100,21 @@ wait
         assert!(started.elapsed() < Duration::from_secs(5));
         for name in ["pid", "grandchild"] {
             let pid = spied(&dir, name);
-            let gone = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-                .map(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
-                .unwrap_or(true);
-            assert!(gone, "{name} {pid} was left running");
+            let gone = || {
+                std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                    .map(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+                    .unwrap_or(true)
+            };
+            // The group was sent SIGKILL, but the call returns as soon as
+            // the leader has ended, and a grandchild may take a moment longer.
+            let killed = Instant::now();
+            while !gone() {
+                assert!(
+                    killed.elapsed() < Duration::from_secs(5),
+                    "{name} {pid} was left running"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
     }
@@ -1091,5 +1146,291 @@ wait
         let direct = ytdlp(bin, None);
         let msg = direct.search("x", 1).unwrap_err().to_string();
         assert!(msg.contains("Connection refused"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod spare_tests {
+    use super::*;
+    use crate::inflight::Why;
+    use crate::store::testing::TempDir;
+    use std::path::Path;
+
+    /// A yt-dlp written in Python, installed the way pip installs it: the
+    /// entry script, and the `yt_dlp` package beside it. It logs when it is
+    /// imported and when it runs, by which process, and what it was given.
+    fn python_ytdlp(dir: &Path) -> Option<String> {
+        let python = std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join("python3"))
+            .find(|p| p.is_file())?;
+        let pkg = dir.join("yt_dlp");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("__init__.py"),
+            r#"import json, os, subprocess, sys, time
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def log(what):
+    with open(os.path.join(HERE, "log"), "a") as f:
+        f.write(f"{what} {os.getpid()} {time.time()}\n")
+log("import")
+def main(argv=None):
+    log("run")
+    args = sys.argv[1:]
+    conf = args[args.index("--config-locations") + 1]
+    target = open(conf, encoding="utf-8-sig").read().splitlines()[-1]
+    with open(os.path.join(HERE, f"call-{os.getpid()}"), "w") as f:
+        json.dump({"argv": args, "stdin": os.readlink("/proc/self/fd/0"),
+                   "pgid": os.getpgid(0), "argv0": sys.argv[0]}, f)
+    if "hang" in target:
+        child = subprocess.Popen(["sleep", "60"])
+        with open(os.path.join(HERE, "hung"), "w") as f:
+            f.write(f"{os.getpid()} {child.pid} {os.path.dirname(conf)}\n")
+        time.sleep(60)
+    print('{"entries":[]}')
+    return 0
+"#,
+        )
+        .unwrap();
+        let script = dir.join("yt-dlp");
+        std::fs::write(
+            &script,
+            format!(
+                "#!{}\nimport sys\nfrom yt_dlp import main\nif __name__ == '__main__':\n    sys.exit(main())\n",
+                python.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Some(script.display().to_string())
+    }
+
+    fn yt(bin: String) -> Ytdlp {
+        Ytdlp {
+            cache_dir: Path::new(&bin).with_file_name("cache").join("qveil"),
+            bin,
+            net: Net::new(Some("http://user:SECRETPW@127.0.0.1:3128".into()), true).unwrap(),
+            calls: Arc::default(),
+        }
+    }
+
+    /// The log's lines: what happened, and in which process.
+    fn log(dir: &Path) -> Vec<(String, u32)> {
+        std::fs::read_to_string(dir.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                let mut w = l.split(' ');
+                (
+                    w.next().unwrap().to_string(),
+                    w.next().unwrap().parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Waits until a process has imported yt-dlp and not run it: the spare.
+    fn spare_pid(dir: &Path) -> u32 {
+        let started = Instant::now();
+        loop {
+            let log = log(dir);
+            if let Some((_, pid)) = log
+                .iter()
+                .rev()
+                .find(|(what, pid)| what == "import" && !log.contains(&("run".into(), *pid)))
+            {
+                return *pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "no spare: {log:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits until the spare is ready for a call, and returns its process id.
+    fn ready_spare(yt: &Ytdlp, dir: &Path) -> u32 {
+        let started = Instant::now();
+        while !yt.calls.spare_ready() {
+            assert!(started.elapsed() < Duration::from_secs(10), "no spare");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        spare_pid(dir)
+    }
+
+    fn call(dir: &Path, pid: u32) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(dir.join(format!("call-{pid}"))).unwrap())
+            .unwrap()
+    }
+
+    fn gone(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+            .unwrap_or(true)
+    }
+
+    fn wait_gone(pid: u32) {
+        let started = Instant::now();
+        while !gone(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{pid} still runs"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The call's arguments, with its private config file's path left out.
+    fn argv_without_config(c: &Value) -> Vec<String> {
+        let args: Vec<String> = serde_json::from_value(c["argv"].clone()).unwrap();
+        let at = args.iter().position(|a| a == "--config-locations").unwrap();
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at + 1)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_spare_takes_the_next_call_exactly_as_a_new_process_would() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        let yt = yt(bin.clone());
+        // Without a spare asked for, a call starts the usual way.
+        yt.search("q", 5).unwrap();
+        let usual = log(&dir.0);
+        assert_eq!(usual[0].0, "import");
+        assert_eq!(usual[0].1, usual[1].1);
+        let usual = call(&dir.0, usual[0].1);
+
+        yt.keep_spare();
+        let spare = ready_spare(&yt, &dir.0);
+        // Its own process group, as every child of the engine has.
+        assert_eq!(unsafe { libc::getpgid(spare as libc::pid_t) } as u32, spare);
+        let started = Instant::now();
+        yt.search("q", 5).unwrap();
+        let took = started.elapsed();
+        assert_eq!(log(&dir.0).last().unwrap(), &("run".to_string(), spare));
+        let taken = call(&dir.0, spare);
+        // The same arguments, and nothing to read on stdin.
+        assert_eq!(argv_without_config(&taken), argv_without_config(&usual));
+        assert_eq!(taken["stdin"], "/dev/null");
+        assert_eq!(taken["argv0"], usual["argv0"]);
+        assert_eq!(taken["pgid"], spare);
+        // Nothing private shows on its command line either.
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", spare_pid_next(&dir.0, spare)))
+            .unwrap_or_default();
+        let cmdline = String::from_utf8_lossy(&cmdline);
+        assert!(
+            !cmdline.contains("SECRETPW") && !cmdline.contains("ytsearch"),
+            "{cmdline}"
+        );
+        wait_gone(spare);
+        eprintln!("a call on the spare took {took:?}");
+
+        // The next spare is there, and a route change ends it.
+        let next = spare_pid(&dir.0);
+        assert_ne!(next, spare);
+        yt.calls.close(Why::RouteChanged);
+        wait_gone(next);
+    }
+
+    /// The spare started after `after`.
+    fn spare_pid_next(dir: &Path, after: u32) -> u32 {
+        let started = Instant::now();
+        loop {
+            let pid = spare_pid(dir);
+            if pid != after {
+                return pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_spare_whose_call_is_given_up_on_is_killed_with_what_it_started() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        let yt = yt(bin);
+        yt.keep_spare();
+        let spare = ready_spare(&yt, &dir.0);
+        let hung = dir.0.join("hung");
+        let abort = || hung.exists();
+        let err = yt
+            .resolve_until("https://www.youtube.com/watch?v=hanghanghan", "b", &abort)
+            .unwrap_err();
+        assert_eq!(err.to_string(), CANCELLED);
+        let text = std::fs::read_to_string(&hung).unwrap();
+        let w: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(w[0].parse::<u32>().unwrap(), spare);
+        wait_gone(spare);
+        wait_gone(w[1].parse().unwrap());
+        assert!(!Path::new(w[2]).exists(), "its private files are left");
+        yt.calls.close(Why::RouteChanged);
+    }
+
+    #[test]
+    fn a_spare_of_a_yt_dlp_that_was_upgraded_since_runs_it_afresh() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        let yt = yt(bin);
+        yt.keep_spare();
+        let spare = ready_spare(&yt, &dir.0);
+        let init = dir.0.join("yt_dlp").join("__init__.py");
+        let text = std::fs::read_to_string(&init).unwrap();
+        std::fs::write(&init, text.replace("log(\"run\")", "log(\"run2\")")).unwrap();
+        yt.search("q", 1).unwrap();
+        let log = log(&dir.0);
+        // The same process, which imported the new code and ran that.
+        let of_spare: Vec<_> = log
+            .iter()
+            .filter(|(_, pid)| *pid == spare)
+            .map(|(what, _)| what.as_str())
+            .collect();
+        assert_eq!(of_spare, ["import", "import", "run2"]);
+        yt.calls.close(Why::RouteChanged);
+    }
+
+    #[test]
+    fn a_spare_that_cannot_start_leaves_calls_to_start_the_usual_way() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        // Plugins that were loaded on import: the spare refuses to serve.
+        std::fs::write(
+            dir.0.join("yt_dlp").join("globals.py"),
+            "class _I:\n    value = True\nall_plugins_loaded = _I()\n",
+        )
+        .unwrap();
+        let init = dir.0.join("yt_dlp").join("__init__.py");
+        let text = std::fs::read_to_string(&init).unwrap();
+        std::fs::write(&init, format!("from . import globals\n{text}")).unwrap();
+        let yt = yt(bin);
+        yt.keep_spare();
+        let started = Instant::now();
+        while yt.calls.running() > 0 || log(&dir.0).is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        yt.search("q", 1).unwrap();
+        let log = log(&dir.0);
+        let (last_import, last_run) = (&log[log.len() - 2], &log[log.len() - 1]);
+        assert_eq!(
+            (last_import.0.as_str(), last_run.0.as_str()),
+            ("import", "run")
+        );
+        assert_eq!(last_import.1, last_run.1, "a fresh process ran the call");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(yt.calls.running(), 0, "another spare was started");
+        yt.calls.close(Why::RouteChanged);
     }
 }

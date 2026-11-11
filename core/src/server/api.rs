@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -31,6 +32,8 @@ struct ConfigPatch {
     max_height: Option<u32>,
     resume_days: Option<u32>,
     topic_feeds: Option<bool>,
+    prepare_next: Option<bool>,
+    keep_thumbnails: Option<bool>,
 }
 
 /// What the window reports while a video plays: `POST api/resume`.
@@ -63,11 +66,68 @@ impl Server {
         match opened {
             Ok(opened) => {
                 let body = json!(opened.info).to_string();
-                respond(out, 200, "application/json", body.as_bytes())?;
+                let _recording = opened.watched.is_some().then(|| self.recording());
+                if let Err(e) = respond(out, 200, "application/json", body.as_bytes()) {
+                    // Nobody will play it, so what is being fetched for
+                    // the player is not wanted either.
+                    if let Some(s) = &opened.session {
+                        s.warm.stop();
+                    }
+                    return Err(e);
+                }
                 self.remember(&opened);
                 Ok(())
             }
             // Nobody is listening for the reason.
+            Err(_) if watch.gone() => Ok(()),
+            Err(e) => {
+                let body = errors::body(&format!("{e:#}")).to_string();
+                respond(out, 500, "application/json", body.as_bytes())
+            }
+        }
+    }
+
+    /// `POST api/prepare?v=…`: looks up a video that is likely to be played
+    /// next (the next one in the list, near the end of this one), so that
+    /// playing it needs no lookup of its own (see `lookups`). Only while
+    /// that is turned on. One at a time: a new one ends the one before, and
+    /// the window hanging up (it moved on to another video) ends it too.
+    /// Nothing is added to the history: nothing was watched.
+    pub(super) fn prepare_next(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
+        let watch = Watch::new(out);
+        let rt = self.runtime();
+        if !rt.cfg.prepare_next {
+            let body = json!({ "error": "getting the next video ready is off", "code": "other" });
+            return respond(out, 403, "application/json", body.to_string().as_bytes());
+        }
+        let prepared = req.param("v").and_then(|target| {
+            let v = ids::parse_video(target)
+                .with_context(|| format!("{target:?} isn't a YouTube video"))?;
+            let format = rt.cfg.format();
+            if self.lookups.get(&v.id, &format, &rt.net).is_some() {
+                return Ok(false);
+            }
+            let mine = Arc::new(AtomicBool::new(false));
+            if let Some(before) = lock(&self.preparing).replace(Arc::clone(&mine)) {
+                before.store(true, Ordering::Release);
+            }
+            let given_up = || mine.load(Ordering::Acquire) || watch.gone();
+            let done = self.look_up(&rt, &v, &format, &given_up);
+            {
+                let mut preparing = lock(&self.preparing);
+                if preparing.as_ref().is_some_and(|p| Arc::ptr_eq(p, &mine)) {
+                    *preparing = None;
+                }
+            }
+            let (s, live) = self.guarded(&rt, done)?;
+            self.keep_lookup(&rt, &v.id, &format, &s, &live);
+            Ok(true)
+        });
+        match prepared {
+            Ok(looked_up) => {
+                let body = json!({ "lookedUp": looked_up }).to_string();
+                respond(out, 200, "application/json", body.as_bytes())
+            }
             Err(_) if watch.gone() => Ok(()),
             Err(e) => {
                 let body = errors::body(&format!("{e:#}")).to_string();
@@ -136,12 +196,17 @@ impl Server {
                 json!({ "added": added, "total": total })
             }
             ("GET", ["api", "history"]) => {
+                self.history_settled();
                 let mut w = app::load_history(paths)?.watched;
                 w.reverse();
                 json!(w)
             }
             ("POST", ["api", "history", "clear"]) => {
                 app::clear_history(paths)?;
+                // They say what was watched lately, too, and the
+                // thumbnails kept on disk what was shown.
+                self.lookups.clear();
+                self.thumbs.disk.forget(&paths.thumbs())?;
                 json!({})
             }
             ("GET", ["api", "read"]) => self.read_json(req),
@@ -224,6 +289,8 @@ impl Server {
             "maxHeight": rt.cfg.max_height,
             "resumeDays": rt.cfg.resume_days,
             "topicFeeds": rt.cfg.topic_feeds,
+            "prepareNext": rt.cfg.prepare_next,
+            "keepThumbnails": rt.cfg.keep_thumbnails,
             "configPath": self.paths.config,
             // What the window says about privacy, from the one place that
             // words it (see `privacy`).
@@ -274,6 +341,12 @@ impl Server {
         if let Some(on) = p.topic_feeds {
             cfg.topic_feeds = on;
         }
+        if let Some(on) = p.prepare_next {
+            cfg.prepare_next = on;
+        }
+        if let Some(on) = p.keep_thumbnails {
+            cfg.keep_thumbnails = on;
+        }
         // Validates the proxy before anything is saved.
         let mut next = Runtime::new(cfg, &self.paths, None, false)?;
         next.cfg.save(&self.paths.config)?;
@@ -282,6 +355,7 @@ impl Server {
         if next.cfg.resume_days != rt.cfg.resume_days {
             resume::purge(&self.paths, next.cfg.resume_days, app::now())?;
         }
+        let keep_thumbnails = next.cfg.keep_thumbnails;
         let route_changed = !next.net.same_route(&rt.net);
         let topics_off = rt.cfg.topic_feeds && !next.cfg.topic_feeds;
         if !route_changed {
@@ -300,6 +374,8 @@ impl Server {
             for (_, session) in sessions.drain(..) {
                 session.cancel();
             }
+            // Their URLs only work from the old route's addresses.
+            self.lookups.clear();
             drop(sessions);
             // The identities of the pages of thumbnails belong to the old route too.
             self.thumbs.forget_batches();
@@ -308,8 +384,17 @@ impl Server {
             // try again. Closed after the swap, so what starts from now on
             // belongs to the new route.
             rt.yt.calls.close(Why::RouteChanged);
+            // The spare went with them; the new route gets one of its own.
+            if rt.yt.calls.spare_wanted().is_some() {
+                self.runtime().yt.keep_spare();
+            }
         } else {
             drop(sessions);
+        }
+        // The thumbnails kept on disk go when keeping them is off. After the
+        // swap, so that a thumbnail being kept now sees that it is off.
+        if !keep_thumbnails {
+            self.thumbs.disk.forget(&self.paths.thumbs())?;
         }
         // Turned off, what the topic feeds found is not kept. Deleted after
         // the swap: a refresh that is running sees the setting off before it
@@ -1047,6 +1132,122 @@ echo '{"entries":[]}'"#,
             "a video that was never answered"
         );
         assert!(lock(&s.sessions).is_empty());
+    }
+
+    #[test]
+    fn getting_the_next_video_ready_is_off_unless_turned_on() {
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(&bin.0, "https://gv.test/v?expire=99999999999&n=");
+        let (_s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let (status, body) = http(&base, "POST", &path(&base, "api/prepare?v=dQw4w9WgXcQ"), "");
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(runs(&bin.0), 0, "a lookup went out");
+        let (_, body) = http(&base, "GET", &path(&base, "api/config"), "");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["prepareNext"], false);
+    }
+
+    #[test]
+    fn the_next_video_is_looked_up_ahead_and_played_from_that_lookup() {
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(&bin.0, "https://gv.test/v?expire=99999999999&n=");
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            history: true,
+            ..Config::default()
+        });
+        let post = |rest: &str, body: &str| http(&base, "POST", &path(&base, rest), body);
+        assert_eq!(post("api/config", r#"{"prepareNext":true}"#).0, 200);
+        let (status, body) = post("api/prepare?v=dQw4w9WgXcQ", "");
+        assert_eq!((status, body.as_str()), (200, r#"{"lookedUp":true}"#));
+        assert_eq!(runs(&bin.0), 1);
+        // Getting it ready isn't watching it.
+        assert!(app::load_history(&s.paths).unwrap().watched.is_empty());
+        assert!(lock(&s.sessions).is_empty());
+        // Asked again, there is nothing to do.
+        assert_eq!(
+            post("api/prepare?v=dQw4w9WgXcQ", "").1,
+            r#"{"lookedUp":false}"#
+        );
+        // Playing it needs no lookup of its own.
+        let (status, body) = post("api/play?v=dQw4w9WgXcQ", "");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(runs(&bin.0), 1);
+        assert_eq!(app::load_history(&s.paths).unwrap().watched.len(), 1);
+    }
+
+    #[test]
+    fn a_new_next_video_or_the_window_moving_on_ends_the_lookup_ahead() {
+        let bin = TempDir::new();
+        let (s, base, _d) = server_with(Config {
+            ytdlp: hanging_ytdlp(&bin.0),
+            prepare_next: true,
+            ..Config::default()
+        });
+        let ask = |id: &str| {
+            let mut c = TcpStream::connect(addr(&base)).unwrap();
+            write!(
+                c,
+                "POST {} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                path(&base, &format!("api/prepare?v={id}"))
+            )
+            .unwrap();
+            c
+        };
+        let mut first = ask("aaaaaaaaaaa");
+        let (pid, private) = hanging_running(&bin.0);
+        std::fs::remove_file(bin.0.join("pid")).unwrap();
+        // The next one in line changed: the lookup of the old one ends.
+        let second = ask("bbbbbbbbbbb");
+        assert_stopped_and_cleaned_up(&pid, &private);
+        let (status, _) = read_reply(&mut first);
+        assert_eq!(status, 500);
+        // And the window hanging up (the user went elsewhere) ends this one.
+        let (pid, private) = hanging_running(&bin.0);
+        drop(second);
+        assert_stopped_and_cleaned_up(&pid, &private);
+        wait_for("the registry to be empty", Duration::from_secs(5), || {
+            s.runtime().yt.calls.running() == 0
+        });
+        assert!(lock(&s.preparing).is_none());
+    }
+
+    #[test]
+    fn the_history_asked_for_right_after_a_play_answers_has_the_video() {
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(&bin.0, "https://gv.test/v?n=");
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            history: true,
+            ..Config::default()
+        });
+        // The history can't be written while this is held, so the play's
+        // answer arrives well before its video is in the history.
+        let held = crate::store::lock(&s.paths).unwrap();
+        let mut c = TcpStream::connect(addr(&base)).unwrap();
+        write!(
+            c,
+            "POST {} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+            path(&base, "api/play?v=dQw4w9WgXcQ")
+        )
+        .unwrap();
+        assert_eq!(read_reply(&mut c).0, 200);
+        let asked = {
+            let base = base.clone();
+            std::thread::spawn(move || http(&base, "GET", &path(&base, "api/history"), ""))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !asked.is_finished(),
+            "the history was read before the video was in it"
+        );
+        drop(held);
+        let (status, body) = asked.join().unwrap();
+        assert_eq!(status, 200);
+        assert!(body.contains("dQw4w9WgXcQ"), "{body}");
     }
 
     /// Reads one reply the way a client does: by its Content-Length, not by

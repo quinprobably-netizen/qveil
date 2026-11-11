@@ -59,6 +59,7 @@ FocusScope {
         backend.closeComments()
         expanded = false
         sheet.current = "next"
+        ahead.reset()
         surface.prepare(video)
         flick.contentY = 0
     }
@@ -90,6 +91,7 @@ FocusScope {
     function close() {
         // A lookup of comments that is still running is for nobody now.
         backend.closeComments()
+        ahead.reset()
         surface.stop()
     }
 
@@ -303,6 +305,30 @@ FocusScope {
                 font.family: Style.font
                 font.pixelSize: Style.body
             }
+        }
+    }
+
+    // "Get the next video ready": in the last 30 seconds of a video played
+    // from a list, the next one in it is looked up once, so that Next plays
+    // it at once. Only the clock starts it, never pointing at a card.
+    QtObject {
+        id: ahead
+        readonly property var next: page.list && page.index >= 0 && page.index + 1 < page.list.count
+            ? page.list.get(page.index + 1) : null
+        readonly property bool due: !!backend.config.prepareNext && !!next && !!next.id
+            && surface.length > 0 && surface.length - surface.mpv.position <= 30
+        // The video that was asked for, so it is asked for once.
+        property string asked: ""
+        onDueChanged: {
+            if (due && next.id !== asked) {
+                asked = next.id
+                backend.prepare(asked)
+            }
+        }
+        function reset() {
+            if (asked !== "")
+                backend.cancelPrepare()
+            asked = ""
         }
     }
 

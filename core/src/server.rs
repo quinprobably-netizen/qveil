@@ -15,16 +15,20 @@
 //! - `jobs`: the feed refresh, one at a time, that requests can join.
 //! - `thumbs`: thumbnails, fetched a page at a time.
 //! - `relay`: the video relay, chunked and Range-forwarding.
+//! - `lookups`: the lookups of the videos played lately, to play them again.
+//! - `warm`: the start and end of a video's streams, fetched when it is opened.
 
 mod api;
 mod comments;
 mod http;
 mod jobs;
 mod lenses;
+mod lookups;
 mod relay;
 #[cfg(test)]
 mod testkit;
 mod thumbs;
+mod warm;
 
 use crate::app::{self, Runtime, Watched};
 use crate::ids::VideoRef;
@@ -34,6 +38,7 @@ use crate::resume;
 use crate::store::Paths;
 use crate::util::{lock, random_hex};
 use crate::video::Chapter;
+use crate::ytdlp::Streams;
 use anyhow::{Context, Result, bail};
 use http::{
     ACCEPT_BACKOFF, Deadline, Pending, REQUEST_LINE_TIMEOUT, REQUEST_TIMEOUT, Reject, Slot,
@@ -44,7 +49,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -68,6 +73,32 @@ pub struct Server {
     connections: Arc<AtomicUsize>,
     /// Connections that haven't shown the token yet.
     unverified: Arc<Unverified>,
+    /// Whether a session starts fetching the start and end of its streams
+    /// when it is opened (see `warm`). Always on, except in the tests that
+    /// count every request the upstream gets.
+    warming: AtomicBool,
+    /// The lookups of the videos played lately (see `lookups`).
+    lookups: lookups::Lookups,
+    /// What tells the lookup of the next video that is running, if one is,
+    /// to stop (see `prepare_next`).
+    preparing: Mutex<Option<Arc<AtomicBool>>>,
+    /// How many plays have answered and not yet added their video to the
+    /// history (see `Recording`).
+    recording: (Mutex<usize>, std::sync::Condvar),
+}
+
+/// Held by a play from just before it answers until its video is in the
+/// history. The window asks for the history as soon as it has the answer,
+/// and that has to find the video there; `Server::history_settled` waits
+/// for this.
+pub(super) struct Recording<'a>(&'a Server);
+
+impl Drop for Recording<'_> {
+    fn drop(&mut self) {
+        let (count, settled) = &self.0.recording;
+        *lock(count) -= 1;
+        settled.notify_all();
+    }
 }
 
 #[derive(Serialize)]
@@ -109,6 +140,8 @@ pub struct Opened {
     pub info: PlayInfo,
     /// What to add to the history, if it is on. Not added yet: see `Server::remember`.
     watched: Option<Watched>,
+    /// The session it was registered as.
+    session: Option<Arc<Session>>,
 }
 
 impl Server {
@@ -123,6 +156,13 @@ impl Server {
         if let Err(e) = app::tidy_topics(&paths, rt.cfg.topic_feeds) {
             note!("qveil: couldn't tidy the topic feeds' files: {e:#}");
         }
+        // Thumbnails kept on disk while that was on, before it was turned off
+        // in the config file.
+        if !rt.cfg.keep_thumbnails
+            && let Err(e) = thumbs::Disk::default().forget(&paths.thumbs())
+        {
+            note!("qveil: couldn't delete the thumbnails kept on disk: {e:#}");
+        }
         Arc::new(Self {
             runtime: RwLock::new(Arc::new(rt)),
             paths,
@@ -135,6 +175,10 @@ impl Server {
             settings: Mutex::new(()),
             connections: Arc::new(AtomicUsize::new(0)),
             unverified: Arc::new(Unverified::default()),
+            warming: AtomicBool::new(true),
+            lookups: lookups::Lookups::default(),
+            preparing: Mutex::new(None),
+            recording: Default::default(),
         })
     }
 
@@ -215,23 +259,30 @@ impl Server {
     fn open_until(self: &Arc<Self>, v: &VideoRef, abort: &dyn Fn() -> bool) -> Result<Opened> {
         let base = self.listen()?;
         let rt = self.runtime();
-        let yt = rt.pinned_ytdlp();
         let format = rt.cfg.format();
-        let s = yt.resolve_until(&v.watch_url(), &format, abort)?;
+        // A video played again a little later is played from the same lookup.
+        let (s, live, fresh) = match self.lookups.get(&v.id, &format, &rt.net) {
+            Some((s, live)) => (s, live, false),
+            None => {
+                let (s, live) = self.look_up(&rt, v, &format, abort)?;
+                (s, live, true)
+            }
+        };
         let has_audio = s.audio.is_some();
-        let session = Session::new(
-            v.clone(),
-            format,
-            rt.net.clone(),
-            Live {
-                generation: 0,
-                video: s.video,
-                audio: s.audio,
-                headers: s.headers,
-                client: yt.net.relay_client()?,
-            },
-        );
+        let (video_size, audio_size) = (s.video_size, s.audio_size);
+        let session = Session::new(v.clone(), format.clone(), rt.net.clone(), live.clone());
         let sid = self.register(&rt, session)?;
+        if fresh {
+            self.keep_lookup(&rt, &v.id, &format, &s, &live);
+        }
+        // What mpv will ask for first is fetched while the answer travels
+        // and mpv starts.
+        let session = self.session(&sid);
+        if let Some(s) = &session
+            && self.warming.load(Ordering::Relaxed)
+        {
+            warm::start(s, [video_size, audio_size]);
+        }
         let watched = rt.cfg.history.then(|| Watched {
             id: v.id.clone(),
             title: s.title.clone(),
@@ -256,6 +307,7 @@ impl Server {
                 chapters: s.chapters,
             },
             watched,
+            session,
         })
     }
 
@@ -273,6 +325,30 @@ impl Server {
                 note!("qveil: couldn't read where this video was stopped: {e:#}");
                 None
             }
+        }
+    }
+
+    /// Marks a play as about to answer: see `Recording`.
+    fn recording(&self) -> Recording<'_> {
+        *lock(&self.recording.0) += 1;
+        Recording(self)
+    }
+
+    /// Waits (a little, at most) until the plays that have answered have
+    /// added their videos to the history.
+    fn history_settled(&self) {
+        let (count, settled) = &self.recording;
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut n = lock(count);
+        while *n > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            n = match settled.wait_timeout(n, left) {
+                Ok((n, _)) => n,
+                Err(e) => e.into_inner().0,
+            };
         }
     }
 
@@ -309,6 +385,38 @@ impl Server {
             }
         }
         Ok(sid)
+    }
+
+    /// Resolves `v` through one pinned identity of `rt`'s route, with the
+    /// relay client of that identity.
+    fn look_up(
+        &self,
+        rt: &Runtime,
+        v: &VideoRef,
+        format: &str,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<(Streams, Live)> {
+        let yt = rt.pinned_ytdlp();
+        let s = yt.resolve_until(&v.watch_url(), format, abort)?;
+        let live = Live {
+            generation: 0,
+            video: s.video.clone(),
+            audio: s.audio.clone(),
+            headers: s.headers.clone(),
+            client: yt.net.relay_client()?,
+        };
+        Ok((s, live))
+    }
+
+    /// Keeps a lookup made on `rt`'s route for playing the video again,
+    /// unless the route has changed since. Under the sessions lock, like
+    /// `register`, so that it can't slip in after `update_config` has
+    /// cleared the lookups of the old route.
+    fn keep_lookup(&self, rt: &Runtime, id: &str, format: &str, s: &Streams, live: &Live) {
+        let _sessions = lock(&self.sessions);
+        if self.still_on(rt) {
+            self.lookups.put(id, format, &rt.net, s, live);
+        }
     }
 
     fn session(&self, sid: &str) -> Option<Arc<Session>> {
@@ -399,6 +507,7 @@ impl Server {
             }
             ("GET", ["api", "feed"]) => self.feed(&mut stream, &req),
             ("POST", ["api", "play"]) => self.play(&mut stream, &req),
+            ("POST", ["api", "prepare"]) => self.prepare_next(&mut stream, &req),
             ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),
             _ => self.json_api(&mut stream, &req, &segs),
         }

@@ -13,8 +13,10 @@
 //! the engine by a moment and kills the groups it was told about.
 
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 /// A child process and the group it leads.
 ///
@@ -67,6 +69,14 @@ impl Group {
         self.child.id()
     }
 
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
     }
@@ -111,6 +121,41 @@ impl Group {
         self.reaped = true;
         guard::forget(self.child.id());
         Ok(status)
+    }
+}
+
+/// A pidfd for process `pid`, which becomes readable when the process ends.
+/// Only right while `pid` is a child that hasn't been reaped (its id can't be
+/// someone else's then). `None` if the kernel can't (older than 5.3).
+pub fn pidfd(pid: u32) -> Option<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    // SAFETY: a non-negative result is a new descriptor that nothing else owns.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+}
+
+/// Waits up to `limit` for `fd` (a pidfd) to become readable: true if it
+/// did, which is when its process ended.
+pub fn wait_readable(fd: &OwnedFd, limit: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Rounded up, so a wait that wakes a moment early doesn't spin.
+        let ms = left.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
+        let mut p = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut p, 1, ms) } {
+            1.. => return Ok(true),
+            0 => return Ok(false),
+            _ => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
     }
 }
 
