@@ -372,33 +372,32 @@ mod tests {
     #[test]
     fn the_head_reaches_the_player_as_it_arrives_not_once_it_is_all_in() {
         let up = Upstream::start();
-        // A round trip of 300 ms and then about 160 KB/s, as over a slow Tor
-        // circuit: the whole video head takes more than six seconds to come,
-        // and the audio's more than a second.
-        let (s, base, _d, _bin) =
-            warm_server(&up, &format!("/big?size={SIZE}&ttfb=300&pace=100&run="));
+        // Each head sends its first 16 KiB, and the rest only once the gate
+        // opens: the player's first bytes must come while it is still shut.
+        up.gauge.gate.store(true, Ordering::SeqCst);
+        let (s, base, _d, _bin) = warm_server(&up, &format!("/big?size={SIZE}&gated=1&run="));
         let info = s.open(&test_video()).unwrap();
-        // mpv opens the audio while the video is opening, so each is timed
-        // from its own request, made right after the open.
+        // mpv opens the audio while the video is opening.
         let audio = {
             let (base, audio) = (base.clone(), info.audio.clone().unwrap());
             std::thread::spawn(move || {
-                let (head, took, _, a) = first_byte(&base, rel(&base, &audio), "bytes=0-");
-                (head, took, a)
+                let (head, _, _, a) = first_byte(&base, rel(&base, &audio), "bytes=0-");
+                (head, a)
             })
         };
-        let (head, took, mut body, mut c) = first_byte(&base, rel(&base, &info.video), "bytes=0-");
-        eprintln!("first byte of the video after {took:?}");
+        let (head, _, mut body, mut c) = first_byte(&base, rel(&base, &info.video), "bytes=0-");
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
         assert!(
             head.contains(&format!("Content-Range: bytes 0-{}/{SIZE}", SIZE - 1)),
             "{head}"
         );
-        assert!(took < Duration::from_millis(900), "{took:?}");
-        let (head, took, _a) = audio.join().unwrap();
-        eprintln!("first byte of the audio after {took:?}");
+        let (head, _a) = audio.join().unwrap();
         assert!(head.starts_with("HTTP/1.1 206"), "{head}");
-        assert!(took < Duration::from_millis(900), "{took:?}");
+        assert!(
+            up.gauge.gate.load(Ordering::SeqCst),
+            "the gate opened on its own"
+        );
+        up.gauge.gate.store(false, Ordering::SeqCst);
         read_up_to(&mut c, &mut body, 200_000);
         assert!(body[..200_000] == big_bytes(0, 200_000), "the bytes differ");
         // Both came from the requests made at open: the start was asked for

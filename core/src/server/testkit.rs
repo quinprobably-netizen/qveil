@@ -115,6 +115,9 @@ pub struct Gauge {
     pub hold: AtomicBool,
     /// How many thumbnail requests are waiting on `hold`.
     pub waiting: AtomicUsize,
+    /// While set, a `/big?gated=1` response stops after its first 16 KiB and
+    /// sends the rest once it is cleared (or after 30 s).
+    pub gate: AtomicBool,
 }
 
 /// A tiny stand-in for googlevideo on a local port. It records every
@@ -280,7 +283,8 @@ pub fn big_bytes(from: u64, to: u64) -> Vec<u8> {
 /// again after that, and `dead=1` one whose connections die at once after
 /// the first chunk. `hold=B` leaves a request for a range that ends at byte
 /// `B` unanswered for ten seconds, and `cut=B` stops one half-way. `Gauge::cuts`
-/// makes that many responses stop half-way.
+/// makes that many responses stop half-way, and `gated=1` holds what follows
+/// the first 16 KiB of a response behind `Gauge::gate`.
 pub fn big(mut conn: TcpStream, query: &str, range: Option<&str>, head_only: bool, gauge: &Gauge) {
     big_to(&mut conn, query, range, head_only, gauge, true);
 }
@@ -372,6 +376,12 @@ fn big_to(
         }
         gauge.sent.fetch_add(block.len(), Ordering::SeqCst);
         at += n;
+        if at == a + n && param("gated").is_some() {
+            let started = Instant::now();
+            while gauge.gate.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         if pace > 0 {
             std::thread::sleep(Duration::from_millis(pace));
         }
