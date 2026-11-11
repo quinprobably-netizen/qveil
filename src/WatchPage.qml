@@ -9,9 +9,10 @@ FocusScope {
     id: page
     objectName: "watch"
 
-    // The list the video was opened from, and where in it.
+    // The list the video was opened from, where in it, and in words where it came from.
     property var list: null
     property int index: -1
+    property string from: ""
     property string thumbs: "frosted"
     property real savedVolume: 80
     // The video takes the width, and the sheet steps aside.
@@ -261,6 +262,7 @@ FocusScope {
             thumbs: page.thumbs
             list: page.list
             index: page.index
+            from: page.from
             onPicked: (video, row) => page.videoRequested(video, page.list, row)
         }
     }

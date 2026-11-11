@@ -16,13 +16,13 @@ FocusScope {
     property bool arming: false
     property string thumbs: "clear"
     // `list` is what the video was clicked in, and `index` where: what comes
-    // next is the rest of it.
-    signal playRequested(var video, var list, int index)
+    // next is the rest of it. `origin` says in words which list that was.
+    signal playRequested(var video, var list, int index, string origin)
 
     // Plays the video at `index` of what is listed (the history, or what is
-    // kept unfinished).
-    function play(rows, index) {
-        page.playRequested(rows[index], Arrange.listed(rows), index)
+    // kept unfinished), which `origin` calls by its name.
+    function play(rows, index, origin) {
+        page.playRequested(rows[index], Arrange.listed(rows), index, origin)
     }
     // The unfinished videos as videos: where they were stopped is no part of one.
     readonly property var keptRows: backend.resume.map(k => ({ id: k.id, title: k.title || "", channel: k.channel || "", duration: k.dur }))
@@ -163,7 +163,7 @@ FocusScope {
             required property var modelData
             required property int index
             readonly property bool current: ListView.isCurrentItem && kept.activeFocus
-            function play() { page.play(page.keptRows, index) }
+            function play() { page.play(page.keptRows, index, qsTr("Unfinished")) }
             objectName: "history-kept"
             width: kept.width
             height: 92
@@ -286,7 +286,7 @@ FocusScope {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         model: page.on ? backend.history : []
-        Keys.onReturnPressed: if (currentIndex >= 0) page.play(backend.history, currentIndex)
+        Keys.onReturnPressed: if (currentIndex >= 0) page.play(backend.history, currentIndex, qsTr("History"))
 
         delegate: Rectangle {
             id: row
@@ -345,7 +345,7 @@ FocusScope {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: page.play(backend.history, row.index)
+                onClicked: page.play(backend.history, row.index, qsTr("History"))
             }
         }
     }

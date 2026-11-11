@@ -40,18 +40,19 @@ FocusScope {
     }
 
     signal activated(var video, int index)
-    // A video on a shelf: `list` is what comes after it.
-    signal shelfActivated(var video, var list, int index)
+    // A video on a shelf: `list` is what comes after it, and `origin` says in
+    // words where that list came from.
+    signal shelfActivated(var video, var list, int index, string origin)
     signal channelRequested(string id)
-    signal resumed(var video, var list, int index)
-    signal restarted(var video, var list, int index)
+    signal resumed(var video, var list, int index, string origin)
+    signal restarted(var video, var list, int index, string origin)
     signal forgotten(var kept)
     signal shortsToggled(bool shown)
     signal refreshRequested()
     signal newLensRequested()
-    signal addChannelRequested()
     // A lens's shelf is opened in full: the Lenses page has it.
     signal lensRequested(string id)
+    signal addChannelRequested()
 
     // The latest from the channels, in full.
     function showAll() {
@@ -80,9 +81,9 @@ FocusScope {
         onArranged: (key, setting) => page.arranged(key, setting)
         loading: page.loading
         noChannels: page.noChannels
-        onActivated: (video, list, index) => page.shelfActivated(video, list, index)
-        onResumed: (video, list, index) => page.resumed(video, list, index)
-        onRestarted: (video, list, index) => page.restarted(video, list, index)
+        onActivated: (video, list, index, origin) => page.shelfActivated(video, list, index, origin)
+        onResumed: (video, list, index, origin) => page.resumed(video, list, index, origin)
+        onRestarted: (video, list, index, origin) => page.restarted(video, list, index, origin)
         onForgotten: kept => page.forgotten(kept)
         onAllRequested: which => which === "latest" ? page.showAll() : page.lensRequested(which)
         onChannelRequested: id => page.channelRequested(id)

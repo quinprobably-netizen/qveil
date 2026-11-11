@@ -155,6 +155,8 @@ ApplicationWindow {
     // what comes next is the rest of that list.
     property var playList: null
     property int playIndex: -1
+    // In words, where that list came from ("Unfinished", "search: rust"), or "".
+    property string playOrigin: ""
     // What comes next is the list as it was when the video was played: the
     // list itself may re-sort, filter or refill under it while it plays.
     VideoModel { id: playedFrom }
@@ -233,14 +235,14 @@ ApplicationWindow {
             backend.refreshFeed(true, prefs.showShorts)
     }
 
-    // The first run's way in: Channels, with the add field ready to type in.
-    function addChannel() {
     // The Lenses page, with the lens `id` open.
     function openLens(id) {
         lensesPage.show(id)
         go("lenses")
     }
 
+    // The first run's way in: Channels, with the add field ready to type in.
+    function addChannel() {
         go("channels")
         // go() puts focus on the list on the next turn; the field comes after.
         Qt.callLater(() => subsPage.focusAdd())
@@ -259,7 +261,12 @@ ApplicationWindow {
 
     // The player opens at once, with what the card knows, while the engine
     // looks the video up. `list` and `index` say where it was opened from.
+    // (A video taken from the list that is playing from keeps its origin.)
     function play(video, list, index) {
+        playListed(list && list === playedFrom ? playOrigin : "", video, list, index)
+    }
+    // The same for a video opened from a list that says where it came from.
+    function playListed(origin, video, list, index) {
         openingAs = null
         if (list && list !== playedFrom) {
             const rows = []
@@ -269,6 +276,7 @@ ApplicationWindow {
         }
         playList = list ? playedFrom : null
         playIndex = list ? index : -1
+        playOrigin = list ? origin : ""
         // While a video is in the small window, the next one plays there
         // too, and the main window stays where it is.
         if (pip) {
@@ -285,8 +293,8 @@ ApplicationWindow {
     // at, and `forget` says that the place the engine kept for it is forgotten
     // once the video has begun, not before (a video that doesn't open keeps it).
     property var openingAs: null
-    function startOver(video, list, index) {
-        play(video, list, index)
+    function startOver(origin, video, list, index) {
+        playListed(origin, video, list, index)
         openingAs = { id: video.id, at: 0, forget: true }
     }
 
@@ -679,11 +687,11 @@ ApplicationWindow {
                     arrangements: win.arrangements
                     watched: win.watchedIds
                     onArranged: (key, setting) => win.arrange(key, setting)
-                    onActivated: (video, index) => win.play(video, feedPage.model, index)
-                    onShelfActivated: (video, list, index) => win.play(video, list, index)
+                    onActivated: (video, index) => win.playListed(qsTr("Latest from your channels"), video, feedPage.model, index)
+                    onShelfActivated: (video, list, index, origin) => win.playListed(origin, video, list, index)
                     onChannelRequested: id => win.openChannel(id)
-                    onResumed: (video, list, index) => win.play(video, list, index)
-                    onRestarted: (video, list, index) => win.startOver(video, list, index)
+                    onResumed: (video, list, index, origin) => win.playListed(origin, video, list, index)
+                    onRestarted: (video, list, index, origin) => win.startOver(origin, video, list, index)
                     onForgotten: kept => win.forgotPlace(kept)
                     onShortsToggled: shown => {
                         prefs.showShorts = shown
@@ -694,6 +702,7 @@ ApplicationWindow {
                         win.go("lenses")
                         lensesPage.startNew()
                     }
+                    onLensRequested: id => win.openLens(id)
                     onAddChannelRequested: win.addChannel()
                 }
 
@@ -702,7 +711,6 @@ ApplicationWindow {
                     objectName: "searchPage"
                     anchors.fill: parent
                     visible: win.page === "search" && !win.watching
-                    onLensRequested: id => win.openLens(id)
                     thumbs: win.thumbs
                     progress: win.watched
                     heading: backend.query ? qsTr("\u201c%1\u201d").arg(backend.query) : qsTr("Search")
@@ -715,7 +723,7 @@ ApplicationWindow {
                     estimateNote: qsTr("Approximate: YouTube's search only says how long ago")
                     loading: backend.busy.indexOf("search") >= 0
                     emptyText: backend.query ? qsTr("No results.") : ""
-                    onActivated: (video, index) => win.play(video, searchPage.grid.list, index)
+                    onActivated: (video, index) => win.playListed(qsTr("search: %1").arg(backend.query), video, searchPage.grid.list, index)
                     onChannelRequested: id => win.openChannel(id)
 
                     // A search worth repeating becomes a feed.
@@ -745,7 +753,7 @@ ApplicationWindow {
                     estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
                     loading: backend.busy.indexOf("channel") >= 0
                     emptyText: qsTr("No videos.")
-                    onActivated: (video, index) => win.play(video, channelPage.grid.list, index)
+                    onActivated: (video, index) => win.playListed(backend.channel.name || "", video, channelPage.grid.list, index)
 
                     // Subscribe is the call to action; Subscribed is the same
                     // word switched on, with a check.
@@ -767,7 +775,7 @@ ApplicationWindow {
                     thumbs: win.thumbs
                     progress: win.watched
                     onChannelRequested: id => win.openChannel(id)
-                    onActivated: (video, list, index) => win.play(video, list, index)
+                    onActivated: (video, list, index, origin) => win.playListed(origin, video, list, index)
                 }
 
                 HistoryPage {
@@ -775,7 +783,7 @@ ApplicationWindow {
                     anchors.fill: parent
                     thumbs: win.thumbs
                     visible: win.page === "history" && !win.watching
-                    onPlayRequested: (video, list, index) => win.play(video, list, index)
+                    onPlayRequested: (video, list, index, origin) => win.playListed(origin, video, list, index)
                 }
 
                 WatchPage {
@@ -784,6 +792,7 @@ ApplicationWindow {
                     visible: active
                     list: win.playList
                     index: win.playIndex
+                    from: win.playOrigin
                     thumbs: win.thumbs
                     full: win.fullscreen
                     hold: route.opened || help.opened
@@ -815,7 +824,7 @@ ApplicationWindow {
                     arrangements: win.arrangements
                     watched: win.watchedIds
                     onArranged: (key, setting) => win.arrange(key, setting)
-                    onActivated: (video, index) => win.play(video, lensesPage.grid.list, index)
+                    onActivated: (video, index) => win.playListed(qsTr("lens: %1").arg(lensesPage.lens.text || ""), video, lensesPage.grid.list, index)
                     onChannelRequested: id => win.openChannel(id)
                 }
 

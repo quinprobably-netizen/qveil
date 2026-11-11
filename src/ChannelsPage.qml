@@ -14,8 +14,8 @@ FocusScope {
     // Where focus belongs when the page is shown.
     readonly property Item content: list
     signal channelRequested(string id)
-    // A video in the pane: `list` is what comes after it.
-    signal activated(var video, var list, int index)
+    // A video in the pane: `list` is what comes after it, and `origin` is the channel's name.
+    signal activated(var video, var list, int index, string origin)
 
     // The feed's videos, by channel (named for its count, so that it follows the feed).
     readonly property var byChannel: {
@@ -316,7 +316,7 @@ FocusScope {
             thumbs: page.thumbs
             progress: page.progress
             estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
-            onActivated: (video, index) => page.activated(video, theirs, index)
+            onActivated: (video, index) => page.activated(video, theirs, index, page.chosen.name || "")
             // Left (or h) at its edge goes back to the channels.
             leftExits: true
             onLeftEdge: list.forceActiveFocus()

@@ -87,10 +87,12 @@ FocusScope {
                 return group
         return ({})
     }
-    signal activated(var video, var list, int index)
+    // A video on a shelf: `list` is what comes after it, and `origin` says in
+    // words where that list came from.
+    signal activated(var video, var list, int index, string origin)
     // The lead is picked up, or played from its start: `list` is what comes after it.
-    signal resumed(var video, var list, int index)
-    signal restarted(var video, var list, int index)
+    signal resumed(var video, var list, int index, string origin)
+    signal restarted(var video, var list, int index, string origin)
     // The place kept for the lead was forgotten: `kept` is what it was.
     signal forgotten(var kept)
     signal allRequested(string feed)
@@ -166,6 +168,16 @@ FocusScope {
         const n = key === "latest" && latestRows > 1 ? latestRows * across : most
         return sourceOf(key).slice(0, n)
     }
+    // In words, where what a shelf plays came from.
+    function originOf(key) {
+        if (key === "latest")
+            return qsTr("Latest from your channels")
+        if (key === "resume")
+            return qsTr("Unfinished")
+        if (key.indexOf("topic-") === 0)
+            return qsTr("topic: %1").arg(topicOf(key).label || "")
+        return qsTr("lens: %1").arg(lensOf(key).text || "")
+    }
     function pick(key, video, index) {
         if (key === "latest" && Arrange.plain(arrangements[key])) {
             // The shelf is the start of the feed: what comes next is the rest of
@@ -176,9 +188,9 @@ FocusScope {
                     at = i
                     break
                 }
-            page.activated(video, backend.feed, at)
+            page.activated(video, backend.feed, at, originOf(key))
         } else {
-            page.activated(video, Arrange.listed(sourceOf(key)), index)
+            page.activated(video, Arrange.listed(sourceOf(key)), index, originOf(key))
         }
     }
     // The cursor steps aside when the pointer moves over the page (not when
@@ -294,17 +306,21 @@ FocusScope {
             pick(key, entries[column], column)
     }
     // What follows the lead when it is played: the other unfinished videos
-    // (the shelf under it), and when there are none, the latest from the channels.
+    // (the shelf under it), and when there are none, the latest from the
+    // channels. { list, origin }
     function afterLead(kept) {
         const video = { id: kept.id, title: kept.title || "", channel: kept.channel || "" }
         let rest = sourceOf("resume").filter(v => v.id !== video.id)
-        if (rest.length === 0)
+        let origin = originOf("resume")
+        if (rest.length === 0) {
             rest = Arrange.rows(backend.feed).filter(v => v.id !== video.id)
-        return Arrange.listed([video].concat(rest))
+            origin = originOf("latest")
+        }
+        return { list: Arrange.listed([video].concat(rest)), origin: origin }
     }
     function resume(kept) {
-        const list = afterLead(kept)
-        page.resumed(list.get(0), list, 0)
+        const after = afterLead(kept)
+        page.resumed(after.list.get(0), after.list, 0, after.origin)
     }
     function forget(kept) {
         backend.forgetResume(kept.id)
@@ -312,8 +328,8 @@ FocusScope {
     }
     function startOver(kept) {
         // (The place is forgotten once the video has begun, not before: see Main.)
-        const list = afterLead(kept)
-        page.restarted(list.get(0), list, 0)
+        const after = afterLead(kept)
+        page.restarted(after.list.get(0), after.list, 0, after.origin)
     }
 
     Component.onCompleted: rekey()

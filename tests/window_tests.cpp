@@ -1664,6 +1664,139 @@ private slots:
         QCOMPARE(app.items("next-entry").at(1)->property("title").toString(), QString("The 1970s synth that refuses to stay in tune"));
     }
 
+    // The line over Up next that says where its list came from, and how many follow.
+    void upNextSaysWhereItsListCameFrom()
+    {
+        const auto said = [](App &app) {
+            QQuickItem *from = app.item("next-from-text"), *count = app.item("next-from-count");
+            return from && count && from->isVisible() ? from->property("text").toString() + " " + count->property("text").toString().simplified() : QString();
+        };
+        const QString dot = QString::fromUtf8("\u00b7");
+        {
+            // Resuming: the other unfinished videos; going on and picking from the list keeps it.
+            App app;
+            READY(app);
+            QTRY_VERIFY(app.item("lead")->isVisible());
+            app.click(app.item("lead-resume"));
+            QTRY_COMPARE(said(app), "From Unfinished " + dot + " 2");
+            // The line is in view, over the first entry, at the top of the sheet's list.
+            const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+            QTRY_VERIFY(box(app.item("next-from-text")).top() >= box(app.item("sheet")).top());
+            QTRY_VERIFY(box(app.items("next-entry").first()).top() >= box(app.item("next-from-text")).bottom());
+            QTest::keyClick(app.window, Qt::Key_N);
+            QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000005"));
+            QTRY_COMPARE(said(app), "From Unfinished " + dot + " 1");
+            app.click(app.items("next-entry").first());
+            QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000004"));
+            // Nothing follows the last one: no line either.
+            QTRY_COMPARE(app.items("next-entry").size(), 0);
+            QCOMPARE(said(app), QString());
+        }
+        {
+            // The last unfinished video is followed by the latest.
+            App app;
+            READY(app);
+            QTRY_VERIFY(app.item("lead")->isVisible());
+            app.backend->forgetResume("vid00000005");
+            app.backend->forgetResume("vid00000004");
+            QTRY_COMPARE(app.backend->resume().size(), 1);
+            app.click(app.item("lead-resume"));
+            QTRY_COMPARE(said(app), "From Latest from your channels " + dot + " 11");
+        }
+        {
+            // A shelf's own name, and the feed in full.
+            App app(false, QSize(1280, 1600));
+            READY(app);
+            QTRY_VERIFY(app.item("lead")->isVisible());
+            QTRY_VERIFY(app.item("shelf-aaaa0002") && App::count(app.item("shelf-aaaa0002"), "card") >= 4);
+            app.click(App::under(app.item("shelf-aaaa0002"), "card"));
+            QTRY_VERIFY(app.window->property("watching").toBool());
+            QTRY_VERIFY(said(app).startsWith("From lens: systems talks over 30 min, this year " + dot + " "));
+            QTest::keyClick(app.window, Qt::Key_Escape);
+            QTRY_VERIFY(!app.window->property("watching").toBool());
+            app.click(App::under(app.item("shelf-latest"), "shelf-all"));
+            QTRY_COMPARE(app.item("home-grid")->property("count").toInt(), 12);
+            QTest::keyClick(app.window, Qt::Key_Return);
+            QTRY_COMPARE(said(app), "From Latest from your channels " + dot + " 11");
+        }
+        {
+            // The Lenses page, a search, and a channel's page.
+            App app;
+            READY(app);
+            QTest::keyClick(app.window, Qt::Key_2);
+            QQuickItem *grid = nullptr;
+            QTRY_VERIFY((grid = app.item("lens-grid")) && grid->property("count").toInt() > 0);
+            QTRY_VERIFY(app.items("card").size() > 0);
+            app.click(app.items("card").first());
+            QTRY_VERIFY(said(app).startsWith("From lens: slow woodworking with hand tools, no music " + dot + " "));
+            QTest::keyClick(app.window, Qt::Key_Escape);
+            QTRY_VERIFY(!app.window->property("watching").toBool());
+
+            QMetaObject::invokeMethod(app.item("search"), "edit");
+            app.type("talks over 30 min");
+            QTest::keyClick(app.window, Qt::Key_Return);
+            QTRY_COMPARE(app.page(), QString("search"));
+            QTRY_VERIFY(app.items("card").size() > 0);
+            app.click(app.items("card").first());
+            QTRY_VERIFY(said(app).startsWith("From search: talks over 30 min " + dot + " "));
+            QTest::keyClick(app.window, Qt::Key_Escape);
+
+            QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+            QTRY_COMPARE(app.page(), QString("channel"));
+            QTRY_VERIFY(app.items("card").size() > 0);
+            app.click(app.items("card").first());
+            QTRY_VERIFY(said(app).startsWith("From Low Level Hours " + dot + " "));
+        }
+        {
+            // Channels, with the pane's own list, and the history in both of its states.
+            App app;
+            READY(app);
+            QTest::keyClick(app.window, Qt::Key_3);
+            QQuickItem *pane = nullptr;
+            QTRY_VERIFY((pane = app.item("channel-pane")) && pane->property("count").toInt() == 3);
+            QTest::keyClick(app.window, Qt::Key_L);
+            QTRY_VERIFY(pane->hasActiveFocus());
+            QTest::keyClick(app.window, Qt::Key_Return);
+            QTRY_COMPARE(said(app), "From Low Level Hours " + dot + " 2");
+            QTest::keyClick(app.window, Qt::Key_Escape);
+
+            QTest::keyClick(app.window, Qt::Key_4);
+            QTRY_COMPARE(app.items("history-kept").size(), 3);
+            app.click(app.items("history-kept").at(1));
+            QTRY_COMPARE(said(app), "From Unfinished " + dot + " 1");
+            QTest::keyClick(app.window, Qt::Key_Escape);
+            app.backend->setConfig({{"history", true}});
+            QTRY_VERIFY(app.backend->config().value("history").toBool());
+            QTest::keyClick(app.window, Qt::Key_4);
+            QTRY_COMPARE(app.items("history-row").size(), 4);
+            app.click(app.items("history-row").at(1));
+            QTRY_COMPARE(said(app), "From History " + dot + " 2");
+        }
+        {
+            // A long name gives way to the count, in the narrow sheet that stands beside the video.
+            const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+            App app(false, QSize(1100, 520));
+            READY(app);
+            QTest::keyClick(app.window, Qt::Key_2);
+            QTRY_VERIFY(app.items("card").size() > 0);
+            app.click(app.items("card").first());
+            QTRY_VERIFY(said(app).startsWith("From lens: slow woodworking"));
+            QQuickItem *text = app.item("next-from-text"), *count = app.item("next-from-count");
+            QTRY_VERIFY(text->property("truncated").toBool());
+            QVERIFY(box(count).right() <= box(app.item("sheet")).right());
+            QVERIFY(box(text).right() <= box(count).left() + 1);
+        }
+        {
+            // A video that wasn't opened from a list has no line.
+            App app;
+            READY(app);
+            app.play({{"id", "vid00000002"}});
+            QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+            QVERIFY(!app.item("next-from"));
+            QCOMPARE(said(app), QString());
+        }
+    }
+
     void historyPlaysWithTheListItWasClickedIn()
     {
         {

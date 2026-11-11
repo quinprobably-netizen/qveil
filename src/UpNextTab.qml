@@ -11,6 +11,10 @@ ListView {
     property var list: null
     // Where in the list the video that is playing is.
     property int index: -1
+    // Where the list came from, in words ("Unfinished", "lens: slow woodworking"), or "".
+    property string from: ""
+    // How many follow the video that is playing: all of them, though it lists the next forty.
+    readonly property int remaining: list && index >= 0 ? Math.max(0, list.count - index - 1) : 0
     // "frosted" or "clear": how thumbnails are shown (see Frost).
     property string thumbs: "clear"
     readonly property var entries: {
@@ -25,18 +29,68 @@ ListView {
     property bool keyed: false
     function step(by) {
         currentIndex = Math.max(0, Math.min(count - 1, currentIndex + by))
-        positionViewAtIndex(currentIndex, ListView.Contain)
+        // (The first has the line over it in view too.)
+        if (currentIndex === 0)
+            positionViewAtBeginning()
+        else
+            positionViewAtIndex(currentIndex, ListView.Contain)
     }
     function activate() {
         if (currentIndex >= 0 && currentIndex < entries.length)
             picked(entries[currentIndex].video, entries[currentIndex].row)
     }
-    onEntriesChanged: currentIndex = 0
+    // A list begins at its start, with the line over it; the line may have
+    // come after the list, which then stood where it was.
+    function toStart() {
+        currentIndex = 0
+        positionViewAtBeginning()
+    }
+    onEntriesChanged: toStart()
+    onFromChanged: Qt.callLater(positionViewAtBeginning)
     keyNavigationEnabled: false
 
     model: entries
     clip: true
     boundsBehavior: Flickable.StopAtBounds
+
+    // Where the list came from, once, over all of it.
+    header: tab.from !== "" && tab.count > 0 ? provenance : null
+    Component {
+        id: provenance
+        Item {
+            objectName: "next-from"
+            width: tab.width
+            height: 34
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.u * 2
+                anchors.right: parent.right
+                anchors.rightMargin: Style.u * 3
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Style.u
+                Text {
+                    objectName: "next-from-text"
+                    // The count keeps its place: a long name gives way, not it.
+                    width: Math.min(implicitWidth, parent.width - count.width)
+                    text: qsTr("From %1").arg(tab.from)
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    color: Style.dim
+                    font.family: Style.font
+                    font.pixelSize: Style.small
+                }
+                Text {
+                    id: count
+                    objectName: "next-from-count"
+                    text: "  \u00b7  " + tab.remaining
+                    textFormat: Text.PlainText
+                    color: Style.faint
+                    font.family: Style.font
+                    font.pixelSize: Style.small
+                }
+            }
+        }
+    }
 
     delegate: Rectangle {
         id: entry
