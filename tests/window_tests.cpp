@@ -885,9 +885,12 @@ private slots:
         QQuickItem *left = App::under(page, "set-file-ignored");
         QTRY_VERIFY(left->isVisible());
         QCOMPARE(left->property("text").toString(), QString("Left out, as this version has no such settings: chapters_on_the_bar, something_newer"));
-        // A change rewrites the file with the settings this version has.
+        // A change rewrites the file, and keeps the keys it left out as they
+        // were (a newer qveil needs them): they are still said to be left out.
         app.backend->setConfig({{"history", true}});
-        QTRY_VERIFY(!left->isVisible());
+        QTRY_VERIFY(app.backend->config().value("history").toBool());
+        QVERIFY(left->isVisible());
+        QCOMPARE(left->property("text").toString(), QString("Left out, as this version has no such settings: chapters_on_the_bar, something_newer"));
     }
 
     void aLinkInADescriptionLeadsBackIntoTheAppOrIsOnlyCopied()

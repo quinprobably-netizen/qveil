@@ -66,7 +66,7 @@ CHAPTERS = [(0, "The error everyone hits"), (252, "Ownership in one picture"), (
             (1100, "Lifetimes are regions"), (1565, "Two-phase borrows"), (2028, "When to reach for Rc"),
             (2350, "Recap")]
 
-COMMENTS = [
+COMMENT_THREADS = [
     {"id": "c1", "author": "Low Level Hours", "text": "Correction: at 18:20 the lifetime on screen should be 'a, not 'b. The code in the description is right.",
      "likes": 640, "timeText": "9 hours ago", "pinned": True, "byUploader": True, "replies": []},
     {"id": "c2", "author": "mara_k", "text": "The diagram at 12:40 finally made reborrowing click for me.",
@@ -81,31 +81,70 @@ COMMENTS = [
      "likes": 41, "timeText": "1 hour ago", "pinned": False, "byUploader": False, "replies": []},
 ]
 
+# The engine's own words (core/src/privacy.rs), on one line each so that a
+# test of the engine's (`the_stand_in_engine_says_the_same`) can check they
+# are the same, and that every page the engine has a text for is here.
+SUMMARY_DIRECT = "Direct: YouTube sees your IP address."
+SUMMARY_TOR = "Through Tor: YouTube sees an exit node's address, not your IP, but can still link requests by their fingerprint and timing."
+ROUTE_DIRECT = "YouTube sees your IP address."
+ROUTE_TOR = "Fresh SOCKS credentials per request, which Tor puts on separate circuits (a video, and a page of thumbnails, each share one); requests can still be linked by their fingerprint and timing."
+ROUTE_PROXY = "A proxy you trust, such as a VPN's: YouTube sees its address, not yours. A SOCKS proxy gets fresh credentials per request (a separate circuit if it is Tor); a proxy URL with credentials of its own is not isolated."
+DIRECT_POINT = "YouTube sees your IP address with every request, which links them all."
+FINGERPRINT_POINT = "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits, and by the one-byte request (bytes=0-0) for the start of a video that keeps a connection ready for a seek, sent at most once every 10 seconds while it plays over HTTP/1.1."
+SUBSCRIPTIONS_POINT = "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them."
+COOKIES_POINT = "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends."
+COMMENTS_POINT = "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched."
+LOOKUP_POINT = "Playing a video, or getting it ready, looks it up the way yt-dlp does by itself: its watch page, and then YouTube's player for its streams, with the same identity. Its chapters, its channel's name and its age come with that lookup, and cost no request of their own. yt-dlp asks the player as one of YouTube's own clients, with that client's User-Agent (with current yt-dlp, Safari's, from its visionOS client) and not qveil's Chrome one, which the video's bytes carry: a lookup and its stream show two browser identities."
+LENSES_POINT = "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content."
+LOCAL_POINT = "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry."
+SEARCH = "Straight from YouTube's search, without an account; qveil stores no cookies and doesn't keep your searches. A search with a filter in it (\"over 30 min\", \"-word\") is sent as one search per topic, like a lens, and filtered and ordered on this computer."
+SUBSCRIPTIONS = "Kept only on this computer. Each channel is fetched on its own, in random order, but a refresh is still a burst of requests for exactly your channels."
+HISTORY_OFF = "Off: qveil keeps no history. Where you stopped in unfinished videos is remembered separately, while resume is on."
+HISTORY_ON = "On: kept only on this computer, in a file only you can read, until you clear it."
+TOPICS_OFF = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself."
+TOPICS_ON = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups, in a new random order each time and 2 to 8 seconds apart: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that."
+COMMENTS = "Fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing. Commenters' pictures are never fetched."
+COMMENTS_SHORT = "Loaded on demand, one extra request."
+LENSES = "A refresh sends one search per topic, each a request of its own, in a new random order each time and 2 to 8 seconds apart. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer."
+LENSES_SHORT = "A refresh sends each topic to YouTube as a search of its own, sometimes twice."
+PREPARE_OFF = "Off: a video is looked up when you play it, and not before."
+PREPARE_ON = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it."
+KEEP_THUMBS_OFF = "Off: thumbnails are kept in memory while qveil runs, and not on disk."
+KEEP_THUMBS_ON = "On: the thumbnails you were shown are kept on disk, in ~/.cache/qveil/thumbs, in files only you can read (at most 64 MiB, the least recently shown going first), so that they aren't fetched again. They are a record, on this computer, of the pictures you were shown. Turning this off, clearing the history or qveil wipe deletes them."
+RESUME_OFF = "Off: qveil doesn't remember where you stopped."
+RESUME_ON = "On: qveil remembers where you stopped in an unfinished video for {days}, in a file only you can read. After that it is no longer offered, and it is deleted the next time qveil starts or saves a position. A finished video is forgotten at once."
+
+
+
+def resume_text(days):
+    """What the engine says of resume when positions are kept for `days`."""
+    if days == 0:
+        return RESUME_OFF
+    return RESUME_ON.format(days="1 day" if days == 1 else "%d days" % days)
+
+
 PRIVACY = {
-    "summary": "Direct: YouTube sees your IP address.",
-    # As long as the engine's own, so that what holds them is tried at its real size.
-    "points": ["YouTube sees your IP address with every request, which links them all.",
-               "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits, and by the one-byte request (bytes=0-0) for the start of a video that keeps a connection ready for a seek, sent at most once every 10 seconds while it plays over HTTP/1.1.",
-               "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
-               "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
-               "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.",
-               "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.",
-               "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry."],
-    "routes": {"direct": "YouTube sees your IP address.",
-               "tor": "Fresh SOCKS credentials per request, which Tor puts on separate circuits.",
-               "proxy": "A proxy you trust, such as a VPN's: YouTube sees its address, not yours."},
-    "pages": {"search": "Straight from YouTube's search, without an account.",
-              "subscriptions": "Kept only on this computer.",
-              "history_off": "Off: qveil keeps no history.",
-              "history_on": "On: kept only on this computer, until you clear it.",
-              "topics": "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.",
-              "topics_off": "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.",
-              "topics_on": None,  # TOPICS_ON, below
-              "resume": "On: qveil remembers where you stopped in an unfinished video for 7 days.",
-              "comments": "Fetched only when you open them, as one more lookup of that video.",
-              "comments_short": None,  # COMMENTS_SHORT, below
-              "lenses": "A refresh sends one search per topic, each a request of its own, in a new random order each time and 2 to 8 seconds apart. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.",
-              "lenses_short": None},  # LENSES_SHORT, below
+    "summary": SUMMARY_DIRECT,
+    "points": [DIRECT_POINT, FINGERPRINT_POINT, SUBSCRIPTIONS_POINT, COOKIES_POINT, COMMENTS_POINT, LOOKUP_POINT, LENSES_POINT, LOCAL_POINT],
+    "routes": {"direct": ROUTE_DIRECT,
+               "tor": ROUTE_TOR,
+               "proxy": ROUTE_PROXY},
+    "pages": {"search": SEARCH,
+              "subscriptions": SUBSCRIPTIONS,
+              "history_off": HISTORY_OFF,
+              "history_on": HISTORY_ON,
+              "topics": TOPICS_OFF,
+              "topics_off": TOPICS_OFF,
+              "topics_on": TOPICS_ON,
+              "resume": RESUME_ON.format(days="7 days"),
+              "comments": COMMENTS,
+              "comments_short": COMMENTS_SHORT,
+              "lenses": LENSES,
+              "lenses_short": LENSES_SHORT,
+              "prepare_off": PREPARE_OFF,
+              "prepare_on": PREPARE_ON,
+              "keep_thumbs_off": KEEP_THUMBS_OFF,
+              "keep_thumbs_on": KEEP_THUMBS_ON},
 }
 
 state = {
@@ -132,26 +171,13 @@ state = {
     ],
     "log": [],
     "next": 3,
+    # The videos got ready (`api/prepare`), which are not looked up again.
+    "prepared": set(),
 }
+# What the topics page says follows the setting, as the engine's does.
+PRIVACY["pages"]["topics"] = TOPICS_ON if state["config"]["topicFeeds"] else TOPICS_OFF
 # Topic feeds: two groups of the channels above, and what a search found
 # for each on other channels. `fetched` says whether they were searched for.
-TOPICS_OFF = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself."
-# The engine's own words, on one line each so that a test of the engine's
-# (core/src/privacy.rs) can check they are the same.
-TOPICS_ON = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups, in a new random order each time and 2 to 8 seconds apart: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that."
-PRIVACY["pages"]["topics_on"] = TOPICS_ON
-LENSES_SHORT = "A refresh sends each topic to YouTube as a search of its own, sometimes twice."
-PRIVACY["pages"]["lenses_short"] = LENSES_SHORT
-COMMENTS_SHORT = "Loaded on demand, one extra request."
-PRIVACY["pages"]["comments_short"] = COMMENTS_SHORT
-PREPARE_OFF = "Off: a video is looked up when you play it, and not before."
-PREPARE_ON = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it."
-PRIVACY["pages"]["prepare_off"] = PREPARE_OFF
-PRIVACY["pages"]["prepare_on"] = PREPARE_ON
-KEEP_THUMBS_OFF = "Off: thumbnails are kept in memory while qveil runs, and not on disk."
-KEEP_THUMBS_ON = "On: the thumbnails you were shown are kept on disk, in ~/.cache/qveil/thumbs, in files only you can read (at most 64 MiB, the least recently shown going first), so that they aren't fetched again. They are a record, on this computer, of the pictures you were shown. Turning this off, clearing the history or qveil wipe deletes them."
-PRIVACY["pages"]["keep_thumbs_off"] = KEEP_THUMBS_OFF
-PRIVACY["pages"]["keep_thumbs_on"] = KEEP_THUMBS_ON
 # QVEIL_STANDIN_TOPICS=fetched: they were searched for on an earlier day.
 state["topics"] = {"fetched": os.environ.get("QVEIL_STANDIN_TOPICS") == "fetched", "hidden": [], "new": set()}
 
@@ -455,7 +481,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if q.get("v") == "slowslowslo":
                 time.sleep(5)
             n = int(q.get("n", "40"))
-            found = json.loads(json.dumps(COMMENTS))
+            found = json.loads(json.dumps(COMMENT_THREADS))
             if q.get("replies") != "1":
                 for c in found:
                     c["replies"] = []
@@ -499,21 +525,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os._exit(3)
         if path == "api/config":
             cfg = state["config"]
+            # What was got ready belongs to the route it was looked up on.
+            if body.get("route", cfg["route"]) != cfg["route"]:
+                state["prepared"].clear()
             for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds", "prepareNext", "keepThumbnails"):
                 if key in body:
                     cfg[key] = body[key]
-            # The file is saved with only the keys the engine knows.
-            cfg["ignoredKeys"] = []
+            # The engine saves the keys it has no setting for as they were,
+            # and still says which they are: ignoredKeys stays as it is.
             cfg["resumeDays"] = max(0, min(365, int(cfg["resumeDays"])))
             if cfg["resumeDays"] == 0:
                 state["resume"] = []
             days = cfg["resumeDays"]
-            cfg["privacy"]["pages"]["resume"] = (
-                "Off: qveil doesn't remember where you stopped." if days == 0 else
-                "On: qveil remembers where you stopped in an unfinished video for %d day%s." % (days, "" if days == 1 else "s"))
+            cfg["privacy"]["pages"]["resume"] = resume_text(days)
             cfg["privacy"]["pages"]["topics"] = TOPICS_ON if cfg["topicFeeds"] else TOPICS_OFF
-            cfg["privacy"]["summary"] = {"direct": "Direct: YouTube sees your IP address.",
-                                         "tor": "Through Tor: YouTube sees an exit node's address, not your IP.",
+            cfg["privacy"]["summary"] = {"direct": SUMMARY_DIRECT,
+                                         "tor": SUMMARY_TOR,
                                          "proxy": "Through your proxy: YouTube sees its address, not your IP."}[cfg["route"]]
             self.send(200, cfg)
         elif path == "api/prepare":
@@ -521,7 +548,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if state["config"]["prepareNext"]:
                 # QVEIL_STANDIN_SLOW_PREPARE: seconds the lookup ahead takes.
                 time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_PREPARE", "0")))
-                self.send(200, {"lookedUp": True})
+                # As the engine answers: looked up only the first time.
+                v = q.get("v", "")
+                self.send(200, {"lookedUp": v not in state["prepared"]})
+                state["prepared"].add(v)
             else:
                 self.send(403, {"error": "getting the next video ready is off", "code": "other"})
         elif path == "api/play":

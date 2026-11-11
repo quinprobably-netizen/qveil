@@ -76,9 +76,7 @@ impl Kind {
         let relink = "A video that outlives its circuit, or whose circuit stalls (no answer within 15 seconds, or a minute without a byte), is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.";
         let isolated = "Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page, and a video played again within nine minutes is played from the same lookup on the same set.";
         match self {
-            Kind::Direct => {
-                vec!["YouTube sees your IP address with every request, which links them all."]
-            }
+            Kind::Direct => vec![DIRECT_POINT],
             Kind::Tor => vec![
                 "Requests go through the SOCKS proxy on 127.0.0.1:9050 (Tor), so YouTube sees an exit node's address instead of yours.",
                 isolated,
@@ -101,16 +99,27 @@ impl Kind {
     }
 }
 
-/// What holds on every route, and is short enough for the window.
+/// What is said of Direct's address.
+const DIRECT_POINT: &str = "YouTube sees your IP address with every request, which links them all.";
+
+/// What holds on every route, and is short enough for the window. Each is
+/// named, so that the stand-in engine's copy can be checked (see
+/// `the_stand_in_engine_says_the_same`).
 const EVERYWHERE: &[&str] = &[
-    "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits, and by the one-byte request (bytes=0-0) for the start of a video that keeps a connection ready for a seek, sent at most once every 10 seconds while it plays over HTTP/1.1.",
-    "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
-    "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
-    "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.",
+    FINGERPRINT_POINT,
+    SUBSCRIPTIONS_POINT,
+    COOKIES_POINT,
+    COMMENTS_POINT,
     LOOKUP_POINT,
-    "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.",
-    "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.",
+    LENSES_POINT,
+    LOCAL_POINT,
 ];
+const FINGERPRINT_POINT: &str = "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits, and by the one-byte request (bytes=0-0) for the start of a video that keeps a connection ready for a seek, sent at most once every 10 seconds while it plays over HTTP/1.1.";
+const SUBSCRIPTIONS_POINT: &str = "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.";
+const COOKIES_POINT: &str = "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.";
+const COMMENTS_POINT: &str = "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.";
+const LENSES_POINT: &str = "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.";
+const LOCAL_POINT: &str = "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.";
 
 /// Who yt-dlp says it is when it asks YouTube's player for a video's
 /// streams, which is not qveil's `net::USER_AGENT`: said with either lookup.
@@ -804,21 +813,85 @@ mod tests {
             "/../tests/shots/engine.py"
         ))
         .expect("the stand-in engine is in tests/shots");
-        for (name, text) in [
-            ("TOPICS_ON", TOPICS_ON),
-            ("TOPICS_OFF", TOPICS_OFF),
-            ("LENSES_SHORT", LENSES_SHORT),
-            ("COMMENTS_SHORT", COMMENTS_SHORT),
-            ("PREPARE_OFF", PREPARE_OFF),
-            ("PREPARE_ON", PREPARE_ON),
-            ("KEEP_THUMBS_OFF", KEEP_THUMBS_OFF),
-            ("KEEP_THUMBS_ON", KEEP_THUMBS_ON),
-        ] {
+        // As a Python string in double quotes.
+        let py = |text: &str| format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""));
+        let has = |line: String| {
             assert!(
-                standin.contains(&format!("{name} = \"{text}\"")),
-                "tests/shots/engine.py's {name} is not the engine's: {text}"
-            );
+                standin.contains(&line),
+                "tests/shots/engine.py doesn't say what the engine says:\n{line}"
+            )
+        };
+        let pin = |name: &str, text: &str| has(format!("{name} = {}", py(text)));
+
+        // Every page's text, each a constant of its own there that the
+        // stand-in's PRIVACY uses: a page the engine adds fails here until
+        // the stand-in has it too.
+        let privacy = describe(&net(None), &Config::default());
+        let pages = json!(privacy.pages);
+        for (key, text) in pages.as_object().unwrap() {
+            match key.as_str() {
+                // What the settings say now: off, until the stand-in's
+                // settings change it.
+                "topics" => has("\"topics\": TOPICS_OFF".into()),
+                "resume" => {
+                    pin("RESUME_OFF", &resume(0));
+                    let on = resume(7);
+                    assert!(on.contains("7 days"), "{on}");
+                    pin("RESUME_ON", &on.replace("7 days", "{days}"));
+                    has("\"resume\": RESUME_ON.format(days=\"7 days\")".into());
+                }
+                _ => {
+                    let name = key.to_uppercase();
+                    pin(&name, text.as_str().unwrap());
+                    has(format!("\"{key}\": {name}"));
+                }
+            }
         }
+        for (key, text) in [
+            ("direct", ROUTES.direct),
+            ("tor", ROUTES.tor),
+            ("proxy", ROUTES.proxy),
+        ] {
+            let name = format!("ROUTE_{}", key.to_uppercase());
+            pin(&name, text);
+            has(format!("\"{key}\": {name}"));
+        }
+        pin("SUMMARY_DIRECT", Kind::Direct.summary());
+        pin("SUMMARY_TOR", Kind::Tor.summary());
+
+        // The points the stand-in shows: Direct's, then every one that holds
+        // on every route, in the engine's order.
+        let everywhere = [
+            ("FINGERPRINT_POINT", FINGERPRINT_POINT),
+            ("SUBSCRIPTIONS_POINT", SUBSCRIPTIONS_POINT),
+            ("COOKIES_POINT", COOKIES_POINT),
+            ("COMMENTS_POINT", COMMENTS_POINT),
+            ("LOOKUP_POINT", LOOKUP_POINT),
+            ("LENSES_POINT", LENSES_POINT),
+            ("LOCAL_POINT", LOCAL_POINT),
+        ];
+        assert_eq!(everywhere.map(|(_, text)| text), EVERYWHERE);
+        let direct = [("DIRECT_POINT", DIRECT_POINT)];
+        assert_eq!(
+            direct.map(|(_, text)| text).to_vec(),
+            Kind::Direct.route_points()
+        );
+        let shown: Vec<_> = direct.iter().chain(&everywhere).collect();
+        for (name, text) in &shown {
+            pin(name, text);
+        }
+        assert_eq!(
+            privacy.points,
+            shown.iter().map(|(_, text)| *text).collect::<Vec<_>>()
+        );
+        has(format!(
+            "\"points\": [{}]",
+            shown
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     #[test]
