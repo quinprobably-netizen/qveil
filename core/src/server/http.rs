@@ -464,11 +464,21 @@ mod tests {
         let (_s, base, _d) = server();
         // More silent connections than the server has places for.
         let idle = idle_clients(&base, MAX_UNVERIFIED + MAX_CONNECTIONS + 16);
-        // The app, which has the token, is served all the same, and at once.
-        let started = Instant::now();
+        // The app, which has the token, is served all the same, and at once:
+        // before a single stranger has been told it was too slow, so it
+        // didn't have to wait for their places to run out.
         let (status, body) = http(&base, "GET", &path(&base, "api/config"), "");
         assert_eq!(status, 200, "{body}");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        for c in &idle {
+            c.set_nonblocking(true).unwrap();
+            let mut head = [0u8; 12];
+            let n = c.peek(&mut head).unwrap_or(0);
+            assert!(
+                !head[..n].starts_with(b"HTTP/1.1 408"),
+                "the app was served only after the strangers timed out"
+            );
+            c.set_nonblocking(false).unwrap();
+        }
 
         // And the silent ones don't linger: each is closed, within the short
         // deadline for a request line, not left for the full 15 s.
