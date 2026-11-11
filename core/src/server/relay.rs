@@ -363,25 +363,40 @@ impl Server {
         let status = up.status();
         // The format selector only picks plain downloads, but if a manifest
         // still turns up, relaying it would hand mpv absolute segment URLs
-        // that it fetches itself, around the route. Refuse it instead.
-        if up
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(is_playlist_type)
-        {
-            return respond(
-                out,
-                502,
-                "text/plain",
-                b"the stream is a playlist (HLS or DASH), which qveil can't relay through your route",
-            );
+        // that it fetches itself, around the route. Refuse it instead, and
+        // anything else that isn't a video either, whatever its type says
+        // (an error is passed on as it is: mpv doesn't play what comes with
+        // one).
+        let refuse = |out: &mut TcpStream| respond(out, 502, "text/plain", NOT_A_STREAM);
+        let mut start = Vec::new();
+        if status.is_success() {
+            if !up_type(&up).is_none_or(is_media_type) {
+                return refuse(out);
+            }
+            if req.method != "HEAD" && content_range(&up).is_none_or(|(a, _, _)| a == 0) {
+                let since = Instant::now();
+                start = match sniff(&mut up) {
+                    Ok(start) => start,
+                    Err(e) => {
+                        if stalled_read(&e) {
+                            self.recover(&s, &live, true, since);
+                        }
+                        return respond(out, 502, "text/plain", b"the stream broke upstream");
+                    }
+                };
+                if !start.is_empty() {
+                    live.served.mark();
+                }
+                if is_manifest(&start) {
+                    return refuse(out);
+                }
+            }
         }
         if let Some(plan) = wanted.and_then(|w| w.plan(&up)) {
             if self.sparing.load(Ordering::Relaxed) {
                 s.keep_spare(&live, kind, &up);
             }
-            return self.relay_chunked(out, &s, kind, live, up, plan);
+            return self.relay_chunked(out, &s, kind, live, up, start, plan);
         }
         let mut head = format!(
             "HTTP/1.1 {} {}\r\n",
@@ -399,7 +414,8 @@ impl Server {
         out.write_all(head.as_bytes())?;
         if req.method != "HEAD" {
             out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT))?;
-            if let Err(e) = copy_body(&mut up, out, &s.cancelled, &live.served) {
+            let mut body = start.as_slice().chain(&mut up);
+            if let Err(e) = copy_body(&mut body, out, &s.cancelled, &live.served) {
                 // The player asks again, and that has to find a client
                 // that isn't stuck on the connection that just stalled.
                 if let Some(since) = e
@@ -511,7 +527,9 @@ impl Server {
 
     /// Answers a range with one response while a second thread fetches it
     /// upstream chunk by chunk (see `CHUNK`). `first` is the first chunk's
-    /// response, already checked by `relay`.
+    /// response, already checked by `relay`, and `start` what `relay` has
+    /// read of its body.
+    #[allow(clippy::too_many_arguments)]
     fn relay_chunked(
         self: &Arc<Self>,
         out: &mut TcpStream,
@@ -519,14 +537,19 @@ impl Server {
         kind: &str,
         live: Live,
         first: reqwest::blocking::Response,
+        start: Vec<u8>,
         plan: Plan,
     ) -> Result<()> {
-        let ctype = first
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        self.serve_ahead(out, s, kind, live, ctype, plan, First::Response(first))
+        let ctype = up_type(&first).map(String::from);
+        self.serve_ahead(
+            out,
+            s,
+            kind,
+            live,
+            ctype,
+            plan,
+            First::Response(first, start),
+        )
     }
 
     /// Answers a range that starts inside the head fetched at open: its
@@ -886,8 +909,9 @@ struct Fetcher {
 
 /// Where a relayed range's first bytes come from.
 enum First {
-    /// The first chunk's response, already checked.
-    Response(reqwest::blocking::Response),
+    /// The first chunk's response, already checked, and the start of its
+    /// body that was read to check it.
+    Response(reqwest::blocking::Response, Vec<u8>),
     /// The head fetched at open (see `warm`), as far as `chunk_end`.
     Kept(Arc<Head>),
 }
@@ -924,7 +948,10 @@ impl Fetcher {
         // at the same byte ends the stream.
         let mut failed_at = None;
         let mut up = match first {
-            First::Response(up) => up,
+            First::Response(up, start) => {
+                self.pass_on(start);
+                up
+            }
             First::Kept(head) => {
                 self.take_kept(&head);
                 if self.stopped() || self.pos > self.end {
@@ -992,6 +1019,21 @@ impl Fetcher {
             drop(st);
             self.ahead.changed.notify_all();
         }
+    }
+
+    /// Hands `block`, the next bytes of the current chunk, to `ahead`
+    /// (never more than the chunk).
+    fn pass_on(&mut self, mut block: Vec<u8>) {
+        block.truncate(((self.chunk_end + 1).saturating_sub(self.pos)) as usize);
+        if block.is_empty() {
+            return;
+        }
+        self.pos += block.len() as u64;
+        let mut st = lock(&self.ahead.state);
+        st.bytes += block.len();
+        st.blocks.push_back(block);
+        drop(st);
+        self.ahead.changed.notify_all();
     }
 
     /// Reads the current chunk's body into `ahead`.
@@ -1111,6 +1153,11 @@ impl Fetcher {
                 "upstream answered {status} part-way through the stream"
             )));
         }
+        if !up_type(&up).is_none_or(is_media_type) {
+            return Err(Failure::Final(
+                "upstream sent something other than the stream".into(),
+            ));
+        }
         match content_range(&up) {
             Some((a, b, total)) if a == self.pos && total == self.total && b <= self.end => {
                 self.chunk_end = b;
@@ -1193,10 +1240,68 @@ fn copy_body(
     }
 }
 
+/// What `relay` answers in place of a stream that isn't one.
+const NOT_A_STREAM: &[u8] =
+    b"the stream is a playlist (HLS or DASH) or not a video at all, which qveil can't relay through your route";
+
+/// How much of a stream's start `sniff` reads at most.
+const SNIFF_MAX: usize = 4 << 10;
+
+/// The Content-Type of a response, if it says one.
+pub(super) fn up_type(up: &reqwest::blocking::Response) -> Option<&str> {
+    up.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok())
+}
+
 /// HLS and DASH manifests, however the server spells the type.
-pub(super) fn is_playlist_type(content_type: &str) -> bool {
+fn is_playlist_type(content_type: &str) -> bool {
     let t = content_type.to_ascii_lowercase();
     t.contains("mpegurl") || t.contains("dash+xml")
+}
+
+/// A type a stream may be sent as: video, audio, bytes of no stated kind,
+/// or none at all; not a manifest's.
+pub(super) fn is_media_type(content_type: &str) -> bool {
+    let t = content_type.split(';').next().unwrap_or("").trim();
+    let t = t.to_ascii_lowercase();
+    let media = t.is_empty()
+        || t.starts_with("video/")
+        || t.starts_with("audio/")
+        || t == "application/octet-stream";
+    media && !is_playlist_type(&t)
+}
+
+/// Whether a body that starts with `start` is an HLS or a DASH manifest,
+/// after a byte order mark and white space, whatever it was sent as.
+pub(super) fn is_manifest(start: &[u8]) -> bool {
+    let s = start.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(start);
+    let s = s.trim_ascii_start();
+    [&b"#EXTM3U"[..], b"<?xml", b"<MPD"]
+        .iter()
+        .any(|m| s.get(..m.len()).is_some_and(|p| p.eq_ignore_ascii_case(m)))
+}
+
+/// Reads the start of a body, enough for `is_manifest` to tell: until 8
+/// bytes past any byte order mark and white space are in, it ends, or
+/// `SNIFF_MAX` are. Only the start of a stream is looked at: a range
+/// from inside a video can hold any bytes, and mpv has read the start
+/// (and so taken it for what it is) before it asks for one.
+pub(super) fn sniff(up: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut got = vec![0u8; SNIFF_MAX];
+    let mut n = 0;
+    loop {
+        let s = got[..n].strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&got[..n]);
+        if s.trim_ascii_start().len() >= 8 || n == SNIFF_MAX {
+            break;
+        }
+        match up.read(&mut got[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    got.truncate(n);
+    Ok(got)
 }
 
 /// The upstream side of a relayed stream failed part-way through the body.
@@ -1294,6 +1399,60 @@ mod tests {
         }
         assert!(is_playlist_type("Application/X-MpegURL; charset=utf-8"));
         assert!(!is_playlist_type("video/mp4"));
+    }
+
+    #[test]
+    fn a_manifest_is_refused_whatever_type_it_is_sent_as() {
+        let up = Upstream::start();
+        let (s, base, _d) = server();
+        for path in [
+            "/hls?type=video/mp4",
+            "/hls?type=application/octet-stream&pad=1",
+            "/hls?type=text/plain",
+            "/dash?type=video/mp4",
+            "/dash?type=audio/webm&xml=1&pad=1",
+            "/dash?type=text/html",
+            "/hls?type=audio/x-mpegurl",
+        ] {
+            let sid = add_session(&s, up.url(path));
+            let stream = format!("s/{sid}/v");
+            // Whole, from the start, and as the start of a long range.
+            for range in [None, Some("bytes=0-99"), Some("bytes=0-")] {
+                let headers: Vec<_> = range.iter().map(|r| ("Range", *r)).collect();
+                let (status, _, body) = fetch(&base, "GET", &stream, &headers);
+                let text = String::from_utf8_lossy(&body);
+                assert_eq!(status, 502, "{path} {range:?}: {text}");
+                assert!(text.contains("can't relay"), "{text}");
+                assert!(!text.contains("googlevideo"), "{text}");
+            }
+        }
+        // A video passes, whatever its type says: video, audio, plain bytes,
+        // or nothing.
+        let sid = add_session(&s, up.url("/video"));
+        let (status, _, body) = fetch(&base, "GET", &format!("s/{sid}/v"), &[]);
+        assert_eq!((status, body), (200, payload()));
+        for t in [
+            "video/mp4",
+            "Audio/WebM; codecs=opus",
+            "application/octet-stream",
+            "",
+        ] {
+            assert!(is_media_type(t), "{t}");
+        }
+        for t in ["text/plain", "text/html; charset=utf-8", "application/json"] {
+            assert!(!is_media_type(t), "{t}");
+        }
+        for start in [
+            &b"#EXTM3U\n"[..],
+            b"\xEF\xBB\xBF\r\n  #extm3u",
+            b"<?xml version=\"1.0\"?><MPD>",
+            b"\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">",
+        ] {
+            assert!(is_manifest(start), "{start:?}");
+        }
+        assert!(!is_manifest(b"\0\0\0\x18ftypmp42"));
+        assert!(!is_manifest(b"\x1a\x45\xdf\xa3"));
+        assert!(!is_manifest(b""));
     }
 
     #[test]

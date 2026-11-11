@@ -21,10 +21,12 @@
 //! the end of one.
 
 use super::Server;
-use super::relay::{Live, Session, content_range, fetch_upstream, is_playlist_type, stalled_read};
+use super::relay::{
+    Live, Session, content_range, fetch_upstream, is_manifest, is_media_type, sniff, stalled_read,
+    up_type,
+};
 use crate::util::lock;
 use reqwest::StatusCode;
-use reqwest::header::CONTENT_TYPE;
 use std::io::{self, Read};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -314,12 +316,8 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
     if up.status() != StatusCode::PARTIAL_CONTENT {
         return Ok(());
     }
-    let content_type = up
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    if content_type.as_deref().is_some_and(is_playlist_type) {
+    let content_type = up_type(&up).map(String::from);
+    if !content_type.as_deref().is_none_or(is_media_type) {
         return Ok(());
     }
     let Some((0, last, total)) = content_range(&up) else {
@@ -328,6 +326,20 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
     if last >= want {
         return Ok(());
     }
+    // What it is sent as isn't the last word (see `relay`).
+    let start = match sniff(&mut up) {
+        Ok(start) => start,
+        Err(e) if stalled_read(&e) => return Err(Stalled(since)),
+        Err(_) => return Ok(()),
+    };
+    if is_manifest(&start) {
+        return Ok(());
+    }
+    if !start.is_empty() {
+        since = live.served.mark();
+    }
+    let want = last as usize + 1;
+    let have = start.len().min(want);
     {
         let mut st = lock(&head.state);
         if st.ended {
@@ -338,12 +350,12 @@ fn fetch_head(s: &Session, live: &Live, kind: &str, head: &Head) -> Result<(), S
             total,
             content_type,
         });
-        st.bytes.reserve_exact(last as usize + 1);
+        st.bytes.reserve_exact(want);
+        st.bytes.extend_from_slice(&start[..have]);
     }
     head.changed.notify_all();
-    let want = last as usize + 1;
     let mut buf = vec![0u8; 16 << 10];
-    let mut have = 0;
+    let mut have = have;
     while have < want {
         if s.cancelled.load(Ordering::Acquire) || head.ended() {
             return Ok(());
@@ -616,6 +628,31 @@ mod tests {
         // The client that just served the player is not replaced: a new
         // one would be a new identity, and over Tor a sure 403.
         assert_eq!(lock(&session.live).dial, 0);
+    }
+
+    #[test]
+    fn a_head_that_is_a_manifest_is_not_kept() {
+        let up = Upstream::start();
+        // Sent as a video, but its first bytes say what it is.
+        let (s, base, _d, _bin) = warm_server(&up, "/hls?type=video/mp4&n=");
+        let info = s.open(&test_video()).unwrap();
+        let session = s
+            .session(rel(&base, &info.video).split('/').nth(1).unwrap())
+            .unwrap();
+        let head = lock(&session.warm.state).video.clone().unwrap();
+        wait_for("the warm-up to end", Duration::from_secs(5), || {
+            head.ended()
+        });
+        assert!(lock(&head.state).meta.is_none());
+        let (status, _, body) = fetch(
+            &base,
+            "GET",
+            rel(&base, &info.video),
+            &[("Range", "bytes=0-")],
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 502, "{text}");
+        assert!(text.contains("can't relay"), "{text}");
     }
 
     #[test]

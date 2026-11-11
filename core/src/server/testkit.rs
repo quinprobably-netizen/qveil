@@ -243,18 +243,49 @@ pub fn upstream_serve(
             }
             None => send("200 OK", "Content-Type: video/mp4\r\n", &body, 100),
         },
-        "/hls" => send(
-            "200 OK",
-            "Content-Type: application/vnd.apple.mpegurl\r\n",
-            b"#EXTM3U\nhttps://rr1.googlevideo.com/seg1.ts\n",
-            43,
-        ),
-        "/dash" => send(
-            "200 OK",
-            "Content-Type: application/dash+xml\r\n",
-            b"<MPD><BaseURL>https://rr1.googlevideo.com/</BaseURL></MPD>",
-            57,
-        ),
+        // A manifest, as its own type unless `type=` says another, after
+        // a byte order mark and some white space with `pad=1`, and after an
+        // XML declaration with `xml=1`. A Range from the start gets a 206.
+        "/hls" | "/dash" => {
+            let param = |k: &str| {
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+            };
+            let (own, text) = if path == "/hls" {
+                (
+                    "application/vnd.apple.mpegurl",
+                    "#EXTM3U\nhttps://rr1.googlevideo.com/seg1.ts\n",
+                )
+            } else {
+                (
+                    "application/dash+xml",
+                    "<MPD><BaseURL>https://rr1.googlevideo.com/</BaseURL></MPD>",
+                )
+            };
+            let mut doc = Vec::new();
+            if param("pad").is_some() {
+                doc.extend_from_slice(b"\xEF\xBB\xBF \r\n\t");
+            }
+            if param("xml").is_some() {
+                doc.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+            }
+            doc.extend_from_slice(text.as_bytes());
+            let ctype = param("type").unwrap_or(own);
+            let len = doc.len();
+            match range.as_deref() {
+                Some(r) if r.starts_with("bytes=0-") => send(
+                    "206 Partial Content",
+                    &format!(
+                        "Content-Type: {ctype}\r\nContent-Range: bytes 0-{}/{len}\r\n",
+                        len - 1
+                    ),
+                    &doc,
+                    len,
+                ),
+                _ => send("200 OK", &format!("Content-Type: {ctype}\r\n"), &doc, len),
+            }
+        }
         // Promises 100 bytes, sends 10 and hangs up.
         "/cut" => send("200 OK", "Content-Type: video/mp4\r\n", &body[..10], 100),
         _ => send("404 Not Found", "", b"", 0),
