@@ -332,10 +332,10 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
 
         let (status, v) = json(&base, "GET", &format!("api/lens?id={id}&refresh=1"), "");
         assert_eq!(status, 200, "{v}");
-        assert_eq!(
-            asked(&bin),
-            ["'ytsearch30:bread'", "'ytsearch30:sourdough'"]
-        );
+        // In either order: it is a new one each time.
+        let mut sent = asked(&bin);
+        sent.sort();
+        assert_eq!(sent, ["'ytsearch30:bread'", "'ytsearch30:sourdough'"]);
         let videos = v["videos"].as_array().unwrap();
         assert_eq!(videos.len(), 4);
         for video in videos {
@@ -745,14 +745,21 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         // A refresh sends each group's searches, and nothing else.
         let (status, v) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(status, 200, "{v}");
-        let wanted: Vec<String> = v["groups"]
+        let mut wanted: Vec<String> = v["groups"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|g| g["searches"].as_array().unwrap().clone())
             .map(|s| format!("'ytsearch20:{}'", s.as_str().unwrap()))
             .collect();
-        assert_eq!(asked(&bin), wanted);
+        wanted.sort();
+        // In no fixed order.
+        let sorted = || {
+            let mut sent = asked(&bin);
+            sent.sort();
+            sent
+        };
+        assert_eq!(sorted(), wanted);
         let first = &v["groups"][0];
         assert!(first["fetchedAt"].as_i64().unwrap() > 0);
         // What was found, with the phrase that found it; and nothing from a
@@ -771,7 +778,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
 
         // Within the day, a refresh has nothing to do.
         let (_, again) = json(&base, "GET", "api/topics?refresh=1", "");
-        assert_eq!(asked(&bin), wanted);
+        assert_eq!(sorted(), wanted);
         assert_eq!(again["groups"][0]["videos"], first["videos"]);
 
         // A group that is hidden is gone, and stays gone.
@@ -789,7 +796,7 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         json(&base, "POST", "api/config", r#"{"topicFeeds":false}"#);
         let (_, v) = json(&base, "GET", "api/topics?refresh=1", "");
         assert_eq!(v, serde_json::json!({ "enabled": false, "groups": [] }));
-        assert_eq!(asked(&bin), wanted);
+        assert_eq!(sorted(), wanted);
     }
 
     fn topics_on(base: &str) {
@@ -813,8 +820,9 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
         assert_eq!(v["errors"].as_array().unwrap().len(), 1, "{v}");
         // ...and nothing more was searched for: offline, every search would
         // fail, and each would count.
-        assert_eq!(asked(&bin), ["'ytsearch20:hand plane'"]);
-        assert!(groups[1].get("fetchedAt").is_none(), "{v}");
+        let sent = asked(&bin);
+        assert_eq!(sent.last().unwrap(), "'ytsearch20:hand plane'", "{sent:?}");
+        assert_eq!(sent.iter().filter(|s| s.contains("hand plane")).count(), 1);
     }
 
     #[test]
@@ -1021,6 +1029,41 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
             "{:?}",
             asked(&bin)
         );
+    }
+
+    #[test]
+    fn a_topic_refresh_pauses_between_all_its_searches_and_stops_in_a_pause() {
+        let (bin, d) = (TempDir::new(), TempDir::new());
+        let mut rt = topics_at(&bin, &d);
+        let all = all_searches(&rt, &d);
+        assert!(all >= 2, "{all}");
+        let paused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&paused);
+        rt.pause = std::sync::Arc::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        app::topics(&rt, &d.paths(), true, &|_, _| {}, &|| true).unwrap();
+        assert_eq!(asked(&bin).len(), all);
+        // Between one group's searches and the next group's alike.
+        assert_eq!(paused.load(std::sync::atomic::Ordering::SeqCst), all - 1);
+
+        // Due again, and turned off during the first pause: nothing more is
+        // sent, or counted.
+        std::fs::remove_file(d.paths().topics_cache()).unwrap();
+        std::fs::remove_file(d.paths().topic_searches()).unwrap();
+        let off = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let turn_off = std::sync::Arc::clone(&off);
+        rt.pause = std::sync::Arc::new(move |wanted| {
+            turn_off.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(!wanted());
+        });
+        let wanted = || !off.load(std::sync::atomic::Ordering::SeqCst);
+        let r = app::topics(&rt, &d.paths(), true, &|_, _| {}, &wanted);
+        assert!(r.is_err());
+        assert_eq!(asked(&bin).len(), all + 1);
+        let counted: crate::topics::Searched =
+            crate::store::load(&d.paths().topic_searches()).unwrap();
+        assert_eq!(counted.at.len(), 1);
     }
 
     #[test]

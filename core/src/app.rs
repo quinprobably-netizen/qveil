@@ -15,6 +15,7 @@ use crate::util::lock;
 use crate::video::Video;
 use crate::ytdlp::Ytdlp;
 use anyhow::{Context, Result, bail};
+use rand::seq::SliceRandom;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -28,6 +29,16 @@ use std::time::{Duration, Instant};
 /// killed mid-refresh loses at most this much of it.
 const SAVE_EVERY: Duration = Duration::from_secs(2);
 
+/// How long a lens or topic refresh waits before each of its searches after
+/// the first, at random between these: searches that go out back to back,
+/// and in the same order each time, are easier to tell from a person's.
+pub const SEARCH_PAUSE: (Duration, Duration) = (Duration::from_secs(2), Duration::from_secs(8));
+
+/// What a refresh does before each of its searches after the first: waits
+/// (see `SEARCH_PAUSE`), and ends early once what it is given says the
+/// answer is no longer wanted. It must not hold a lock while it waits.
+pub type Pause = Arc<dyn Fn(&dyn Fn() -> bool) + Send + Sync>;
+
 pub struct Runtime {
     pub cfg: Config,
     pub net: Net,
@@ -40,6 +51,9 @@ pub struct Runtime {
     pub thumb_base: String,
     /// How often a refresh saves (`SAVE_EVERY`); only tests change it.
     pub save_every: Duration,
+    /// The wait between a refresh's searches (`SEARCH_PAUSE`); only tests
+    /// change it.
+    pub pause: Pause,
 }
 
 impl Runtime {
@@ -66,6 +80,7 @@ impl Runtime {
             feed_base: "https://www.youtube.com".into(),
             thumb_base: "https://i.ytimg.com".into(),
             save_every: SAVE_EVERY,
+            pause: search_pause(),
         })
     }
 
@@ -102,6 +117,68 @@ impl Runtime {
     pub fn keeping_calls_of(mut self, from: &Runtime) -> Self {
         self.yt.calls = Arc::clone(&from.yt.calls);
         self
+    }
+}
+
+/// The pause between a refresh's searches: `SEARCH_PAUSE`, except in tests.
+/// The window's tests run the engine itself, and ask for none with
+/// `QVEIL_TEST_NO_SEARCH_PAUSE=1`.
+fn search_pause() -> Pause {
+    if cfg!(test) || std::env::var_os("QVEIL_TEST_NO_SEARCH_PAUSE").is_some_and(|v| v == "1") {
+        return Arc::new(|_| {});
+    }
+    Arc::new(|wanted| {
+        use rand::Rng;
+        let (low, high) = SEARCH_PAUSE;
+        wait_while_wanted(rand::rng().random_range(low..=high), wanted)
+    })
+}
+
+/// Waits `long`, or until `wanted` says no, which it asks every tenth of a
+/// second: a client that hangs up, a route that is left or a setting turned
+/// off ends the wait as soon as it would end a search.
+fn wait_while_wanted(long: Duration, wanted: &dyn Fn() -> bool) {
+    let until = Instant::now() + long;
+    while wanted() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// Spaces out the searches of one refresh: each one after the first waits
+/// for `Runtime::pause`. A search typed in waits for nothing.
+struct Pacing<'a> {
+    pause: Option<&'a Pause>,
+    sent: std::cell::Cell<bool>,
+}
+
+impl<'a> Pacing<'a> {
+    fn of(rt: &'a Runtime) -> Self {
+        Pacing {
+            pause: Some(&rt.pause),
+            sent: Default::default(),
+        }
+    }
+
+    fn none() -> Self {
+        Pacing {
+            pause: None,
+            sent: Default::default(),
+        }
+    }
+
+    /// Before a search: waits, unless it is the first. Whether the search
+    /// is still wanted.
+    fn before_search(&self, wanted: &dyn Fn() -> bool) -> bool {
+        if self.sent.replace(true)
+            && let Some(pause) = self.pause
+        {
+            pause(wanted);
+        }
+        wanted()
     }
 }
 
@@ -184,6 +261,7 @@ pub fn lens(
             progress,
             &|| Ok(()),
             wanted,
+            &Pacing::of(rt),
         )?;
         let fresh = Cached {
             fetched_at: at,
@@ -222,7 +300,16 @@ pub fn smart_search(
     limit: usize,
     wanted: &dyn Fn() -> bool,
 ) -> Result<Vec<Ranked>> {
-    search_topics(rt, paths, reading, limit, &|_, _| {}, &|| Ok(()), wanted)
+    search_topics(
+        rt,
+        paths,
+        reading,
+        limit,
+        &|_, _| {},
+        &|| Ok(()),
+        wanted,
+        &Pacing::none(),
+    )
 }
 
 /// How many searches `search_topics` may send for `reading` at `now`: one
@@ -237,10 +324,12 @@ fn searches_needed(reading: &Reading, now: i64) -> usize {
     reading.topics.len() * per_topic
 }
 
-/// One search per topic, one after the other, then the ranking. The searches
-/// are all that leaves the machine: the rules and the order are applied here.
-/// `charge` is called before each search is sent, and an error from it stops
-/// the searching there.
+/// One search per topic, one after the other in random order (the ranking
+/// doesn't depend on it), then the ranking. The searches are all that leaves
+/// the machine: the rules and the order are applied here. `pacing` spaces
+/// them out. `charge` is called before each search is sent, and an error
+/// from it stops the searching there.
+#[allow(clippy::too_many_arguments)]
 fn search_topics(
     rt: &Runtime,
     paths: &Paths,
@@ -249,6 +338,7 @@ fn search_topics(
     progress: &dyn Fn(usize, usize),
     charge: &dyn Fn() -> Result<()>,
     wanted: &dyn Fn() -> bool,
+    pacing: &Pacing,
 ) -> Result<Vec<Ranked>> {
     reading.check()?;
     // What the ranking needs from this machine is read first: if it can't
@@ -274,8 +364,14 @@ fn search_topics(
     // pass; the rules are applied here afterwards either way.
     let filter = lens::sp::sp(reading, now());
     let mut found = Vec::new();
-    for (topic, query) in reading.topics.iter().enumerate() {
+    let mut order: Vec<usize> = (0..total).collect();
+    order.shuffle(&mut rand::rng());
+    for (done, topic) in order.into_iter().enumerate() {
+        let query = &reading.topics[topic];
         let mut search = |sp: Option<&str>| {
+            if !pacing.before_search(wanted) {
+                bail!(crate::ytdlp::CANCELLED);
+            }
             charge()?;
             // Counting it may have waited for the lock, while the answer
             // stopped being wanted: then it stays counted, and isn't sent.
@@ -301,7 +397,7 @@ fn search_topics(
         if !wanted() {
             bail!(crate::ytdlp::CANCELLED);
         }
-        progress(topic + 1, total);
+        progress(done + 1, total);
     }
     Ok(rank::rank(
         reading,
@@ -496,10 +592,13 @@ pub fn topics(
         // What a refresh that this one waited for found.
         results = store::load_cache(&paths.topics_cache())?;
         let at = now();
-        let due: Vec<&topics::Group> = groups
+        let mut due: Vec<&topics::Group> = groups
             .iter()
             .filter(|group| topics::due(results.groups.get(&group.key()), at))
             .collect();
+        due.shuffle(&mut rand::rng());
+        // One refresh's searches are spaced out across its groups too.
+        let pacing = Pacing::of(rt);
         // How far it is, counted in searches, over all the groups that are due.
         let total: usize = due.iter().map(|g| g.searches.len()).sum();
         let mut before = 0;
@@ -559,6 +658,7 @@ pub fn topics(
                 &|done, _| progress(so_far + done, total),
                 &charge,
                 wanted,
+                &pacing,
             );
             if !wanted() {
                 bail!(crate::ytdlp::CANCELLED);
@@ -1165,7 +1265,9 @@ mod tests {
 while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && tail -n 1 "$2" >> "$d/asked"; shift; done
 tail -n 1 "$d/asked" | grep -q "results?" && exit 0
 n=$(wc -l < "$d/asked")
-echo "{\"id\":\"aaaaaaaaa${n}1\",\"title\":\"t\",\"channel\":\"C\",\"channel_id\":\"UCaaaaaaaaaaaaaaaaaaaaa${n}\",\"duration\":2000.0}"
+id=$(printf 'v%010d' "$n")
+channel=$(printf 'UC%022d' "$n")
+echo "{\"id\":\"$id\",\"title\":\"t\",\"channel\":\"C\",\"channel_id\":\"$channel\",\"duration\":2000.0}"
 "#,
         )
     }
@@ -1198,6 +1300,7 @@ echo "{\"id\":\"aaaaaaaaa${n}1\",\"title\":\"t\",\"channel\":\"C\",\"channel_id\
                 Ok(())
             },
             &|| true,
+            &Pacing::none(),
         )
         .unwrap();
         assert_eq!(found.len(), 2);
@@ -1207,6 +1310,114 @@ echo "{\"id\":\"aaaaaaaaa${n}1\",\"title\":\"t\",\"channel\":\"C\",\"channel_id\
         // begins, or the budget would cut it off half-way.
         assert_eq!(searches_needed(&reading, now()), 4);
         assert_eq!(searches_needed(&read("bread, sourdough", now()), now()), 2);
+    }
+
+    /// A runtime whose pause between searches waits for nothing, and says
+    /// each time whether the store was free to lock meanwhile.
+    fn pausing(paths: &Paths, ytdlp: &str) -> (Runtime, Arc<Mutex<Vec<bool>>>) {
+        let paused: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let mut rt = Runtime::new(rt_cfg(ytdlp), paths, None, false).unwrap();
+        let (seen, lock_file) = (Arc::clone(&paused), paths.lock_file());
+        rt.pause = Arc::new(move |_| {
+            let free = fs::File::create(&lock_file).unwrap().try_lock().is_ok();
+            lock(&seen).push(free);
+        });
+        (rt, paused)
+    }
+
+    #[test]
+    fn a_lens_refresh_pauses_between_its_searches_with_nothing_locked() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (rt, paused) = pausing(&paths, &unfiltered_ytdlp(&dir.0));
+        let id = lens::add(&paths, "bread, sourdough, rye", now())
+            .unwrap()
+            .id;
+        let found = lens(&rt, &paths, &id, LensRefresh::Force, &|_, _| {}, &|| true).unwrap();
+        assert_eq!(found.videos.len(), 3);
+        assert_eq!(asked(&dir).len(), 3);
+        // Before the second and the third, not before the first.
+        assert_eq!(*lock(&paused), [true, true]);
+    }
+
+    #[test]
+    fn a_refresh_that_stops_being_wanted_while_it_pauses_sends_nothing_more() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let ytdlp = unfiltered_ytdlp(&dir.0);
+        let mut rt = Runtime::new(rt_cfg(&ytdlp), &paths, None, false).unwrap();
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hang_up = Arc::clone(&gone);
+        // The window goes away during the first pause.
+        rt.pause = Arc::new(move |wanted| {
+            hang_up.store(true, Ordering::SeqCst);
+            assert!(!wanted());
+        });
+        let id = lens::add(&paths, "bread, sourdough, rye", now())
+            .unwrap()
+            .id;
+        let wanted = || !gone.load(Ordering::SeqCst);
+        let r = lens(&rt, &paths, &id, LensRefresh::Force, &|_, _| {}, &wanted);
+        assert_eq!(r.err().unwrap().to_string(), crate::ytdlp::CANCELLED);
+        assert_eq!(asked(&dir).len(), 1);
+        assert!(!paths.lens_cache(&id).exists());
+    }
+
+    #[test]
+    fn a_search_typed_in_does_not_pause() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let (rt, paused) = pausing(&paths, &unfiltered_ytdlp(&dir.0));
+        let reading = crate::lens::read::read_search("bread, sourdough over 10 min", now());
+        smart_search(&rt, &paths, &reading, 5, &|| true).unwrap();
+        assert!(asked(&dir).len() >= 2);
+        assert!(lock(&paused).is_empty());
+    }
+
+    #[test]
+    fn the_pause_ends_as_soon_as_it_is_not_wanted() {
+        let started = Instant::now();
+        wait_while_wanted(Duration::from_secs(60), &|| false);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        let asked = std::cell::Cell::new(0);
+        wait_while_wanted(Duration::from_secs(60), &|| {
+            asked.set(asked.get() + 1);
+            asked.get() < 3
+        });
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // And otherwise lasts as long as it was meant to.
+        let started = Instant::now();
+        wait_while_wanted(Duration::from_millis(50), &|| true);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        // The real one is a few seconds, which no two refreshes share.
+        let (low, high) = SEARCH_PAUSE;
+        assert!(Duration::from_secs(2) <= low && low < high && high <= Duration::from_secs(8));
+    }
+
+    #[test]
+    fn the_topics_are_searched_in_a_new_order_each_time_and_ranked_the_same() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        let rt = Runtime::new(rt_cfg(&unfiltered_ytdlp(&dir.0)), &paths, None, false).unwrap();
+        let reading = read("bread, sourdough, rye", now());
+        let mut orders = HashSet::new();
+        for round in 0..20 {
+            let found = search_topics(
+                &rt,
+                &paths,
+                &reading,
+                5,
+                &|_, _| {},
+                &|| Ok(()),
+                &|| true,
+                &Pacing::none(),
+            )
+            .unwrap();
+            let why: Vec<&str> = found.iter().map(|r| r.why[0].as_str()).collect();
+            assert_eq!(why, ["bread", "sourdough", "rye"]);
+            orders.insert(asked(&dir)[round * 3..].to_vec());
+        }
+        assert!(orders.len() > 1, "always {orders:?}");
     }
 
     #[test]
