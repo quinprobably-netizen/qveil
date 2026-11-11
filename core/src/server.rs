@@ -82,6 +82,23 @@ pub struct Server {
     /// What tells the lookup of the next video that is running, if one is,
     /// to stop (see `prepare_next`).
     preparing: Mutex<Option<Arc<AtomicBool>>>,
+    /// How many plays have answered and not yet added their video to the
+    /// history (see `Recording`).
+    recording: (Mutex<usize>, std::sync::Condvar),
+}
+
+/// Held by a play from just before it answers until its video is in the
+/// history. The window asks for the history as soon as it has the answer,
+/// and that has to find the video there; `Server::history_settled` waits
+/// for this.
+pub(super) struct Recording<'a>(&'a Server);
+
+impl Drop for Recording<'_> {
+    fn drop(&mut self) {
+        let (count, settled) = &self.0.recording;
+        *lock(count) -= 1;
+        settled.notify_all();
+    }
 }
 
 #[derive(Serialize)]
@@ -161,6 +178,7 @@ impl Server {
             warming: AtomicBool::new(true),
             lookups: lookups::Lookups::default(),
             preparing: Mutex::new(None),
+            recording: Default::default(),
         })
     }
 
@@ -307,6 +325,30 @@ impl Server {
                 note!("qveil: couldn't read where this video was stopped: {e:#}");
                 None
             }
+        }
+    }
+
+    /// Marks a play as about to answer: see `Recording`.
+    fn recording(&self) -> Recording<'_> {
+        *lock(&self.recording.0) += 1;
+        Recording(self)
+    }
+
+    /// Waits (a little, at most) until the plays that have answered have
+    /// added their videos to the history.
+    fn history_settled(&self) {
+        let (count, settled) = &self.recording;
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut n = lock(count);
+        while *n > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            n = match settled.wait_timeout(n, left) {
+                Ok((n, _)) => n,
+                Err(e) => e.into_inner().0,
+            };
         }
     }
 

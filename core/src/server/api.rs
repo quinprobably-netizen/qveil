@@ -66,6 +66,7 @@ impl Server {
         match opened {
             Ok(opened) => {
                 let body = json!(opened.info).to_string();
+                let _recording = opened.watched.is_some().then(|| self.recording());
                 if let Err(e) = respond(out, 200, "application/json", body.as_bytes()) {
                     // Nobody will play it, so what is being fetched for
                     // the player is not wanted either.
@@ -195,6 +196,7 @@ impl Server {
                 json!({ "added": added, "total": total })
             }
             ("GET", ["api", "history"]) => {
+                self.history_settled();
                 let mut w = app::load_history(paths)?.watched;
                 w.reverse();
                 json!(w)
@@ -1211,6 +1213,41 @@ echo '{"entries":[]}'"#,
             s.runtime().yt.calls.running() == 0
         });
         assert!(lock(&s.preparing).is_none());
+    }
+
+    #[test]
+    fn the_history_asked_for_right_after_a_play_answers_has_the_video() {
+        let bin = TempDir::new();
+        let ytdlp = fake_ytdlp(&bin.0, "https://gv.test/v?n=");
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            history: true,
+            ..Config::default()
+        });
+        // The history can't be written while this is held, so the play's
+        // answer arrives well before its video is in the history.
+        let held = crate::store::lock(&s.paths).unwrap();
+        let mut c = TcpStream::connect(addr(&base)).unwrap();
+        write!(
+            c,
+            "POST {} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+            path(&base, "api/play?v=dQw4w9WgXcQ")
+        )
+        .unwrap();
+        assert_eq!(read_reply(&mut c).0, 200);
+        let asked = {
+            let base = base.clone();
+            std::thread::spawn(move || http(&base, "GET", &path(&base, "api/history"), ""))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !asked.is_finished(),
+            "the history was read before the video was in it"
+        );
+        drop(held);
+        let (status, body) = asked.join().unwrap();
+        assert_eq!(status, 200);
+        assert!(body.contains("dQw4w9WgXcQ"), "{body}");
     }
 
     /// Reads one reply the way a client does: by its Content-Length, not by
