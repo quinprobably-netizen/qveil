@@ -827,6 +827,11 @@ void Backend::refreshTopics() {
                     *answered = true;
                     m_topics = o.value("result").toMap();
                     emit topicsChanged();
+                    // A group whose search failed keeps what it had; the
+                    // engine names it, and that is said.
+                    const QStringList errors = m_topics.value("errors").toStringList();
+                    if (!errors.isEmpty())
+                        setError(tr("A topic couldn't be searched: %1").arg(errors.join(QStringLiteral("; "))));
                 }
             }
         },

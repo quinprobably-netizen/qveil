@@ -344,7 +344,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if refresh:
                 was_on = True
                 time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_TOPICS", "0")))
-                if os.environ.get("QVEIL_STANDIN_TOPICS_FAIL"):
+                failing = os.environ.get("QVEIL_STANDIN_TOPICS_FAIL")
+                if failing and failing != "group":
                     self.lines([{"error": "The engine's words for a search that failed", "code": "other"}])
                     return
                 state["topics"]["fetched"] = True
@@ -353,6 +354,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # (A refresh that was running when the setting was turned off
                 # still says what it found: the window must not show it.)
                 result = topics() if not refresh else {"enabled": True, "groups": topic_groups()}
+                # As the engine does when one group's search fails: the others are
+                # there, that one has nothing new, and it is named in `errors`.
+                if refresh and os.environ.get("QVEIL_STANDIN_TOPICS_FAIL") == "group":
+                    result["groups"][1]["videos"] = []
+                    result["groups"][1].pop("fetchedAt", None)
+                    result["errors"] = ["borrow checker, allocators: YouTube didn't answer"]
                 self.lines([{"progress": {"done": 0, "total": 4}}, {"result": result}], 0.05)
             else:
                 self.send(200, topics())

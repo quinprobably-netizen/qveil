@@ -317,13 +317,8 @@ FocusScope {
             estimateNote: qsTr("Approximate: YouTube's feed for this channel was unavailable")
             onActivated: (video, index) => page.activated(video, theirs, index)
             // Left (or h) at its edge goes back to the channels.
-            Keys.priority: Keys.BeforeItem
-            Keys.onPressed: event => {
-                if ((event.key === Qt.Key_H || event.key === Qt.Key_Left) && (currentIndex < 0 || currentIndex % columns === 0)) {
-                    list.forceActiveFocus()
-                    event.accepted = true
-                }
-            }
+            leftExits: true
+            onLeftEdge: list.forceActiveFocus()
         }
         EmptyState {
             anchors.fill: pane

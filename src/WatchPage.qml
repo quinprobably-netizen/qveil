@@ -52,6 +52,8 @@ FocusScope {
     signal copied(string text)
 
     function prepare(video) {
+        // A new video has the keyboard in the video, wherever it was last.
+        surface.forceActiveFocus()
         // A lookup of the last video's comments is for nobody now.
         backend.closeComments()
         expanded = false
@@ -60,6 +62,9 @@ FocusScope {
         flick.contentY = 0
     }
     function open(i) { surface.open(i) }
+    // The sheet is hidden in theatre and fullscreen: the keyboard can't stay in it.
+    onTheatreChanged: if (theatre && inSheet) leaveSheet()
+    onFullChanged: if (full && inSheet) leaveSheet()
     // Gives the keyboard to the sheet, on one of its tabs; and back to the video.
     function enterSheet(tab) {
         theatre = false

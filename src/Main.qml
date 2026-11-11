@@ -51,7 +51,8 @@ ApplicationWindow {
     // browsed, they move through what is browsed, as they always do.
     // (A window counts as active while its parent window is, so that is
     // not the question; whether something in it has the keyboard is.)
-    readonly property bool steering: (watching && !watch.inSheet) || (pip && pipWindow.activeFocusItem !== null)
+    readonly property bool steering: ((watching && !watch.inSheet) || (pip && pipWindow.activeFocusItem !== null))
+        && !route.opened && !help.opened && openMenu === null
     // Where a channel's page was opened from.
     property string channelFrom: "home"
     readonly property bool typing: !!activeFocusItem && typeof activeFocusItem.cursorPosition === "number"
@@ -126,6 +127,9 @@ ApplicationWindow {
     // what comes next is the rest of that list.
     property var playList: null
     property int playIndex: -1
+    // What comes next is the list as it was when the video was played: the
+    // list itself may re-sort, filter or refill under it while it plays.
+    VideoModel { id: playedFrom }
 
     function go(p) {
         if (!pages[p])
@@ -214,7 +218,13 @@ ApplicationWindow {
     // The player opens at once, with what the card knows, while the engine
     // looks the video up. `list` and `index` say where it was opened from.
     function play(video, list, index) {
-        playList = list || null
+        if (list && list !== playedFrom) {
+            const rows = []
+            for (let i = 0; i < list.count; i++)
+                rows.push(list.get(i))
+            playedFrom.assign(rows)
+        }
+        playList = list ? playedFrom : null
         playIndex = list ? index : -1
         // While a video is in the small window, the next one plays there
         // too, and the main window stays where it is.
@@ -478,6 +488,13 @@ ApplicationWindow {
                 windowWidth: root.width
                 windowHeight: root.height
                 onSettingsRequested: win.go("settings")
+                // The keyboard goes back to what is showing.
+                onClosed: {
+                    if (win.watching)
+                        watch.forceActiveFocus()
+                    else
+                        win.focusPage(win.page)
+                }
             }
 
             // Errors stay until dismissed, under the bar.
@@ -657,7 +674,8 @@ ApplicationWindow {
                         if (win.fullscreen)
                             win.showNormal()
                         theatre = false
-                        Qt.callLater(() => win.focusPage(win.page))
+                        // (Not out of a popup that is open: it gives the keyboard back when it closes.)
+                        Qt.callLater(() => { if (!route.opened && !help.opened) win.focusPage(win.page) })
                     }
                     onChannelRequested: id => win.openChannel(id)
                     onVideoRequested: (video, list, index) => win.play(video, list, index)

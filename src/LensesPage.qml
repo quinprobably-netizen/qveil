@@ -155,10 +155,11 @@ FocusScope {
             width: parent.width
             lens: page.lens
             onSaved: text => {
-                if (fresh)
+                // (`editor.` by name: the page has an Act whose id is `fresh`.)
+                if (editor.fresh)
                     backend.addLens(text)
                 else
-                    backend.editLens(lens.id, text)
+                    backend.editLens(editor.lens.id, text)
             }
             onRefreshRequested: page.refresh()
             onDeleted: backend.removeLens(lens.id)

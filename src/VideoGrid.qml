@@ -30,6 +30,9 @@ GridView {
     readonly property var list: arranged ? held : (source !== null ? source : model)
     function at(i) { return list.get(i) }
     signal activated(var video, int index)
+    // When set, left (or h) at the start of a row is not a move but `leftEdge`.
+    property bool leftExits: false
+    signal leftEdge()
     signal channelRequested(string id)
 
     readonly property int gutter: Style.gutter - Style.u * 2
@@ -120,7 +123,9 @@ GridView {
     Keys.onPressed: event => {
         navigating = true
         event.accepted = true
-        if (event.key === Qt.Key_H)
+        if (leftExits && (event.key === Qt.Key_H || event.key === Qt.Key_Left) && (currentIndex < 0 || currentIndex % columns === 0))
+            leftEdge()
+        else if (event.key === Qt.Key_H)
             moveCurrentIndexLeft()
         else if (event.key === Qt.Key_L)
             moveCurrentIndexRight()

@@ -33,8 +33,11 @@ FocusScope {
     property int rowAt: 0
     readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume], playback: [qualityRow], home: [pictures, topicsRow, shortsRow], about: [] })
     onCategoryChanged: {
+        const had = pane.activeFocus
         inRows = false
         rowAt = 0
+        if (had)
+            cats.forceActiveFocus()
     }
     function enterRows() {
         if (rowsIn[category].length === 0)
@@ -55,7 +58,15 @@ FocusScope {
         category = categories[Math.max(0, Math.min(categories.length - 1, at + by))].key
     }
 
-    onVisibleChanged: if (visible) chooser.refresh()
+    onVisibleChanged: {
+        if (visible) {
+            chooser.refresh()
+        } else {
+            // Back on the page, the keyboard starts in the categories.
+            inRows = false
+            rowAt = 0
+        }
+    }
 
     component Choice: TabWord {
         // What picking it sends to the engine.
@@ -145,6 +156,10 @@ FocusScope {
         // In the rows: up and down (k, j) move, left and right (h, l) change the choice.
         Keys.onPressed: event => {
             const list = page.rowsIn[page.category]
+            if (!page.inRows || list.length === 0) {
+                event.accepted = false
+                return
+            }
             event.accepted = true
             if (event.key === Qt.Key_J || event.key === Qt.Key_Down)
                 page.rowAt = Math.min(list.length - 1, page.rowAt + 1)

@@ -2267,6 +2267,168 @@ private slots:
         QVERIFY(box(app.item("help-group-1")).top() > box(app.item("help-group-0")).bottom() - 1);
     }
 
+    // --- What the second council found in the code. ---
+
+    void editingALensChangesItAndAddsNone()
+    {
+        App app(true);
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_2);
+        QQuickItem *text = app.item("lens-text");
+        QTRY_VERIFY(text->property("editing").toBool());
+        app.type("bread, sourdough over 30 min");
+        QTRY_VERIFY(app.item("lens-save")->isEnabled());
+        app.click(app.item("lens-save"));
+        QTRY_COMPARE(app.items("lens-row").size(), 1);
+        QCOMPARE(app.asked("POST api/lenses"), 1);
+        // Now change its words: the same lens is saved again.
+        QMetaObject::invokeMethod(text, "edit");
+        QTRY_VERIFY(text->property("editing").toBool());
+        QTest::keyClick(app.window, Qt::Key_A, Qt::ControlModifier);
+        app.type("bread, rye over 30 min");
+        QTRY_VERIFY(app.item("lens-save")->isEnabled());
+        app.click(app.item("lens-save"));
+        QTRY_COMPARE(app.asked("POST api/lenses/bbbb"), 1);
+        QCOMPARE(app.asked("POST api/lenses"), 2);
+        QCOMPARE(app.items("lens-row").size(), 1);
+    }
+
+    void theKeyboardGoesBackToTheVideo()
+    {
+        App app;
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        const auto play = [&](int i) {
+            QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(i)),
+                                      Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, i));
+            QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        };
+        QQuickItem *watch = app.item("watch");
+        play(0);
+        QTest::keyClick(app.window, Qt::Key_C);
+        QTRY_VERIFY(watch->property("inSheet").toBool());
+        // Left by a page key with the keyboard in the sheet: the next video has it in the video.
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_COMPARE(app.page(), QString("lenses"));
+        play(1);
+        QTRY_VERIFY(app.window->property("watching").toBool());
+        QVERIFY(!watch->property("inSheet").toBool());
+        QVERIFY(app.window->property("steering").toBool());
+        // Theatre hides the sheet, and takes the keyboard out of it.
+        QTest::keyClick(app.window, Qt::Key_C);
+        QTRY_VERIFY(watch->property("inSheet").toBool());
+        watch->setProperty("theatre", true);
+        QTRY_VERIFY(!watch->property("inSheet").toBool());
+        QVERIFY(app.item("surface")->hasActiveFocus() || app.item("surface")->property("activeFocus").toBool()
+                || app.window->property("steering").toBool());
+        watch->setProperty("theatre", false);
+
+        // The route's popup, opened while watching, has the arrows and h and l.
+        QObject *popup = app.object("routePopup");
+        QTest::keyClick(app.window, Qt::Key_P);
+        QTRY_VERIFY(popup->property("opened").toBool());
+        QVERIFY(!app.window->property("steering").toBool());
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
+        // (A new route ends what was playing over the old one; the popup keeps the keyboard.)
+        QTest::keyClick(app.window, Qt::Key_Left);
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("direct"));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!popup->property("opened").toBool());
+        QTRY_VERIFY(app.window->activeFocusItem() != nullptr);
+    }
+
+    void settingsKeysChangeOnlyTheMarkedRow()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_5);
+        QQuickItem *settings = app.item("settings");
+        QTRY_COMPARE(app.page(), QString("settings"));
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_VERIFY(settings->property("inRows").toBool());
+        // A category chosen with the pointer: nothing is marked, and keys change nothing.
+        app.click(app.item("settings-cat-home"));
+        QTRY_VERIFY(!settings->property("inRows").toBool());
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTest::keyClick(app.window, Qt::Key_L);
+        QCOMPARE(app.window->property("thumbs").toString(), QString("clear"));
+        QVERIFY(!app.backend->config().value("topicFeeds").toBool());
+        // About has no rows: keys there are harmless.
+        app.click(app.item("settings-cat-about"));
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTest::keyClick(app.window, Qt::Key_L);
+        QVERIFY(!settings->property("inRows").toBool());
+        // Leaving with the keyboard in the rows and coming back starts in the categories.
+        app.click(app.item("settings-cat-playback"));
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_VERIFY(settings->property("inRows").toBool());
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTest::keyClick(app.window, Qt::Key_5);
+        QTRY_COMPARE(app.page(), QString("settings"));
+        QVERIFY(!settings->property("inRows").toBool());
+    }
+
+    void whatComesNextIsTheListAsItWasWhenPlayed()
+    {
+        App app(false, QSize(1280, 720));
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QTest::keyClick(app.window, Qt::Key_3);
+        QQuickItem *list = nullptr;
+        QTRY_VERIFY((list = app.item("channel-list")) && list->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(app.item("channel-pane-name")->property("text").toString(), QString("Northlight Woodworks"));
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_VERIFY(app.window->property("watching").toBool());
+        QObject *next = app.item("watch")->property("list").value<QObject *>();
+        QVERIFY(next);
+        const auto channels = [&] {
+            QStringList found;
+            QObject *l = app.item("watch")->property("list").value<QObject *>();
+            for (int i = 0; i < l->property("count").toInt(); ++i) {
+                QVariantMap v;
+                QMetaObject::invokeMethod(l, "get", Q_RETURN_ARG(QVariantMap, v), Q_ARG(int, i));
+                found << v.value("channel").toString();
+            }
+            return found;
+        };
+        QTRY_VERIFY(!channels().isEmpty());
+        const QStringList before = channels();
+        QVERIFY(before.contains("Northlight Woodworks"));
+        // The channels change while it plays (one is let go): what comes next doesn't.
+        app.backend->unsubscribe("UCeeeeeeeeeeeeeeeeeeeeee");
+        QTRY_COMPARE(app.backend->property("subs").toList().size(), 4);
+        QTest::qWait(100);
+        QCOMPARE(channels(), before);
+    }
+
+    void leftLeavesTheChannelPaneOnlyFromItsEdge()
+    {
+        App app(false, QSize(1280, 720));
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QTest::keyClick(app.window, Qt::Key_3);
+        QQuickItem *list = nullptr, *pane = nullptr;
+        QTRY_VERIFY((list = app.item("channel-list")) && list->hasActiveFocus());
+        pane = app.item("channel-pane");
+        QTRY_VERIFY(pane->property("count").toInt() >= 2);
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_VERIFY(pane->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_COMPARE(pane->property("currentIndex").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_COMPARE(pane->property("currentIndex").toInt(), 0);
+        QVERIFY(pane->hasActiveFocus());
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_VERIFY(list->hasActiveFocus());
+    }
+
     // --- What the council found in the code. ---
 
     void turningTopicFeedsOffDuringARefreshKeepsThemOff()
@@ -2299,6 +2461,18 @@ private slots:
         QTRY_VERIFY(!app.backend->error().isEmpty());
         QVERIFY((wood = app.item("shelf-topic-aa11bb22cc33")));
         QVERIFY(App::count(wood, "card") >= 4);
+    }
+
+    void aTopicWhoseSearchFailedIsSaid()
+    {
+        App app(false, QSize(1280, 2400), {{"QVEIL_STANDIN_TOPICS", "fetched"}, {"QVEIL_STANDIN_TOPICS_FAIL", "group"}});
+        READY(app);
+        QTRY_VERIFY(app.item("shelf-topic-aa11bb22cc33"));
+        QTRY_VERIFY_WITH_TIMEOUT(!app.backend->busy().contains("topics"), 4000);
+        // The engine names the group whose search failed; the window says so.
+        QTRY_VERIFY2(app.backend->error().contains("borrow checker, allocators: YouTube didn't answer"),
+                     qPrintable(app.backend->error()));
+        QVERIFY(app.item("shelf-topic-aa11bb22cc33"));
     }
 
     void hidingATopicNeverLeavesAShelfWaitingForNothing()
