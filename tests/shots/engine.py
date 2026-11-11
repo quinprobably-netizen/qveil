@@ -88,8 +88,8 @@ PRIVACY = {
                "qveil's requests carry a browser User-Agent on a TLS handshake that no browser makes, which is probably rare, so a careful observer can link them by that fingerprint, even across circuits, and by the one-byte request (bytes=0-0) for the start of a video that keeps a connection ready for a seek, sent at most once every 10 seconds while it plays over HTTP/1.1.",
                "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.",
                "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.",
-               "Comments are fetched only when you open them, as one more lookup of that video; commenters' pictures are never fetched.",
-               "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing): on one address their timing links them, and even over Tor a set of related searches can be linked by content.",
+               "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.",
+               "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.",
                "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry."],
     "routes": {"direct": "YouTube sees your IP address.",
                "tor": "Fresh SOCKS credentials per request, which Tor puts on separate circuits.",
@@ -104,7 +104,7 @@ PRIVACY = {
               "resume": "On: qveil remembers where you stopped in an unfinished video for 7 days.",
               "comments": "Fetched only when you open them, as one more lookup of that video.",
               "comments_short": None,  # COMMENTS_SHORT, below
-              "lenses": "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.",
+              "lenses": "A refresh sends one search per topic, each a request of its own, in a new random order each time and 2 to 8 seconds apart. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.",
               "lenses_short": None},  # LENSES_SHORT, below
 }
 
