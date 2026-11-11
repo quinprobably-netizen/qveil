@@ -187,7 +187,16 @@ impl Session {
     /// is being made ready, none within `SPARE_EVERY` of the last, and one
     /// that isn't ready within `SPARE_WITHIN` is given up on. Over HTTP/2
     /// every request shares one connection, and there is nothing to spare.
-    fn keep_spare(self: &Arc<Self>, live: &Live, kind: &str, up: &reqwest::blocking::Response) {
+    ///
+    /// It doesn't go out once the session is cancelled or the route is not
+    /// `server`'s any more, which may have happened since it was asked for.
+    fn keep_spare(
+        self: &Arc<Self>,
+        server: &Arc<Server>,
+        live: &Live,
+        kind: &str,
+        up: &reqwest::blocking::Response,
+    ) {
         if up.version() >= reqwest::Version::HTTP_2
             || self.cancelled.load(Ordering::Acquire)
             || live.pool.has_idle()
@@ -199,13 +208,24 @@ impl Session {
             if spare.dialing || spare.last.is_some_and(|t| t.elapsed() < SPARE_EVERY) {
                 return;
             }
-            *spare = Spare {
-                dialing: true,
-                last: Some(Instant::now()),
-            };
+            spare.dialing = true;
+            spare.last = Some(Instant::now());
         }
-        let (s, live, kind) = (Arc::clone(self), live.clone(), kind.to_string());
+        let (s, server) = (Arc::clone(self), Arc::clone(server));
+        let (live, kind) = (live.clone(), kind.to_string());
         let spawned = std::thread::Builder::new().spawn(move || {
+            // However this ends, the next spare may be asked for.
+            let _dialing = Dialing(&s);
+            #[cfg(test)]
+            {
+                let hook = lock(&s.spare).before_send.clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            if s.cancelled.load(Ordering::Acquire) || !server.runtime().net.same_route(&s.route) {
+                return;
+            }
             let range = Some("bytes=0-0");
             if let Ok(Some(mut spare)) = send_upstream(
                 &live,
@@ -221,7 +241,6 @@ impl Session {
                     live.pool.put_back();
                 }
             }
-            lock(&s.spare).dialing = false;
         });
         if spawned.is_err() {
             lock(&self.spare).dialing = false;
@@ -251,6 +270,19 @@ pub(super) struct Spare {
     pub(super) dialing: bool,
     /// When the last was asked for.
     last: Option<Instant>,
+    /// Run by the spare's thread right before it sends its request.
+    #[cfg(test)]
+    pub(super) before_send: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Lets the next spare be asked for once the one being made ready is done
+/// with, however that ends.
+struct Dialing<'a>(&'a Session);
+
+impl Drop for Dialing<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.spare).dialing = false;
+    }
 }
 
 struct Attached<'a> {
@@ -452,7 +484,7 @@ impl Server {
         }
         if let Some(plan) = wanted.and_then(|w| w.plan(&up)) {
             if self.sparing.load(Ordering::Relaxed) {
-                s.keep_spare(&live, kind, &up);
+                s.keep_spare(self, &live, kind, &up);
             }
             return self.relay_chunked(out, &s, kind, live, up, start, plan);
         }
@@ -1285,7 +1317,8 @@ impl Fetcher {
             Some((a, b, total)) if a == self.pos && total == self.total && b <= self.end => {
                 self.chunk_end = b;
                 if self.server.sparing.load(Ordering::Relaxed) {
-                    self.session.keep_spare(&self.live, &self.kind, &up);
+                    self.session
+                        .keep_spare(&self.server, &self.live, &self.kind, &up);
                 }
                 Ok(up)
             }
@@ -2442,6 +2475,51 @@ EOF
         // Once on the client, and once on the new one put in its place.
         assert_eq!(up.connections(), 2);
         assert!(took < Duration::from_secs(10), "{took:?}");
+    }
+
+    /// A session on `up` with sparing on, whose spare runs the hook that
+    /// `make` makes (given the server's base URL) right before it would go
+    /// out, and a player reading from its start.
+    fn spare_with_hook<H: Fn() + Send + Sync + 'static>(
+        make: impl FnOnce(String) -> H,
+    ) -> (KeepAlive, Arc<Server>, TempDir, Arc<Session>, TcpStream) {
+        let up = KeepAlive::start(Duration::ZERO);
+        let (s, base, d) = server();
+        s.sparing.store(true, Ordering::Relaxed);
+        let sid = add_session(&s, up.url(&format!("/big?size={}&pace=20", 40u64 << 20)));
+        let session = s.session(&sid).unwrap();
+        lock(&session.spare).before_send = Some(Arc::new(make(base.clone())));
+        let mut player = start_ranged(&base, &sid);
+        let mut buf = vec![0u8; 64 << 10];
+        assert!(player.read(&mut buf).unwrap() > 0);
+        (up, s, d, session, player)
+    }
+
+    #[test]
+    fn a_spare_is_not_asked_for_on_a_route_the_user_has_just_left() {
+        let switched = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&switched);
+        let (up, _s, _d, session, _player) = spare_with_hook(move |base| {
+            move || {
+                // The owner switches to Tor while the spare is on its way out.
+                switch_to_tor(&base);
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+        wait_for("the spare to be done", Duration::from_secs(10), || {
+            switched.load(Ordering::SeqCst) && !lock(&session.spare).dialing
+        });
+        let asked = up.ranges();
+        assert!(!asked.iter().any(|r| r == "bytes=0-0"), "{asked:?}");
+    }
+
+    #[test]
+    fn a_spare_that_fails_badly_does_not_hold_the_next_one_back() {
+        let (_up, _s, _d, session, _player) =
+            spare_with_hook(|_| || panic!("a spare that broke (as this test wants)"));
+        wait_for("the spare to be let go", Duration::from_secs(5), || {
+            !lock(&session.spare).dialing
+        });
     }
 
     #[test]
