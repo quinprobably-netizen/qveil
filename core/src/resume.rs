@@ -137,9 +137,12 @@ pub fn forget(paths: &Paths, id: &str) -> Result<()> {
 pub fn clear(paths: &Paths) -> Result<()> {
     let _lock = store::lock(paths)?;
     match std::fs::remove_file(paths.resume()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
     }
+    // And what a write that a crash cut short left of it (see `store::sweep_temps`).
+    store::sweep_temps(&paths.data, store::TEMP_ABANDONED);
+    Ok(())
 }
 
 /// Deletes what has expired, so that it doesn't sit on disk until the next
@@ -288,6 +291,22 @@ mod tests {
             0o600
         );
         assert_eq!(list(&p, 7, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clearing_removes_what_a_write_cut_short_by_a_crash_left_too() {
+        let d = TempDir::new();
+        let p = d.paths();
+        note(&p, 7, pos("aaaaaaaaaaa", 100, 400, 0), 0).unwrap();
+        // The temp file of a process that died, with what it was writing.
+        let crashed = p.data.join(".resume.json.99999999-0123456789abcdef.tmp");
+        std::fs::write(&crashed, br#"{"positions":[{"id":"aaaaaaaaaaa"}"#).unwrap();
+        clear(&p).unwrap();
+        assert!(!p.resume().exists() && !crashed.exists());
+        // Turning resume off does the same: it purges to zero days.
+        std::fs::write(&crashed, b"{").unwrap();
+        purge(&p, 0, 0).unwrap();
+        assert!(!crashed.exists());
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::ids::VideoRef;
 use crate::inflight::{ROUTE_CHANGED, Why};
 use crate::lens;
 use crate::resume;
-use crate::store::Paths;
+use crate::store::{self, Paths};
 use crate::util::{lock, random_hex};
 use crate::video::Chapter;
 use crate::ytdlp::Streams;
@@ -164,6 +164,11 @@ pub struct Opened {
 
 impl Server {
     pub fn new(rt: Runtime, paths: Paths) -> Arc<Self> {
+        // A write that a process died in the middle of leaves its temp file,
+        // and nothing else would ever remove it.
+        for dir in [paths.config_dir(), &paths.data, &paths.cache] {
+            store::sweep_temps(dir, store::TEMP_ABANDONED);
+        }
         // What has expired is deleted now, and not only when the next video
         // is watched: it is a record of what was watched.
         if let Err(e) = resume::purge(&paths, rt.cfg.resume_days, app::now()) {
@@ -590,6 +595,32 @@ mod tests {
     use crate::server::testkit::*;
     use crate::store::testing::TempDir;
     use serde_json::Value;
+
+    #[test]
+    fn temp_files_that_crashed_writes_left_go_when_the_engine_starts() {
+        let d = TempDir::new();
+        let paths = d.paths();
+        let left = |dir: &std::path::Path, name: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            let file = dir.join(format!(".{name}.99999999-0123456789abcdef.tmp"));
+            std::fs::write(&file, b"{").unwrap();
+            file
+        };
+        let temps = [
+            left(paths.config_dir(), "config.toml"),
+            left(&paths.data, "history.json"),
+            left(&paths.cache, "feed.json"),
+        ];
+        // Not one of ours: whatever else is in there stays.
+        let other = paths.data.join(".keep.tmp");
+        std::fs::write(&other, b"x").unwrap();
+        let rt = crate::app::Runtime::new(Config::default(), &paths, None, false).unwrap();
+        drop(Server::new(rt, paths));
+        for t in &temps {
+            assert!(!t.exists(), "{}", t.display());
+        }
+        assert!(other.exists());
+    }
 
     #[test]
     fn requires_the_token() {

@@ -7,6 +7,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Paths {
@@ -304,34 +305,120 @@ pub fn save_compact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// directory, so concurrent writers never share a temp file and the rename
 /// stays on one filesystem.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    stage(path, bytes)?.commit()
+}
+
+/// `write_atomic` in two steps, for a caller that wants the slow one (writing
+/// and syncing the file) done outside a lock it takes for the quick one (the
+/// rename): the bytes are written to the temp file now, and `commit` puts
+/// them in place. Dropped without that, the temp file is removed.
+#[must_use = "the temp file is removed unless it is committed"]
+pub struct Staged {
+    tmp: PathBuf,
+    target: PathBuf,
+}
+
+pub fn stage(path: &Path, bytes: &[u8]) -> Result<Staged> {
     let dir = path.parent().context("path has no parent")?;
     ensure_dir(dir)?;
     let name = path.file_name().context("path has no file name")?;
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(format!(
-        ".{}-{:016x}.tmp",
+    let tmp = dir.join(temp_name(
+        &name.to_string_lossy(),
         std::process::id(),
-        rand::random::<u64>()
+        rand::random::<u64>(),
     ));
-    let tmp = dir.join(tmp_name);
-    let written = OpenOptions::new()
+    // From here on dropping it removes the file, whether or not it was made.
+    let staged = Staged {
+        tmp,
+        target: path.to_path_buf(),
+    };
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&tmp)
+        .open(&staged.tmp)
         .and_then(|mut f| {
             f.write_all(bytes)?;
             f.sync_all()
         })
-        .with_context(|| format!("writing {}", tmp.display()))
-        .and_then(|()| {
-            fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
-        });
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
+        .with_context(|| format!("writing {}", staged.tmp.display()))?;
+    Ok(staged)
+}
+
+impl Staged {
+    pub fn commit(self) -> Result<()> {
+        fs::rename(&self.tmp, &self.target)
+            .with_context(|| format!("replacing {}", self.target.display()))
     }
-    written
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        // Gone already once it was renamed.
+        let _ = fs::remove_file(&self.tmp);
+    }
+}
+
+/// How a temp file of `write_atomic` is named: a dot, the target's name, the
+/// writing process and a random part.
+fn temp_name(target: &str, pid: u32, random: u64) -> String {
+    format!(".{target}.{pid}-{random:016x}.tmp")
+}
+
+/// The process that was writing the temp file called `name`, if it is one
+/// of `write_atomic`'s.
+fn temp_writer(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let (target_and_pid, random) = rest.rsplit_once('-')?;
+    if random.len() != 16 || !random.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (target, pid) = target_and_pid.rsplit_once('.')?;
+    let pid: u32 = pid
+        .parse()
+        .ok()
+        .filter(|p| (1..=i32::MAX as u32).contains(p))?;
+    (!target.is_empty()).then_some(pid)
+}
+
+/// How long a temp file may stay before it counts as abandoned even though
+/// a process with its writer's id exists (ids are used again).
+pub const TEMP_ABANDONED: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a process with this id exists. Signal 0 sends nothing, only asks;
+/// not being allowed to signal it (EPERM) means it does.
+fn is_running(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 sends nothing.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    sent == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Removes the temp files of `write_atomic` in `dir` (not below it) that a
+/// write left behind when the process died with the file half written: those
+/// of a process that isn't running, and those older than `older_than`. They
+/// can hold what was meant to be deleted (a history that was cleared), and
+/// nothing else would ever remove them. Returns how many went. A file of a
+/// writer that is running is left alone: it may be about to be renamed.
+pub fn sweep_temps(dir: &Path, older_than: Duration) -> usize {
+    let mut removed = 0;
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(temp_writer) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+            .unwrap_or_default();
+        if (age >= older_than || !is_running(pid)) && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -518,6 +605,66 @@ mod tests {
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// Plants a temp file the way a write that was cut short leaves one.
+    fn plant(dir: &Path, name: &str, age: Duration) -> PathBuf {
+        let file = dir.join(name);
+        fs::write(&file, b"half").unwrap();
+        let f = File::options().append(true).open(&file).unwrap();
+        f.set_modified(std::time::SystemTime::now() - age).unwrap();
+        file
+    }
+
+    #[test]
+    fn temp_files_of_dead_writers_are_swept_and_the_live_ones_left() {
+        let dir = TempDir::new();
+        let d = &dir.0;
+        let fresh = Duration::from_secs(1);
+        // What a crash leaves: a process that is gone (no process has this id).
+        let dead = plant(d, ".history.json.99999999-0123456789abcdef.tmp", fresh);
+        // A writer that is running, and whose file is still being written.
+        let mine = plant(d, &temp_name("history.json", std::process::id(), 7), fresh);
+        // One that has been there for ages under an id that is in use again.
+        let reused = plant(
+            d,
+            &temp_name("feed.json", std::process::id(), 8),
+            Duration::from_secs(11 * 60),
+        );
+        // Not temp files of this program's, whatever their age.
+        let old = Duration::from_secs(3600);
+        let others = [
+            plant(d, ".keep.tmp", old),
+            plant(d, "history.json.99999999-0123456789abcdef.tmp", old),
+            plant(d, ".history.json.99999999-short.tmp", old),
+            plant(d, ".history.json.99999999-0123456789abcdef.tmp.bak", old),
+            plant(d, ".history.json.abc-0123456789abcdef.tmp", old),
+            plant(d, ".history.json.0-0123456789abcdef.tmp", old),
+            plant(d, "history.json", old),
+        ];
+        fs::create_dir(d.join(".dir.99999999-0123456789abcdef.tmp")).unwrap();
+
+        assert_eq!(sweep_temps(d, Duration::from_secs(600)), 2);
+        assert!(!dead.exists() && !reused.exists());
+        assert!(mine.exists(), "the file of a writer that is running");
+        for other in &others {
+            assert!(other.exists(), "{}", other.display());
+        }
+        assert!(d.join(".dir.99999999-0123456789abcdef.tmp").is_dir());
+        // Nothing there, or no directory: nothing to do.
+        assert_eq!(sweep_temps(d, Duration::from_secs(600)), 0);
+        assert_eq!(sweep_temps(&d.join("absent"), Duration::from_secs(600)), 0);
+    }
+
+    #[test]
+    fn the_name_a_write_gives_its_temp_file_is_the_one_the_sweep_reads() {
+        let name = temp_name("history.json", 4242, 0xab);
+        assert_eq!(name, ".history.json.4242-00000000000000ab.tmp");
+        assert_eq!(temp_writer(&name), Some(4242));
+        assert_eq!(temp_writer("history.json"), None);
+        // A target with a dot or a dash of its own.
+        let name = temp_name("lens-a.b.json", 7, 1);
+        assert_eq!(temp_writer(&name), Some(7));
     }
 
     #[test]
