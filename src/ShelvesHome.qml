@@ -134,14 +134,19 @@ FocusScope {
                            why: [qsTr("%1 left").arg(Format.clock(Math.max(0, kept.dur - kept.pos)))] })
         } else if (key === "latest") {
             // As it came, only as much of it as is shown is read.
+            // (The video that leads is not shown again under it.)
+            const lead = first !== null ? first.id : ""
             if (Arrange.plain(arrangements[key])) {
                 all = []
                 const n = latestRows > 1 ? latestRows * across : most
-                for (let i = 0; i < backend.feed.count && i < n; i++)
-                    all.push(backend.feed.get(i))
+                for (let i = 0; i < backend.feed.count && all.length < n; i++) {
+                    const v = backend.feed.get(i)
+                    if (v.id !== lead)
+                        all.push(v)
+                }
                 return all
             }
-            all = Arrange.rows(backend.feed)
+            all = Arrange.rows(backend.feed).filter(v => v.id !== lead)
         } else if (key.indexOf("topic-") === 0) {
             all = topicOf(key).videos || []
         } else {
@@ -161,8 +166,15 @@ FocusScope {
         if (key === "resume") {
             page.resumed(video)
         } else if (key === "latest" && Arrange.plain(arrangements[key])) {
-            // The shelf is the start of the feed: what comes next is the rest of it.
-            page.activated(video, backend.feed, index)
+            // The shelf is the start of the feed: what comes next is the rest of
+            // it, from where the video is in the feed (the lead's is left out here).
+            let at = index
+            for (let i = 0; i < backend.feed.count; i++)
+                if (backend.feed.get(i).id === video.id) {
+                    at = i
+                    break
+                }
+            page.activated(video, backend.feed, at)
         } else {
             page.activated(video, Arrange.listed(sourceOf(key)), index)
         }

@@ -161,11 +161,21 @@ ApplicationWindow {
     // list itself may re-sort, filter or refill under it while it plays.
     VideoModel { id: playedFrom }
 
+    // Leaving the watch page: a video that is playing goes on in the small
+    // window, from where it is; one that is paused or over is put away
+    // (where it was is kept).
+    function leaveWatch() {
+        const s = watch.surface
+        if (s.active && !s.pending && !s.mpv.paused && !s.mpv.ended)
+            togglePip()
+        else
+            watch.close()
+    }
     function go(p) {
         if (!pages[p])
             return
         if (watch.active)
-            watch.close()
+            leaveWatch()
         if (p !== "channel" && p !== "search")
             returnPage = p
         // What was typed in the search field belongs to the search page only.
@@ -199,7 +209,7 @@ ApplicationWindow {
         if (!id)
             return
         if (watch.active)
-            watch.close()
+            leaveWatch()
         if (page !== "channel" && page !== "search")
             returnPage = page
         if (page !== "channel")
@@ -347,7 +357,7 @@ ApplicationWindow {
         else if (watch.active && watch.theatre)
             watch.theatre = false
         else if (watch.active)
-            watch.close()
+            leaveWatch()
         else if (typing)
             focusPage(page)
         else if (page === "settings" && settingsPage.inRows)

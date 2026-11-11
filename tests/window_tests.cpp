@@ -596,8 +596,9 @@ private slots:
         App app;
         READY(app);
         QTRY_VERIFY(app.items("card").size() >= 4);
-        // Opened from the feed's second card: what comes next is the rest of the feed.
-        app.click(app.items("card").at(1));
+        // Opened from the feed's second video (Latest's first card: the first
+        // video leads, above it): what comes next is the rest of the feed.
+        app.click(app.items("card").at(0));
         QQuickItem *surface = app.item("surface");
         QTRY_VERIFY(!surface->property("pending").toBool());
         app.click(app.item("tab-chapters"));
@@ -926,6 +927,69 @@ private slots:
         QVERIFY(!app.window->property("pip").toBool());
     }
 
+    void theLeadsVideoIsNotAlsoTheFirstOfLatest()
+    {
+        App app;
+        READY(app);
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QQuickItem *shelf = nullptr;
+        QTRY_VERIFY((shelf = app.item("shelf-latest")) && App::count(shelf, "card") >= 3);
+        // The lead is the first of the feed; Latest starts at the second.
+        QCOMPARE(app.item("lead-title")->property("text").toString(), QString("Why the borrow checker says no"));
+        QStringList ids;
+        for (QQuickItem *card : app.items("card"))
+            if (App::under(shelf, "card") && card->parentItem() && shelf->isAncestorOf(card))
+                ids << card->property("videoId").toString();
+        QVERIFY2(!ids.contains("vid00000001"), qPrintable(ids.join(",")));
+        QVERIFY2(ids.contains("vid00000002"), qPrintable(ids.join(",")));
+        // Playing from Latest goes on through the feed as it is.
+        QTest::keyClick(app.window, Qt::Key_Down);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000002"));
+        QTRY_VERIFY(app.items("next-entry").size() >= 2);
+    }
+
+    void leavingAPlayingVideoHandsItToTheSmallWindow()
+    {
+        App app;
+        READY(app);
+        QQuickWindow *pip = app.pip();
+        app.play({{"id", "vid00000001"}, {"title", "Why the borrow checker says no"}});
+        QTRY_COMPARE(app.item("surface")->property("startedAt").toInt(), 845);
+        // A place key: the video goes on in the small window, from where it was.
+        QTest::keyClick(app.window, Qt::Key_2);
+        QTRY_VERIFY(pip->isVisible());
+        QCOMPARE(app.page(), QString("lenses"));
+        QVERIFY(!app.window->property("watching").toBool());
+        QQuickItem *small = app.inPip("pip-surface");
+        QVERIFY(small->property("active").toBool());
+        QCOMPARE(small->property("info").toMap().value("id").toString(), QString("vid00000001"));
+        QCOMPARE(small->property("startedAt").toInt(), 845);
+        app.pip()->close();
+        QTRY_VERIFY(!pip->isVisible());
+
+        // Esc from the watch page does the same.
+        app.play({{"id", "vid00000002"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTRY_VERIFY(app.window->property("watching").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(pip->isVisible());
+        QTRY_COMPARE(app.inPip("pip-surface")->property("info").toMap().value("id").toString(), QString("vid00000002"));
+        app.pip()->close();
+        QTRY_VERIFY(!pip->isVisible());
+
+        // A video that is paused is put away instead (where it was is kept).
+        app.play({{"id", "vid00000003"}});
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QObject *mpv = app.item("surface")->property("mpv").value<QObject *>();
+        QMetaObject::invokeMethod(mpv, "togglePause");
+        QTRY_VERIFY(mpv->property("paused").toBool());
+        QTest::keyClick(app.window, Qt::Key_1);
+        QTRY_VERIFY(!app.window->property("watching").toBool());
+        QTest::qWait(200);
+        QVERIFY(!pip->isVisible());
+    }
+
     void anotherVideoOpenedMeanwhilePlaysInTheSmallWindow()
     {
         App app;
@@ -935,7 +999,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_I);
         QTRY_VERIFY(app.pip()->isVisible());
         QTRY_VERIFY(app.items("card").size() >= 4);
-        app.click(app.items("card").at(2));
+        app.click(app.items("card").at(1));
         QQuickItem *small = app.inPip("pip-surface");
         QTRY_COMPARE(small->property("info").toMap().value("id").toString(), QString("vid00000003"));
         QTRY_VERIFY(!small->property("pending").toBool());
@@ -1240,6 +1304,8 @@ private slots:
         QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000001"));
 
         // Starting over forgets the place first, so the video starts at its start.
+        // (Put away first: left while playing, it would go on in the small window.)
+        QMetaObject::invokeMethod(app.item("watch"), "close");
         QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
         QTRY_VERIFY(app.item("lead")->isVisible());
         // Coming back, the page is where it was left: the lead is still in view.
@@ -1319,9 +1385,9 @@ private slots:
             if (card->property("selected").toBool())
                 selected = card;
         QVERIFY(selected);
-        QCOMPARE(selected->property("videoId").toString(), QString("vid00000003"));
+        QCOMPARE(selected->property("videoId").toString(), QString("vid00000004"));
         QTest::keyClick(app.window, Qt::Key_Return);
-        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000003"));
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000004"));
         QTRY_VERIFY(!app.items("next-entry").isEmpty());
         // Up has an end, and so has Left.
         QMetaObject::invokeMethod(app.window, "go", Q_ARG(QVariant, QString("home")));
@@ -1638,11 +1704,12 @@ private slots:
                 first = qMin(first, box(card).left());
         QVERIFY2(qAbs(first - box(row).left()) <= 1, qPrintable(QString::number(first - box(row).left())));
         app.click(next);
-        QTRY_COMPARE(row->property("contentX").toReal(), 8 * cell);
+        // (To its end: eleven cards, the lead's video being above it.)
+        QTRY_COMPARE(row->property("contentX").toReal(), 7 * cell);
         // At the end there is no more that way.
         QTRY_VERIFY(!next->isVisible());
         app.click(prev);
-        QTRY_COMPARE(row->property("contentX").toReal(), 4 * cell);
+        QTRY_COMPARE(row->property("contentX").toReal(), 3 * cell);
         // A shelf whose videos all fit has no arrows.
         QQuickItem *few = app.item("shelf-resume");
         app.hover(App::under(few, "shelf-row"));
@@ -1717,7 +1784,7 @@ private slots:
             }
             return best ? best->property("videoId").toString() : QString();
         };
-        QCOMPARE(first(shelf), QString("vid00000001"));
+        QCOMPARE(first(shelf), QString("vid00000002"));
         QQuickItem *sort = App::under(shelf, "shelf-sort");
         QVERIFY(sort);
         QCOMPARE(sort->property("text").toString(), QString("Newest"));
@@ -1859,7 +1926,7 @@ private slots:
         QVERIFY(marked().isEmpty());
         // Down is the first shelf's first card, framed on its picture; Up is the lead again.
         QTest::keyClick(app.window, Qt::Key_Down);
-        QTRY_COMPARE(marked(), QStringList{"vid00000001"});
+        QTRY_COMPARE(marked(), QStringList{"vid00000002"});
         QVERIFY(!home->property("leadSelected").toBool());
         QQuickItem *cursor = nullptr;
         for (QQuickItem *card : app.items("card"))
@@ -2312,6 +2379,10 @@ private slots:
         // Left by a page key with the keyboard in the sheet: the next video has it in the video.
         QTest::keyClick(app.window, Qt::Key_2);
         QTRY_COMPARE(app.page(), QString("lenses"));
+        // (It went on in the small window; that is closed, so the next plays here.)
+        QTRY_VERIFY(app.pip()->isVisible());
+        app.pip()->close();
+        QTRY_VERIFY(!app.pip()->isVisible());
         play(1);
         QTRY_VERIFY(app.window->property("watching").toBool());
         QVERIFY(!watch->property("inSheet").toBool());
