@@ -127,7 +127,7 @@ QVariantMap Backend::privacyOf(const QVariantMap &config) {
     const QVariantMap sentRoutes = sent.value("routes").toMap(), sentPages = sent.value("pages").toMap();
     for (const char *key : {"direct", "tor", "proxy"})
         routes.insert(key, text(sentRoutes, key));
-    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses", "lenses_short", "topics", "topics_on", "topics_off", "prepare_on", "prepare_off"})
+    for (const char *key : {"search", "subscriptions", "history_off", "history_on", "resume", "comments", "lenses", "lenses_short", "topics", "topics_on", "topics_off", "prepare_on", "prepare_off", "keep_thumbs_on", "keep_thumbs_off"})
         pages.insert(key, text(sentPages, key));
     QStringList points;
     for (const QVariant &point : sent.value("points").toList())

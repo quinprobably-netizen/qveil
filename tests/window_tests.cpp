@@ -1446,7 +1446,7 @@ private slots:
         const QList<std::tuple<QString, QString, QString>> rows{
             {"privacy", "set-route", "route-tor"},     {"privacy", "set-history", "history-on"},
             {"privacy", "set-resume", "resume-7"},     {"playback", "set-quality", "quality-1080"},
-            {"playback", "set-prepare", "prepare-off"},
+            {"playback", "set-prepare", "prepare-off"}, {"home", "set-keep-thumbs", "keep-thumbs-off"},
             {"home", "set-thumbs", "thumbs-clear"},    {"home", "set-shorts", "shorts-hidden"}};
         qreal left = -1, right = -1;
         for (const auto &[category, rowName, controlName] : rows) {
@@ -2879,6 +2879,26 @@ private slots:
         QTRY_VERIFY(app.backend->config().value("prepareNext").toBool());
         QTRY_VERIFY(!would->isVisible());
         QCOMPARE(app.item("set-prepare-note")->property("text").toString(), pages.value("prepare_on").toString());
+    }
+
+    void keepingThumbnailsOnDiskIsOffUntilTurnedOnAndSaysWhatItKeeps()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-home"));
+        const QVariantMap pages = app.backend->privacy().value("pages").toMap();
+        QVERIFY(pages.value("keep_thumbs_on").toString().contains("record"));
+        QVERIFY(!app.backend->config().value("keepThumbnails").toBool());
+        QCOMPARE(app.item("set-keep-thumbs-note")->property("text").toString(), pages.value("keep_thumbs_off").toString());
+        QQuickItem *would = app.item("set-keep-thumbs-would");
+        QVERIFY(would && would->isVisible());
+        QCOMPARE(would->property("text").toString(), pages.value("keep_thumbs_on").toString());
+        app.click(app.item("keep-thumbs-on"));
+        QTRY_VERIFY(app.backend->config().value("keepThumbnails").toBool());
+        QTRY_VERIFY(!would->isVisible());
+        app.click(app.item("keep-thumbs-off"));
+        QTRY_VERIFY(!app.backend->config().value("keepThumbnails").toBool());
     }
 
     void nearTheEndTheNextVideoInTheListIsGotReadyOnce()

@@ -29,6 +29,10 @@ pub struct Config {
     pub topic_feeds: bool,
     /// Show thumbnails (fetched through the same route as everything else).
     pub thumbnails: bool,
+    /// Keep the thumbnails that were fetched on disk, in the cache directory,
+    /// so that they aren't fetched again. Off by default: they are a record
+    /// of what was shown.
+    pub keep_thumbnails: bool,
     /// Near the end of a video played from a list, look up the next one in
     /// the list, so that it starts without waiting for yt-dlp. Off by
     /// default: it is a lookup of a video that may never be watched.
@@ -51,6 +55,7 @@ impl Default for Config {
             resume_days: 7,
             topic_feeds: false,
             thumbnails: true,
+            keep_thumbnails: false,
             prepare_next: false,
             feed_workers: 4,
             ytdlp: "yt-dlp".into(),

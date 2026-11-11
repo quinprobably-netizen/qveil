@@ -31,7 +31,7 @@ FocusScope {
     // and on which of them.
     property bool inRows: false
     property int rowAt: 0
-    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume], playback: [qualityRow, aheadRow], home: [pictures, topicsRow, shortsRow], about: [] })
+    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume], playback: [qualityRow, aheadRow], home: [pictures, keptRow, topicsRow, shortsRow], about: [] })
     onCategoryChanged: {
         const had = pane.activeFocus
         inRows = false
@@ -335,6 +335,21 @@ FocusScope {
                             current: pictures.off
                             onClicked: backend.setConfig({ thumbnails: false })
                         }
+                    }
+                }
+                SettingRow {
+                    id: keptRow
+                    objectName: "set-keep-thumbs"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === keptRow
+                    width: parent.width
+                    name: qsTr("Keep thumbnails on disk")
+                    note: (page.config.keepThumbnails ? page.pages.keep_thumbs_on : page.pages.keep_thumbs_off) || ""
+                    noteName: "set-keep-thumbs-note"
+                    would: page.config.keepThumbnails ? "" : (page.pages.keep_thumbs_on || "")
+                    wouldName: "set-keep-thumbs-would"
+                    Choices {
+                        Choice { objectName: "keep-thumbs-off"; text: qsTr("Off"); current: !page.config.keepThumbnails; patch: ({ keepThumbnails: false }) }
+                        Choice { objectName: "keep-thumbs-on"; text: qsTr("On"); current: !!page.config.keepThumbnails; patch: ({ keepThumbnails: true }) }
                     }
                 }
                 SettingRow {

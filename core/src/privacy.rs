@@ -145,7 +145,7 @@ const DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Local data",
-        "Subscriptions, lenses, resume positions, the history, the topic feeds you hid and when recent topic searches were made live in `~/.local/share/qveil`, the feed cache and what each lens and topic feed found in `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those).",
+        "Subscriptions, lenses, resume positions, the history, the topic feeds you hid and when recent topic searches were made live in `~/.local/share/qveil`, the feed cache, what each lens and topic feed found and (while keeping them is on) the thumbnails you were shown in `~/.cache/qveil`, settings in `~/.config/qveil`. The directories are mode `0700` and the files `0600`, and qveil tightens them at startup, because the window creates them first with looser defaults (leftover `veil` directories too). Watch history is **off** by default. `qveil wipe` deletes the data and caches, and anything left over from veil's directories (`qveil config` lists those).",
     ),
 ];
 
@@ -194,6 +194,9 @@ pub struct Pages {
     /// Getting the next video ready, on and off.
     pub prepare_on: &'static str,
     pub prepare_off: &'static str,
+    /// Keeping thumbnails on disk, on and off.
+    pub keep_thumbs_on: &'static str,
+    pub keep_thumbs_off: &'static str,
 }
 
 const ROUTES: Routes = Routes {
@@ -214,6 +217,10 @@ const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, q
 const PREPARE_OFF: &str = "Off: a video is looked up when you play it, and not before.";
 const PREPARE_ON: &str = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it.";
 const PREPARE_POINT: &str = "Getting the next video ready is on: near the end of a video, the next one in its list is looked up before you play it, so YouTube sees a lookup of a video you may not watch.";
+const KEEP_THUMBS_OFF: &str =
+    "Off: thumbnails are kept in memory while qveil runs, and not on disk.";
+const KEEP_THUMBS_ON: &str = "On: the thumbnails you were shown are kept on disk, in ~/.cache/qveil/thumbs, in files only you can read (at most 64 MiB, the least recently shown going first), so that they aren't fetched again. They are a record, on this computer, of the pictures you were shown. Turning this off, clearing the history or qveil wipe deletes them.";
+const KEEP_THUMBS_POINT: &str = "Thumbnails are kept on disk: ~/.cache/qveil/thumbs is a record, on this computer, of the pictures you were shown, until you turn that off or clear the history.";
 const LENSES: &str = "A refresh sends one search per topic, each a request of its own. YouTube sees those searches, and a length, date or order rule that it has a filter for is sent with the search as YouTube's own filter; a topic whose filtered search finds nothing is searched a second time without it. Your wording, the other rules and the ranking stay on this computer.";
 const LENSES_SHORT: &str =
     "A refresh sends each topic to YouTube as a search of its own, sometimes twice.";
@@ -244,6 +251,7 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
         // What is only true while a setting is on.
         .chain(cfg.topic_feeds.then_some(TOPICS_POINT))
         .chain(cfg.prepare_next.then_some(PREPARE_POINT))
+        .chain(cfg.keep_thumbnails.then_some(KEEP_THUMBS_POINT))
         .map(String::from)
         .collect();
     Privacy {
@@ -268,6 +276,8 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
             topics_off: TOPICS_OFF,
             prepare_on: PREPARE_ON,
             prepare_off: PREPARE_OFF,
+            keep_thumbs_on: KEEP_THUMBS_ON,
+            keep_thumbs_off: KEEP_THUMBS_OFF,
         },
     }
 }
@@ -334,6 +344,8 @@ pub fn markdown() -> String {
         ("Topic feeds, on", TOPICS_ON),
         ("Getting the next video ready, off", PREPARE_OFF),
         ("Getting the next video ready, on", PREPARE_ON),
+        ("Keeping thumbnails on disk, off", KEEP_THUMBS_OFF),
+        ("Keeping thumbnails on disk, on", KEEP_THUMBS_ON),
     ] {
         md.push_str(&format!("- **{name}.** {line}\n"));
     }
@@ -530,6 +542,8 @@ mod tests {
                 "comments",
                 "history_off",
                 "history_on",
+                "keep_thumbs_off",
+                "keep_thumbs_on",
                 "lenses",
                 "lenses_short",
                 "prepare_off",
@@ -638,6 +652,27 @@ mod tests {
         assert!(on.pages.prepare_on.contains("pointed at it"));
     }
 
+    #[test]
+    fn keeping_thumbnails_on_disk_is_said_while_it_is_on() {
+        let net = Net::new(None, true).unwrap();
+        let off = describe(&net, &Config::default());
+        assert!(!off.points.iter().any(|p| p == KEEP_THUMBS_POINT));
+        assert!(off.pages.keep_thumbs_off.starts_with("Off"));
+        let on = describe(
+            &net,
+            &Config {
+                keep_thumbnails: true,
+                ..Config::default()
+            },
+        );
+        assert!(on.points.iter().any(|p| p == KEEP_THUMBS_POINT));
+        assert!(
+            on.pages.keep_thumbs_on.contains("record")
+                && on.pages.keep_thumbs_on.contains("deletes them")
+        );
+        assert!(markdown().contains("the thumbnails you were shown in `~/.cache/qveil`"));
+    }
+
     /// The window's tests run against a stand-in engine, which has to say
     /// what this one says where the window shows it word for word.
     #[test]
@@ -653,6 +688,8 @@ mod tests {
             ("LENSES_SHORT", LENSES_SHORT),
             ("PREPARE_OFF", PREPARE_OFF),
             ("PREPARE_ON", PREPARE_ON),
+            ("KEEP_THUMBS_OFF", KEEP_THUMBS_OFF),
+            ("KEEP_THUMBS_ON", KEEP_THUMBS_ON),
         ] {
             assert!(
                 standin.contains(&format!("{name} = \"{text}\"")),

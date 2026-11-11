@@ -81,6 +81,10 @@ impl Paths {
     pub fn topic_searches(&self) -> PathBuf {
         self.data.join("topic-searches.json")
     }
+    /// The thumbnails kept on disk, while that is on (see `server::thumbs`).
+    pub fn thumbs(&self) -> PathBuf {
+        self.cache.join("thumbs")
+    }
     pub fn feed_cache(&self) -> PathBuf {
         self.cache.join("feed.json")
     }

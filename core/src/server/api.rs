@@ -33,6 +33,7 @@ struct ConfigPatch {
     resume_days: Option<u32>,
     topic_feeds: Option<bool>,
     prepare_next: Option<bool>,
+    keep_thumbnails: Option<bool>,
 }
 
 /// What the window reports while a video plays: `POST api/resume`.
@@ -200,8 +201,10 @@ impl Server {
             }
             ("POST", ["api", "history", "clear"]) => {
                 app::clear_history(paths)?;
-                // They say what was watched lately, too.
+                // They say what was watched lately, too, and the
+                // thumbnails kept on disk what was shown.
                 self.lookups.clear();
+                self.thumbs.disk.forget(&paths.thumbs())?;
                 json!({})
             }
             ("GET", ["api", "read"]) => self.read_json(req),
@@ -285,6 +288,7 @@ impl Server {
             "resumeDays": rt.cfg.resume_days,
             "topicFeeds": rt.cfg.topic_feeds,
             "prepareNext": rt.cfg.prepare_next,
+            "keepThumbnails": rt.cfg.keep_thumbnails,
             "configPath": self.paths.config,
             // What the window says about privacy, from the one place that
             // words it (see `privacy`).
@@ -338,6 +342,9 @@ impl Server {
         if let Some(on) = p.prepare_next {
             cfg.prepare_next = on;
         }
+        if let Some(on) = p.keep_thumbnails {
+            cfg.keep_thumbnails = on;
+        }
         // Validates the proxy before anything is saved.
         let mut next = Runtime::new(cfg, &self.paths, None, false)?;
         next.cfg.save(&self.paths.config)?;
@@ -346,6 +353,7 @@ impl Server {
         if next.cfg.resume_days != rt.cfg.resume_days {
             resume::purge(&self.paths, next.cfg.resume_days, app::now())?;
         }
+        let keep_thumbnails = next.cfg.keep_thumbnails;
         let route_changed = !next.net.same_route(&rt.net);
         let topics_off = rt.cfg.topic_feeds && !next.cfg.topic_feeds;
         if !route_changed {
@@ -380,6 +388,11 @@ impl Server {
             }
         } else {
             drop(sessions);
+        }
+        // The thumbnails kept on disk go when keeping them is off. After the
+        // swap, so that a thumbnail being kept now sees that it is off.
+        if !keep_thumbnails {
+            self.thumbs.disk.forget(&self.paths.thumbs())?;
         }
         // Turned off, what the topic feeds found is not kept. Deleted after
         // the swap: a refresh that is running sees the setting off before it

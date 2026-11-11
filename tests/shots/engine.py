@@ -112,6 +112,7 @@ state = {
                "history": False, "thumbnails": True, "maxHeight": 1080, "resumeDays": 7,
                "topicFeeds": bool(os.environ.get("QVEIL_STANDIN_TOPICS")),
                "prepareNext": False,
+               "keepThumbnails": False,
                "configPath": "/dev/null", "privacy": PRIVACY},
     "subs": [{"id": c, "name": n} for c, n in CHANNELS],
     "resume": [
@@ -142,6 +143,10 @@ PREPARE_OFF = "Off: a video is looked up when you play it, and not before."
 PREPARE_ON = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it."
 PRIVACY["pages"]["prepare_off"] = PREPARE_OFF
 PRIVACY["pages"]["prepare_on"] = PREPARE_ON
+KEEP_THUMBS_OFF = "Off: thumbnails are kept in memory while qveil runs, and not on disk."
+KEEP_THUMBS_ON = "On: the thumbnails you were shown are kept on disk, in ~/.cache/qveil/thumbs, in files only you can read (at most 64 MiB, the least recently shown going first), so that they aren't fetched again. They are a record, on this computer, of the pictures you were shown. Turning this off, clearing the history or qveil wipe deletes them."
+PRIVACY["pages"]["keep_thumbs_off"] = KEEP_THUMBS_OFF
+PRIVACY["pages"]["keep_thumbs_on"] = KEEP_THUMBS_ON
 # QVEIL_STANDIN_TOPICS=fetched: they were searched for on an earlier day.
 state["topics"] = {"fetched": os.environ.get("QVEIL_STANDIN_TOPICS") == "fetched", "hidden": [], "new": set()}
 
@@ -453,7 +458,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os._exit(3)
         if path == "api/config":
             cfg = state["config"]
-            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds", "prepareNext"):
+            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds", "prepareNext", "keepThumbnails"):
                 if key in body:
                     cfg[key] = body[key]
             cfg["resumeDays"] = max(0, min(365, int(cfg["resumeDays"])))

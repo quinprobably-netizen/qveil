@@ -139,6 +139,13 @@ impl Server {
         if let Err(e) = app::tidy_topics(&paths, rt.cfg.topic_feeds) {
             note!("qveil: couldn't tidy the topic feeds' files: {e:#}");
         }
+        // Thumbnails kept on disk while that was on, before it was turned off
+        // in the config file.
+        if !rt.cfg.keep_thumbnails
+            && let Err(e) = thumbs::Disk::default().forget(&paths.thumbs())
+        {
+            note!("qveil: couldn't delete the thumbnails kept on disk: {e:#}");
+        }
         Arc::new(Self {
             runtime: RwLock::new(Arc::new(rt)),
             paths,

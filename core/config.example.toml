@@ -43,6 +43,12 @@ prepare_next = false
 # still tie them together.
 thumbnails = true
 
+# Keep the thumbnails that were fetched on disk (in ~/.cache/qveil/thumbs, at
+# most 64 MiB, the least recently shown going first), so that they aren't
+# fetched again. They are a record of the pictures you were shown, so it is
+# off until you turn it on; turning it off deletes them.
+keep_thumbnails = false
+
 # Channel feeds fetched at once.
 feed_workers = 4
 
