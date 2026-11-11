@@ -1077,7 +1077,13 @@ echo '{"entries":[]}'"#,
         wait_for("the registry to be empty", Duration::from_secs(10), || {
             s.runtime().yt.calls.running() == 0
         });
-        assert!(lock(&s.preparing).is_none());
+        // Let go by its request's thread once yt-dlp has ended, which on a
+        // busy machine can be a moment after the registry is empty.
+        wait_for(
+            "the lookup ahead to be let go",
+            Duration::from_secs(10),
+            || lock(&s.preparing).is_none(),
+        );
     }
 
     #[test]
@@ -1559,7 +1565,8 @@ echo '{"title":"T","channel":"Chan","timestamp":5,"url":"https://gv.test/c?expir
         let script = r#"d=$(dirname "$0")
 n=$(cat "$d/runs" 2>/dev/null || echo 0)
 n=$((n + 1))
-echo $n > "$d/runs"
+# Whole or not at all: the test reads it meanwhile.
+echo $n > "$d/runs.new" && mv "$d/runs.new" "$d/runs"
 while [ ! -e "$d/go" ]; do sleep 0.02; done
 cat <<EOF
 {"title":"T","requested_formats":[
@@ -1709,7 +1716,13 @@ EOF
         wait_for("the registry to be empty", Duration::from_secs(10), || {
             s.runtime().yt.calls.running() == 0
         });
-        assert!(lock(&s.preparing).is_none());
+        // Let go by its request's thread once yt-dlp has ended, which on a
+        // busy machine can be a moment after the registry is empty.
+        wait_for(
+            "the lookup ahead to be let go",
+            Duration::from_secs(10),
+            || lock(&s.preparing).is_none(),
+        );
     }
 
     #[test]

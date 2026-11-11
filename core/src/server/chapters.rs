@@ -160,7 +160,7 @@ mod tests {
             &format!(
                 r#"d=$(dirname "$0")
 n=$(cat "$d/runs" 2>/dev/null || echo 0)
-echo $((n + 1)) > "$d/runs"
+echo $((n + 1)) > "$d/runs.new" && mv "$d/runs.new" "$d/runs"
 echo "$*" > "$d/args"
 while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && cp "$2" "$d/asked"; shift; done
 sleep {delay}

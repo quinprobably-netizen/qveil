@@ -2579,7 +2579,10 @@ EOF
 
     /// A session on `up` with sparing on, whose spare runs the hook that
     /// `make` makes (given the server's base URL) right before it would go
-    /// out, and a player reading from its start.
+    /// out, and a player reading from its start. The hook waits until the
+    /// player has had its first bytes: on a busy machine the spare can be on
+    /// its way before then, and a hook that ends the stream would end it
+    /// with nothing sent.
     fn spare_with_hook<H: Fn() + Send + Sync + 'static>(
         make: impl FnOnce(String) -> H,
     ) -> (KeepAlive, Arc<Server>, TempDir, Arc<Session>, TcpStream) {
@@ -2588,10 +2591,20 @@ EOF
         s.sparing.store(true, Ordering::Relaxed);
         let sid = add_session(&s, up.url(&format!("/big?size={}&pace=20", 40u64 << 20)));
         let session = s.session(&sid).unwrap();
-        lock(&session.spare).before_send = Some(Arc::new(make(base.clone())));
+        let playing = Arc::new(AtomicBool::new(false));
+        let hook = make(base.clone());
+        let started = Arc::clone(&playing);
+        lock(&session.spare).before_send = Some(Arc::new(move || {
+            let asked = Instant::now();
+            while !started.load(Ordering::SeqCst) && asked.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            hook()
+        }));
         let mut player = start_ranged(&base, &sid);
         let mut buf = vec![0u8; 64 << 10];
         assert!(player.read(&mut buf).unwrap() > 0);
+        playing.store(true, Ordering::SeqCst);
         (up, s, d, session, player)
     }
 
