@@ -1972,6 +1972,17 @@ private slots:
         QVERIFY(row && next && prev);
         // The arrows are there when the shelf is pointed at, and only where there is more.
         QVERIFY(!next->isVisible() && !prev->isVisible());
+        // The categories are as wide as the channels' rail, which stands at the same edge,
+        // and the rows start a gutter beyond them.
+        QCOMPARE(box(App::under(page, "settings-cat-privacy")).width(), qreal(260));
+        QCOMPARE(box(App::under(page, "settings-cat-privacy")).left(), qreal(24));
+        QCOMPARE(left, box(App::under(page, "settings-cat-privacy")).right() + 24);
+        QTest::keyClick(app.window, Qt::Key_3);
+        QTRY_COMPARE(app.page(), QString("channels"));
+        QCOMPARE(box(app.item("channel-list")).width(), box(App::under(page, "settings-cat-privacy")).width());
+        QCOMPARE(box(app.item("channel-list")).left(), box(App::under(page, "settings-cat-privacy")).left());
+        QTest::keyClick(app.window, Qt::Key_5);
+        QTRY_COMPARE(app.page(), QString("settings"));
         app.hover(row);
         QTRY_VERIFY(next->isVisible());
         QVERIFY(!prev->isVisible());

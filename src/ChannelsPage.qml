@@ -52,7 +52,7 @@ FocusScope {
         anchors.leftMargin: Style.gutter
         anchors.topMargin: Style.u * 2
         anchors.bottomMargin: Style.gutter
-        width: page.width < 700 ? 200 : 260
+        width: Style.rail(page.width)
 
         Column {
             id: railHead

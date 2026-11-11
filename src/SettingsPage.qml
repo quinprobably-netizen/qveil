@@ -78,8 +78,9 @@ FocusScope {
     Column {
         id: cats
         x: Style.gutter
-        y: Style.u * 3
-        width: 200
+        y: Style.u * 2
+        // As wide as the channels' rail.
+        width: Style.rail(page.width)
         spacing: 2
         focus: true
         Keys.onUpPressed: page.step(-1)
@@ -143,10 +144,10 @@ FocusScope {
     Flickable {
         id: pane
         anchors.left: cats.right
-        anchors.leftMargin: Style.u * 8
+        anchors.leftMargin: Style.gutter
         anchors.top: parent.top
         anchors.bottom: parent.bottom
-        width: Math.min(760, page.width - cats.width - cats.x - Style.u * 8 - Style.gutter)
+        width: Math.min(760, page.width - cats.width - cats.x - anchors.leftMargin - Style.gutter)
         // The first row is level with the first category.
         topMargin: cats.y + 46
         bottomMargin: Style.gutter

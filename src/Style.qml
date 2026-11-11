@@ -46,6 +46,9 @@ QtObject {
     readonly property int bar: 56
     readonly property int gutter: 24
     readonly property int control: 28
+    // How wide the column down the side of a page is (the channels, the
+    // settings' categories), in a page `width` wide.
+    function rail(width) { return width < 700 ? 200 : 260 }
     // How far a button's word is from its edge, to either side (see Act). A
     // row of them at the end of a line is pulled out by this much, so that
     // the last word stands at the edge of what is under it.
