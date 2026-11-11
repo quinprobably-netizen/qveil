@@ -79,11 +79,16 @@ pub struct Results {
     pub searched: Vec<i64>,
 }
 
+/// How far in the future results can be dated and still count as found now:
+/// a clock put right by a few seconds or minutes is not a new day.
+pub const SLACK: i64 = 600;
+
 /// Whether a group whose searches found `found` is to be searched for again
-/// at `now`: nothing was found, or it is a day old. Found "later" than now
-/// means the clock was set back since, and its age is not known: it is due.
+/// at `now`: nothing was found, or it is a day old. Found more than `SLACK`
+/// "later" than now means the clock was set back since, and its age is not
+/// known: it is due.
 pub fn due(found: Option<&crate::lens::Cached>, now: i64) -> bool {
-    found.is_none_or(|c| c.fetched_at > now || now - c.fetched_at >= STALE)
+    found.is_none_or(|c| c.fetched_at > now + SLACK || now - c.fetched_at >= STALE)
 }
 
 /// When each of the last day's searches was sent. Kept apart from what they
@@ -569,7 +574,12 @@ mod tests {
         assert!(due(None, now));
         assert!(!due(Some(&found(now - 60)), now));
         assert!(due(Some(&found(now - STALE)), now));
-        assert!(due(Some(&found(now + 60)), now));
+        // A clock that was put back a little (a correction) is not a new day...
+        assert!(!due(Some(&found(now + 1)), now));
+        assert!(!due(Some(&found(now + SLACK)), now));
+        // ...but one put back further makes the age unknown.
+        assert!(due(Some(&found(now + SLACK + 1)), now));
+        assert!(due(Some(&found(now + 7 * 24 * 3600)), now));
         // What an older version kept beside them is read, and not written back.
         let old: Results = serde_json::from_str(r#"{"groups":{},"searched":[5,6]}"#).unwrap();
         assert_eq!(old.searched, [5, 6]);
