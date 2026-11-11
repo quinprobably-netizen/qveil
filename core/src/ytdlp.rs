@@ -1700,6 +1700,8 @@ def log(what):
     with open(os.path.join(HERE, "log"), "a") as f:
         f.write(f"{what} {os.getpid()} {time.time()}\n")
 log("import")
+with open(os.path.join(HERE, f"plugins-{os.getpid()}"), "w") as f:
+    f.write(os.environ.get("YTDLP_NO_PLUGINS", ""))
 def main(argv=None):
     log("run")
     args = sys.argv[1:]
@@ -2053,6 +2055,56 @@ def main(argv=None):
         wait_gone(pid);
         assert!(!yt.calls.spare_ready());
         yt.search("q", 1).unwrap();
+        yt.calls.close(Why::RouteChanged);
+    }
+
+    #[test]
+    fn a_spare_is_started_with_yt_dlps_plugins_turned_off_by_its_environment() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        let yt = yt(bin);
+        // A call started the usual way has no say in it: its own arguments do.
+        yt.search("q", 1).unwrap();
+        let usual = log(&dir.0)[0].1;
+        yt.keep_spare();
+        let spare = ready_spare(&yt, &dir.0);
+        let said = |pid: u32| std::fs::read_to_string(dir.0.join(format!("plugins-{pid}")));
+        assert_eq!(said(spare).unwrap(), "1");
+        assert_eq!(said(usual).unwrap(), "");
+        yt.calls.close(Why::RouteChanged);
+    }
+
+    #[test]
+    fn a_spare_that_has_imported_a_plugin_refuses_to_serve() {
+        let dir = TempDir::new();
+        let Some(bin) = python_ytdlp(&dir.0) else {
+            return;
+        };
+        // What yt-dlp would have found in a plugin directory, loaded while it
+        // was imported (a version that ignores the environment, or a plugin
+        // that is another package's): it could have changed what any call does.
+        let plugin = dir.0.join("yt_dlp_plugins");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("x.py"), "LOADED = True\n").unwrap();
+        let init = dir.0.join("yt_dlp").join("__init__.py");
+        let text = std::fs::read_to_string(&init).unwrap();
+        std::fs::write(&init, format!("import yt_dlp_plugins.x\n{text}")).unwrap();
+        let yt = yt(bin);
+        let hour = Duration::from_secs(3600);
+        yt.calls
+            .set_spare_timing(Duration::from_secs(10), hour, hour);
+        yt.keep_spare();
+        // It exits (with 3) before it says it is ready.
+        wait_failures(&yt, 1);
+        assert!(!yt.calls.spare_ready());
+        // And the call is run the usual way, plugin and all.
+        yt.search("q", 1).unwrap();
+        let log = log(&dir.0);
+        let (import, run) = (&log[log.len() - 2], &log[log.len() - 1]);
+        assert_eq!((import.0.as_str(), run.0.as_str()), ("import", "run"));
+        assert_eq!(import.1, run.1, "a fresh process ran the call");
         yt.calls.close(Why::RouteChanged);
     }
 }

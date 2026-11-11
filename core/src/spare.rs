@@ -25,9 +25,12 @@ pub const READY: &[u8] = b"qveil-spare-ready\n";
 ///
 /// `-P` keeps the current directory off `sys.path`; the script's own
 /// directory (the zipapp itself) is put first instead, which is what Python
-/// does when it runs the script. Once it has its arguments, it checks that
-/// yt-dlp wasn't replaced (an upgrade) since it was imported, and if it was,
-/// runs the script afresh in this same process (`execv`) instead.
+/// does when it runs the script. It refuses to serve (exit status 3) if
+/// plugins were loaded all the same, by the import or by a package that is
+/// named like one, as any call's behaviour could have changed. Once it has
+/// its arguments, it checks that yt-dlp wasn't replaced (an upgrade) since
+/// it was imported, and if it was, runs the script afresh in this same
+/// process (`execv`) instead.
 const BOOT: &str = r#"import os, sys
 script, zipped = sys.argv[1], sys.argv[2] == "1"
 sys.path.insert(0, script if zipped else os.path.dirname(os.path.realpath(script)))
@@ -38,6 +41,8 @@ except Exception:
     pass
 g = getattr(sys.modules.get("yt_dlp.globals"), "all_plugins_loaded", None)
 if g is not None and getattr(g, "value", False):
+    sys.exit(3)
+if any(name.startswith("yt_dlp_plugins") for name in sys.modules):
     sys.exit(3)
 def stamp():
     return [(s.st_ino, s.st_size, s.st_mtime_ns) for s in map(os.stat, (script, yt_dlp.__file__))]
@@ -68,9 +73,13 @@ pub struct Launch {
 
 impl Launch {
     /// The spare's command, with stdin piped (where its arguments come).
+    ///
+    /// It starts before it has the call's `--no-plugin-dirs`, so it is told
+    /// by its environment not to load yt-dlp's plugins while it imports it.
     pub fn command(&self) -> Command {
         let mut c = Command::new(&self.python);
-        c.arg("-P")
+        c.env("YTDLP_NO_PLUGINS", "1")
+            .arg("-P")
             .arg("-c")
             .arg(BOOT)
             .arg(&self.script)
