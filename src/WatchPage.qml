@@ -64,6 +64,18 @@ FocusScope {
         flick.contentY = 0
     }
     function open(i) { surface.open(i) }
+    // Takes over the video the small window's surface `from` is playing,
+    // with its player (see PlayerSurface.adopt).
+    function adopt(from) {
+        if (!surface.adopt(from))
+            return false
+        surface.forceActiveFocus()
+        backend.closeComments()
+        expanded = false
+        sheet.current = "next"
+        flick.contentY = 0
+        return true
+    }
     // The sheet is hidden in theatre and fullscreen: the keyboard can't stay in it.
     onTheatreChanged: if (theatre && inSheet) leaveSheet()
     onFullChanged: if (full && inSheet) leaveSheet()

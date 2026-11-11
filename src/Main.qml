@@ -340,8 +340,10 @@ ApplicationWindow {
     }
 
     // Picture in picture: the video leaves the page for a small window of
-    // its own, or comes back from it. Each has a player of its own; the
-    // video carries on in the other from where it was, and only one plays.
+    // its own, or comes back from it. The player goes with it, so it plays
+    // on from where it is with nothing opened again: over Tor, opening it
+    // anew takes seconds. Should the player not come along, the video is
+    // opened again in the other window, from where it was.
     function togglePip() {
         const from = pip ? pipWindow.surface : watch.surface
         if (!from.active || from.pending)
@@ -350,14 +352,20 @@ ApplicationWindow {
         // Before the first frame, where it was going to start is where it is.
         const at = from.mpv.started ? from.mpv.position : from.startedAt
         if (pip) {
-            pipWindow.end()
-            watch.prepare(info)
-            watch.surface.openAt(info, at)
+            if (!watch.adopt(pipWindow.surface)) {
+                pipWindow.end()
+                watch.prepare(info)
+                watch.surface.openAt(info, at)
+            }
             watch.forceActiveFocus()
             win.requestActivate()
         } else {
-            watch.close()
-            pipWindow.take(info, at)
+            // A lookup of comments that is still running is for nobody now.
+            backend.closeComments()
+            if (!pipWindow.adopt(watch.surface)) {
+                watch.close()
+                pipWindow.take(info, at)
+            }
         }
     }
 

@@ -3,8 +3,8 @@ import Qveil
 import "Format.js" as Format
 
 // The video and its controls. It is shown in the watch page, and again in
-// the small window of picture in picture: each has one of its own, and only
-// one of them is playing at a time.
+// the small window of picture in picture. Only one of them plays at a time,
+// and the player is handed from one to the other (see adopt).
 FocusScope {
     id: surface
 
@@ -88,10 +88,34 @@ FocusScope {
         reveal()
     }
 
+    // Takes over the video `from` (the other window's surface) is playing,
+    // with its player: it goes on here from where it is, and nothing is
+    // looked up or opened again. False if there was no player to take.
+    function adopt(from) {
+        if (!mpv.takeOver(from.mpv))
+            return false
+        pending = false
+        info = from.info
+        startedAt = from.startedAt
+        lastSeek = from.lastSeek
+        lastPosition = from.lastPosition
+        forgetWhenStarted = from.forgetWhenStarted
+        note.shown = false
+        active = true
+        from.release()
+        reveal()
+        return true
+    }
+    // Lets go of the video that another surface adopted: it is still
+    // playing, so where it is isn't told from here.
+    function release() { finish(false) }
+
     // Stops the video and remembers where it was.
-    function stop() {
+    function stop() { finish(true) }
+    function finish(stopping) {
         const was = active
-        report()
+        if (stopping)
+            report()
         if (pending)
             backend.cancelPlay()
         pending = false
@@ -172,6 +196,8 @@ FocusScope {
                 surface.report()
         }
         onEndedChanged: if (ended) surface.report()
+        // The picture couldn't follow a handover: the video is opened again, where it was.
+        onTakeOverFailed: if (surface.active && surface.info.video) surface.openAt(surface.info, surface.lastPosition)
         onStartedChanged: {
             if (started && surface.forgetWhenStarted) {
                 surface.forgetWhenStarted = false
@@ -190,6 +216,7 @@ FocusScope {
     }
     // While it plays, every so often.
     Timer {
+        objectName: "report-timer"
         interval: 15000
         repeat: true
         running: surface.active && !surface.pending && !mpv.paused && !mpv.ended
