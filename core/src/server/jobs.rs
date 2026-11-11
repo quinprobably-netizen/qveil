@@ -48,6 +48,9 @@ pub(super) struct FeedJob {
     listed: BTreeSet<String>,
     state: Mutex<JobState>,
     changed: Condvar,
+    /// How many requests joined it after it started, for the tests.
+    #[cfg(test)]
+    joined: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Default)]
@@ -69,7 +72,14 @@ impl FeedJob {
             listed,
             state: Mutex::default(),
             changed: Condvar::new(),
+            #[cfg(test)]
+            joined: Default::default(),
         })
+    }
+
+    #[cfg(test)]
+    fn joined(&self) -> usize {
+        self.joined.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn update(&self, change: impl FnOnce(&mut JobState)) {
@@ -184,6 +194,8 @@ impl Jobs {
             && job.net.same_route(net)
         {
             return if job.covers(refresh, subscribed) {
+                #[cfg(test)]
+                job.joined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Claim::Job(Arc::clone(job))
             } else {
                 Claim::Busy(Arc::clone(job))
@@ -547,7 +559,7 @@ mod tests {
     #[test]
     fn a_refresh_while_one_is_running_joins_it_and_never_starts_a_second_burst() {
         use crate::store::testing::listing_runs as runs;
-        let (_s, base, _d, bin) = feed_server("sleep 0.4", 4);
+        let (s, base, _d, bin) = feed_server("sleep 0.4", 4);
         let first = ask(&base, "refresh=1&stream=1");
         wait_for("the refresh to start", Duration::from_secs(10), || {
             runs(&bin.0) >= 1
@@ -555,10 +567,13 @@ mod tests {
         // While it runs: a stream and a plain request. Both want what it is
         // already fetching.
         let (second, plain) = (ask(&base, "refresh=1&stream=1"), ask(&base, "refresh=1"));
-        // They must have asked before the subscription below, or they would
-        // be asking for more than this job started with. (It runs for more
-        // than a second, and a request takes a few milliseconds to arrive.)
-        std::thread::sleep(Duration::from_millis(300));
+        // They must have joined before the subscription below, or they would
+        // be asking for more than this job started with.
+        wait_for("both to join it", Duration::from_secs(10), || {
+            lock(&s.jobs.running)
+                .as_ref()
+                .is_some_and(|job| job.joined() == 2)
+        });
         // A channel subscribed to meanwhile is not on the list that the job
         // went by, so the request for it can't join: it is held until the
         // job is over, and then fetches that one channel.
