@@ -11,7 +11,7 @@
 //!
 //! What is kept is bounded (`HEAD` of the video, `AUDIO_HEAD` of the audio,
 //! and there are at most `MAX_SESSIONS`), belongs to one resolve of the
-//! stream (a refresh makes it stale), and is dropped when the session is
+//! stream (a refresh drops it), and is dropped when the session is
 //! cancelled. A failure here costs nothing: the player's request then goes
 //! upstream as it would have anyway, and so does one that finds the head
 //! stalled (no response within `HEAD_WAIT`).
@@ -204,6 +204,20 @@ impl Warm {
 
     fn stopped(&self) -> bool {
         lock(&self.state).stopped
+    }
+
+    /// Drops what is kept from a resolve other than `generation`, and stops
+    /// fetching it: once the stream is resolved again, the old head would
+    /// only take up memory until the session ends.
+    pub(super) fn forget_older(&self, generation: u32) {
+        let gone = {
+            let mut st = lock(&self.state);
+            let old = |head: &mut Option<Arc<Head>>| head.take_if(|h| h.generation != generation);
+            [old(&mut st.video), old(&mut st.audio)]
+        };
+        for head in gone.into_iter().flatten() {
+            head.end();
+        }
     }
 
     /// The head of stream `kind`, from the resolve `generation`, if it holds
@@ -647,6 +661,12 @@ mod tests {
             big_bytes(2_000_000, 2_000_100)
         );
         assert_eq!(runs(&bin.0), 2);
+        // What the old resolve fetched is no use now, and isn't kept.
+        let session = s.session(video.split('/').nth(1).unwrap()).unwrap();
+        let st = lock(&session.warm.state);
+        assert!(st.video.is_none() && st.audio.is_none());
+        assert!(!st.stopped, "a new head can still be fetched");
+        drop(st);
         // The head now comes from the new resolve, not from memory.
         assert_eq!(get("bytes=0-99").2, big_bytes(0, 100));
         let after: Vec<_> = up.requests()[before..]

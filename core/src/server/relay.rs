@@ -650,6 +650,7 @@ impl Server {
             pool: Arc::default(),
         };
         *lock(&s.live) = fresh.clone();
+        s.warm.forget_older(fresh.generation);
         // A lookup kept for playing it again has stopped working too.
         self.lookups.forget(&s.source.id);
         Ok(fresh)
