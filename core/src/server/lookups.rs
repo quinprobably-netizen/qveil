@@ -16,6 +16,7 @@ use crate::util::lock;
 use crate::ytdlp::{CANCELLED, Streams};
 use anyhow::{Result, anyhow};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,17 @@ pub(super) struct Lookups {
     entries: Mutex<VecDeque<Entry>>,
     /// The lookups ahead that are running (see `Running`).
     running: Mutex<Vec<Arc<Running>>>,
+    /// Counts the clears, so that a lookup that was running across one is
+    /// not kept after it (see `Started`).
+    epoch: AtomicU64,
+}
+
+/// When a lookup started, taken before it does: what `put` needs to know
+/// how long it may be kept, and whether the lookups were cleared meanwhile.
+#[derive(Clone, Copy)]
+pub(super) struct Started {
+    at: Instant,
+    epoch: u64,
 }
 
 /// How often a play waiting on a lookup ahead asks whether it was given up.
@@ -99,12 +111,20 @@ impl Running {
         self.changed.notify_all();
     }
 
+    /// The plays waiting on it.
+    #[cfg(test)]
+    pub(super) fn waiting(&self) -> usize {
+        lock(&self.state).waiting
+    }
+
     /// Waits for the lookup's result. `None` if it was given up before this
-    /// could wait on it. `abort` ends the wait (as it would a lookup of its
-    /// own), and with nobody else waiting, the lookup too.
+    /// could wait on it, whether or not it has ended yet: it ends cancelled,
+    /// which is no answer for a play that still wants the video. `abort`
+    /// ends the wait (as it would a lookup of its own), and with nobody else
+    /// waiting, the lookup too.
     fn join(&self, abort: &dyn Fn() -> bool) -> Option<Result<(Streams, Live)>> {
         let mut st = lock(&self.state);
-        if st.abandoned && st.outcome.is_none() {
+        if st.abandoned {
             return None;
         }
         st.waiting += 1;
@@ -152,6 +172,14 @@ impl Drop for RunGuard<'_> {
 }
 
 impl Lookups {
+    /// Taken right before a lookup starts, for `put`.
+    pub(super) fn start(&self) -> Started {
+        Started {
+            at: Instant::now(),
+            epoch: self.epoch.load(Ordering::Acquire),
+        }
+    }
+
     /// Marks a lookup ahead of `id` as running, until the guard is dropped.
     pub(super) fn begin(&self, id: &str, format: &str, route: &Net) -> RunGuard<'_> {
         let run = Arc::new(Running {
@@ -194,18 +222,33 @@ impl Lookups {
             .map(|e| (e.streams.clone(), e.live.clone()))
     }
 
-    /// Keeps a lookup that was just made, for as long as it is good.
-    pub(super) fn put(&self, id: &str, format: &str, route: &Net, streams: &Streams, live: &Live) {
-        let Some(good_for) = good_for(route, streams, unix_now()) else {
+    /// Keeps a lookup that was just made, which `started` then, for as
+    /// long as it is good. Not if the lookups were cleared since it started:
+    /// clearing the history forgets the videos being looked up as well.
+    pub(super) fn put(
+        &self,
+        id: &str,
+        format: &str,
+        route: &Net,
+        streams: &Streams,
+        live: &Live,
+        started: Started,
+    ) {
+        let Some(until) = kept_until(route, streams, unix_now(), Instant::now(), started.at) else {
             return;
         };
         let mut entries = lock(&self.entries);
+        // Under the lock that `clear` bumps it under, so a clear comes
+        // either before this looks (and nothing is kept) or after it.
+        if self.epoch.load(Ordering::Acquire) != started.epoch {
+            return;
+        }
         entries.retain(|e| !(e.id == id && e.format == format));
         entries.push_back(Entry {
             id: id.to_string(),
             format: format.to_string(),
             route: route.clone(),
-            until: Instant::now() + good_for,
+            until,
             streams: streams.clone(),
             live: live.clone(),
         });
@@ -220,7 +263,9 @@ impl Lookups {
     }
 
     pub(super) fn clear(&self) {
-        lock(&self.entries).clear();
+        let mut entries = lock(&self.entries);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        entries.clear();
     }
 }
 
@@ -228,6 +273,24 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Until when a lookup that started at `started` and ended at `now` (`unix`
+/// in Unix seconds) may be used. Over SOCKS its circuit was first used when
+/// it started, so that is what its `CIRCUIT` counts from. `None` when it
+/// isn't good now, or that can't be told.
+fn kept_until(
+    route: &Net,
+    streams: &Streams,
+    unix: u64,
+    now: Instant,
+    started: Instant,
+) -> Option<Instant> {
+    let mut until = now + good_for(route, streams, unix)?;
+    if route.is_socks() {
+        until = until.min(started + CIRCUIT);
+    }
+    (until > now).then_some(until)
 }
 
 /// How long a lookup made at `now` (Unix seconds) may be used. `None` when
@@ -332,6 +395,42 @@ mod tests {
         let http = Net::new(Some("http://10.0.0.1:3128".into()), true).unwrap();
         assert!(good_for(&http, &streams(&url, None), now).unwrap() > CIRCUIT);
     }
+
+    #[test]
+    fn over_socks_a_lookup_is_kept_from_when_it_started_not_from_when_it_ended() {
+        let unix = 1_000_000;
+        let url = format!("https://gv.test/v?expire={}", unix + 6 * 3600);
+        let s = streams(&url, None);
+        let tor = Net::new(Some(TOR_PROXY.into()), true).unwrap();
+        // Later than any test could start, so that subtracting is safe.
+        let now = Instant::now() + Duration::from_secs(3600);
+        let min = Duration::from_secs(60);
+        // Its circuit was first used when the lookup started: one that took
+        // eight minutes has one left.
+        assert_eq!(
+            kept_until(&tor, &s, unix, now, now - 8 * min),
+            Some(now + min)
+        );
+        assert_eq!(kept_until(&tor, &s, unix, now, now), Some(now + CIRCUIT));
+        assert_eq!(kept_until(&tor, &s, unix, now, now - CIRCUIT), None);
+        // Without a circuit, only the URLs' expiry counts.
+        let direct = Net::new(None, true).unwrap();
+        assert_eq!(
+            kept_until(&direct, &s, unix, now, now - 8 * min),
+            Some(now + Duration::from_secs(6 * 3600) - MARGIN)
+        );
+    }
+
+    #[test]
+    fn a_play_never_joins_a_lookup_ahead_that_was_given_up() {
+        let lookups = Lookups::default();
+        let net = Net::new(None, true).unwrap();
+        let ahead = lookups.begin("v", "f", &net);
+        assert!(ahead.run.give_up(true));
+        // Told it was cancelled, but not yet gone from the running ones.
+        ahead.finish(&Err(anyhow!(CANCELLED)));
+        assert!(lookups.join("v", "f", &net, &|| false).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +439,7 @@ mod played_again {
     use crate::server::testkit::*;
     use crate::store::testing::TempDir;
     use crate::util::lock;
+    use std::time::Duration;
 
     fn later() -> u64 {
         super::unix_now() + 6 * 3600
@@ -413,5 +513,107 @@ mod played_again {
         assert_eq!(runs(&bin.0), 2, "resolved again after the 403");
         s.open(&test_video()).unwrap();
         assert_eq!(runs(&bin.0), 3);
+    }
+
+    /// A yt-dlp like `fake_ytdlp`, except that once `hold` exists, run `n`
+    /// waits for `go<n>`, and run `n` fails if `fail<n>` exists.
+    fn held_ytdlp(dir: &std::path::Path, url: &str) -> String {
+        let script = r#"d=$(dirname "$0")
+n=$(cat "$d/runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo $n > "$d/runs.new" && mv "$d/runs.new" "$d/runs"
+if [ -e "$d/hold" ]; then while [ ! -e "$d/go$n" ]; do sleep 0.02; done; fi
+if [ -e "$d/fail$n" ]; then echo "ERROR: [youtube] x: Something went wrong" >&2; exit 1; fi
+cat <<EOF
+{"title":"T","requested_formats":[
+ {"url":"@URL@$n","protocol":"https","vcodec":"avc1"},
+ {"url":"@URL@$n","protocol":"https","vcodec":"none"}]}
+EOF
+"#
+        .replace("@URL@", url);
+        crate::store::testing::script(&dir.join("yt-dlp"), &script)
+    }
+
+    fn touch(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+
+    /// Sends a POST and leaves the connection open (see `api`'s tests).
+    fn post_open(base: &str, rest: &str) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut c = std::net::TcpStream::connect(addr(base)).unwrap();
+        write!(
+            c,
+            "POST {} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+            path(base, rest)
+        )
+        .unwrap();
+        c
+    }
+
+    fn play(base: &str) -> std::thread::JoinHandle<(u16, String)> {
+        let base = base.to_string();
+        std::thread::spawn(move || http(&base, "POST", &path(&base, "api/play?v=dQw4w9WgXcQ"), ""))
+    }
+
+    #[test]
+    fn a_lookup_still_running_when_the_history_is_cleared_is_not_kept() {
+        let bin = TempDir::new();
+        let ytdlp = held_ytdlp(&bin.0, &format!("https://gv.test/v?expire={}&n=", later()));
+        let (_s, base, _d) = server_with(Config {
+            ytdlp,
+            prepare_next: true,
+            ..Config::default()
+        });
+        let clear = || http(&base, "POST", &path(&base, "api/history/clear"), "").0;
+        touch(&bin.0, "hold");
+        // A play, cleared while it looks the video up.
+        let first = play(&base);
+        wait_for("the lookup to start", Duration::from_secs(10), || {
+            runs(&bin.0) == 1
+        });
+        assert_eq!(clear(), 200);
+        touch(&bin.0, "go1");
+        assert_eq!(first.join().unwrap().0, 200);
+        // A lookup ahead, likewise.
+        let mut ahead = post_open(&base, "api/prepare?v=dQw4w9WgXcQ");
+        wait_for("the lookup ahead to start", Duration::from_secs(10), || {
+            runs(&bin.0) == 2
+        });
+        assert_eq!(clear(), 200);
+        touch(&bin.0, "go2");
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut ahead, &mut reply).unwrap();
+        assert!(reply.contains(r#""lookedUp":true"#), "{reply}");
+        // Neither was kept: the next play looks it up again.
+        touch(&bin.0, "go3");
+        assert_eq!(play(&base).join().unwrap().0, 200);
+        assert_eq!(runs(&bin.0), 3);
+    }
+
+    #[test]
+    fn a_play_waiting_on_a_lookup_ahead_that_fails_looks_the_video_up_itself() {
+        let bin = TempDir::new();
+        let ytdlp = held_ytdlp(&bin.0, &format!("https://gv.test/v?expire={}&n=", later()));
+        let (s, base, _d) = server_with(Config {
+            ytdlp,
+            prepare_next: true,
+            ..Config::default()
+        });
+        touch(&bin.0, "hold");
+        touch(&bin.0, "fail1");
+        touch(&bin.0, "go2");
+        let _ahead = post_open(&base, "api/prepare?v=dQw4w9WgXcQ");
+        wait_for("the lookup ahead to start", Duration::from_secs(10), || {
+            runs(&bin.0) == 1
+        });
+        let played = play(&base);
+        wait_for("the play to wait on it", Duration::from_secs(10), || {
+            lock(&s.lookups.running).iter().any(|r| r.waiting() == 1)
+        });
+        touch(&bin.0, "go1");
+        let (status, body) = played.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(runs(&bin.0), 2, "one more run, the play's own");
     }
 }
