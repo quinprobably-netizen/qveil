@@ -2573,6 +2573,12 @@ EOF
     }
 
     #[test]
+    fn the_privacy_text_says_how_soon_a_stall_is_taken_for_one() {
+        let said = format!("no answer within {} seconds", FIRST_WITHIN.as_secs());
+        assert!(crate::privacy::markdown().contains(&said), "{said}");
+    }
+
+    #[test]
     fn the_first_chunk_after_a_seek_is_small_and_the_next_is_full_size() {
         let up = Upstream::start();
         let (s, base, _d) = server();

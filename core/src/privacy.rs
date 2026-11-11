@@ -73,7 +73,7 @@ impl Kind {
     /// What the route does to the address and to the requests, which is the
     /// part of the story that depends on it.
     fn route_points(self) -> Vec<&'static str> {
-        let relink = "A video that outlives its circuit, or whose circuit stalls (a minute without a byte), is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.";
+        let relink = "A video that outlives its circuit, or whose circuit stalls (no answer within 15 seconds, or a minute without a byte), is looked up again on a fresh one, which links the two circuits: it is the same video, resumed at the same byte.";
         let isolated = "Requests go out with fresh SOCKS credentials per request (a separate circuit if this is Tor), except that a video's lookup and its bytes share one set, as do the thumbnails of one page, and a video played again within nine minutes is played from the same lookup on the same set.";
         match self {
             Kind::Direct => {
