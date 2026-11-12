@@ -111,6 +111,8 @@ const EVERYWHERE: &[&str] = &[
     COOKIES_POINT,
     COMMENTS_POINT,
     LOOKUP_POINT,
+    LIVE_PLAYBACK_POINT,
+    WAITING_POINT,
     LENSES_POINT,
     LOCAL_POINT,
 ];
@@ -118,6 +120,8 @@ const FINGERPRINT_POINT: &str = "qveil's requests carry a browser User-Agent on 
 const SUBSCRIPTIONS_POINT: &str = "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.";
 const COOKIES_POINT: &str = "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.";
 const COMMENTS_POINT: &str = "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.";
+const LIVE_PLAYBACK_POINT: &str = "Live streams are fetched segment by segment over your route, a few seconds ahead of what plays.";
+const WAITING_POINT: &str = "Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave.";
 const LENSES_POINT: &str = "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.";
 const LOCAL_POINT: &str = "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.";
 
@@ -252,6 +256,8 @@ const COMMENTS_SHORT: &str = "Loaded on demand, one extra request.";
 const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.";
 const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups, in a new random order each time and 2 to 8 seconds apart: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
+const LIVE_CHECK_POINT: &str = "With the live check on, each feed refresh also reads the Streams tab of each followed channel due for a refresh: one more request per channel, in random order with 2\u{2013}8 s pauses.";
+const CHAT_POINT: &str = "Live chat is read only while its tab is open: one long-running request stream over your route. No pictures (avatars, badges, emoji) are fetched.";
 const PREPARE_OFF: &str = "Off: a video is looked up when you play it, and not before.";
 const PREPARE_ON: &str = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it.";
 const PREPARE_POINT: &str = "Getting the next video ready is on: near the end of a video, the next one in its list is looked up before you play it, so YouTube sees a lookup of a video you may not watch.";
@@ -294,6 +300,8 @@ pub fn describe(net: &Net, cfg: &Config) -> Privacy {
         }))
         // What is only true while a setting is on.
         .chain(cfg.topic_feeds.then_some(TOPICS_POINT))
+        .chain(cfg.live_check.then_some(LIVE_CHECK_POINT))
+        .chain(cfg.live_chat.then_some(CHAT_POINT))
         .chain(cfg.prepare_next.then_some(PREPARE_POINT))
         .chain(cfg.keep_thumbnails.then_some(KEEP_THUMBS_POINT))
         .map(String::from)
@@ -388,6 +396,8 @@ pub fn markdown() -> String {
         ("Resume, off", resume_off.as_str()),
         ("Topic feeds, off", TOPICS_OFF),
         ("Topic feeds, on", TOPICS_ON),
+        ("Live check, on", LIVE_CHECK_POINT),
+        ("Live chat, on", CHAT_POINT),
         ("Getting the next video ready, off", PREPARE_OFF),
         ("Getting the next video ready, on", PREPARE_ON),
         ("Keeping thumbnails on disk, off", KEEP_THUMBS_OFF),
@@ -804,6 +814,111 @@ mod tests {
         assert!(markdown().contains("the thumbnails you were shown in `~/.cache/qveil`"));
     }
 
+    #[test]
+    fn live_playback_and_the_waiting_room_are_said_on_every_route() {
+        for (_, n) in routes() {
+            let points = describe(&n, &Config::default()).points;
+            for point in [LIVE_PLAYBACK_POINT, WAITING_POINT] {
+                assert!(points.iter().any(|p| p == point), "{point}");
+            }
+        }
+        // A stream is played from its segments, over the route, a little ahead.
+        assert!(LIVE_PLAYBACK_POINT.contains("segment by segment over your route"));
+        assert!(LIVE_PLAYBACK_POINT.contains("a few seconds ahead of what plays"));
+        // The waiting room's schedule, and when it stops.
+        for right in [
+            "once at its start time",
+            "then every minute",
+            "every 5 minutes after half an hour late",
+            "stops after 6 hours or when you leave",
+        ] {
+            assert!(
+                WAITING_POINT.contains(right),
+                "{right:?} in: {WAITING_POINT}"
+            );
+        }
+        let md = markdown();
+        assert!(md.contains(&format!("- {LIVE_PLAYBACK_POINT}\n")));
+        assert!(md.contains(&format!("- {WAITING_POINT}\n")));
+    }
+
+    #[test]
+    fn the_live_check_is_said_while_it_is_on() {
+        let net = Net::new(None, true).unwrap();
+        // Off by default, and then nothing is said.
+        assert!(!Config::default().live_check);
+        let off = describe(&net, &Config::default());
+        assert!(!off.points.iter().any(|p| p == LIVE_CHECK_POINT));
+        let on = describe(
+            &net,
+            &Config {
+                live_check: true,
+                ..Config::default()
+            },
+        );
+        assert!(on.points.iter().any(|p| p == LIVE_CHECK_POINT));
+        assert_eq!(on.points.len(), off.points.len() + 1);
+        // What it reads, how many requests, and the pacing, which is the refresh's.
+        let (low, high) = crate::app::SEARCH_PAUSE;
+        let pauses = format!(
+            "in random order with {}\u{2013}{} s pauses",
+            low.as_secs(),
+            high.as_secs()
+        );
+        for right in [
+            "With the live check on, each feed refresh also reads",
+            "Streams tab",
+            "one more request per channel",
+            pauses.as_str(),
+        ] {
+            assert!(
+                LIVE_CHECK_POINT.contains(right),
+                "{right:?} in: {LIVE_CHECK_POINT}"
+            );
+        }
+        // It covers the channels the refresh fetches, which skips those
+        // fetched in the last 15 minutes (see `SUBSCRIPTIONS_POINT`), and
+        // not every channel each time.
+        assert!(SUBSCRIPTIONS_POINT.contains("skipping channels fetched in the last 15 minutes"));
+        assert!(LIVE_CHECK_POINT.contains("each followed channel due for a refresh"));
+        assert!(!LIVE_CHECK_POINT.contains("every followed channel"));
+        // The README has it, and the command line prints it.
+        assert!(markdown().contains(&format!("- **Live check, on.** {LIVE_CHECK_POINT}\n")));
+        let cfg = Config {
+            live_check: true,
+            ..Config::default()
+        };
+        assert!(text(&net, &cfg).contains(LIVE_CHECK_POINT));
+        assert!(!text(&net, &Config::default()).contains(LIVE_CHECK_POINT));
+    }
+
+    #[test]
+    fn live_chat_is_said_while_it_is_on() {
+        let net = Net::new(None, true).unwrap();
+        // On by default.
+        assert!(Config::default().live_chat);
+        let on = describe(&net, &Config::default());
+        assert!(on.points.iter().any(|p| p == CHAT_POINT));
+        let off = describe(
+            &net,
+            &Config {
+                live_chat: false,
+                ..Config::default()
+            },
+        );
+        assert!(!off.points.iter().any(|p| p == CHAT_POINT));
+        assert_eq!(on.points.len(), off.points.len() + 1);
+        for right in [
+            "Live chat is read only while its tab is open",
+            "one long-running request stream over your route",
+            "No pictures (avatars, badges, emoji) are fetched",
+        ] {
+            assert!(CHAT_POINT.contains(right), "{right:?} in: {CHAT_POINT}");
+        }
+        assert!(markdown().contains(&format!("- **Live chat, on.** {CHAT_POINT}\n")));
+        assert!(text(&net, &Config::default()).contains(CHAT_POINT));
+    }
+
     /// The window's tests run against a stand-in engine, which has to say
     /// what this one says where the window shows it word for word.
     #[test]
@@ -860,13 +975,16 @@ mod tests {
         pin("SUMMARY_TOR", Kind::Tor.summary());
 
         // The points the stand-in shows: Direct's, then every one that holds
-        // on every route, in the engine's order.
+        // on every route, in the engine's order, then those of settings that
+        // are on by default.
         let everywhere = [
             ("FINGERPRINT_POINT", FINGERPRINT_POINT),
             ("SUBSCRIPTIONS_POINT", SUBSCRIPTIONS_POINT),
             ("COOKIES_POINT", COOKIES_POINT),
             ("COMMENTS_POINT", COMMENTS_POINT),
             ("LOOKUP_POINT", LOOKUP_POINT),
+            ("LIVE_PLAYBACK_POINT", LIVE_PLAYBACK_POINT),
+            ("WAITING_POINT", WAITING_POINT),
             ("LENSES_POINT", LENSES_POINT),
             ("LOCAL_POINT", LOCAL_POINT),
         ];
@@ -876,7 +994,15 @@ mod tests {
             direct.map(|(_, text)| text).to_vec(),
             Kind::Direct.route_points()
         );
-        let shown: Vec<_> = direct.iter().chain(&everywhere).collect();
+        // Then what a setting that is on by default adds (the stand-in's
+        // settings don't turn any off): the chat's.
+        assert!(Config::default().live_chat);
+        let by_default = [("CHAT_POINT", CHAT_POINT)];
+        let shown: Vec<_> = direct
+            .iter()
+            .chain(&everywhere)
+            .chain(&by_default)
+            .collect();
         for (name, text) in &shown {
             pin(name, text);
         }
