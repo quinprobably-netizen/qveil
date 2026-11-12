@@ -8,7 +8,7 @@ use relay::CHUNK;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub fn server() -> (Arc<Server>, String, TempDir) {
@@ -580,13 +580,17 @@ pub type Fetched = (u16, HashMap<String, String>, Vec<u8>);
 /// A request with extra headers; returns the status, the lowercased
 /// response headers and the body bytes.
 pub fn fetch(base: &str, method: &str, rest: &str, headers: &[(&str, &str)]) -> Fetched {
+    fetch_target(base, method, &path(base, rest), headers)
+}
+
+/// `fetch` for a request target as it is, with no relay's path in front.
+pub fn fetch_target(base: &str, method: &str, target: &str, headers: &[(&str, &str)]) -> Fetched {
     let mut c = TcpStream::connect(addr(base)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let extra: String = headers
         .iter()
         .map(|(k, v)| format!("{k}: {v}\r\n"))
         .collect();
-    let target = path(base, rest);
     write!(c, "{method} {target} HTTP/1.1\r\nHost: x\r\n{extra}\r\n").unwrap();
     let mut raw = Vec::new();
     let _ = c.read_to_end(&mut raw);
@@ -1132,4 +1136,681 @@ EOF
     .replace("@COUNT@", &dir.join("runs").display().to_string())
     .replace("@URL@", url);
     crate::store::testing::script(&dir.join("yt-dlp"), &script)
+}
+
+/// A stand-in for googlevideo serving a live stream, on a local port. Its
+/// head grows by one segment every `target_ms`; each segment is 64 KiB of
+/// its own name (see `live_segment`), and `X-Head-Seqnum` says how far it
+/// has got. What it answers:
+///
+/// - `/live/{generation}/{track}` (`v` or `a`): a HEAD, or any request without
+///   `&sq=`, is sent on (302) to `/live2/{generation}/{track}`, which is 200 with
+///   `X-Head-Seqnum` and no body. A request with `&sq=n` (after the path, as
+///   a Track's base takes it, or after a `?`) is segment `n`, in `/live` as
+///   in `/live2`, with `X-Head-Seqnum` and `X-Sequence-Num`.
+/// - A segment below the first there is, below `drop_before`, or above the
+///   head is a 404.
+/// - A generation refused by `forbid_until_relooked` is a 403, whatever the
+///   request.
+///
+/// The generation is the one in the URL that `fake_live_ytdlp` printed: one
+/// more for each lookup. Every request target is kept (`requests`).
+pub struct LiveUpstream {
+    pub base: String,
+    live: Arc<LiveShared>,
+}
+
+/// What a `LiveUpstream`'s threads share.
+struct LiveShared {
+    target_ms: u64,
+    first: u64,
+    head: u64,
+    began: Instant,
+    /// The head, once the stream has ended.
+    ended: Mutex<Option<u64>>,
+    /// Segments below this are gone.
+    dropped: AtomicU64,
+    /// The segment whose next request hangs.
+    frozen: Mutex<Option<u64>>,
+    /// Generations up to this one answer 403 (-1: none).
+    forbidden: AtomicI64,
+    /// The newest generation any request named (-1: none yet).
+    newest: AtomicI64,
+    hanging: AtomicUsize,
+    seen: Mutex<Vec<String>>,
+    /// The folders of the fake yt-dlps made for it (see `fake_live_ytdlp`),
+    /// which learn of the end, and say how many generations they have given.
+    homes: Mutex<Vec<std::path::PathBuf>>,
+    /// Set when the `LiveUpstream` is dropped.
+    released: AtomicBool,
+}
+
+impl LiveShared {
+    /// The newest segment that exists.
+    fn head(&self) -> u64 {
+        match *self.ended.lock().unwrap() {
+            Some(head) => head,
+            None => self.growing_head(),
+        }
+    }
+
+    fn growing_head(&self) -> u64 {
+        self.head + self.began.elapsed().as_millis() as u64 / self.target_ms
+    }
+}
+
+/// The marker a fake yt-dlp finds in its folder once the stream is over.
+const LIVE_ENDED: &str = "live-ended";
+/// What a fake yt-dlp keeps in its folder: the next generation to give.
+const LIVE_GEN: &str = "live-gen";
+
+/// What a segment of the stand-in is: its track's name and number
+/// (`v-5`) repeated to 64 KiB.
+pub fn live_segment(track: &str, n: u64) -> Vec<u8> {
+    format!("{track}-{n}")
+        .bytes()
+        .cycle()
+        .take(64 << 10)
+        .collect()
+}
+
+impl LiveUpstream {
+    /// A stream whose segments `first..=head` exist, and whose head grows by
+    /// one every `target_ms` from now on.
+    pub fn start(target_ms: u64, first: u64, head: u64) -> Self {
+        assert!(target_ms > 0, "a segment takes no time");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let live = Arc::new(LiveShared {
+            target_ms,
+            first,
+            head,
+            began: Instant::now(),
+            ended: Mutex::new(None),
+            dropped: AtomicU64::new(0),
+            frozen: Mutex::new(None),
+            forbidden: AtomicI64::new(-1),
+            newest: AtomicI64::new(-1),
+            hanging: AtomicUsize::new(0),
+            seen: Mutex::default(),
+            homes: Mutex::default(),
+            released: AtomicBool::new(false),
+        });
+        let shared = Arc::clone(&live);
+        let own = base.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                if shared.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (shared, own) = (Arc::clone(&shared), own.clone());
+                std::thread::spawn(move || live_serve(conn, &shared, &own));
+            }
+        });
+        LiveUpstream { base, live }
+    }
+
+    /// The newest segment that exists now.
+    pub fn head(&self) -> u64 {
+        self.live.head()
+    }
+
+    /// The stream is over: the head stops, and a lookup made from now on
+    /// says `was_live`.
+    pub fn end(&self) {
+        let homes = self.live.homes.lock().unwrap();
+        self.live
+            .ended
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| self.live.growing_head());
+        for home in homes.iter() {
+            std::fs::write(home.join(LIVE_ENDED), "").unwrap();
+        }
+    }
+
+    /// Segments below `n` are gone (404), as those past the rewind window
+    /// are.
+    pub fn drop_before(&self, n: u64) {
+        self.live.dropped.store(n, Ordering::SeqCst);
+    }
+
+    /// The first request that would be answered with segment `n` (of either
+    /// track) is left hanging, as a Tor circuit that stalls leaves one,
+    /// until the client hangs up or the `LiveUpstream` is dropped. The ones
+    /// after it are answered.
+    pub fn freeze(&self, n: u64) {
+        *self.live.frozen.lock().unwrap() = Some(n);
+    }
+
+    /// How many requests are hanging (see `freeze`).
+    pub fn hanging(&self) -> usize {
+        self.live.hanging.load(Ordering::SeqCst)
+    }
+
+    /// Every URL of the newest generation that was given out (or asked
+    /// for) so far answers 403, as one from a retired circuit does. The
+    /// next lookup's URLs, one generation on, are good.
+    pub fn forbid_until_relooked(&self) {
+        let given = self
+            .live
+            .homes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|home| std::fs::read_to_string(home.join(LIVE_GEN)).ok())
+            .filter_map(|n| n.trim().parse::<i64>().ok())
+            .map(|next| next - 1)
+            .max()
+            .unwrap_or(-1);
+        let newest = self.live.newest.load(Ordering::SeqCst);
+        self.live
+            .forbidden
+            .fetch_max(given.max(newest), Ordering::SeqCst);
+    }
+
+    /// The request targets so far, in the order they came.
+    pub fn requests(&self) -> Vec<String> {
+        self.live.seen.lock().unwrap().clone()
+    }
+
+    /// Makes a fake yt-dlp's folder known, so that it hears of the end.
+    fn adopt(&self, home: &std::path::Path) {
+        let mut homes = self.live.homes.lock().unwrap();
+        homes.push(home.to_path_buf());
+        if self.live.ended.lock().unwrap().is_some() {
+            std::fs::write(home.join(LIVE_ENDED), "").unwrap();
+        }
+    }
+}
+
+impl Drop for LiveUpstream {
+    fn drop(&mut self) {
+        self.live.released.store(true, Ordering::SeqCst);
+        // The listener is waiting for a connection: give it one, to see it.
+        let _ = TcpStream::connect(addr(&self.base));
+    }
+}
+
+fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
+    let mut r = BufReader::new(conn.try_clone().unwrap());
+    let mut line = String::new();
+    if r.read_line(&mut line).unwrap_or(0) == 0 {
+        return;
+    }
+    let mut words = line.split_whitespace();
+    let head_only = words.next() == Some("HEAD");
+    let target = words.next().unwrap_or("/").to_string();
+    loop {
+        let mut h = String::new();
+        if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+            break;
+        }
+    }
+    live.seen.lock().unwrap().push(target.clone());
+    let reply = |conn: &mut TcpStream, status: &str, headers: &str, body: &[u8]| {
+        let _ = write!(
+            conn,
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        if !head_only {
+            let _ = conn.write_all(body);
+        }
+    };
+    // `/live/0/v&sq=5` or `/live/0/v?...&sq=5`: the path ends at the first
+    // `&` or `?`, and what follows are parameters.
+    let (path, query) = match target.find(['?', '&']) {
+        Some(i) => (&target[..i], &target[i + 1..]),
+        None => (target.as_str(), ""),
+    };
+    let sq: Option<u64> = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("sq=")?.parse().ok());
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let (kind, generation, track) = match parts[..] {
+        [kind @ ("live" | "live2"), generation, track @ ("v" | "a")] => {
+            match generation.parse::<u64>() {
+                Ok(generation) => (kind, generation, track),
+                Err(_) => return reply(&mut conn, "404 Not Found", "", b""),
+            }
+        }
+        _ => return reply(&mut conn, "404 Not Found", "", b""),
+    };
+    live.newest.fetch_max(generation as i64, Ordering::SeqCst);
+    if generation as i64 <= live.forbidden.load(Ordering::SeqCst) {
+        return reply(&mut conn, "403 Forbidden", "", b"denied");
+    }
+    let head = || format!("X-Head-Seqnum: {}\r\n", live.head());
+    let Some(n) = sq else {
+        return match kind {
+            "live" => reply(
+                &mut conn,
+                "302 Found",
+                &format!("Location: {base}/live2/{generation}/{track}\r\n"),
+                b"",
+            ),
+            _ => reply(&mut conn, "200 OK", &head(), b""),
+        };
+    };
+    let first = live.first.max(live.dropped.load(Ordering::SeqCst));
+    if n < first || n > live.head() {
+        return reply(&mut conn, "404 Not Found", "", b"");
+    }
+    let hold = {
+        let mut frozen = live.frozen.lock().unwrap();
+        let hold = *frozen == Some(n);
+        if hold {
+            *frozen = None;
+        }
+        hold
+    };
+    if hold {
+        live.hanging.fetch_add(1, Ordering::SeqCst);
+        hang(&mut conn, live);
+        live.hanging.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let ctype = if track == "v" {
+        "video/webm"
+    } else {
+        "audio/mp4"
+    };
+    reply(
+        &mut conn,
+        "200 OK",
+        &format!("Content-Type: {ctype}\r\n{}X-Sequence-Num: {n}\r\n", head()),
+        &live_segment(track, n),
+    );
+}
+
+/// Holds `conn` open, answering nothing, until the client hangs up or the
+/// `LiveUpstream` is dropped.
+fn hang(conn: &mut TcpStream, live: &LiveShared) {
+    conn.set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let mut b = [0u8; 1];
+    while !live.released.load(Ordering::SeqCst) {
+        match conn.read(&mut b) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// A yt-dlp for a `LiveUpstream`, which counts its runs (`runs`) and keeps
+/// each one's config as `conf<n>`. The usual lookup (manifests skipped)
+/// finds no format, as one of a running stream does. The live lookup
+/// (`--live-from-start`) prints the stream with two formats, `271` (video,
+/// WebM, the track `v`) and `140` (audio, the track `a`), at
+/// `{base}/live/{generation}/v` and `/a`, where the generation is 0 for the first
+/// lookup that gives URLs and one more for each after. Once the
+/// `LiveUpstream` has ended, a lookup says `was_live`.
+pub fn fake_live_ytdlp(dir: &std::path::Path, up: &LiveUpstream) -> std::path::PathBuf {
+    fake_live_ytdlp_upcoming(dir, up, 0, 0)
+}
+
+/// `fake_live_ytdlp`, announced at first: its first `k` live lookups answer
+/// that the stream starts at `starts` (Unix seconds), and don't count as
+/// generations. The usual lookup says so too until then, and after that it
+/// says the stream is running.
+pub fn fake_live_ytdlp_upcoming(
+    dir: &std::path::Path,
+    up: &LiveUpstream,
+    k: usize,
+    starts: i64,
+) -> std::path::PathBuf {
+    up.adopt(dir);
+    // Each counter is written whole or not at all: a test may be reading
+    // it meanwhile.
+    let script = r#"d='@DIR@'
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+bump() {
+  n=$(cat "$d/$1" 2>/dev/null || echo 0)
+  echo $((n + 1)) > "$d/$1.new" && mv "$d/$1.new" "$d/$1"
+  echo $n
+}
+run=$(bump runs)
+cp "$conf" "$d/conf$((run + 1))"
+asked=$(cat "$d/live-lookups" 2>/dev/null || echo 0)
+if ! grep -qx -- --live-from-start "$conf"; then
+  if [ "$asked" -lt @UPCOMING@ ]; then
+    echo 'ERROR: [youtube] x: This live event will begin in 2 hours.' >&2
+  else
+    echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2
+  fi
+  exit 1
+fi
+bump live-lookups > /dev/null
+if [ "$asked" -lt @UPCOMING@ ]; then
+  echo '{"title":"A live cam","channel":"Cam","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","live_status":"is_upcoming","is_upcoming":true,"release_timestamp":@STARTS@}'
+  exit 0
+fi
+gen=$(bump @GEN@)
+if [ -e "$d/@ENDED@" ]; then
+  state='"live_status":"was_live"'
+else
+  state='"live_status":"is_live","is_live":true'
+fi
+# A height the default cap allows: this is what the track is called, not a size.
+cat <<EOF
+{"title":"A live cam","channel":"Cam","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa",$state,
+ "release_timestamp":1771008448,"concurrent_view_count":567,"formats":[
+ {"format_id":"140","ext":"m4a","protocol":"http_dash_segments_generator","height":null,"vcodec":"none","acodec":"mp4a.40.2","target_duration":@TARGET@,"url":"@BASE@/live/$gen/a","http_headers":{"User-Agent":"UA"}},
+ {"format_id":"271","ext":"webm","protocol":"http_dash_segments_generator","height":720,"vcodec":"vp9","acodec":"none","target_duration":@TARGET@,"url":"@BASE@/live/$gen/v","http_headers":{"User-Agent":"UA"}}]}
+EOF
+"#
+    .replace("@DIR@", &dir.display().to_string())
+    .replace("@UPCOMING@", &k.to_string())
+    .replace("@STARTS@", &starts.to_string())
+    .replace("@GEN@", LIVE_GEN)
+    .replace("@ENDED@", LIVE_ENDED)
+    .replace("@TARGET@", &(up.live.target_ms as f64 / 1000.0).to_string())
+    .replace("@BASE@", &up.base);
+    crate::store::testing::script(&dir.join("yt-dlp"), &script).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::{Fragments, Opening};
+    use serde_json::Value;
+    use std::path::Path;
+    use std::process::Command;
+
+    const WATCH: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+
+    fn get(up: &LiveUpstream, method: &str, target: &str) -> Fetched {
+        fetch_target(&up.base, method, target, &[])
+    }
+
+    fn head_seqnum(headers: &HashMap<String, String>) -> u64 {
+        headers["x-head-seqnum"].parse().unwrap()
+    }
+
+    /// Runs a fake yt-dlp as `Ytdlp` does: `options` are its config file's
+    /// lines. Returns whether it succeeded, what it printed and what it said.
+    fn ask(bin: &Path, options: &[&str]) -> (bool, String, String) {
+        let conf = bin.with_file_name("conf-asked");
+        std::fs::write(&conf, options.join("\n") + "\n").unwrap();
+        let out = Command::new(bin)
+            .arg("--config-locations")
+            .arg(&conf)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    const PLAIN: &[&str] = &[
+        "-J",
+        "--no-playlist",
+        "--extractor-args",
+        "youtube:skip=hls,dash",
+    ];
+    const LIVE: &[&str] = &[
+        "-J",
+        "--no-playlist",
+        "--live-from-start",
+        "--ignore-no-formats-error",
+    ];
+
+    /// The URL of a track (`v` or `a`) in a live lookup's answer.
+    fn url_of(answer: &str, format_id: &str) -> String {
+        let v: Value = serde_json::from_str(answer).unwrap();
+        let f = v["formats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["format_id"] == format_id)
+            .unwrap();
+        f["url"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_live_fake_grows_redirects_and_numbers_segments() {
+        let up = LiveUpstream::start(500, 0, 10);
+        // The base redirects, and the head's number is where it goes.
+        let (status, headers, _) = get(&up, "HEAD", "/live/0/v");
+        assert_eq!(status, 302);
+        let to = headers["location"].clone();
+        assert_eq!(to, format!("{}/live2/0/v", up.base));
+        assert!(!headers.contains_key("x-head-seqnum"));
+        let followed = to.strip_prefix(&up.base).unwrap().to_string();
+        let (status, headers, _) = get(&up, "HEAD", &followed);
+        assert_eq!((status, head_seqnum(&headers)), (200, 10));
+        // One tick later, the head is one on.
+        wait_for("the head to grow", Duration::from_secs(5), || {
+            head_seqnum(&get(&up, "HEAD", &followed).1) >= 11
+        });
+        assert!(up.head() >= 11);
+        // A segment is numbered in its body and its headers, 64 KiB of it.
+        let (status, headers, body) = get(&up, "GET", "/live/0/v&sq=5");
+        assert_eq!(status, 200);
+        assert!(body.starts_with(b"v-5v-5v-5"), "{:?}", &body[..12]);
+        assert_eq!(body.len(), 64 << 10);
+        assert_eq!(headers["x-sequence-num"], "5");
+        assert_eq!(headers["content-length"], (64 << 10).to_string());
+        assert!(head_seqnum(&headers) >= 11);
+        let (_, _, body) = get(&up, "GET", "/live/0/a&sq=3");
+        assert!(body.starts_with(b"a-3a-3"));
+        assert_eq!(body, live_segment("a", 3));
+        // `sq` is found after a `?` as well.
+        let (status, _, body) = get(&up, "GET", "/live2/0/v?mime=video&sq=6");
+        assert_eq!((status, &body[..3]), (200, &b"v-6"[..]));
+        // Every request is kept, as it was asked.
+        let seen = up.requests();
+        assert_eq!(seen[0], "/live/0/v");
+        assert_eq!(seen[1], "/live2/0/v");
+        assert!(seen.contains(&"/live/0/v&sq=5".to_string()));
+        assert!(seen.contains(&"/live2/0/v?mime=video&sq=6".to_string()));
+    }
+
+    #[test]
+    fn the_live_fake_stops_growing_when_the_stream_ends() {
+        let up = LiveUpstream::start(40, 0, 3);
+        wait_for("the head to grow", Duration::from_secs(5), || {
+            up.head() >= 5
+        });
+        up.end();
+        let head = up.head();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(up.head(), head);
+        let (_, headers, _) = get(&up, "HEAD", "/live2/0/v");
+        assert_eq!(head_seqnum(&headers), head);
+        // And what exists stays there.
+        assert_eq!(get(&up, "GET", &format!("/live/0/a&sq={head}")).0, 200);
+        assert_eq!(
+            get(&up, "GET", &format!("/live/0/a&sq={}", head + 1)).0,
+            404
+        );
+    }
+
+    #[test]
+    fn the_live_fake_has_no_segment_before_the_first_after_the_head_or_dropped() {
+        let up = LiveUpstream::start(60_000, 2, 8);
+        let status = |n: u64| get(&up, "GET", &format!("/live/0/v&sq={n}")).0;
+        assert_eq!([1, 2, 8, 9].map(status), [404, 200, 200, 404]);
+        up.drop_before(4);
+        assert_eq!([2, 3, 4, 8].map(status), [404, 404, 200, 200]);
+        // Neither a track nor a generation that is not one.
+        assert_eq!(get(&up, "GET", "/live/0/x&sq=5").0, 404);
+        assert_eq!(get(&up, "GET", "/elsewhere").0, 404);
+    }
+
+    /// Asks for a segment of the audio track and does not read the answer.
+    fn ask_for(up: &LiveUpstream, n: u64) -> TcpStream {
+        let mut c = TcpStream::connect(addr(&up.base)).unwrap();
+        write!(c, "GET /live/0/a&sq={n} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        c
+    }
+
+    fn timed_out(e: &std::io::Error) -> bool {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    }
+
+    #[test]
+    fn a_frozen_segment_hangs_once_and_is_freed_when_the_client_leaves() {
+        let up = LiveUpstream::start(60_000, 0, 8);
+        up.freeze(5);
+        // Another segment is as usual.
+        assert_eq!(get(&up, "GET", "/live/0/v&sq=4").0, 200);
+        // The first request for 5 is not answered.
+        let mut first = ask_for(&up, 5);
+        first
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let err = first.read(&mut [0u8; 1]).unwrap_err();
+        assert!(timed_out(&err), "{err}");
+        assert_eq!(up.hanging(), 1);
+        // The second is answered, with the segment.
+        let (status, _, body) = get(&up, "GET", "/live/0/v&sq=5");
+        assert_eq!((status, &body[..3]), (200, &b"v-5"[..]));
+        assert_eq!(up.hanging(), 1);
+        // The client that gives up frees it.
+        drop(first);
+        wait_for(
+            "the hung request to be let go",
+            Duration::from_secs(5),
+            || up.hanging() == 0,
+        );
+        // A segment ahead of the head is not hung on: it is not there.
+        up.freeze(9);
+        assert_eq!(get(&up, "GET", "/live/0/v&sq=9").0, 404);
+        assert_eq!(up.hanging(), 0);
+    }
+
+    #[test]
+    fn a_frozen_segment_is_let_go_when_the_fake_is_dropped() {
+        let up = LiveUpstream::start(60_000, 0, 8);
+        up.freeze(6);
+        let mut waiting = ask_for(&up, 6);
+        waiting
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        wait_for("it to hang", Duration::from_secs(5), || up.hanging() == 1);
+        drop(up);
+        let freed = waiting.read(&mut [0u8; 1]);
+        assert!(
+            matches!(freed, Ok(0)) || freed.as_ref().is_err_and(|e| !timed_out(e)),
+            "{freed:?}"
+        );
+    }
+
+    #[test]
+    fn the_live_fake_forbids_a_generation_until_the_stream_is_looked_up_again() {
+        let up = LiveUpstream::start(60_000, 0, 8);
+        let bin = TempDir::new();
+        let yt = fake_live_ytdlp(&bin.0, &up);
+        let (ok, answer, _) = ask(&yt, LIVE);
+        assert!(ok);
+        assert_eq!(url_of(&answer, "271"), format!("{}/live/0/v", up.base));
+        assert_eq!(url_of(&answer, "140"), format!("{}/live/0/a", up.base));
+        let status = |generation: u64, target: &str| {
+            get(&up, "GET", &format!("/live/{generation}/{target}")).0
+        };
+        assert_eq!(status(0, "v&sq=5"), 200);
+        up.forbid_until_relooked();
+        // Every request of the old generation is refused: segments, and the head's.
+        assert_eq!(status(0, "v&sq=5"), 403);
+        assert_eq!(status(0, "v"), 403);
+        assert_eq!(get(&up, "HEAD", "/live2/0/a").0, 403);
+        // The next lookup's URLs are good, and so are the following ones.
+        let (_, answer, _) = ask(&yt, LIVE);
+        assert_eq!(url_of(&answer, "271"), format!("{}/live/1/v", up.base));
+        assert_eq!(status(1, "v&sq=5"), 200);
+        assert_eq!(status(1, "a"), 302);
+        // And the one after that is forbidden in turn.
+        up.forbid_until_relooked();
+        assert_eq!(
+            [
+                status(0, "v&sq=5"),
+                status(1, "v&sq=5"),
+                status(2, "v&sq=5")
+            ],
+            [403, 403, 200]
+        );
+        assert_eq!(runs(&bin.0), 2);
+    }
+
+    #[test]
+    fn the_live_fake_ytdlp_opens_as_live_and_then_as_ended() {
+        let up = LiveUpstream::start(300, 0, 10);
+        let bin = TempDir::new();
+        let ytdlp = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let (s, _base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let rt = s.runtime();
+        let open = || rt.yt.open_until(WATCH, "b", 1080, &|| false).unwrap();
+        let Opening::Live(live) = open() else {
+            panic!("not live")
+        };
+        assert_eq!(live.video.base, format!("{}/live/0/v", up.base));
+        assert_eq!(live.audio.base, format!("{}/live/0/a", up.base));
+        assert_eq!((live.video.ext, live.audio.ext), ("mkv", "m4a"));
+        assert_eq!(live.fragments, Fragments::Numbered);
+        assert_eq!(live.target, 0.3);
+        assert!(!live.ended);
+        // The usual lookup found no format, and the live one answered.
+        assert_eq!(runs(&bin.0), 2);
+        // A later lookup is a new generation, and says it is over once it is.
+        up.end();
+        let Opening::Live(live) = open() else {
+            panic!("not live")
+        };
+        assert_eq!(live.video.base, format!("{}/live/1/v", up.base));
+        assert!(live.ended);
+        assert_eq!(runs(&bin.0), 4);
+    }
+
+    #[test]
+    fn the_upcoming_fake_ytdlp_announces_k_times_and_then_is_live() {
+        let up = LiveUpstream::start(300, 0, 10);
+        let bin = TempDir::new();
+        let yt = fake_live_ytdlp_upcoming(&bin.0, &up, 2, 1_800_000_000);
+        // While it is announced, the usual lookup says so.
+        let (ok, _, said) = ask(&yt, PLAIN);
+        assert!(!ok);
+        assert!(said.contains("live event will begin"), "{said}");
+        let ytdlp = yt.display().to_string();
+        let (s, _base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let rt = s.runtime();
+        let open = || rt.yt.open_until(WATCH, "b", 1080, &|| false).unwrap();
+        for _ in 0..2 {
+            let Opening::Upcoming { starts, .. } = open() else {
+                panic!("not upcoming")
+            };
+            assert_eq!(starts, Some(1_800_000_000));
+        }
+        // The third time it has started, and its numbers begin at 0.
+        let Opening::Live(live) = open() else {
+            panic!("not live")
+        };
+        assert_eq!(live.video.base, format!("{}/live/0/v", up.base));
+        // 1 above, then three lookups of two calls each.
+        assert_eq!(runs(&bin.0), 7);
+        let (_, _, said) = ask(&yt, PLAIN);
+        assert!(
+            said.contains("live stream recording is not available"),
+            "{said}"
+        );
+    }
 }
