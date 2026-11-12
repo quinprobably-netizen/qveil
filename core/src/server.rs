@@ -19,6 +19,7 @@
 //! - `warm`: the start of a video's streams, fetched when it is opened.
 //! - `chapters`: a video's chapters, when the page data had to be asked for.
 //! - `timeline`: a live stream's playlists, and the session that serves their segments.
+//! - `wait`: the waiting room, until an announced stream starts.
 
 mod api;
 mod chapters;
@@ -33,6 +34,7 @@ mod relay;
 mod testkit;
 mod thumbs;
 mod timeline;
+mod wait;
 mod warm;
 
 use crate::app::{self, Runtime, Watched};
@@ -848,6 +850,7 @@ impl Server {
             ("POST", ["api", "prepare"]) => self.prepare_next(&mut stream, &req),
             ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),
             ("GET", ["api", "chapters"]) => self.chapters(&mut stream, &req),
+            ("GET", ["api", "wait"]) => self.wait(&mut stream, &req),
             _ => self.json_api(&mut stream, &req, &segs),
         }
     }

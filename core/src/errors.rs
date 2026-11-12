@@ -85,10 +85,6 @@ impl Explained {
 
 /// The engine's own words for an announced stream that never started: the
 /// waiting room stops looking 6 hours after the time it was announced for.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the waiting room gives up with it")
-)]
 pub const GAVE_UP: &str =
     "The stream hasn't started, and qveil stopped waiting for it after 6 hours.";
 
