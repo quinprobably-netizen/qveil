@@ -88,28 +88,42 @@ impl Explained {
 pub const GAVE_UP: &str =
     "The stream hasn't started, and qveil stopped waiting for it after 6 hours.";
 
-/// Whether `err` says the video is gone: removed by its uploader or by
-/// YouTube, or unavailable, in yt-dlp's words.
+/// Whether `err` says the video is gone for good: removed by its uploader
+/// or by YouTube, or its account terminated, in yt-dlp's words. A bare
+/// "Video unavailable" is not: YouTube's answer to an address it is
+/// limiting starts that way too ("Video unavailable. This content isn't
+/// available, try again later. The current session has been rate-limited
+/// by YouTube"), and so may other passing refusals.
 pub fn unavailable(err: &str) -> bool {
     const GONE: &[&str] = &[
-        "Video unavailable",
-        "This video is unavailable",
         "This video has been removed",
         "This video is no longer available",
     ];
-    GONE.iter().any(|needle| err.contains(needle))
+    !passing(explain(err).code) && GONE.iter().any(|needle| err.contains(needle))
+}
+
+/// Whether a failure of kind `code` is about this address, now: a bot check
+/// or a limit on how fast it may ask, which another try may well not meet.
+pub fn passing(code: Code) -> bool {
+    matches!(code, Code::RateLimited | Code::BotCheck)
 }
 
 /// Whether asking about the video again can't change the answer `err` is:
 /// it is private, members-only, age-restricted, not offered in this
-/// route's region, gone, or a stream that ended without a recording. A bot
-/// check, a limit on how fast, a stalled circuit or a timeout may well be
-/// different the next time.
+/// route's region, removed, or a stream that ended without a recording. A
+/// bot check, a limit on how fast, a stalled circuit or a timeout may well
+/// be different the next time, whatever else their words say.
 pub fn for_good(err: &str) -> bool {
-    matches!(
-        explain(err).code,
-        Code::Private | Code::MembersOnly | Code::Region | Code::AgeRestricted | Code::NoRecording
-    ) || unavailable(err)
+    let code = explain(err).code;
+    !passing(code)
+        && (matches!(
+            code,
+            Code::Private
+                | Code::MembersOnly
+                | Code::Region
+                | Code::AgeRestricted
+                | Code::NoRecording
+        ) || unavailable(err))
 }
 
 /// The body of an error reply: `{"error": <text>, "code": <code>}`.
@@ -325,8 +339,16 @@ mod tests {
             "The proxy refused the connection (Tor listens on 127.0.0.1:9050).",
             crate::live::NO_FRAGMENTS,
             "ERROR: [youtube] x: This live event will begin in 2 hours.",
+            // A limit on how fast, in a removed video's opening words.
+            "ERROR: [youtube] x: Video unavailable. This content isn't available, try again \
+             later. The current session has been rate-limited by YouTube for up to an hour.",
+            "ERROR: [youtube] x: Video unavailable. This video has been removed. \
+             Sign in to confirm you're not a bot",
+            // And a bare "unavailable", which says no more than that.
+            "ERROR: [youtube] x: Video unavailable",
         ] {
             assert!(!for_good(err), "{err}");
+            assert!(!unavailable(err), "{err}");
         }
     }
 

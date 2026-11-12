@@ -17,7 +17,7 @@ use super::http::respond;
 use super::relay::{FAILED_FOR, RECOVER_EVERY, answer_within, content_range, stalled_read};
 use crate::errors::{self, friendly};
 use crate::ids::VideoRef;
-use crate::live::{Fragments, LiveStreams, NO_FRAGMENTS, Opening, Track};
+use crate::live::{self, Fragments, LiveStreams, Opening, Track};
 use crate::net::Net;
 use crate::util::lock;
 use anyhow::{Context, Result, bail};
@@ -148,19 +148,16 @@ const CHUNK: usize = 64 << 10;
 /// What a lookup again says of a stream that is no live stream any more.
 const NOT_LIVE: &str = "This video is no longer a live stream; open it again.";
 
-/// Whether a check lookup that failed with `err` means the stream is over:
-/// it ended and YouTube kept no recording (or none that can be fetched in
-/// fragments), it is no live stream any more, or it was made private or
-/// members-only, or taken down. A bot check, a timeout or a stalled circuit
-/// says nothing of it.
+/// Whether a check lookup that failed with `err` says positively that the
+/// stream is over: it ended and YouTube kept no recording, or it ended and
+/// nothing of it can be fetched (`live::ENDED`). Nothing else does: not a
+/// bot check or a limit on how fast (YouTube words that one "Video
+/// unavailable" too), not a running stream's answer without fragments (an
+/// HLS-only one, which another identity may well get), not a timeout.
 fn ends_it(err: &str) -> bool {
-    use errors::Code;
-    matches!(
-        errors::explain(err).code,
-        Code::NoRecording | Code::Private | Code::MembersOnly
-    ) || errors::unavailable(err)
-        || err.contains(NO_FRAGMENTS)
-        || err.contains(NOT_LIVE)
+    let code = errors::explain(err).code;
+    !matches!(code, errors::Code::RateLimited | errors::Code::BotCheck)
+        && (code == errors::Code::NoRecording || err.contains(live::ENDED))
 }
 
 /// What the engine's own words end with when the head's response said nothing of it.
@@ -607,19 +604,21 @@ impl LiveSession {
                 let ended = match self.check_end(server) {
                     _ if self.is_cancelled() => return,
                     Ok(ended) => ended,
-                    // A stream that ended without a recording, or was made
-                    // private or taken down as it ended, is never "ended"
-                    // to a lookup: the lookup fails, and that is the end.
-                    // The URLs the session has stay; they serve what is left.
+                    // A stream that ended without a recording, or with
+                    // nothing left that can be fetched, is never "ended" to
+                    // a lookup: the lookup fails, saying so, and that is the
+                    // end. The URLs the session has stay; they serve what
+                    // is left.
                     Err(e) if ends_it(&format!("{e:#}")) => true,
                     Err(e) => {
                         note!("qveil: couldn't check whether a live stream has ended: {e:#}");
                         false
                     }
                 };
-                if ended {
-                    // The last head, should the polls before have missed it.
-                    let _ = self.request(server, Method::HEAD, Kind::Video, None, None);
+                // The last head, should the polls before have missed it, and
+                // the last word: a head that moved again is a stream that
+                // goes on, whatever the lookup said, and is watched on.
+                if ended && self.still_after_one_more_poll(server) {
                     lock(&self.span).ended = true;
                     self.notify();
                     return;
@@ -628,6 +627,14 @@ impl LiveSession {
                 check_in = (check_in * 2).min(CHECK_AT_MOST.max(still));
             }
         }
+    }
+
+    /// Polls the head once more: whether it still hasn't moved. One that
+    /// can't be asked for hasn't been seen to move.
+    fn still_after_one_more_poll(&self, server: &Server) -> bool {
+        let moved = lock(&self.clock).moved;
+        let _ = self.request(server, Method::HEAD, Kind::Video, None, None);
+        lock(&self.clock).moved == moved
     }
 
     /// One lookup that says whether the stream has ended. Its URLs and
@@ -1835,6 +1842,99 @@ mod serving {
         assert!(st.live_lookups() >= 2);
         // The URLs it had still serve what there is.
         assert_eq!(st.segment(&sid, "v", last).2, live_segment("v", last));
+    }
+
+    /// What YouTube's answer to an address it is limiting reads like, by
+    /// the time yt-dlp has worded it: it starts as a removed video's does.
+    const RATE_LIMITED: &str = "ERROR: [youtube] dQw4w9WgXcQ: Video unavailable. This content \
+        isn't available, try again later. The current session has been rate-limited by \
+        YouTube for up to an hour. It is recommended to use `-t sleep` to add a delay \
+        between video requests to avoid exceeding the rate limit.";
+
+    /// A running stream's answer with only an HLS format: nothing to fetch
+    /// in fragments, but not over.
+    const HLS_ONLY: &str = r#"{"title":"A live cam","live_status":"is_live","is_live":true,
+        "formats":[{"format_id":"301","ext":"mp4","protocol":"m3u8_native","vcodec":"avc1.4d401f",
+        "acodec":"mp4a.40.2","height":720,"url":"http://127.0.0.1:1/hls.m3u8"}]}"#;
+
+    /// The head stands still until a check lookup has been made and
+    /// answered `answer`, and then goes on: the playlist goes on with it,
+    /// and never ends.
+    fn a_check_that_says_does_not_end_the_stream(answer: &str) {
+        let st = stream(200, 0, 10);
+        let sid = st.open();
+        st.up.lookups_answer(Some(answer));
+        st.up.hold_head();
+        let lookups = st.live_lookups();
+        wait_for("a check lookup", Duration::from_secs(10), || {
+            assert!(!st.listed(&sid).1, "it ended");
+            st.live_lookups() > lookups
+        });
+        // Past where it would have ended, with its last poll made.
+        for _ in 0..20 {
+            assert!(!st.listed(&sid).1, "it ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let held = st.up.head();
+        st.up.release_head();
+        wait_for("the playlist to grow again", Duration::from_secs(5), || {
+            let (listed, ended) = st.listed(&sid);
+            assert!(!ended, "it ended");
+            *listed.last().unwrap() > held + 1
+        });
+        assert_eq!(state(&st, &sid)["state"], "now");
+    }
+
+    #[test]
+    fn a_rate_limited_end_check_does_not_end_the_stream() {
+        a_check_that_says_does_not_end_the_stream(RATE_LIMITED);
+    }
+
+    #[test]
+    fn an_hls_only_live_answer_does_not_end_the_stream() {
+        a_check_that_says_does_not_end_the_stream(HLS_ONLY);
+    }
+
+    #[test]
+    fn an_ended_answer_with_nothing_to_fetch_ends_the_stream() {
+        let st = stream(200, 0, 10);
+        let sid = st.open();
+        // Over, and offered only as a plain download now.
+        st.up.lookups_answer(Some(
+            r#"{"title":"A live cam","live_status":"was_live","formats":[{"format_id":"22",
+            "ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a","height":720,
+            "url":"http://127.0.0.1:1/v.mp4"}]}"#,
+        ));
+        st.up.end();
+        let last = st.up.head();
+        wait_for("the playlist to end", Duration::from_secs(10), || {
+            st.listed(&sid).1
+        });
+        assert_eq!(st.listed(&sid).0, (0..=last).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_check_that_says_ended_while_the_head_moves_on_does_not_end_it() {
+        let st = stream(200, 0, 10);
+        let sid = st.open();
+        // The lookup says it is over (a stream that kept no recording), but
+        // the head goes on as it is asked for one last time.
+        st.up.lookups_answer(Some(
+            "ERROR: [youtube] x: This live stream recording is not available.",
+        ));
+        st.up.hold_head();
+        let held = st.up.head();
+        st.up.release_head_at_the_next_lookup();
+        let lookups = st.live_lookups();
+        wait_for("a check lookup", Duration::from_secs(10), || {
+            assert!(!st.listed(&sid).1, "it ended");
+            st.live_lookups() > lookups
+        });
+        wait_for("the playlist to grow again", Duration::from_secs(5), || {
+            let (listed, ended) = st.listed(&sid);
+            assert!(!ended, "it ended");
+            *listed.last().unwrap() > held + 1
+        });
     }
 
     fn state(st: &Stream, sid: &str) -> Value {

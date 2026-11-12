@@ -1185,6 +1185,14 @@ struct LiveShared {
     ranged: Mutex<Vec<(String, Option<String>)>>,
     /// Once ended, a live lookup says the stream kept no recording.
     unrecorded: AtomicBool,
+    /// The head stands still here (see `hold_head`).
+    held: Mutex<Option<u64>>,
+    /// Segments the head is behind the clock, for the time it was held.
+    behind: AtomicU64,
+    /// A held head goes on once more live lookups than this have been made.
+    release_after: Mutex<Option<u64>>,
+    /// What a live lookup answers instead, while set (see `lookups_answer`).
+    says: Mutex<Option<String>>,
     /// Generations up to this one answer 403 (-1: none).
     forbidden: AtomicI64,
     /// The newest generation any request named (-1: none yet).
@@ -1208,6 +1216,38 @@ impl LiveShared {
     }
 
     fn growing_head(&self) -> u64 {
+        let after = *self.release_after.lock().unwrap();
+        if after.is_some_and(|n| self.lookups() > n) {
+            *self.release_after.lock().unwrap() = None;
+            self.release();
+        }
+        if let Some(head) = *self.held.lock().unwrap() {
+            return head;
+        }
+        self.clock_head() - self.behind.load(Ordering::SeqCst)
+    }
+
+    /// Lets a held head go on, with the segment that came in meanwhile
+    /// there at once.
+    fn release(&self) {
+        if let Some(head) = self.held.lock().unwrap().take() {
+            self.behind
+                .store(self.clock_head().saturating_sub(head + 1), Ordering::SeqCst);
+        }
+    }
+
+    /// The live lookups the fake yt-dlps made for it have made.
+    fn lookups(&self) -> u64 {
+        self.homes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|home| std::fs::read_to_string(home.join("live-lookups")).ok())
+            .filter_map(|n| n.trim().parse::<u64>().ok())
+            .sum()
+    }
+
+    fn clock_head(&self) -> u64 {
         self.head + self.began.elapsed().as_millis() as u64 / self.target_ms
     }
 }
@@ -1218,6 +1258,9 @@ const LIVE_ENDED: &str = "live-ended";
 const LIVE_GEN: &str = "live-gen";
 /// The marker a fake yt-dlp finds once the stream is over and kept nothing.
 const LIVE_UNRECORDED: &str = "live-unrecorded";
+/// What a fake yt-dlp's live lookup answers instead, while it is there: an
+/// `ERROR:` line is said on stderr and fails, anything else is printed.
+const LIVE_SAYS: &str = "live-says";
 
 /// What a segment of the stand-in is: its track's name and number
 /// (`v-5`) repeated to 64 KiB.
@@ -1250,6 +1293,10 @@ impl LiveUpstream {
             in_flight: AtomicUsize::new(0),
             ranged: Mutex::default(),
             unrecorded: AtomicBool::new(false),
+            held: Mutex::new(None),
+            behind: AtomicU64::new(0),
+            release_after: Mutex::new(None),
+            says: Mutex::new(None),
             forbidden: AtomicI64::new(-1),
             newest: AtomicI64::new(-1),
             hanging: AtomicUsize::new(0),
@@ -1306,6 +1353,34 @@ impl LiveUpstream {
     /// hangs up or the `LiveUpstream` is dropped (it counts as `hanging`).
     pub fn cut(&self, n: u64, at: usize) {
         *self.live.cut.lock().unwrap() = Some((n, at));
+    }
+
+    /// The head stands still, as it does when a streamer's connection
+    /// drops for a while, until `release_head`.
+    pub fn hold_head(&self) {
+        let head = self.live.growing_head();
+        self.live.held.lock().unwrap().get_or_insert(head);
+    }
+
+    /// The head grows again from where it stood, the next segment there at
+    /// once.
+    pub fn release_head(&self) {
+        self.live.release();
+    }
+
+    /// `release_head` as soon as a live lookup is made: the next head asked
+    /// for after it has moved on.
+    pub fn release_head_at_the_next_lookup(&self) {
+        *self.live.release_after.lock().unwrap() = Some(self.live.lookups());
+    }
+
+    /// Every live lookup from now on answers `text` (see `LIVE_SAYS`), or as
+    /// it did again with `None`.
+    pub fn lookups_answer(&self, text: Option<&str>) {
+        *self.live.says.lock().unwrap() = text.map(str::to_string);
+        for home in self.live.homes.lock().unwrap().iter() {
+            write_says(home, text);
+        }
     }
 
     /// Segment bodies are sent 1 KiB at a time, `ms` apart, from now on.
@@ -1385,6 +1460,22 @@ impl LiveUpstream {
         }
         if self.live.unrecorded.load(Ordering::SeqCst) {
             std::fs::write(home.join(LIVE_UNRECORDED), "").unwrap();
+        }
+        write_says(home, self.live.says.lock().unwrap().as_deref());
+    }
+}
+
+/// Puts `text` in a fake yt-dlp's folder for its live lookups, whole or not
+/// at all, or takes it away.
+fn write_says(home: &std::path::Path, text: Option<&str>) {
+    match text {
+        Some(text) => {
+            let new = home.join(format!("{LIVE_SAYS}.new"));
+            std::fs::write(&new, text).unwrap();
+            std::fs::rename(new, home.join(LIVE_SAYS)).unwrap();
+        }
+        None => {
+            let _ = std::fs::remove_file(home.join(LIVE_SAYS));
         }
     }
 }
@@ -1626,6 +1717,11 @@ if ! grep -qx -- --live-from-start "$conf"; then
   exit 1
 fi
 bump live-lookups > /dev/null
+if [ -e "$d/@SAYS@" ]; then
+  if grep -q '^ERROR:' "$d/@SAYS@"; then cat "$d/@SAYS@" >&2; exit 1; fi
+  cat "$d/@SAYS@"
+  exit 0
+fi
 if [ -e "$d/@UNRECORDED@" ]; then
   echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2
   exit 1
@@ -1654,6 +1750,7 @@ EOF
     .replace("@GEN@", LIVE_GEN)
     .replace("@ENDED@", LIVE_ENDED)
     .replace("@UNRECORDED@", LIVE_UNRECORDED)
+    .replace("@SAYS@", LIVE_SAYS)
     .replace("@TARGET@", &(up.live.target_ms as f64 / 1000.0).to_string())
     .replace("@BASE@", &up.base);
     crate::store::testing::script(&dir.join("yt-dlp"), &script).into()

@@ -133,6 +133,12 @@ pub fn choose(v: &Value, max_height: u32) -> Result<LiveStreams> {
     })
 }
 
+/// What a lookup of a stream that has ended (`was_live`, `post_live`) says
+/// when nothing of it can be played: in front of why (`NO_FRAGMENTS`). It is
+/// a lookup's positive word that the stream is over, which a session that
+/// plays it ends on; a running stream's `NO_FRAGMENTS` alone is not.
+pub const ENDED: &str = "The stream has ended";
+
 /// What a live stream without a track that can be fetched in fragments ends
 /// with: an HLS-only stream, or one without formats at all.
 pub const NO_FRAGMENTS: &str =

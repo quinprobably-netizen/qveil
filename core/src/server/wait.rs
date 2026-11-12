@@ -619,6 +619,38 @@ exit 1
     }
 
     #[test]
+    fn a_rate_limited_ask_keeps_waiting() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let fake = fake_live_ytdlp_upcoming(&bin.0, &up, 1, app::now() - 720);
+        // The first ask is limited, in words that start as a removed
+        // video's do; then it is the fake, which announces once and starts.
+        let wrapper = TempDir::new();
+        let ytdlp = crate::store::testing::script(
+            &wrapper.0.join("yt-dlp"),
+            &format!(
+                r#"d='{}'
+if [ ! -e "$d/limited" ]; then
+  touch "$d/limited"
+  echo "ERROR: [youtube] x: Video unavailable. This content isn't available, try again later. The current session has been rate-limited by YouTube for up to an hour." >&2
+  exit 1
+fi
+exec '{}' "$@"
+"#,
+                wrapper.0.display(),
+                fake.display()
+            ),
+        );
+        let (_s, base, _d, _bin, _up) = serve(ytdlp, |_| {}, bin, up);
+        let lines = waited(&base, &format!("v={ID}"));
+        assert!(wrapper.0.join("limited").exists());
+        // Nothing was said of it, and the wait went on to the start.
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["state"], "upcoming");
+        assert_eq!(lines[1], json!({"state":"now"}));
+    }
+
+    #[test]
     fn waiting_gives_up_six_hours_after_the_announced_time() {
         // Ten minutes short of six hours late.
         let starts = app::now() - 21_000;

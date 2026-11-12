@@ -624,6 +624,9 @@ impl Ytdlp {
         let is_stream = live_state(&v).is_some() || streamed(&v);
         match live::choose(&v, max_height) {
             Ok(s) => Ok(Opening::Live(s)),
+            // Over, and nothing of it can be fetched: said as such, so that
+            // a session playing it knows it has ended (see `live::ENDED`).
+            Err(e) if streamed(&v) => Err(e.context(live::ENDED)),
             Err(e) if is_stream => Err(e),
             // An ordinary video that yt-dlp found nothing for: what the
             // usual lookup said is what there is to say.
