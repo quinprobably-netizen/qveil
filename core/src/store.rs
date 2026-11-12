@@ -482,6 +482,49 @@ pub mod testing {
         script(&dir.join("yt-dlp"), &body)
     }
 
+    /// A yt-dlp for the live check. A channel's Videos tab lists one video,
+    /// as `listing_ytdlp` does (counted in `<dir>/runs`). Its Streams tab
+    /// lists what `<dir>/streams-<channel id>.json` holds (nothing without
+    /// it), and fails while `<dir>/streams-<channel id>.fail` is there. Each
+    /// Streams tab asked for is added to `<dir>/streams-asked`, one line
+    /// each, and that call's config file is copied to `<dir>/streams-config`.
+    /// `extra` is shell run first in a Streams call.
+    pub fn streams_ytdlp(dir: &std::path::Path, extra: &str) -> String {
+        let body = format!(
+            r#"d=$(dirname "$0")
+conf=""
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+target=$(tail -n 1 "$conf" | tr -d "'")
+case "$target" in
+  */streams)
+    {extra}
+    echo "$target" >> "$d/streams-asked"
+    cp "$conf" "$d/streams-config"
+    ch=$(basename "$(dirname "$target")")
+    if [ -f "$d/streams-$ch.fail" ]; then echo "ERROR: the Streams tab is down" >&2; exit 1; fi
+    if [ -f "$d/streams-$ch.json" ]; then cat "$d/streams-$ch.json"; else echo '{{"entries":[]}}'; fi
+    ;;
+  *)
+    echo x >> "$d/runs"
+    printf '{{"entries":[{{"id":"v%010d","title":"t"}}]}}' $$
+    ;;
+esac
+"#
+        );
+        script(&dir.join("yt-dlp"), &body)
+    }
+
+    /// The Streams tabs `streams_ytdlp` was asked for, in order: the
+    /// channel ID of each.
+    pub fn streams_asked(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("streams-asked"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_suffix("/streams")?.rsplit('/').next())
+            .map(String::from)
+            .collect()
+    }
+
     /// A stand-in for YouTube's feed endpoint on a local port: the first
     /// `fail` requests get a 500 and the rest a feed with one video, named
     /// after the request's number. Returns its base URL (for

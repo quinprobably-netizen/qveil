@@ -38,6 +38,12 @@ pub struct Config {
     /// the list, so that it starts without waiting for yt-dlp. Off by
     /// default: it is a lookup of a video that may never be watched.
     pub prepare_next: bool,
+    /// At each feed refresh, also read every followed channel's Streams tab
+    /// to find what is live or about to start (see `app::refresh`). Off by
+    /// default: it is one more request per channel.
+    pub live_check: bool,
+    /// Show a live stream's chat, which is read only while its tab is open.
+    pub live_chat: bool,
     /// How many channel feeds to fetch at once.
     pub feed_workers: usize,
     /// Experimental, and off: look a video up without its watch page (see
@@ -83,6 +89,8 @@ impl Default for Config {
             thumbnails: true,
             keep_thumbnails: false,
             prepare_next: false,
+            live_check: false,
+            live_chat: true,
             feed_workers: 4,
             quick_lookup: false,
             ytdlp: DEFAULT_YTDLP.into(),

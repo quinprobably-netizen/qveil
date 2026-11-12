@@ -34,6 +34,8 @@ struct ConfigPatch {
     topic_feeds: Option<bool>,
     prepare_next: Option<bool>,
     keep_thumbnails: Option<bool>,
+    live_check: Option<bool>,
+    live_chat: Option<bool>,
 }
 
 /// What the window reports while a video plays: `POST api/resume`.
@@ -219,7 +221,9 @@ impl Server {
                 json!(self.guarded(&rt, found)?)
             }
             ("GET", ["api", "channel"]) => {
-                let page = app::channel(&rt, paths, req.param("id")?);
+                // The Streams tab is read only when it is asked for.
+                let tab = app::ChannelTab::named(req.query.get("tab").map(String::as_str))?;
+                let page = app::channel(&rt, paths, req.param("id")?, tab);
                 json!(self.guarded(&rt, page)?)
             }
             ("GET", ["api", "subs"]) => json!(app::load_subs(paths)?.channels),
@@ -344,6 +348,8 @@ impl Server {
             "topicFeeds": rt.cfg.topic_feeds,
             "prepareNext": rt.cfg.prepare_next,
             "keepThumbnails": rt.cfg.keep_thumbnails,
+            "liveCheck": rt.cfg.live_check,
+            "liveChat": rt.cfg.live_chat,
             "configPath": self.paths.config,
             // The keys of the file that were left out: a newer qveil's
             // settings, or a typo too far from any setting to be refused.
@@ -402,6 +408,12 @@ impl Server {
         }
         if let Some(on) = p.keep_thumbnails {
             cfg.keep_thumbnails = on;
+        }
+        if let Some(on) = p.live_check {
+            cfg.live_check = on;
+        }
+        if let Some(on) = p.live_chat {
+            cfg.live_chat = on;
         }
         // Validates the proxy before anything is saved.
         let mut next = Runtime::new(cfg, &self.paths, None, false)?.carrying_test_bases(&rt);
@@ -1527,6 +1539,105 @@ echo '{"title":"T","channel":"Chan","timestamp":5,"url":"https://gv.test/c?expir
             assert!(v.get("detailsLater").is_none(), "{v}");
             assert!(v.get("chaptersLater").is_none(), "{v}");
         }
+    }
+
+    #[test]
+    fn the_streams_tab_is_read_only_when_asked_for() {
+        use crate::store::testing::{listing_runs, streams_asked, streams_ytdlp};
+        let bin = TempDir::new();
+        let (s, base, _d) = server_with(Config {
+            ytdlp: streams_ytdlp(&bin.0, ""),
+            ..Config::default()
+        });
+        let channel = format!("UC{:022}", 1);
+        std::fs::write(
+            bin.0.join(format!("streams-{channel}.json")),
+            r#"{"channel":"Chan1","entries":[
+                {"id":"past0000001","title":"Last week","live_status":"was_live","duration":5400.0,"view_count":12,"timestamp":1600000000},
+                {"id":"soon0000001","title":"Friday","live_status":"is_upcoming","release_timestamp":1900000000},
+                {"id":"live0000001","title":"On air","live_status":"is_live"}
+            ]}"#,
+        )
+        .unwrap();
+        let get = |query: &str| {
+            http(
+                &base,
+                "GET",
+                &path(&base, &format!("api/channel?{query}")),
+                "",
+            )
+        };
+
+        // The page as it was: its Videos tab, and no Streams tab.
+        let (status, body) = get(&format!("id={channel}"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!((listing_runs(&bin.0), streams_asked(&bin.0).len()), (1, 0));
+        assert_eq!(get(&format!("id={channel}&tab=videos")).0, 200);
+        assert_eq!((listing_runs(&bin.0), streams_asked(&bin.0).len()), (2, 0));
+
+        let (status, body) = get(&format!("id={channel}&tab=streams"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(streams_asked(&bin.0), std::slice::from_ref(&channel));
+        assert_eq!(listing_runs(&bin.0), 2, "and not its Videos tab");
+        let config = std::fs::read_to_string(bin.0.join("streams-config")).unwrap();
+        assert!(config.lines().any(|l| l == "-I '1:30'"), "{config}");
+        // The same page, running first, then announced, then past.
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["id", "name", "subscribed", "videos"]);
+        assert_eq!(
+            (v["id"].as_str(), v["name"].as_str()),
+            (Some(channel.as_str()), Some("Chan1"))
+        );
+        let videos = v["videos"].as_array().unwrap();
+        let ids: Vec<_> = videos.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["live0000001", "soon0000001", "past0000001"]);
+        assert_eq!(videos[0]["live"], "now");
+        assert_eq!(
+            (videos[1]["live"].as_str(), videos[1]["starts"].as_i64()),
+            (Some("upcoming"), Some(1_900_000_000))
+        );
+        assert_eq!(videos[2]["streamed"], true);
+        assert_eq!(
+            (videos[2]["date"].as_i64(), videos[2]["estimated"].as_bool()),
+            (Some(1_600_000_000), Some(true))
+        );
+        // Kept nowhere: it marks nothing in the feed.
+        let cache: crate::feed::FeedCache =
+            crate::store::load_cache(&s.paths.feed_cache()).unwrap();
+        assert!(cache.live.is_empty() && cache.seen.is_empty());
+
+        let (status, body) = get(&format!("id={channel}&tab=shorts"));
+        assert_eq!(status, 500);
+        assert!(body.contains("no tab"), "{body}");
+        assert_eq!(streams_asked(&bin.0).len(), 1);
+    }
+
+    #[test]
+    fn the_live_settings_are_saved_and_said() {
+        let (s, base, _d) = server();
+        let (_, body) = http(&base, "GET", &path(&base, "api/config"), "");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (&v["liveCheck"], &v["liveChat"]),
+            (&json!(false), &json!(true))
+        );
+        let post = |body: &str| http(&base, "POST", &path(&base, "api/config"), body);
+        let (status, body) = post(r#"{"liveCheck":true,"liveChat":false}"#);
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (&v["liveCheck"], &v["liveChat"]),
+            (&json!(true), &json!(false))
+        );
+        let saved = Config::load(&s.paths.config).unwrap();
+        assert!(saved.live_check && !saved.live_chat);
+        assert!(s.runtime().cfg.live_check);
+        // Each on its own leaves the other as it is.
+        assert_eq!(post(r#"{"liveChat":true}"#).0, 200);
+        let saved = Config::load(&s.paths.config).unwrap();
+        assert!(saved.live_check && saved.live_chat);
     }
 
     #[test]

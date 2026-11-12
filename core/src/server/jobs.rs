@@ -800,6 +800,70 @@ mod tests {
     }
 
     #[test]
+    fn a_second_refresh_joins_the_running_live_check() {
+        use crate::store::testing::{listing_runs as runs, streams_asked, streams_ytdlp};
+        let bin = TempDir::new();
+        // Each channel's Streams tab takes a moment, so that the check is
+        // still going when refresh is pressed again.
+        let (s, base, _d) = server_with(Config {
+            proxy: Some("http://127.0.0.1:1".into()),
+            ytdlp: streams_ytdlp(&bin.0, "sleep 0.5"),
+            feed_workers: 1,
+            live_check: true,
+            ..Config::default()
+        });
+        for n in 1..=3 {
+            let csv = format!("UC{n:022},http://x,Chan{n}\n");
+            assert_eq!(
+                http(&base, "POST", &path(&base, "api/subs/import"), &csv).0,
+                200
+            );
+        }
+        let first = ask(&base, "refresh=1&stream=1");
+        // The feeds are in, and the check has begun.
+        wait_for("the live check to start", Duration::from_secs(10), || {
+            lock(&s.jobs.running)
+                .as_ref()
+                .is_some_and(|job| lock(&job.state).progress.is_some_and(|(done, _)| done >= 3))
+        });
+        assert_eq!(runs(&bin.0), 3);
+        let second = ask(&base, "refresh=1&stream=1");
+        wait_for(
+            "the second refresh to join",
+            Duration::from_secs(10),
+            || {
+                lock(&s.jobs.running)
+                    .as_ref()
+                    .is_some_and(|job| job.joined() >= 1)
+            },
+        );
+        let parse = |text: &str| -> Vec<Value> {
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let (status, first) = first.join().unwrap();
+        assert_eq!(status, 200);
+        let (_, second) = second.join().unwrap();
+        let (first, second) = (parse(&first), parse(&second));
+        assert_eq!(progress(&first).last(), Some(&(6, 6)), "{first:?}");
+        // It saw the end of the same job, and the same feed.
+        assert_eq!(progress(&second).last(), Some(&(6, 6)));
+        assert!(
+            progress(&second)
+                .first()
+                .is_some_and(|(done, _)| *done >= 3),
+            "it joined during the check: {second:?}"
+        );
+        assert_eq!(first.last(), second.last());
+        let mut asked = streams_asked(&bin.0);
+        asked.sort();
+        let all: Vec<_> = (1..=3).map(|n| format!("UC{n:022}")).collect();
+        assert_eq!(asked, all, "each channel asked once, by the one job");
+        assert_eq!(runs(&bin.0), 3, "and each feed fetched once");
+    }
+
+    #[test]
     fn channels_imported_while_a_refresh_runs_are_fetched_by_the_one_that_follows() {
         use crate::store::testing::listing_runs as runs;
         let (_s, base, _d, bin) = feed_server("sleep 0.3", 3);

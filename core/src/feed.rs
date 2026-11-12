@@ -29,6 +29,20 @@ pub struct FeedCache {
     /// has no new entry, so the next refresh tries it again.
     #[serde(default)]
     pub fetched_at: HashMap<String, i64>,
+    /// What the live check last found running or announced on each channel
+    /// (see `checked`). A channel's next check replaces them as a whole, and
+    /// a refresh with the check off drops them all.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub live: HashMap<String, Vec<Mark>>,
+}
+
+/// A running or announced stream that the live check found.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Mark {
+    pub video: Video,
+    /// When a check first found it, which dates it where the feed doesn't
+    /// list it: the checks after it don't move it up the feed again.
+    pub found: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -407,10 +421,13 @@ impl FeedCache {
                         let published = v.published.or(s.video.published);
                         let views = v.views.or(s.video.views);
                         let duration = v.duration.or(s.video.duration);
+                        // A finished stream stays one: the feed doesn't say.
+                        let streamed = v.streamed || s.video.streamed;
                         s.video = Video {
                             published,
                             views,
                             duration,
+                            streamed,
                             ..v.clone()
                         };
                         s.last_seen = now;
@@ -425,23 +442,99 @@ impl FeedCache {
         self.seen.retain(|_, s| now - s.last_seen < RETENTION_SECS);
     }
 
+    /// Takes what the live check found on a channel's Streams tab. Its
+    /// running and announced streams replace what the last check found
+    /// there. Its past broadcasts join the feed, each once: the RSS feed
+    /// lists most of them already, and those are only marked as streamed
+    /// (and given what the feed lacks, such as their length). The Streams
+    /// tab's dates are approximate, so they are kept as estimates, as a
+    /// fallback's are. Anything else it lists is left alone. This is not a
+    /// fetch of the channel's feed, which `fetched_at` stays about.
+    pub fn checked(&mut self, channel_id: &str, found: &[Video], now: i64) {
+        let before = self.live.remove(channel_id).unwrap_or_default();
+        let marks: Vec<Mark> = found
+            .iter()
+            .filter(|v| v.live.is_some())
+            .map(|v| Mark {
+                video: v.clone(),
+                found: before
+                    .iter()
+                    .find(|m| m.video.id == v.id)
+                    .map_or(now, |m| m.found),
+            })
+            .collect();
+        if !marks.is_empty() {
+            self.live.insert(channel_id.to_string(), marks);
+        }
+        for v in found.iter().filter(|v| v.streamed && v.live.is_none()) {
+            let mut v = v.clone();
+            let approx = v.published.take();
+            self.seen
+                .entry(v.id.clone())
+                .and_modify(|s| {
+                    s.video.streamed = true;
+                    s.video.duration = s.video.duration.or(v.duration);
+                    s.video.views = s.video.views.or(v.views);
+                    if s.first_seen == 0 {
+                        s.first_seen = approx.unwrap_or(0);
+                    }
+                    s.last_seen = now;
+                })
+                .or_insert(Seen {
+                    video: v.clone(),
+                    first_seen: approx.unwrap_or(0),
+                    last_seen: now,
+                });
+        }
+    }
+
+    /// Drops every mark the live check set. Whether there were any.
+    pub fn forget_live(&mut self) -> bool {
+        let had = !self.live.is_empty();
+        self.live.clear();
+        had
+    }
+
     pub fn entries(&self, subs: &[Sub], no_shorts: bool, limit: usize) -> Vec<Entry> {
         let ids: HashSet<&str> = subs.iter().map(|s| s.id.as_str()).collect();
-        let mut out: Vec<Entry> = self
-            .seen
+        let followed = |v: &Video| v.channel_id.as_deref().is_some_and(|c| ids.contains(c));
+        // What the live check found, by video: it is fresher than the feed
+        // about whether a stream is running.
+        let marks: HashMap<&str, &Mark> = self
+            .live
+            .iter()
+            .filter(|(channel, _)| ids.contains(channel.as_str()))
+            .flat_map(|(_, marks)| marks)
+            .map(|m| (m.video.id.as_str(), m))
+            .collect();
+        let seen = self.seen.values().filter(|s| followed(&s.video)).map(|s| {
+            let mut video = s.video.clone();
+            if let Some(m) = marks.get(video.id.as_str()) {
+                video.live = m.video.live;
+                video.starts = m.video.starts;
+                video.watching = m.video.watching.or(video.watching);
+            }
+            Entry {
+                date: video.published.unwrap_or(s.first_seen),
+                estimated: video.published.is_none(),
+                video,
+            }
+        });
+        // The streams the feed doesn't list (yet), by when they were found.
+        let unlisted = marks
             .values()
-            .filter(|s| {
-                s.video
-                    .channel_id
-                    .as_deref()
-                    .is_some_and(|c| ids.contains(c))
-            })
-            .filter(|s| !(no_shorts && s.video.short))
-            .map(|s| Entry {
-                video: s.video.clone(),
-                date: s.video.published.unwrap_or(s.first_seen),
-                estimated: s.video.published.is_none(),
-            })
+            .filter(|m| !self.seen.contains_key(&m.video.id))
+            .map(|m| Entry {
+                video: Video {
+                    published: None,
+                    ..m.video.clone()
+                },
+                date: m.found,
+                estimated: true,
+            });
+        let mut out: Vec<Entry> = seen
+            .chain(unlisted)
+            .filter(|e| !(no_shorts && e.video.short))
             .collect();
         out.sort_by(|a, b| {
             b.date
@@ -630,6 +723,75 @@ mod tests {
             cache.entries(&[], false, 10).is_empty(),
             "unsubscribed channels are hidden"
         );
+    }
+
+    fn checked_as(id: &str, status: &str) -> Video {
+        let v: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"entries":[{{"id":"{id}","title":"from the Streams tab","live_status":"{status}","duration":60.0,"timestamp":1500000000}}]}}"#
+        ))
+        .unwrap();
+        let mut v = crate::ytdlp::entries(&v).remove(0);
+        v.channel_id = Some(sub().id);
+        v
+    }
+
+    #[test]
+    fn a_finished_stream_stays_one_after_the_next_rss_fetch() {
+        let s = sub();
+        let mut cache = FeedCache::default();
+        let rss = || fetched(&s, parse_rss(RSS).unwrap(), Source::Rss);
+        cache.merge(&[rss()], 2_000_000_000);
+        cache.checked(
+            &s.id,
+            &[checked_as("5C_HPTJg5ek", "was_live")],
+            2_000_000_050,
+        );
+        cache.merge(&[rss()], 2_000_000_100);
+        let es = cache.entries(std::slice::from_ref(&s), false, 10);
+        assert_eq!(es.len(), 2, "not added a second time");
+        let e = &es[1];
+        assert_eq!(e.video.id, "5C_HPTJg5ek");
+        assert!(e.video.streamed);
+        // What the feed says comes first; the Streams tab fills in what it lacks.
+        assert_eq!((e.date, e.estimated), (1631113212, false));
+        assert_eq!(e.video.title, "Rust in 100 Seconds");
+        assert_eq!(e.video.duration, Some(60));
+    }
+
+    #[test]
+    fn a_running_stream_the_feed_lists_is_shown_once_and_live() {
+        let s = sub();
+        let mut cache = FeedCache::default();
+        cache.merge(
+            &[fetched(&s, parse_rss(RSS).unwrap(), Source::Rss)],
+            2_000_000_000,
+        );
+        cache.checked(
+            &s.id,
+            &[checked_as("5C_HPTJg5ek", "is_live")],
+            2_000_000_050,
+        );
+        let es = cache.entries(std::slice::from_ref(&s), false, 10);
+        assert_eq!(es.len(), 2);
+        assert_eq!(es[1].video.live, Some(LiveState::Now));
+        assert_eq!((es[1].date, es[1].estimated), (1631113212, false));
+        // A stream the feed doesn't list is dated by when a check first found
+        // it, which the checks after it keep.
+        let upcoming = checked_as("ccccccccccc", "is_upcoming");
+        cache.checked(&s.id, std::slice::from_ref(&upcoming), 2_000_000_100);
+        cache.checked(&s.id, &[upcoming], 2_000_000_200);
+        let es = cache.entries(std::slice::from_ref(&s), false, 10);
+        assert_eq!(es.len(), 3);
+        assert_eq!(es[0].video.id, "ccccccccccc");
+        assert_eq!(es[0].video.live, Some(LiveState::Upcoming));
+        assert_eq!((es[0].date, es[0].estimated), (2_000_000_100, true));
+        // The earlier one was replaced by that check, and is no longer live.
+        assert_eq!(es[2].video.live, None);
+        // Marks are kept for channels that are followed, and only shown for them.
+        assert!(cache.entries(&[], false, 10).is_empty());
+        assert!(cache.forget_live());
+        assert!(!cache.forget_live(), "nothing left to forget");
+        assert_eq!(cache.entries(std::slice::from_ref(&s), false, 10).len(), 2);
     }
 
     #[test]

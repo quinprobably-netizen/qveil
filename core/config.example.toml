@@ -42,6 +42,16 @@ topic_feeds = false
 # it on.
 prepare_next = false
 
+# Check followed channels for live streams: each feed refresh also reads every
+# followed channel's Streams tab, one more request per channel, in random order
+# with pauses, so home can say what is live or about to start. Off until you
+# turn it on.
+live_check = false
+
+# Show a live stream's chat. It is read only while the Chat tab is open, as
+# text: no pictures (avatars, badges, emoji) are fetched.
+live_chat = true
+
 # Show thumbnails. They are fetched through the same route as everything else.
 # With Tor isolation each one gets its own circuit, so separate requests can't
 # be linked by IP address. A refresh is still a burst of requests for exactly

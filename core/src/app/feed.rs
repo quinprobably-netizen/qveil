@@ -2,14 +2,14 @@
 //! channel's own page.
 
 use super::now;
-use super::runtime::Runtime;
+use super::runtime::{Pacing, Runtime};
 use super::subs::load_subs;
 use crate::feed::{self, Entry, FeedCache};
 use crate::ids;
 use crate::store::{self, Paths};
 use crate::subs::Sub;
 use crate::util::lock;
-use crate::video::Video;
+use crate::video::{LiveState, Video};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::sync::Mutex;
@@ -114,14 +114,27 @@ pub fn refresh(
         errors: Vec::new(),
         fresh,
     };
+    let checking = rt.cfg.live_check && refresh != Refresh::Off;
+    if !rt.cfg.live_check && refresh != Refresh::Off {
+        // What the check found is only as fresh as the last check, and with
+        // the check off there won't be another: it goes, nothing due or not.
+        let cache: FeedCache = store::load_cache(&paths.feed_cache())?;
+        if !cache.live.is_empty() {
+            update_feed_cache(paths, |cache| {
+                cache.forget_live();
+            })?;
+        }
+    }
     if due.is_empty() {
         return Ok(done);
     }
+    // The live check is a step per channel after the feeds.
+    let total = due.len() * if checking { 2 } else { 1 };
     // The slow part, with nothing locked: the network can take minutes over
     // Tor, and other commands must not wait for it. What is fetched is saved
     // as it arrives, if not channel by channel, and only for that moment is
     // the store locked, so a refresh that is cut off has kept nearly all it got.
-    progress(0, due.len());
+    progress(0, total);
     let saver = Saver::new(paths, rt.save_every);
     let fetch = std::thread::scope(|scope| {
         // Something has to notice that what is waiting has waited long enough
@@ -141,7 +154,7 @@ pub fn refresh(
             rt.cfg.feed_workers,
             current,
             &|f| saver.keep(f),
-            progress,
+            &|done, _| progress(done, total),
         );
         drop(stop);
         fetch
@@ -150,7 +163,85 @@ pub fn refresh(
     done.errors = not_fetched(&fetch);
     done.errors.splice(0..0, fetch.errors);
     saver.finish()?;
+    if checking {
+        let route_said = fetch.skipped > 0;
+        let check = live_check(rt, paths, &due, current, &|n| {
+            progress(due.len() + n, total)
+        });
+        done.errors.extend(check.errors);
+        if check.unchecked > 0 && !route_said {
+            done.errors.push(format!(
+                "The route changed during the live check; {} channel(s) were not checked.",
+                check.unchecked
+            ));
+        }
+    }
     Ok(done)
+}
+
+/// How many entries of a channel's Streams tab the live check reads.
+const LIVE_CHECK_ENTRIES: usize = 5;
+
+/// How many entries a channel's Streams tab lists on its page, as its Videos tab.
+const STREAMS_TAB_ENTRIES: usize = 30;
+
+/// How the live check went.
+struct LiveCheck {
+    /// One for each channel whose check failed (whose marks are kept).
+    errors: Vec<String>,
+    /// Channels not checked because the route changed meanwhile.
+    unchecked: usize,
+}
+
+/// The live check: reads the Streams tab of each of `subs`, in a new random
+/// order and paced like a refresh's searches (see `Pacing`), and saves what
+/// each one found as it comes in (see `FeedCache::checked`). One at a time:
+/// it is one more request per channel, and the pauses are what keep a burst
+/// of them from going out together. `progress(n)` is told after each one.
+/// It runs inside the refresh, and so inside its job, which a second refresh
+/// joins (see `server::jobs`): no channel is asked twice.
+fn live_check(
+    rt: &Runtime,
+    paths: &Paths,
+    subs: &[Sub],
+    current: &(dyn Fn() -> bool + Sync),
+    progress: &dyn Fn(usize),
+) -> LiveCheck {
+    use rand::seq::SliceRandom;
+    let mut order: Vec<&Sub> = subs.iter().collect();
+    order.shuffle(&mut rand::rng());
+    let pacing = Pacing::of(rt);
+    let mut check = LiveCheck {
+        errors: Vec::new(),
+        unchecked: 0,
+    };
+    for (n, sub) in order.iter().enumerate() {
+        if !pacing.before_search(current) {
+            check.unchecked = order.len() - n;
+            break;
+        }
+        let found = rt.yt.channel_streams(&sub.id, LIVE_CHECK_ENTRIES);
+        // What came back over a route that was left is not kept.
+        if !current() {
+            check.unchecked = order.len() - n;
+            break;
+        }
+        let saved = found.and_then(|mut found| {
+            for v in &mut found {
+                v.channel_id = Some(sub.id.clone());
+                v.channel.get_or_insert_with(|| sub.name.clone());
+            }
+            update_feed_cache(paths, |cache| cache.checked(&sub.id, &found, now()))
+                .context("couldn't save what it found")
+        });
+        if let Err(e) = saved {
+            check
+                .errors
+                .push(format!("{}: the live check failed: {e:#}", sub.name));
+        }
+        progress(n + 1);
+    }
+    check
 }
 
 /// Why the channels that a refresh didn't get to were left out, in words.
@@ -296,10 +387,11 @@ fn update_feed_cache(paths: &Paths, change: impl FnOnce(&mut FeedCache)) -> Resu
     // Channels that are no longer subscribed to have no use for a timestamp.
     // Read now rather than at the start of the refresh, which can be long
     // ago: a channel added since must keep its own.
+    // The same goes for the live check's marks.
     if let Ok(subs) = load_subs(paths) {
-        cache
-            .fetched_at
-            .retain(|id, _| subs.channels.iter().any(|s| s.id == *id));
+        let followed = |id: &String| subs.channels.iter().any(|s| s.id == *id);
+        cache.fetched_at.retain(|id, _| followed(id));
+        cache.live.retain(|id, _| followed(id));
     }
     store::save_compact(&paths.feed_cache(), &cache)?;
     Ok(cache)
@@ -313,9 +405,30 @@ pub struct ChannelPage {
     pub videos: Vec<Entry>,
 }
 
+/// Which list of a channel's page.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChannelTab {
+    Videos,
+    /// Its streams: running, then announced, then past broadcasts. Read
+    /// only when it is asked for, and kept nowhere: the live check is what
+    /// marks the feed.
+    Streams,
+}
+
+impl ChannelTab {
+    /// The tab a request names (`tab=`): the Videos tab when it names none.
+    pub fn named(name: Option<&str>) -> Result<Self> {
+        match name.unwrap_or("") {
+            "" | "videos" => Ok(ChannelTab::Videos),
+            "streams" => Ok(ChannelTab::Streams),
+            other => bail!("a channel has no tab {other:?}"),
+        }
+    }
+}
+
 /// A channel's page. `id` is the channel's ID, or its `@handle` (how a link
 /// in a description usually names a channel), which is looked up first.
-pub fn channel(rt: &Runtime, paths: &Paths, id: &str) -> Result<ChannelPage> {
+pub fn channel(rt: &Runtime, paths: &Paths, id: &str, tab: ChannelTab) -> Result<ChannelPage> {
     let id = id.trim();
     let id = if ids::is_channel_id(id) {
         id.to_string()
@@ -327,7 +440,19 @@ pub fn channel(rt: &Runtime, paths: &Paths, id: &str) -> Result<ChannelPage> {
         bail!("{id:?} is not a channel ID or a handle");
     };
     let id = id.as_str();
-    let videos = rt.yt.channel_videos(id, 30)?;
+    let videos = match tab {
+        ChannelTab::Videos => rt.yt.channel_videos(id, 30)?,
+        ChannelTab::Streams => {
+            let mut found = rt.yt.channel_streams(id, STREAMS_TAB_ENTRIES)?;
+            // Stable: within each kind, the tab's own order.
+            found.sort_by_key(|v| match v.live {
+                Some(LiveState::Now) => 0,
+                Some(LiveState::Upcoming) => 1,
+                None => 2,
+            });
+            found
+        }
+    };
     let sub = load_subs(paths)?.channels.into_iter().find(|s| s.id == id);
     let name = sub
         .as_ref()
@@ -338,7 +463,7 @@ pub fn channel(rt: &Runtime, paths: &Paths, id: &str) -> Result<ChannelPage> {
         id: id.into(),
         name,
         subscribed: sub.is_some(),
-        // The Videos tab only gives "3 days ago", so every date is approximate.
+        // Either tab only gives "3 days ago", so every date is approximate.
         videos: videos
             .into_iter()
             .map(|v| Entry {
@@ -362,10 +487,12 @@ mod tests {
     use crate::app::testing::{channel, offline, rt_cfg, with_feeds_at};
     use crate::config::Config;
     use crate::feed::{self, FeedCache};
-    use crate::store::testing::{TempDir, listing_runs, listing_ytdlp};
+    use crate::store::testing::{
+        TempDir, listing_runs, listing_ytdlp, streams_asked, streams_ytdlp,
+    };
     use crate::store::{self, Paths};
     use crate::util::lock;
-    use crate::video::Video;
+    use crate::video::{LiveState, Video};
     use anyhow::bail;
     use std::fs;
     use std::sync::Mutex;
@@ -849,5 +976,261 @@ mod tests {
         })
         .unwrap();
         assert!(lock(&told).is_empty());
+    }
+
+    fn id(n: u32) -> String {
+        format!("UC{n:022}")
+    }
+
+    /// A runtime whose yt-dlp is `streams_ytdlp`, with the live check on or off.
+    fn checking(paths: &Paths, dir: &TempDir, on: bool) -> Runtime {
+        let ytdlp = streams_ytdlp(&dir.0, "");
+        Runtime {
+            cfg: Config {
+                live_check: on,
+                ..rt_cfg(&ytdlp)
+            },
+            ..offline(paths, &ytdlp)
+        }
+    }
+
+    /// What channel `n`'s Streams tab lists from now on.
+    fn streams(dir: &TempDir, n: u32, entries: &str) {
+        let listing = format!(r#"{{"channel":"Chan{n}","entries":[{entries}]}}"#);
+        fs::write(dir.0.join(format!("streams-{}.json", id(n))), listing).unwrap();
+    }
+
+    fn found<'a>(r: &'a FeedResult, video: &str) -> Vec<&'a Entry> {
+        r.entries.iter().filter(|e| e.video.id == video).collect()
+    }
+
+    fn state(r: &FeedResult, video: &str) -> Option<(Option<LiveState>, Option<i64>)> {
+        let found = found(r, video);
+        assert!(
+            found.len() <= 1,
+            "{video} is in the feed {} times",
+            found.len()
+        );
+        found.first().map(|e| (e.video.live, e.video.starts))
+    }
+
+    const ON_AIR: &str = r#"{"id":"live0000001","title":"On air","live_status":"is_live"}"#;
+
+    #[test]
+    fn the_live_check_marks_running_and_upcoming_streams() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=2 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let rt = checking(&paths, &dir, true);
+        streams(
+            &dir,
+            1,
+            &format!(
+                r#"{ON_AIR},
+                {{"id":"soon0000001","title":"Later","live_status":"is_upcoming","release_timestamp":1900000000}},
+                {{"id":"plain000001","title":"Not a stream"}}"#
+            ),
+        );
+        let r = feed(&rt, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        use LiveState::{Now, Upcoming};
+        assert_eq!(state(&r, "live0000001"), Some((Some(Now), None)));
+        assert_eq!(
+            state(&r, "soon0000001"),
+            Some((Some(Upcoming), Some(1_900_000_000)))
+        );
+        assert_eq!(
+            state(&r, "plain000001"),
+            None,
+            "only streams are taken from the Streams tab"
+        );
+        let live = found(&r, "live0000001")[0];
+        assert_eq!(live.video.channel_id.as_deref(), Some(id(1).as_str()));
+        assert_eq!(live.video.channel.as_deref(), Some("Chan1"));
+
+        // The next check replaces what the last one found: the stream is
+        // over (and listed no more), and the announced one is running.
+        streams(
+            &dir,
+            1,
+            r#"{"id":"soon0000001","title":"Later","live_status":"is_live"}"#,
+        );
+        let r = feed(&rt, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+        assert_eq!(state(&r, "live0000001"), None);
+        assert_eq!(state(&r, "soon0000001"), Some((Some(Now), None)));
+    }
+
+    #[test]
+    fn a_channel_whose_live_check_fails_keeps_its_marks_and_says_so() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=2 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let rt = checking(&paths, &dir, true);
+        streams(&dir, 1, ON_AIR);
+        streams(&dir, 2, r#"{"id":"live0000002","live_status":"is_live"}"#);
+        feed(&rt, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+        // Channel 1's Streams tab is down; channel 2's stream is over.
+        fs::write(dir.0.join(format!("streams-{}.fail", id(1))), "").unwrap();
+        streams(&dir, 2, "");
+        let r = feed(&rt, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(
+            r.errors[0].starts_with("Chan1: ") && r.errors[0].contains("live check"),
+            "{:?}",
+            r.errors
+        );
+        assert_eq!(state(&r, "live0000001"), Some((Some(LiveState::Now), None)));
+        assert_eq!(state(&r, "live0000002"), None);
+    }
+
+    #[test]
+    fn the_live_check_asks_every_channel_once_in_shuffled_order() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=6 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let pauses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&pauses);
+        let rt = Runtime {
+            pause: std::sync::Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+            ..checking(&paths, &dir, true)
+        };
+        let all: std::collections::BTreeSet<String> = (1..=6).map(id).collect();
+        let mut orders = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let _ = fs::remove_file(dir.0.join("streams-asked"));
+            pauses.store(0, Ordering::SeqCst);
+            feed(&rt, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+            let asked = streams_asked(&dir.0);
+            assert_eq!(asked.len(), 6, "{asked:?}");
+            assert_eq!(
+                asked
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                all
+            );
+            // A pause before each request after the first.
+            assert_eq!(pauses.load(Ordering::SeqCst), 5);
+            orders.insert(asked);
+        }
+        assert!(orders.len() > 1, "always the same order: {orders:?}");
+        // Flat, the first five entries, with approximate dates.
+        let config = fs::read_to_string(dir.0.join("streams-config")).unwrap();
+        let last = streams_asked(&dir.0)[5].clone();
+        for line in [
+            "--flat-playlist",
+            "--extractor-args 'youtubetab:approximate_date'",
+            "-I '1:5'",
+            &format!("'https://www.youtube.com/channel/{last}/streams'"),
+        ] {
+            assert!(config.lines().any(|l| l == line), "{line:?} in {config}");
+        }
+
+        // A refresh of one channel checks that one; one with nothing due, none.
+        let _ = fs::remove_file(dir.0.join("streams-asked"));
+        feed(&rt, &paths, Refresh::Channel(id(3)), false, 50, &|| true).unwrap();
+        assert_eq!(streams_asked(&dir.0), [id(3)]);
+        feed(&rt, &paths, Refresh::Stale, false, 50, &|| true).unwrap();
+        assert_eq!(streams_asked(&dir.0), [id(3)]);
+    }
+
+    #[test]
+    fn the_live_check_reports_its_progress_after_the_feeds() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=3 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        let rt = checking(&paths, &dir, true);
+        let told = Mutex::new(Vec::new());
+        refresh(&rt, &paths, Refresh::Force, &|| true, &|done, total| {
+            lock(&told).push((done, total))
+        })
+        .unwrap();
+        let steps: Vec<_> = (0..=6).map(|done| (done, 6)).collect();
+        assert_eq!(*lock(&told), steps);
+    }
+
+    #[test]
+    fn past_broadcasts_join_latest_once() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        import_subs(&paths, &channel(1)).unwrap();
+        // The feed lists v0000000001 at the first refresh, v0000000002 at the next.
+        let (base, _) = crate::store::testing::rss_upstream(0);
+        let ytdlp = streams_ytdlp(&dir.0, "");
+        let rt = Runtime {
+            cfg: Config {
+                live_check: true,
+                ..rt_cfg(&ytdlp)
+            },
+            ..with_feeds_at(&paths, &base, &ytdlp)
+        };
+        streams(
+            &dir,
+            1,
+            r#"{"id":"v0000000001","title":"t1","live_status":"was_live","duration":3600.0,"timestamp":1700000000},
+            {"id":"past0000002","title":"Old stream","live_status":"was_live","duration":5400.0,"view_count":12,"timestamp":1600000000}"#,
+        );
+        for round in 1..=2 {
+            let r = feed(&rt, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            assert_eq!(r.entries.len(), round + 1, "round {round}");
+            let rss = found(&r, "v0000000001");
+            assert_eq!(rss.len(), 1, "round {round}");
+            // The one the feed has keeps its real date, and is now a stream.
+            assert!(rss[0].video.streamed);
+            assert_eq!((rss[0].date, rss[0].estimated), (1_704_067_200, false));
+            assert_eq!(rss[0].video.duration, Some(3600));
+            let past = found(&r, "past0000002");
+            assert_eq!(past.len(), 1, "round {round}");
+            assert!(past[0].video.streamed);
+            assert_eq!(past[0].video.channel_id.as_deref(), Some(id(1).as_str()));
+            // The Streams tab's dates are approximate.
+            assert_eq!((past[0].date, past[0].estimated), (1_600_000_000, true));
+            assert_eq!(past[0].video.live, None);
+        }
+    }
+
+    #[test]
+    fn turning_the_check_off_clears_its_marks() {
+        let dir = TempDir::new();
+        let paths = dir.paths();
+        for n in 1..=2 {
+            import_subs(&paths, &channel(n)).unwrap();
+        }
+        streams(
+            &dir,
+            1,
+            &format!(
+                r#"{ON_AIR},{{"id":"past0000001","live_status":"was_live","timestamp":1600000000}}"#
+            ),
+        );
+        let on = checking(&paths, &dir, true);
+        let r = feed(&on, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+        assert!(state(&r, "live0000001").is_some());
+
+        let off = checking(&paths, &dir, false);
+        let _ = fs::remove_file(dir.0.join("streams-asked"));
+        // Even a refresh with nothing due drops them.
+        let r = feed(&off, &paths, Refresh::Stale, false, 50, &|| true).unwrap();
+        assert_eq!((r.fresh, listing_runs(&dir.0)), (2, 2));
+        assert_eq!(state(&r, "live0000001"), None);
+        let cache: FeedCache = store::load(&paths.feed_cache()).unwrap();
+        assert!(cache.live.is_empty());
+        // A past broadcast is a video in the feed like any other, and stays.
+        assert!(state(&r, "past0000001").is_some());
+        // Showing the cache is not a refresh, and the check asks nothing while off.
+        feed(&on, &paths, Refresh::Off, false, 50, &|| true).unwrap();
+        feed(&off, &paths, Refresh::Force, false, 50, &|| true).unwrap();
+        assert!(streams_asked(&dir.0).is_empty());
     }
 }

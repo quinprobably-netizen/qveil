@@ -480,6 +480,28 @@ impl Ytdlp {
         Ok(entries(&v))
     }
 
+    /// The first `limit` entries of the channel's Streams tab, read the same
+    /// way as its Videos tab (see `channel_videos`): running and announced
+    /// streams, and past broadcasts (`streamed`). A running one carries no
+    /// viewer count here. `published` is only approximate.
+    pub fn channel_streams(&self, channel_id: &str, limit: usize) -> Result<Vec<Video>> {
+        let url = format!("https://www.youtube.com/channel/{channel_id}/streams");
+        let range = format!("1:{limit}");
+        let v = self.json(
+            &[
+                "--flat-playlist",
+                "--extractor-args",
+                "youtubetab:approximate_date",
+                "-J",
+                "-I",
+                &range,
+            ],
+            &url,
+            QUICK,
+        )?;
+        Ok(entries(&v))
+    }
+
     /// The first `n` comment threads of a video, in `sort` order, and with
     /// `replies` up to `REPLIES_EACH` replies under each. yt-dlp has no way
     /// to ask for the next page, so more is asked for from the start.
@@ -996,7 +1018,7 @@ pub(crate) fn str_field(v: &Value, keys: &[&str]) -> Option<String> {
         .find_map(|k| v[*k].as_str().filter(|s| !s.is_empty()).map(String::from))
 }
 
-fn entries(v: &Value) -> Vec<Video> {
+pub(crate) fn entries(v: &Value) -> Vec<Video> {
     let parent_channel = str_field(v, &["channel", "uploader"]);
     let parent_id = str_field(v, &["channel_id"]);
     v["entries"]
