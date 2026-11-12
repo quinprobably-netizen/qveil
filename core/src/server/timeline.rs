@@ -1324,15 +1324,18 @@ impl LiveSession {
     }
 
     /// The player joins two segments back from the newest its playlist
-    /// lists, as it last loaded it (`head`). FFmpeg's reads at open can
-    /// take a while, and it may load the playlist again meanwhile: once
-    /// that is past the join's segments fetched ahead (see `warm_join`),
-    /// they are of no use, and only take from the circuit what it waits for.
+    /// listed when it chose where to start: the one it loaded last (`head`
+    /// now), or the one before (measured: FFmpeg had loaded the next one by
+    /// the time it asked for the join). Its reads at open can take a while,
+    /// and it loads the playlist again meanwhile: once that is past the
+    /// join's segments fetched ahead (see `warm_join`), by a playlist's
+    /// slack, they are of no use, and only take from the circuit what it
+    /// waits for.
     fn forget_stale_warm(&self, kind: Kind, head: u64) {
         let mut warm = lock(&self.warm[kind.index()]);
         if warm
             .back()
-            .is_some_and(|(last, _)| (head + 1).saturating_sub(JOIN) > *last)
+            .is_some_and(|(last, _)| head.saturating_sub(JOIN) > *last)
         {
             for (_, f) in warm.drain(..) {
                 f.drop_it();
