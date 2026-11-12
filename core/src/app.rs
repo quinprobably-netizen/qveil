@@ -12,7 +12,7 @@ mod subs;
 mod testing;
 mod topics;
 
-pub use feed::{ChannelTab, Refresh, Refreshed, channel, feed, feed_result, refresh};
+pub use feed::{ChannelTab, FeedResult, Refresh, Refreshed, channel, feed, feed_result, refresh};
 #[cfg(test)]
 pub use history::History;
 pub use history::{Watched, clear_history, load_history, name_in_history, record_history};

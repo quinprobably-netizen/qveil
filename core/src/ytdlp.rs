@@ -590,6 +590,32 @@ impl Ytdlp {
         self.live_lookup(url, max_height, abort, Some(original))
     }
 
+    /// What `url` opens as, for a video said to be live or announced (the
+    /// card it was picked from said so): the live lookup first, without
+    /// the usual lookup that can't find a running stream's formats. If the
+    /// answer is no running or announced stream (the card was wrong, or
+    /// the stream is over), the usual lookup follows, as for any video,
+    /// and the live answer already in hand stands in for the live lookup
+    /// that would come after it: a past broadcast only offered in
+    /// fragments still plays on the timeline.
+    pub fn open_live_first(
+        &self,
+        url: &str,
+        format: &str,
+        max_height: u32,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Opening> {
+        let v = self.json_with(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
+        if live_state(&v).is_some() {
+            return live_answer(&v, url, max_height, None);
+        }
+        match self.lookup(url, format, abort) {
+            Ok(s) => Ok(Opening::Plain(s)),
+            Err(e) if needs_live(&e) => live_answer(&v, url, max_height, Some(e)),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The live lookup alone, for a stream that is known to be one: the
     /// timeline looks a stream it plays up again this way, when its URLs
     /// have stopped working or to see whether it has ended, without the
@@ -614,24 +640,7 @@ impl Ytdlp {
         original: Option<anyhow::Error>,
     ) -> Result<Opening> {
         let v = self.json_with(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
-        if live_state(&v) == Some(LiveState::Upcoming) {
-            return Ok(Opening::Upcoming {
-                title: str_field(&v, &["title"]).unwrap_or_else(|| url.into()),
-                channel: str_field(&v, &["channel", "uploader"]),
-                starts: v["release_timestamp"].as_i64(),
-            });
-        }
-        let is_stream = live_state(&v).is_some() || streamed(&v);
-        match live::choose(&v, max_height) {
-            Ok(s) => Ok(Opening::Live(s)),
-            // Over, and nothing of it can be fetched: said as such, so that
-            // a session playing it knows it has ended (see `live::ENDED`).
-            Err(e) if streamed(&v) => Err(e.context(live::ENDED)),
-            Err(e) if is_stream => Err(e),
-            // An ordinary video that yt-dlp found nothing for: what the
-            // usual lookup said is what there is to say.
-            Err(e) => Err(original.unwrap_or(e)),
-        }
+        live_answer(&v, url, max_height, original)
     }
 
     /// The usual lookup: the quick one first if it is on (see `LOOKUP`),
@@ -891,6 +900,33 @@ fn drain_tail(pipe: Option<impl Read + Send + 'static>, keep: usize) -> JoinHand
         }
         kept
     })
+}
+
+/// What the live lookup's answer `v` opens as (see `Ytdlp::live_lookup`).
+fn live_answer(
+    v: &Value,
+    url: &str,
+    max_height: u32,
+    original: Option<anyhow::Error>,
+) -> Result<Opening> {
+    if live_state(v) == Some(LiveState::Upcoming) {
+        return Ok(Opening::Upcoming {
+            title: str_field(v, &["title"]).unwrap_or_else(|| url.into()),
+            channel: str_field(v, &["channel", "uploader"]),
+            starts: v["release_timestamp"].as_i64(),
+        });
+    }
+    let is_stream = live_state(v).is_some() || streamed(v);
+    match live::choose(v, max_height) {
+        Ok(s) => Ok(Opening::Live(s)),
+        // Over, and nothing of it can be fetched: said as such, so that
+        // a session playing it knows it has ended (see `live::ENDED`).
+        Err(e) if streamed(v) => Err(e.context(live::ENDED)),
+        Err(e) if is_stream => Err(e),
+        // An ordinary video that yt-dlp found nothing for: what the
+        // usual lookup said is what there is to say.
+        Err(e) => Err(original.unwrap_or(e)),
+    }
 }
 
 /// The ways that yt-dlp says it found no format: older versions word it as

@@ -1172,8 +1172,10 @@ struct LiveShared {
     ended: Mutex<Option<u64>>,
     /// Segments below this are gone.
     dropped: AtomicU64,
-    /// The segment whose next request hangs.
-    frozen: Mutex<Option<u64>>,
+    /// The segment whose next requests hang, and how many of them.
+    frozen: Mutex<Option<(u64, usize)>>,
+    /// The track (`v` or `a`) whose base requests hang, while set.
+    held_base: Mutex<Option<String>>,
     /// The segment whose next request stops after this many bytes of its
     /// body, and hangs.
     cut: Mutex<Option<(u64, usize)>>,
@@ -1288,6 +1290,7 @@ impl LiveUpstream {
             ended: Mutex::new(None),
             dropped: AtomicU64::new(0),
             frozen: Mutex::new(None),
+            held_base: Mutex::new(None),
             cut: Mutex::new(None),
             trickle_ms: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
@@ -1417,7 +1420,18 @@ impl LiveUpstream {
     /// until the client hangs up or the `LiveUpstream` is dropped. The ones
     /// after it are answered.
     pub fn freeze(&self, n: u64) {
-        *self.live.frozen.lock().unwrap() = Some(n);
+        self.freeze_times(n, 1);
+    }
+
+    /// `freeze`, for the first `k` requests for segment `n`.
+    pub fn freeze_times(&self, n: u64, k: usize) {
+        *self.live.frozen.lock().unwrap() = Some((n, k));
+    }
+
+    /// Requests for the base of `track` (`v` or `a`), which say where the
+    /// head is, hang from now on (see `freeze`).
+    pub fn hold_base(&self, track: &str) {
+        *self.live.held_base.lock().unwrap() = Some(track.to_string());
     }
 
     /// How many requests are hanging (see `freeze`).
@@ -1545,6 +1559,12 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
     }
     let head = || format!("X-Head-Seqnum: {}\r\n", live.head());
     let Some(n) = sq else {
+        if live.held_base.lock().unwrap().as_deref() == Some(track) {
+            live.hanging.fetch_add(1, Ordering::SeqCst);
+            hang(&mut conn, live);
+            live.hanging.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
         return match kind {
             "live" => reply(
                 &mut conn,
@@ -1565,11 +1585,13 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
         .push((target.clone(), range.clone()));
     let hold = {
         let mut frozen = live.frozen.lock().unwrap();
-        let hold = *frozen == Some(n);
-        if hold {
-            *frozen = None;
+        match *frozen {
+            Some((m, k)) if m == n => {
+                *frozen = (k > 1).then_some((m, k - 1));
+                true
+            }
+            _ => false,
         }
-        hold
     };
     if hold {
         live.hanging.fetch_add(1, Ordering::SeqCst);
@@ -1754,6 +1776,133 @@ EOF
     .replace("@TARGET@", &(up.live.target_ms as f64 / 1000.0).to_string())
     .replace("@BASE@", &up.base);
     crate::store::testing::script(&dir.join("yt-dlp"), &script).into()
+}
+
+/// A SOCKS5 proxy on a local port that passes each connection on to where
+/// it asks to go (on this machine), as Tor would to an exit, and keeps the
+/// identity (the user name) each came over, with where it went. Tor makes a
+/// circuit for each identity; this is how a test sees which identities the
+/// requests used.
+pub struct Hop {
+    pub port: u16,
+    /// For each connection: the identity, and the port it went to.
+    seen: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl Hop {
+    pub fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<(String, u16)>>> = Arc::default();
+        let kept = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for mut client in listener.incoming().flatten() {
+                let kept = Arc::clone(&kept);
+                std::thread::spawn(move || {
+                    let Some((user, to)) = socks_connect(&mut client) else {
+                        return;
+                    };
+                    let Ok(server) = TcpStream::connect(("127.0.0.1", to)) else {
+                        return;
+                    };
+                    kept.lock().unwrap().push((user, to));
+                    let flag = Arc::new(AtomicBool::new(false));
+                    let (up, down) = (server.try_clone().unwrap(), client.try_clone().unwrap());
+                    let f = Arc::clone(&flag);
+                    std::thread::spawn(move || pass_on(up, down, &f));
+                    pass_on(client, server, &flag);
+                });
+            }
+        });
+        Hop { port, seen }
+    }
+
+    pub fn proxy(&self) -> String {
+        format!("socks5h://127.0.0.1:{}", self.port)
+    }
+
+    /// The identities that connections to `port` came over, each once, in order.
+    pub fn identities_to(&self, port: u16) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for (who, to) in self.seen.lock().unwrap().iter() {
+            if *to == port && !found.contains(who) {
+                found.push(who.clone());
+            }
+        }
+        found
+    }
+}
+
+/// `socks_handshake`, which also says the port the client asks to reach.
+fn socks_connect(c: &mut TcpStream) -> Option<(String, u16)> {
+    let mut head = [0u8; 2];
+    c.read_exact(&mut head).ok()?;
+    let mut methods = vec![0u8; head[1] as usize];
+    c.read_exact(&mut methods).ok()?;
+    c.write_all(&[5, 2]).ok()?;
+    let mut len = [0u8; 2];
+    c.read_exact(&mut len).ok()?;
+    let mut user = vec![0u8; len[1] as usize];
+    c.read_exact(&mut user).ok()?;
+    let mut plen = [0u8; 1];
+    c.read_exact(&mut plen).ok()?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    c.read_exact(&mut pass).ok()?;
+    c.write_all(&[1, 0]).ok()?;
+    let mut req = [0u8; 4];
+    c.read_exact(&mut req).ok()?;
+    let skip = match req[3] {
+        1 => 4,
+        4 => 16,
+        _ => {
+            let mut n = [0u8; 1];
+            c.read_exact(&mut n).ok()?;
+            n[0] as usize
+        }
+    };
+    let mut rest = vec![0u8; skip + 2];
+    c.read_exact(&mut rest).ok()?;
+    let port = u16::from_be_bytes([rest[skip], rest[skip + 1]]);
+    c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
+    Some((String::from_utf8_lossy(&user).into_owned(), port))
+}
+
+/// What yt-dlp says when YouTube asks the address to sign in.
+pub const BOT_CHECK: &str = "ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you\u{2019}re not a bot. \
+    Use --cookies-from-browser or --cookies for the authentication.";
+
+/// A yt-dlp in `dir` that meets the bot check on its first `n` runs and
+/// then runs `inner` as it was asked. Every run's identity (its proxy's
+/// user name, empty without one) is kept, in order (see `identities_of`).
+pub fn bot_checked_ytdlp(dir: &std::path::Path, inner: &str, n: u32) -> String {
+    let script = r#"d='@DIR@'
+conf=""
+prev=""
+for a in "$@"; do [ "$prev" = --config-locations ] && conf="$a"; prev="$a"; done
+who=$(sed -n "s|.*--proxy 'socks5h://\([^:]*\):.*|\1|p" "$conf")
+echo "$who" >> "$d/identities"
+k=$(cat "$d/bot-runs" 2>/dev/null || echo 0)
+echo $((k + 1)) > "$d/bot-runs.new" && mv "$d/bot-runs.new" "$d/bot-runs"
+if [ "$k" -lt @N@ ]; then
+  cat "$d/bot-check" >&2
+  exit 1
+fi
+exec '@INNER@' "$@"
+"#
+    .replace("@DIR@", &dir.display().to_string())
+    .replace("@N@", &n.to_string())
+    .replace("@INNER@", inner);
+    std::fs::write(dir.join("bot-check"), format!("{BOT_CHECK}\n")).unwrap();
+    crate::store::testing::script(&dir.join("yt-dlp-bot"), &script)
+}
+
+/// The identities a `bot_checked_ytdlp` in `dir` ran on, in order.
+pub fn identities_of(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("identities"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

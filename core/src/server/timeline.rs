@@ -160,10 +160,18 @@ const WAIT_POLL: Duration = Duration::from_millis(250);
 /// a skipped one.
 const STALL: Duration = Duration::from_secs(10);
 /// A request made again this many times in a row without a byte more coming
-/// in is given up on.
-const STRIKES: u32 = 2;
+/// in is given up on: on a route that isolates, a stall is made again on a
+/// fresh client of the same identity, and a second stall in a row on a
+/// fresh identity (see `recover`); the third is the end of it. Three
+/// stalls and one lookup take about 45 s over Tor, within the player's
+/// own network timeout (60 s), so that it sees a slow segment, not a gap.
+const STRIKES: u32 = 3;
 /// The most requests one fetch makes, however much each brings.
 const TRIES: u32 = 8;
+/// How long the join's segments, fetched before the player asks for them
+/// (see `begin`), wait for it to: it asks within seconds, unless the
+/// window has gone somewhere else meanwhile.
+const WARM_FOR: Duration = Duration::from_secs(60);
 /// How much of a body is read, or written to the player, at a time.
 const CHUNK: usize = 64 << 10;
 
@@ -235,6 +243,9 @@ struct Upstream {
     video: Track,
     audio: Track,
     headers: Vec<(String, String)>,
+    /// The identity the URLs were looked up on: on a route that isolates,
+    /// the only one they work from. A fresh client is made on it.
+    ident: Net,
     client: Client,
 }
 
@@ -453,6 +464,10 @@ pub(super) struct LiveSession {
     /// Told when the head moves, a segment comes in, or the session ends.
     changed: Condvar,
     held: [Mutex<Held>; 2],
+    /// The join's segments, fetched before the player asks (see `begin`
+    /// and `take_warm`), and until when they wait for it.
+    warm: [Mutex<Held>; 2],
+    warm_until: Mutex<Option<Instant>>,
     clock: Mutex<Clock>,
     /// Set when the session ends: evicted, the route changed, or another
     /// video played. Every thread of it stops before its next request.
@@ -469,15 +484,18 @@ pub(super) struct LiveSession {
 }
 
 impl LiveSession {
+    /// A session for the stream `s`, looked up on `ident`, a pinned
+    /// identity of `route`, which its requests go out on.
     pub(super) fn new(
         source: VideoRef,
         max_height: u32,
         route: Net,
         s: &LiveStreams,
-        client: Client,
-    ) -> Self {
+        ident: Net,
+    ) -> Result<Self> {
         let now = Instant::now();
-        LiveSession {
+        let client = ident.relay_client()?;
+        Ok(LiveSession {
             source,
             max_height,
             route,
@@ -487,6 +505,7 @@ impl LiveSession {
                 video: s.video.clone(),
                 audio: s.audio.clone(),
                 headers: s.headers.clone(),
+                ident,
                 client,
             }),
             refreshing: Mutex::new(()),
@@ -499,6 +518,8 @@ impl LiveSession {
             }),
             changed: Condvar::new(),
             held: Default::default(),
+            warm: Default::default(),
+            warm_until: Mutex::new(None),
             clock: Mutex::new(Clock {
                 fetched: None,
                 polled: now,
@@ -512,7 +533,7 @@ impl LiveSession {
             target: s.target,
             ended_at_open: s.ended,
             stall_ms: AtomicU64::new(STALL.as_millis() as u64),
-        }
+        })
     }
 
     fn is_cancelled(&self) -> bool {
@@ -540,23 +561,32 @@ impl LiveSession {
     }
 
     /// Learns where the stream is before the player is told of it: the head,
-    /// from the final answer to a HEAD of the video's base (googlevideo
-    /// redirects it, and the host it ends on is the one that knows), and
+    /// from the final answer to a HEAD of a track's base (googlevideo may
+    /// redirect it, and the host it ends on is the one that knows), and
     /// whether the oldest segment the window allows is still there. If it
     /// isn't (the streamer turned rewinding off), the playlist starts three
     /// segments back. Returns whether it can be rewound. A stream that is
     /// only a list of fragments has nothing to learn.
-    pub(super) fn begin(&self, server: &Server) -> Result<bool> {
+    ///
+    /// Both tracks' bases are asked at once, and the first answer with the
+    /// head is taken (the other track's host is reached meanwhile, for the
+    /// requests that follow). As soon as the head is known, the segments
+    /// the player joins at (the last `HELD` of each track) start coming in,
+    /// while the rest of this, the answer and the player's start take
+    /// their time: its first requests find them on their way (see
+    /// `take_warm`).
+    pub(super) fn begin(self: &Arc<Self>, server: &Arc<Server>) -> Result<bool> {
         if !matches!(self.fragments, Fragments::Numbered) {
             return Ok(true);
         }
         let began = Instant::now();
-        let head = match self.request(server, Method::HEAD, Kind::Video, None, None) {
-            Ok(a) if a.status.is_success() => a.head.context(NO_HEAD)?,
-            Ok(a) => bail!("The stream's server answered {}.", a.status.as_u16()),
-            Err(f) => bail!("{f}"),
-        };
+        let head = self.first_head(server)?;
         trace!("begin head={head} after_ms={}", ms(began));
+        lock(&self.span).head = head;
+        // (Off only in the tests that count every request upstream.)
+        if !self.ended_at_open && server.warming.load(Ordering::Relaxed) {
+            self.warm_join(server, head);
+        }
         let mut oldest = oldest_for(head, self.target);
         if oldest + 3 < head
             && let Ok(a) = self.request(server, Method::HEAD, Kind::Audio, Some(oldest), None)
@@ -570,6 +600,60 @@ impl LiveSession {
         span.head = span.head.max(head);
         span.ended = self.ended_at_open;
         Ok(oldest + 3 < span.head)
+    }
+
+    /// The head, from whichever track's base answers with it first (see
+    /// `begin`). The other's request goes on by itself, and what it says
+    /// of the head is taken too. An error only if neither can say.
+    fn first_head(self: &Arc<Self>, server: &Arc<Server>) -> Result<u64> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for kind in [Kind::Video, Kind::Audio] {
+            let (s, server, sender) = (Arc::clone(self), Arc::clone(server), tx.clone());
+            let spawned = std::thread::Builder::new().spawn(move || {
+                let said = match s.request(&server, Method::HEAD, kind, None, None) {
+                    Ok(a) if a.status.is_success() => a.head.context(NO_HEAD),
+                    Ok(a) => Err(anyhow::anyhow!(
+                        "The stream's server answered {}.",
+                        a.status.as_u16()
+                    )),
+                    Err(f) => Err(anyhow::anyhow!("{f}")),
+                };
+                let _ = sender.send((kind, said));
+            });
+            if let Err(e) = spawned {
+                let _ = tx.send((kind, Err(e).context("too busy to ask the stream's server")));
+            }
+        }
+        drop(tx);
+        let mut failed = None;
+        for (kind, said) in rx {
+            match said {
+                Ok(head) => return Ok(head),
+                // The video's reason is the one given, if both fail.
+                Err(e) if kind == Kind::Video || failed.is_none() => failed = Some(e),
+                Err(_) => {}
+            }
+        }
+        Err(failed.unwrap_or_else(|| anyhow::anyhow!(NO_HEAD)))
+    }
+
+    /// Starts fetching the segments a player joins at, `head - 3..=head` of
+    /// both tracks, before it asks (see `begin`).
+    fn warm_join(self: &Arc<Self>, server: &Arc<Server>, head: u64) {
+        *lock(&self.warm_until) = Some(Instant::now() + WARM_FOR);
+        for kind in [Kind::Video, Kind::Audio] {
+            let mut warm = lock(&self.warm[kind.index()]);
+            for n in head.saturating_sub(HELD as u64 - 1)..=head {
+                let fetch = Arc::new(Fetch::new());
+                warm.push_back((n, Arc::clone(&fetch)));
+                self.fetch_in_background(server, kind, n, fetch);
+            }
+            trace!(
+                "warm {} {:?}",
+                kind.letter(),
+                warm.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Starts watching the head of a running stream (see `watch_head`).
@@ -775,12 +859,16 @@ impl LiveSession {
                 return respond(out, 502, "text/plain", f.to_string().as_bytes());
             }
         };
-        write!(
+        let head = write!(
             out,
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {length}\r\n\
              Cache-Control: no-store\r\nConnection: close\r\n\r\n",
             content_type(ext),
-        )?;
+        );
+        if let Err(e) = head {
+            self.hung_up(kind, fetch);
+            return Err(e.into());
+        }
         trace!(
             "serve {} n={n} len={length} head_ms={}",
             kind.letter(),
@@ -812,6 +900,7 @@ impl LiveSession {
             ms(asked)
         );
         if how == "hung-up" {
+            self.hung_up(kind, fetch);
             bail!("the player hung up");
         }
         Ok(())
@@ -906,6 +995,7 @@ impl LiveSession {
         };
         let until = n.saturating_add(AHEAD).min(last).max(n);
         let mut held = lock(&self.held[kind.index()]);
+        self.take_warm(kind, n, &mut held);
         let reading_on = held
             .front()
             .is_some_and(|(first, _)| (*first..=first + HELD as u64).contains(&n));
@@ -944,6 +1034,50 @@ impl LiveSession {
             .map(|(_, f)| Arc::clone(f))
             .unwrap_or_else(|| Arc::new(Fetch::failed(Failure::Broke("not held".into()))));
         Reading::new(&fetch)
+    }
+
+    /// The join's segments (see `warm_join`) become what is held once the
+    /// player asks for one of them: those from it on, which it reads on
+    /// from, in place of whatever was held. A request for any other segment
+    /// leaves them be: FFmpeg reads the first segments of a playlist when it
+    /// opens it, and only then goes to where it was told to start. They go
+    /// once the player asks for one past them, or after `WARM_FOR`.
+    fn take_warm(&self, kind: Kind, n: u64, held: &mut Held) {
+        let mut warm = lock(&self.warm[kind.index()]);
+        let Some(&(last, _)) = warm.back() else {
+            return;
+        };
+        if warm.iter().any(|(m, _)| *m == n) {
+            for (_, f) in held.drain(..) {
+                f.drop_it();
+            }
+            for (m, f) in warm.drain(..) {
+                if m >= n && !f.broke() {
+                    held.push_back((m, f));
+                } else {
+                    f.drop_it();
+                }
+            }
+            trace!("took warm {} n={n}", kind.letter());
+        } else if n > last || lock(&self.warm_until).is_none_or(|t| Instant::now() >= t) {
+            for (_, f) in warm.drain(..) {
+                f.drop_it();
+            }
+            trace!("dropped warm {} n={n}", kind.letter());
+        }
+    }
+
+    /// The player hung up on `fetch` before it had all of it (FFmpeg does,
+    /// on a seek): unless another request is serving it, it is no longer
+    /// held, and stops being fetched at once instead of coming in whole for
+    /// nobody. Asked for again, it is fetched anew.
+    fn hung_up(&self, kind: Kind, fetch: &Arc<Fetch>) {
+        if fetch.readers.load(Ordering::Acquire) > 1 || lock(&fetch.got).done.is_some() {
+            return;
+        }
+        lock(&self.held[kind.index()]).retain(|(_, f)| !Arc::ptr_eq(f, fetch));
+        lock(&self.warm[kind.index()]).retain(|(_, f)| !Arc::ptr_eq(f, fetch));
+        fetch.drop_it();
     }
 
     fn fetch_in_background(
@@ -1050,7 +1184,7 @@ impl LiveSession {
     ) -> Result<Answer, Failure> {
         let mut up = lock(&self.upstream).clone();
         let mut relooked = false;
-        let (mut strikes, mut tries) = (0, 0);
+        let (mut strikes, mut tries, mut stalls) = (0, 0, 0);
         loop {
             if self.is_cancelled() || into.is_some_and(Fetch::unwanted) {
                 return Err(Failure::Cancelled);
@@ -1106,21 +1240,24 @@ impl LiveSession {
                 return Err(Failure::Cancelled);
             }
             tries += 1;
-            strikes = if into.is_some_and(|f| f.len() > from) {
-                0
+            if into.is_some_and(|f| f.len() > from) {
+                (strikes, stalls) = (0, 0);
             } else {
-                strikes + 1
-            };
+                strikes += 1;
+            }
+            if failed.stalled {
+                stalls += 1;
+            }
             if failed.fatal || strikes >= STRIKES || tries >= TRIES {
                 return Err(Failure::Broke(failed.text));
             }
             trace!(
-                "failed {method} {} n={n:?} stalled={} strikes={strikes} tries={tries}",
+                "failed {method} {} n={n:?} stalled={} strikes={strikes} stalls={stalls} tries={tries}",
                 kind.letter(),
                 failed.stalled
             );
             up = self
-                .recover(server, &up, failed.stalled)
+                .recover(server, &up, failed.stalled.then_some(stalls))
                 .ok_or(Failure::Broke(failed.text))?;
         }
     }
@@ -1289,29 +1426,36 @@ impl LiveSession {
 
     /// What a request on `seen` goes on with after it failed before its
     /// end: `None` to give up. One that broke is made again on the same
-    /// client (a new connection, the same identity). One that stalled may
-    /// be stuck on a circuit that stopped moving, so the client is replaced,
-    /// if it is still the session's (requests that stalled together make one
-    /// replacement), at most once every `RECOVER_EVERY` (within that, the
-    /// request is made again on the client there is). On a route that
-    /// isolates, a new client is a new identity that the URLs don't work
-    /// from, so the stream is looked up again instead, as `Server::recover`
-    /// does. `None` too once the session is over or the route has changed.
-    fn recover(&self, server: &Server, seen: &Upstream, stalled: bool) -> Option<Upstream> {
+    /// client (a new connection, the same identity). One that stalled
+    /// (`stalls` is how many times in a row it has, without a byte more)
+    /// may be stuck on a connection or a circuit that stopped moving, so the
+    /// client is replaced, if it is still the session's (requests that
+    /// stalled together make one replacement): by a fresh client on the
+    /// same identity, which the URLs still work from, so that a segment
+    /// resumes from the byte it had got to, of the same cut. Tor gives the
+    /// new connection the same circuit if that one still works, and a new
+    /// one if it doesn't. On a route that isolates, a second stall in a row
+    /// looks the stream up again instead, on a fresh identity (at most once
+    /// every `RECOVER_EVERY`; within that, the request is made again on the
+    /// client there is), as `Server::recover` does; a 403 (see `request`)
+    /// does at once. `None` too once the session is over or the route has
+    /// changed.
+    fn recover(&self, server: &Server, seen: &Upstream, stalls: Option<u32>) -> Option<Upstream> {
         if self.is_cancelled() || !server.runtime().net.same_route(&self.route) {
             return None;
         }
         let isolating = self.route.isolates();
-        let _one = (stalled && isolating).then(|| lock(&self.refreshing));
+        let relook = isolating && stalls.is_some_and(|k| k >= 2);
+        let _one = relook.then(|| lock(&self.refreshing));
         let mut up = lock(&self.upstream);
-        if up.generation != seen.generation || up.dial != seen.dial || !stalled {
+        if up.generation != seen.generation || up.dial != seen.dial || stalls.is_none() {
             return Some(up.clone());
         }
-        if !self.may_recover() {
-            return Some(up.clone());
-        }
-        trace!("recover stalled={stalled} isolating={isolating}");
-        if isolating {
+        trace!("recover stalls={stalls:?} relook={relook}");
+        if relook {
+            if !self.may_recover() {
+                return Some(up.clone());
+            }
             drop(up);
             return match self.relook(server, seen.generation) {
                 Ok((fresh, _)) => Some(fresh),
@@ -1321,7 +1465,7 @@ impl LiveSession {
                 }
             };
         }
-        up.client = self.route.pinned().relay_client().ok()?;
+        up.client = up.ident.relay_client().ok()?;
         up.dial += 1;
         Some(up.clone())
     }
@@ -1365,17 +1509,19 @@ impl LiveSession {
         {
             bail!("{why}");
         }
-        let yt = rt.pinned_ytdlp();
         let abort = || self.is_cancelled();
         let t = Instant::now();
-        let found = yt.live_until(&self.source.watch_url(), self.max_height, &abort);
-        trace!("relook ms={} ok={}", ms(t), found.is_ok());
-        let found = server.guarded(&rt, found).and_then(|o| match o {
-            Opening::Live(s) => Ok(s),
-            _ => bail!(NOT_LIVE),
+        // A bot check is met on a fresh identity again (see
+        // `Server::fresh_on_bot_check`); the URLs are of the one that got through.
+        let found = server.fresh_on_bot_check(&rt, &abort, |yt| {
+            match yt.live_until(&self.source.watch_url(), self.max_height, &abort)? {
+                Opening::Live(s) => Ok((s, yt.net)),
+                _ => bail!(NOT_LIVE),
+            }
         });
-        let s = match found {
-            Ok(s) => s,
+        trace!("relook ms={} ok={}", ms(t), found.is_ok());
+        let (s, ident) = match server.guarded(&rt, found) {
+            Ok(found) => found,
             Err(e) => {
                 if !self.is_cancelled() {
                     *lock(&self.failed) = Some((seen, Instant::now(), format!("{e:#}")));
@@ -1389,7 +1535,8 @@ impl LiveSession {
             video: s.video,
             audio: s.audio,
             headers: s.headers,
-            client: yt.net.relay_client()?,
+            client: ident.relay_client()?,
+            ident,
         };
         *lock(&self.upstream) = fresh.clone();
         Ok((fresh, s.ended))
@@ -1904,18 +2051,17 @@ mod serving {
             });
             drop(c);
         }
-        // Twenty were started; only the last seek's are still wanted.
-        wait_for(
-            "the fetches the seeks dropped to stop",
-            Duration::from_secs(3),
-            || st.up.in_flight() <= HELD,
-        );
+        // Twenty were started; only the last seek's are still wanted: those
+        // ahead of it go on, for the player to read on with, and the one it
+        // hung up on part way is not fetched for nobody.
+        let until = Instant::now() + Duration::from_secs(5);
+        while st.up.in_flight() != AHEAD as usize && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         for _ in 0..10 {
-            assert!(st.up.in_flight() <= HELD, "{}", st.up.in_flight());
+            assert_eq!(st.up.in_flight(), AHEAD as usize);
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Those of the last seek go on, for the player to read on with.
-        assert_eq!(st.up.in_flight(), HELD);
         // And none that was dropped was asked for again.
         for n in [10, 30, 50, 70, 90] {
             assert_eq!(st.asked(&sq("v", n)), 1, "{n}");
@@ -2277,13 +2423,16 @@ mod serving {
 
     fn session_at(s: &Server, video: &str) -> Arc<LiveSession> {
         let rt = s.runtime();
-        Arc::new(LiveSession::new(
-            test_video(),
-            1080,
-            rt.net.clone(),
-            &streams_at(video, video),
-            rt.net.pinned().relay_client().unwrap(),
-        ))
+        Arc::new(
+            LiveSession::new(
+                test_video(),
+                1080,
+                rt.net.clone(),
+                &streams_at(video, video),
+                rt.net.pinned(),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -2386,5 +2535,325 @@ cat '{}'"#,
             state(&st, &sid),
             serde_json::json!({"state":"ended","head":2,"oldest":0})
         );
+    }
+
+    /// A stream on an isolating route: through a `Hop`, which keeps the
+    /// identity of each connection, with a yt-dlp that meets the bot check
+    /// on its first `bot_checks` runs.
+    struct OnTor {
+        st: Stream,
+        hop: Hop,
+    }
+
+    fn stream_on_tor(target_ms: u64, first: u64, head: u64, bot_checks: u32) -> OnTor {
+        let up = LiveUpstream::start(target_ms, first, head);
+        let bin = TempDir::new();
+        let inner = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let ytdlp = bot_checked_ytdlp(&bin.0, &inner, bot_checks);
+        let hop = Hop::start();
+        let cfg = Config {
+            proxy: Some(hop.proxy()),
+            isolate_circuits: true,
+            ..Config::default()
+        };
+        OnTor {
+            st: stream_with(up, bin, ytdlp, cfg),
+            hop,
+        }
+    }
+
+    impl OnTor {
+        /// The identities the stream's requests came over.
+        fn identities(&self) -> Vec<String> {
+            let port = self.st.up.base.rsplit(':').next().unwrap().parse().unwrap();
+            self.hop.identities_to(port)
+        }
+
+        fn play_live(&self) -> (u16, Value) {
+            let target = path(&self.st.base, &format!("{PLAY}&live=now"));
+            let (status, body) = http(&self.st.base, "POST", &target, "");
+            (status, serde_json::from_str(&body).unwrap())
+        }
+    }
+
+    #[test]
+    fn a_stall_on_tor_is_made_again_on_the_same_identity_first() {
+        let t = stream_on_tor(60_000, 0, 20, 0);
+        let sid = sid_of(&t.play_live().1);
+        t.st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
+        t.st.up.freeze(10);
+        let (status, _, body) = t.st.segment(&sid, "v", 10);
+        assert_eq!(status, 200);
+        assert_eq!(body, live_segment("v", 10));
+        // A fresh connection on the identity the URLs are for: they still
+        // work from it, and nothing was looked up again.
+        assert_eq!(t.st.asked(&sq("v", 10)), 2);
+        assert_eq!(t.st.live_lookups(), 1);
+        assert_eq!(t.identities().len(), 1, "{:?}", t.identities());
+    }
+
+    #[test]
+    fn a_segment_cut_on_tor_resumes_on_the_same_url_and_identity() {
+        let t = stream_on_tor(60_000, 0, 20, 0);
+        let sid = sid_of(&t.play_live().1);
+        t.st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
+        t.st.up.cut(10, 20_000);
+        let (status, _, body) = t.st.segment(&sid, "v", 10);
+        assert_eq!(status, 200);
+        // Every byte once, in order, of the same cut of the segment.
+        assert_eq!(body, live_segment("v", 10));
+        assert_eq!(
+            t.st.up.ranges_of(&sq("v", 10)),
+            [None, Some("bytes=20000-".to_string())]
+        );
+        assert_eq!(t.st.live_lookups(), 1);
+        assert_eq!(t.identities().len(), 1, "{:?}", t.identities());
+    }
+
+    #[test]
+    fn a_second_stall_in_a_row_on_tor_looks_the_stream_up_again_on_a_fresh_identity() {
+        let t = stream_on_tor(60_000, 0, 20, 0);
+        let sid = sid_of(&t.play_live().1);
+        t.st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
+        // The circuit is stuck for good: the fresh connection on it stalls too.
+        t.st.up.freeze_times(10, 2);
+        let asked = Instant::now();
+        let (status, _, body) = t.st.segment(&sid, "v", 10);
+        assert_eq!(status, 200);
+        assert_eq!(body, live_segment("v", 10));
+        assert!(asked.elapsed() >= Duration::from_millis(600));
+        assert_eq!(t.st.asked(&sq("v", 10)), 2);
+        assert_eq!(t.st.live_lookups(), 2);
+        // The third request was the new lookup's, over its own identity.
+        assert!(
+            t.st.up.requests().contains(&"/live/1/v&sq=10".to_string()),
+            "{:?}",
+            t.st.up.requests()
+        );
+        assert_eq!(t.identities().len(), 2, "{:?}", t.identities());
+    }
+
+    #[test]
+    fn the_join_segments_come_in_before_the_player_asks() {
+        let st = stream(60_000, 0, 20);
+        st.s.warming.store(true, Ordering::Relaxed);
+        let sid = st.open();
+        // The last four of each track, the player's first asks at its join.
+        wait_for("the join to come in", Duration::from_secs(5), || {
+            (17..=20).all(|n| st.asked(&sq("v", n)) == 1 && st.asked(&sq("a", n)) == 1)
+        });
+        // FFmpeg reads the first segments when it opens the playlist, before
+        // it goes to the join: that doesn't drop them.
+        assert_eq!(st.segment(&sid, "v", 0).2, live_segment("v", 0));
+        assert_eq!(st.segment(&sid, "a", 0).2, live_segment("a", 0));
+        // Then the join is had without asking upstream again, and read on from.
+        for n in 18..=20 {
+            assert_eq!(st.segment(&sid, "v", n).2, live_segment("v", n));
+            assert_eq!(st.segment(&sid, "a", n).2, live_segment("a", n));
+            assert_eq!(st.asked(&sq("v", n)), 1, "{n}");
+            assert_eq!(st.asked(&sq("a", n)), 1, "{n}");
+        }
+        // The one before the join, which the player didn't need, was let go.
+        assert_eq!(st.asked(&sq("v", 17)), 1);
+    }
+
+    #[test]
+    fn the_head_is_taken_from_whichever_track_says_it_first() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        // The video's host doesn't answer; the audio's does.
+        up.hold_base("v");
+        let bin = TempDir::new();
+        let ytdlp = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let st = stream_with(up, bin, ytdlp, Config::default());
+        let asked = Instant::now();
+        let v = st.play();
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(v["live"]["rewind"], true);
+        assert_eq!(*st.listed(&sid_of(&v)).0.last().unwrap(), 20);
+    }
+
+    #[test]
+    fn a_player_that_hangs_up_part_way_stops_that_fetch_at_once() {
+        let st = stream(60_000, 0, 100);
+        let sid = st.open();
+        // Each segment takes about 6 s to come in.
+        st.up.trickle(100);
+        let mut c = TcpStream::connect(addr(&st.base)).unwrap();
+        write!(
+            c,
+            "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
+            path(&st.base, &format!("live/{sid}/v/5.mkv"))
+        )
+        .unwrap();
+        let mut b = [0u8; 4096];
+        c.read_exact(&mut b).unwrap();
+        wait_for("the read-ahead", Duration::from_secs(5), || {
+            st.up.in_flight() == HELD
+        });
+        drop(c);
+        // The one it hung up on stops within a poll or two; those ahead go on.
+        let gone = Instant::now();
+        wait_for("its fetch to stop", Duration::from_secs(3), || {
+            st.up.in_flight() == AHEAD as usize
+        });
+        assert!(
+            gone.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            gone.elapsed()
+        );
+        // Asked for again, it is fetched anew, from the start.
+        st.up.trickle(0);
+        assert_eq!(st.segment(&sid, "v", 5).2, live_segment("v", 5));
+        assert_eq!(st.asked(&sq("v", 5)), 2);
+    }
+
+    #[test]
+    fn a_stream_the_card_says_is_live_skips_the_usual_lookup() {
+        let st = stream(60_000, 0, 20);
+        let target = path(&st.base, &format!("{PLAY}&live=now"));
+        let (status, body) = http(&st.base, "POST", &target, "");
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["live"]["state"], "now");
+        // One run, and it was the live lookup.
+        assert_eq!(runs(&st.bin.0), 1);
+        assert_eq!(st.live_lookups(), 1);
+    }
+
+    #[test]
+    fn a_stream_a_list_said_was_live_skips_the_usual_lookup() {
+        let st = stream(60_000, 0, 20);
+        st.s.marks
+            .found("dQw4w9WgXcQ", Some(crate::video::LiveState::Now));
+        assert_eq!(st.play()["live"]["state"], "now");
+        assert_eq!(runs(&st.bin.0), 1);
+        // And one it said nothing of is looked up the usual way first.
+        let other = stream(60_000, 0, 20);
+        assert_eq!(other.play()["live"]["state"], "now");
+        assert_eq!(runs(&other.bin.0), 2);
+        // Once a play has found it live, playing it again skips it too.
+        assert_eq!(other.play()["live"]["state"], "now");
+        assert_eq!(runs(&other.bin.0), 3);
+    }
+
+    #[test]
+    fn a_stream_the_card_says_is_coming_is_asked_once() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let ytdlp = fake_live_ytdlp_upcoming(&bin.0, &up, 1, 1_800_000_000)
+            .display()
+            .to_string();
+        let st = stream_with(up, bin, ytdlp, Config::default());
+        let target = path(&st.base, &format!("{PLAY}&live=upcoming"));
+        let (status, body) = http(&st.base, "POST", &target, "");
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["waiting"]["starts"], 1_800_000_000);
+        assert_eq!(runs(&st.bin.0), 1);
+    }
+
+    /// A yt-dlp whose live lookup finds an ordinary video, which the usual
+    /// lookup plays from `url`, and which counts its runs.
+    fn ordinary_ytdlp(dir: &std::path::Path, url: &str) -> String {
+        let script = r#"n=$(cat '@DIR@/runs' 2>/dev/null || echo 0)
+echo $((n + 1)) > '@DIR@/runs.new' && mv '@DIR@/runs.new' '@DIR@/runs'
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+if grep -qx -- --live-from-start "$conf"; then
+  echo '{"title":"T","live_status":"not_live","formats":[{"format_id":"18","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a","height":360,"url":"@URL@"}]}'
+else
+  echo '{"title":"T","requested_formats":[{"url":"@URL@","protocol":"https","vcodec":"avc1"},{"url":"@URL@","protocol":"https","vcodec":"none"}]}'
+fi
+"#
+        .replace("@DIR@", &dir.display().to_string())
+        .replace("@URL@", url);
+        crate::store::testing::script(&dir.join("yt-dlp"), &script)
+    }
+
+    #[test]
+    fn a_card_that_wrongly_says_live_still_plays_the_video() {
+        let bin = TempDir::new();
+        let ytdlp = ordinary_ytdlp(&bin.0, "http://127.0.0.1:1/v");
+        let (_s, base, _d) = server_with(Config {
+            ytdlp,
+            ..Config::default()
+        });
+        let target = path(&base, &format!("{PLAY}&live=now"));
+        let (status, body) = http(&base, "POST", &target, "");
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        // Played as the video it is, from the usual lookup after the live one.
+        assert!(v.get("live").is_none(), "{v}");
+        assert!(v["video"].as_str().unwrap().contains("/s/"), "{v}");
+        assert_eq!(runs(&bin.0), 2);
+    }
+
+    #[test]
+    fn a_bot_check_on_tor_is_asked_again_on_fresh_circuits() {
+        let t = stream_on_tor(60_000, 0, 20, 2);
+        let (status, v) = t.play_live();
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["live"]["state"], "now");
+        // Three runs, each on an identity of its own.
+        let ran = identities_of(&t.st.bin.0);
+        assert_eq!(ran.len(), 3, "{ran:?}");
+        assert!(ran.iter().all(|w| !w.is_empty()), "{ran:?}");
+        assert!(
+            ran[0] != ran[1] && ran[1] != ran[2] && ran[0] != ran[2],
+            "{ran:?}"
+        );
+        // The stream is fetched on the one that got through, and only on it.
+        let sid = sid_of(&v);
+        assert_eq!(t.st.segment(&sid, "v", 10).0, 200);
+        assert_eq!(t.identities(), [ran[2].clone()]);
+    }
+
+    #[test]
+    fn three_bot_checks_in_a_row_are_the_answer() {
+        let t = stream_on_tor(60_000, 0, 20, 3);
+        let (status, v) = t.play_live();
+        assert_eq!(status, 500, "{v}");
+        assert_eq!(v["code"], "bot_check", "{v}");
+        assert_eq!(identities_of(&t.st.bin.0).len(), 3);
+        assert!(t.identities().is_empty());
+    }
+
+    #[test]
+    fn a_bot_check_on_a_route_that_does_not_isolate_is_the_answer_at_once() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let inner = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let ytdlp = bot_checked_ytdlp(&bin.0, &inner, 1);
+        let st = stream_with(up, bin, ytdlp, Config::default());
+        let target = path(&st.base, &format!("{PLAY}&live=now"));
+        let (status, body) = http(&st.base, "POST", &target, "");
+        assert_eq!(status, 500, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["code"],
+            "bot_check"
+        );
+        assert_eq!(identities_of(&st.bin.0).len(), 1);
+    }
+
+    #[test]
+    fn a_bot_check_on_tor_is_asked_again_for_an_ordinary_video_too() {
+        let bin = TempDir::new();
+        let inner = fake_ytdlp(&bin.0, "http://127.0.0.1:1/v");
+        let ytdlp = bot_checked_ytdlp(&bin.0, &inner, 1);
+        let (_s, base, _d) = server_with(Config {
+            ytdlp,
+            proxy: Some("socks5h://127.0.0.1:9".into()),
+            isolate_circuits: true,
+            ..Config::default()
+        });
+        let (status, body) = http(&base, "POST", &path(&base, PLAY), "");
+        assert_eq!(status, 200, "{body}");
+        let ran = identities_of(&bin.0);
+        assert_eq!(ran.len(), 2, "{ran:?}");
+        assert_ne!(ran[0], ran[1]);
+        assert_eq!(runs(&bin.0), 1);
     }
 }
