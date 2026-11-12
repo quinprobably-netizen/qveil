@@ -1194,7 +1194,7 @@ impl LiveSession {
             let sent_at = Instant::now();
             let answer = self.send(&up, &method, &url, from);
             trace!(
-                "up {method} {} n={n:?} from={from} gen={} dial={} -> {} redirected={} ms={}",
+                "up {method} {} n={n:?} from={from} gen={} dial={} -> {} length={:?} redirected={} ms={}",
                 kind.letter(),
                 up.generation,
                 up.dial,
@@ -1203,6 +1203,7 @@ impl LiveSession {
                     Err(b) if b.stalled => "stalled".to_string(),
                     Err(_) => "broke".to_string(),
                 },
+                answer.as_ref().ok().and_then(|r| r.content_length()),
                 answer.as_ref().is_ok_and(|r| r.url().as_str() != url),
                 ms(sent_at)
             );
