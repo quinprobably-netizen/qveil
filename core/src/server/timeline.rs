@@ -2919,7 +2919,8 @@ fi
         let bin = TempDir::new();
         let inner = fake_live_ytdlp(&bin.0, &up).display().to_string();
         // With --ignore-no-formats-error, a bot check is a warning and an
-        // answer without formats or a live status, the first time.
+        // answer without a live status or anything to play but the
+        // storyboards, the first time.
         let ytdlp = crate::store::testing::script(
             &bin.0.join("yt-dlp-warned"),
             &format!(
@@ -2927,7 +2928,7 @@ fi
 if [ ! -e "$d/warned" ]; then
   touch "$d/warned"
   echo "WARNING: [youtube] dQw4w9WgXcQ: Sign in to confirm you\u{{2019}}re not a bot." >&2
-  echo '{{"id":"dQw4w9WgXcQ","title":"dQw4w9WgXcQ","formats":[]}}'
+  echo '{{"id":"dQw4w9WgXcQ","title":"dQw4w9WgXcQ","formats":[{{"format_id":"sb0","ext":"mhtml","protocol":"mhtml","vcodec":"none","acodec":"none","url":"http://127.0.0.1:1/sb"}}]}}'
   exit 0
 fi
 exec '{inner}' "$@"

@@ -346,16 +346,17 @@ impl Ytdlp {
     /// The live lookup's answer (see `LIVE_LOOKUP`). With
     /// `--ignore-no-formats-error`, yt-dlp answers even when YouTube asked
     /// this address for a bot check instead of saying anything of the
-    /// video: it only warns, and the answer has neither formats nor a live
-    /// status. That is the bot check's error, as if it had failed, so that
-    /// it is asked again on a fresh identity, not taken for an ordinary
-    /// video and looked up again the usual way.
+    /// video: it only warns, and the answer has no live status and nothing
+    /// to play (at most the storyboards). That is the bot check's error, as
+    /// if it had failed, so that it is asked again on a fresh identity, not
+    /// taken for an ordinary video and looked up again the usual way (which
+    /// the same identity is refused, measured).
     fn live_json(&self, url: &str, abort: &dyn Fn() -> bool) -> Result<Value> {
         let (v, said) = self.json_and_warnings(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
-        let said_nothing =
-            live_state(&v).is_none() && v["formats"].as_array().is_none_or(|f| f.is_empty());
         let said = String::from_utf8_lossy(&said);
-        if said_nothing && let Some(line) = said.lines().rev().find(|l| l.contains("not a bot")) {
+        if live_state(&v).is_none()
+            && let Some(line) = said.lines().rev().find(|l| l.contains("not a bot"))
+        {
             return Err(self.failure(line.as_bytes()));
         }
         Ok(v)
