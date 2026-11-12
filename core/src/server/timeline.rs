@@ -2895,4 +2895,41 @@ fi
         assert_ne!(ran[0], ran[1]);
         assert_eq!(runs(&bin.0), 1);
     }
+
+    #[test]
+    fn a_bot_check_that_yt_dlp_only_warns_of_is_asked_again_too() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let inner = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        // With --ignore-no-formats-error, a bot check is a warning and an
+        // answer without formats or a live status, the first time.
+        let ytdlp = crate::store::testing::script(
+            &bin.0.join("yt-dlp-warned"),
+            &format!(
+                r#"d='{d}'
+if [ ! -e "$d/warned" ]; then
+  touch "$d/warned"
+  echo "WARNING: [youtube] dQw4w9WgXcQ: Sign in to confirm you\u{{2019}}re not a bot." >&2
+  echo '{{"id":"dQw4w9WgXcQ","title":"dQw4w9WgXcQ","formats":[]}}'
+  exit 0
+fi
+exec '{inner}' "$@"
+"#,
+                d = bin.0.display()
+            ),
+        );
+        let hop = Hop::start();
+        let cfg = Config {
+            proxy: Some(hop.proxy()),
+            isolate_circuits: true,
+            ..Config::default()
+        };
+        let st = stream_with(up, bin, ytdlp, cfg);
+        let target = path(&st.base, &format!("{PLAY}&live=now"));
+        let (status, body) = http(&st.base, "POST", &target, "");
+        assert_eq!(status, 200, "{body}");
+        // Asked again as live at once: no usual lookup in between.
+        assert_eq!(runs(&st.bin.0), 1);
+        assert_eq!(st.live_lookups(), 1);
+    }
 }

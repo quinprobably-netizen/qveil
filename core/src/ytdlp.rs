@@ -309,6 +309,20 @@ impl Ytdlp {
         limit: Duration,
         abort: &dyn Fn() -> bool,
     ) -> Result<Value> {
+        Ok(self
+            .json_and_warnings(args, extractor_args, target, limit, abort)?
+            .0)
+    }
+
+    /// `json_with`, and what yt-dlp said on stderr while it went well.
+    fn json_and_warnings(
+        &self,
+        args: &[&str],
+        extractor_args: Option<&str>,
+        target: &str,
+        limit: Duration,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<(Value, Vec<u8>)> {
         // yt-dlp would create it with the default mode, and every directory
         // above it that doesn't exist yet along with it.
         crate::store::ensure_dir(&self.cache_dir)?;
@@ -325,7 +339,26 @@ impl Ytdlp {
         if !out.status.success() {
             return Err(self.failure(&out.stderr));
         }
-        serde_json::from_slice(&out.stdout).context("yt-dlp returned invalid JSON")
+        let v = serde_json::from_slice(&out.stdout).context("yt-dlp returned invalid JSON")?;
+        Ok((v, out.stderr))
+    }
+
+    /// The live lookup's answer (see `LIVE_LOOKUP`). With
+    /// `--ignore-no-formats-error`, yt-dlp answers even when YouTube asked
+    /// this address for a bot check instead of saying anything of the
+    /// video: it only warns, and the answer has neither formats nor a live
+    /// status. That is the bot check's error, as if it had failed, so that
+    /// it is asked again on a fresh identity, not taken for an ordinary
+    /// video and looked up again the usual way.
+    fn live_json(&self, url: &str, abort: &dyn Fn() -> bool) -> Result<Value> {
+        let (v, said) = self.json_and_warnings(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
+        let said_nothing =
+            live_state(&v).is_none() && v["formats"].as_array().is_none_or(|f| f.is_empty());
+        let said = String::from_utf8_lossy(&said);
+        if said_nothing && let Some(line) = said.lines().rev().find(|l| l.contains("not a bot")) {
+            return Err(self.failure(line.as_bytes()));
+        }
+        Ok(v)
     }
 
     /// What a failed run says: its last line on stderr.
@@ -605,7 +638,7 @@ impl Ytdlp {
         max_height: u32,
         abort: &dyn Fn() -> bool,
     ) -> Result<Opening> {
-        let v = self.json_with(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
+        let v = self.live_json(url, abort)?;
         if live_state(&v).is_some() {
             return live_answer(&v, url, max_height, None);
         }
@@ -639,7 +672,7 @@ impl Ytdlp {
         abort: &dyn Fn() -> bool,
         original: Option<anyhow::Error>,
     ) -> Result<Opening> {
-        let v = self.json_with(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
+        let v = self.live_json(url, abort)?;
         live_answer(&v, url, max_height, original)
     }
 
