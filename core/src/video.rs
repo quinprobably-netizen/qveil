@@ -1,4 +1,29 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Where a live stream is: running, or announced for later. A stream that has
+/// finished is an ordinary video, marked by `Video::streamed`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveState {
+    Now,
+    Upcoming,
+}
+
+/// Reads `live` as a state, or as the flag that older caches hold. The flag
+/// didn't say which, so `true` counts as running; the next refresh replaces it.
+fn state_or_flag<'de, D: Deserializer<'de>>(d: D) -> Result<Option<LiveState>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Flag(bool),
+        State(LiveState),
+    }
+    Ok(match Option::<Stored>::deserialize(d)? {
+        Some(Stored::State(s)) => Some(s),
+        Some(Stored::Flag(true)) => Some(LiveState::Now),
+        Some(Stored::Flag(false)) | None => None,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Video {
@@ -17,12 +42,25 @@ pub struct Video {
     pub views: Option<u64>,
     #[serde(default)]
     pub short: bool,
-    /// A live stream, or one that hasn't started yet (yt-dlp's `is_live` or
-    /// `is_upcoming`). qveil can't play those, so the window hides them.
-    /// Only written when true, which keeps old caches readable and the
+    /// Running (`"now"`) or announced (`"upcoming"`); absent for an ordinary
+    /// video. Only written when set, which keeps old caches readable and the
     /// API's JSON the same for every ordinary video.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "state_or_flag"
+    )]
+    pub live: Option<LiveState>,
+    /// When an upcoming stream is due to start, in unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts: Option<i64>,
+    /// How many are watching a stream that is running, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watching: Option<u64>,
+    /// A stream that has finished (`was_live`, `post_live`): an ordinary
+    /// video that was streamed. Only written when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub live: bool,
+    pub streamed: bool,
 }
 
 /// A chapter of a video: where it starts, in seconds, and what it is called.
@@ -68,7 +106,7 @@ impl Video {
         if let Some(c) = &self.channel {
             parts.push(c.clone());
         }
-        if self.live {
+        if self.live.is_some() {
             parts.push("[live]".into());
         } else if self.short {
             parts.push("short".into());
@@ -101,7 +139,7 @@ mod tests {
         assert_eq!(fmt_count(2_648_797), "2.6M");
     }
 
-    fn video(live: bool) -> Video {
+    fn video(live: Option<LiveState>) -> Video {
         Video {
             id: "dQw4w9WgXcQ".into(),
             title: "T".into(),
@@ -112,22 +150,61 @@ mod tests {
             views: None,
             short: false,
             live,
+            starts: None,
+            watching: None,
+            streamed: false,
         }
     }
 
     #[test]
-    fn live_is_only_in_the_json_when_true_and_old_caches_still_load() {
-        let plain = serde_json::to_value(video(false)).unwrap();
-        assert!(plain.get("live").is_none(), "{plain}");
-        assert_eq!(serde_json::to_value(video(true)).unwrap()["live"], true);
-        // A cache written before the field existed.
+    fn live_state_serialises_as_words() {
+        let now = serde_json::to_value(video(Some(LiveState::Now))).unwrap();
+        assert_eq!(now["live"], "now");
+        let soon = serde_json::to_value(video(Some(LiveState::Upcoming))).unwrap();
+        assert_eq!(soon["live"], "upcoming");
+        let plain = serde_json::to_value(video(None)).unwrap();
+        for key in ["live", "starts", "watching", "streamed"] {
+            assert!(plain.get(key).is_none(), "{key} in {plain}");
+        }
+        let mut over = video(None);
+        over.streamed = true;
+        assert_eq!(serde_json::to_value(over).unwrap()["streamed"], true);
+    }
+
+    #[test]
+    fn a_status_round_trips() {
+        let mut v = video(Some(LiveState::Upcoming));
+        v.starts = Some(1_800_000_000);
+        v.watching = Some(12);
+        let back: Video = serde_json::from_value(serde_json::to_value(&v).unwrap()).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn old_caches_still_load() {
+        // Written before the field existed.
         let old: Video = serde_json::from_str(r#"{"id":"dQw4w9WgXcQ","title":"T"}"#).unwrap();
-        assert!(!old.live);
+        assert_eq!(old.live, None);
+        assert!(!old.streamed);
+        // Written when `live` was a flag: a stream that was on then.
+        let flagged: Video =
+            serde_json::from_str(r#"{"id":"dQw4w9WgXcQ","title":"T","live":true}"#).unwrap();
+        assert_eq!(flagged.live, Some(LiveState::Now));
+        let null: Video =
+            serde_json::from_str(r#"{"id":"dQw4w9WgXcQ","title":"T","live":null}"#).unwrap();
+        assert_eq!(null.live, None);
     }
 
     #[test]
     fn a_listing_marks_live_streams() {
-        assert_eq!(video(true).line(None, 0), "T  ·  C  ·  [live]");
-        assert_eq!(video(false).line(None, 0), "T  ·  C  ·  1:30");
+        assert_eq!(
+            video(Some(LiveState::Now)).line(None, 0),
+            "T  ·  C  ·  [live]"
+        );
+        assert_eq!(
+            video(Some(LiveState::Upcoming)).line(None, 0),
+            "T  ·  C  ·  [live]"
+        );
+        assert_eq!(video(None).line(None, 0), "T  ·  C  ·  1:30");
     }
 }

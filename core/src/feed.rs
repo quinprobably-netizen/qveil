@@ -6,7 +6,7 @@
 use crate::app::Runtime;
 use crate::ids::is_video_id;
 use crate::subs::Sub;
-use crate::video::Video;
+use crate::video::{LiveState, Video};
 use anyhow::{Context, Result, bail};
 use rand::seq::SliceRandom;
 use roxmltree::Node;
@@ -295,16 +295,20 @@ fn child_text(n: Node, name: &str) -> Option<String> {
         .map(|t| t.trim().to_string())
 }
 
-/// Whether an entry says it is a live or upcoming stream. YouTube's feed has
-/// no documented marker for that, so this reads the one element its own APIs
-/// use (`liveBroadcastContent`), in case the feed carries it. Streams that it
-/// doesn't mark come through as ordinary videos here, and are marked when
+/// Whether an entry says it is a running or upcoming stream. YouTube's feed
+/// has no documented marker for that, so this reads the one element its own
+/// APIs use (`liveBroadcastContent`), in case the feed carries it. Streams that
+/// it doesn't mark come through as ordinary videos here, and are marked when
 /// yt-dlp lists them (searches, the fallback).
-fn announces_live(entry: Node) -> bool {
-    entry.descendants().any(|n| {
-        n.tag_name().name() == "liveBroadcastContent"
-            && matches!(n.text().map(str::trim), Some("live" | "upcoming"))
-    })
+fn announces_live(entry: Node) -> Option<LiveState> {
+    entry
+        .descendants()
+        .filter(|n| n.tag_name().name() == "liveBroadcastContent")
+        .find_map(|n| match n.text().map(str::trim) {
+            Some("live") => Some(LiveState::Now),
+            Some("upcoming") => Some(LiveState::Upcoming),
+            _ => None,
+        })
 }
 
 /// The channel's name: the title of its feed, which is how the channel itself
@@ -358,6 +362,9 @@ pub fn parse_rss(xml: &str) -> Result<Vec<Video>> {
                 .and_then(|v| v.parse().ok()),
             short: link.contains("/shorts/"),
             live: announces_live(e),
+            starts: None,
+            watching: None,
+            streamed: false,
             id,
         });
     }
@@ -518,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_that_the_feed_marks_as_live_or_upcoming_is_live() {
+    fn a_stream_that_the_feed_marks_as_live_or_upcoming_says_which() {
         let xml = |kind: &str| {
             format!(
                 r#"<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom"><entry>
@@ -527,15 +534,15 @@ mod tests {
             )
         };
         for (kind, live) in [
-            ("live", true),
-            ("upcoming", true),
-            ("none", false),
-            ("", false),
+            ("live", Some(LiveState::Now)),
+            ("upcoming", Some(LiveState::Upcoming)),
+            ("none", None),
+            ("", None),
         ] {
             assert_eq!(parse_rss(&xml(kind)).unwrap()[0].live, live, "{kind:?}");
         }
         // The feed as it is today carries nothing of the kind.
-        assert!(parse_rss(RSS).unwrap().iter().all(|v| !v.live));
+        assert!(parse_rss(RSS).unwrap().iter().all(|v| v.live.is_none()));
     }
 
     #[test]
@@ -550,7 +557,10 @@ mod tests {
             duration: None,
             views: None,
             short: false,
-            live: false,
+            live: None,
+            starts: None,
+            watching: None,
+            streamed: false,
         };
         let mut cache = FeedCache::default();
         cache.merge(

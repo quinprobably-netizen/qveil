@@ -1303,8 +1303,11 @@ echo '{"entries":[]}'"#,
             .iter()
             .map(|e| e.get("live").cloned())
             .collect();
-        // Only there when true.
-        assert_eq!(live, [Some(json!(true)), Some(json!(true)), None, None]);
+        // Only there for a stream that is on or announced.
+        assert_eq!(
+            live,
+            [Some(json!("now")), Some(json!("upcoming")), None, None]
+        );
     }
 
     #[test]

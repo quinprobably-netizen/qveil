@@ -131,7 +131,7 @@ impl Reading {
     /// that can't be checked (a length rule and a video of unknown length)
     /// turns the video away: what is shown must be known to fit.
     pub fn keeps(&self, v: &Video, subscribed: bool) -> Option<Vec<String>> {
-        if v.live || (v.short && !self.shorts) {
+        if v.live.is_some() || (v.short && !self.shorts) {
             return None;
         }
         let mut why = Vec::new();
@@ -589,6 +589,7 @@ fn lift_dates(w: &mut Words, now: i64, r: &mut Reading) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::LiveState;
 
     /// 2026-11-10 12:00:00 UTC.
     const NOW: i64 = 1_794_312_000;
@@ -761,7 +762,10 @@ mod tests {
             duration: None,
             views: None,
             short: false,
-            live: false,
+            live: None,
+            starts: None,
+            watching: None,
+            streamed: false,
         };
         let r = read("cooking, no ai", NOW);
         assert!(
@@ -856,7 +860,10 @@ mod tests {
             duration: dur,
             views: None,
             short: false,
-            live: false,
+            live: None,
+            starts: None,
+            watching: None,
+            streamed: false,
         };
         assert_eq!(
             r.keeps(&v("A talk", Some(1900), Some(NOW - 5)), false)
@@ -902,7 +909,7 @@ mod tests {
                 .is_some()
         );
         let mut live = v("Jazz", None, None);
-        live.live = true;
+        live.live = Some(LiveState::Now);
         assert!(plain.keeps(&live, false).is_none());
         // The channel's name counts for what is excluded.
         let no_chan = read("jazz, no chan", NOW);

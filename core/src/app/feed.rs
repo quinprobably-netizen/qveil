@@ -738,7 +738,10 @@ mod tests {
                 duration: None,
                 views: None,
                 short: false,
-                live: false,
+                live: None,
+                starts: None,
+                watching: None,
+                streamed: false,
             }],
             source: feed::Source::Rss,
         }

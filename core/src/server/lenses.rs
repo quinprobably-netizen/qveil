@@ -773,7 +773,10 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
                     duration: None,
                     views: None,
                     short: false,
-                    live: false,
+                    live: None,
+                    starts: None,
+                    watching: None,
+                    streamed: false,
                 };
                 cache.seen.insert(
                     video.id.clone(),
@@ -979,7 +982,10 @@ if [ -n "$whole" ]; then echo "{\"entries\":[$one,$two]}"; else echo "$one"; ech
                 duration: None,
                 views: None,
                 short: false,
-                live: false,
+                live: None,
+                starts: None,
+                watching: None,
+                streamed: false,
             };
             cache.seen.insert(
                 video.id.clone(),

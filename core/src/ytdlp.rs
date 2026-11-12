@@ -14,7 +14,7 @@ use crate::inflight::{Inflight, Run, StartError};
 use crate::net::{Net, USER_AGENT};
 use crate::private::PrivateDir;
 use crate::spare;
-use crate::video::{Chapter, Video};
+use crate::video::{Chapter, LiveState, Video};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 use std::fmt;
@@ -583,7 +583,7 @@ impl Ytdlp {
         abort: &dyn Fn() -> bool,
     ) -> anyhow::Error {
         match self.json_with(&["-J", "--no-playlist"], None, url, RESOLVE, abort) {
-            Ok(v) if is_live_or_upcoming(&v) => anyhow!(LIVE_UNSUPPORTED),
+            Ok(v) if live_state(&v).is_some() => anyhow!(LIVE_UNSUPPORTED),
             Ok(v) if !chosen_formats(&v).iter().all(|f| is_plain(f)) => anyhow!(MANIFEST_ONLY),
             Err(e) if e.to_string() == CANCELLED => e,
             _ => original,
@@ -712,16 +712,24 @@ fn worth_the_usual_way(e: &anyhow::Error) -> bool {
     said == NOTHING_PLAYABLE || said == NO_URL
 }
 
-fn is_live(v: &Value) -> bool {
-    v["is_live"].as_bool() == Some(true) || v["live_status"].as_str() == Some("is_live")
+/// Whether a stream is running (`Now`) or announced (`Upcoming`). A finished
+/// one (`was_live`, `post_live`) is an ordinary video (see `Video::streamed`),
+/// and `is_live` is only set while it runs.
+pub fn live_state(v: &Value) -> Option<LiveState> {
+    if v["is_live"].as_bool() == Some(true) || v["live_status"].as_str() == Some("is_live") {
+        Some(LiveState::Now)
+    } else if v["is_upcoming"].as_bool() == Some(true)
+        || v["live_status"].as_str() == Some("is_upcoming")
+    {
+        Some(LiveState::Upcoming)
+    } else {
+        None
+    }
 }
 
-/// A stream that is running or has been announced. A finished one (`was_live`,
-/// `post_live`) is an ordinary video, and `is_live` is only set while it runs.
-fn is_live_or_upcoming(v: &Value) -> bool {
-    is_live(v)
-        || v["is_upcoming"].as_bool() == Some(true)
-        || v["live_status"].as_str() == Some("is_upcoming")
+/// A stream that has finished, and is now a video to watch from the start.
+fn streamed(v: &Value) -> bool {
+    matches!(v["live_status"].as_str(), Some("was_live" | "post_live"))
 }
 
 /// The formats yt-dlp chose: both halves of a merge, or the video itself.
@@ -740,7 +748,7 @@ fn is_plain(f: &Value) -> bool {
 }
 
 fn streams_from(v: &Value, url: &str) -> Result<Streams> {
-    if is_live_or_upcoming(v) {
+    if live_state(v).is_some() {
         bail!(LIVE_UNSUPPORTED);
     }
     let title = str_field(v, &["title"]).unwrap_or_else(|| url.into());
@@ -914,6 +922,7 @@ fn entries(v: &Value) -> Vec<Video> {
 
 fn entry(e: &Value, channel: &Option<String>, channel_id: &Option<String>) -> Option<Video> {
     let id = e["id"].as_str().filter(|id| ids::is_video_id(id))?;
+    let live = live_state(e);
     Some(Video {
         id: id.into(),
         title: str_field(e, &["title"]).unwrap_or_else(|| id.into()),
@@ -923,7 +932,12 @@ fn entry(e: &Value, channel: &Option<String>, channel_id: &Option<String>) -> Op
         duration: e["duration"].as_f64().map(|d| d as u64),
         views: e["view_count"].as_u64(),
         short: e["url"].as_str().is_some_and(|u| u.contains("/shorts/")),
-        live: is_live_or_upcoming(e),
+        live,
+        starts: e["release_timestamp"]
+            .as_i64()
+            .filter(|_| live == Some(LiveState::Upcoming)),
+        watching: e["concurrent_view_count"].as_u64(),
+        streamed: streamed(e),
     })
 }
 
@@ -1078,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn running_and_announced_streams_are_marked_live_and_finished_ones_are_not() {
+    fn entries_carry_live_state_start_and_watchers() {
         let v: Value = serde_json::from_str(
             r#"{"entries":[
                 {"id":"aaaaaaaaaaa","live_status":"is_live"},
@@ -1088,12 +1102,53 @@ mod tests {
                 {"id":"eeeeeeeeeee","live_status":"post_live"},
                 {"id":"fffffffffff","live_status":"not_live"},
                 {"id":"ggggggggggg","live_status":null},
-                {"id":"hhhhhhhhhhh"}
+                {"id":"hhhhhhhhhhh"},
+                {"id":"hhhhhhhhhhh","live_status":"is_upcoming","release_timestamp":1800000000},
+                {"id":"iiiiiiiiiii","live_status":"is_live","concurrent_view_count":863}
             ]}"#,
         )
         .unwrap();
-        let live: Vec<_> = entries(&v).iter().map(|v| v.live).collect();
-        assert_eq!(live, [true, true, true, false, false, false, false, false]);
+        let es = entries(&v);
+        let live: Vec<_> = es.iter().map(|v| v.live).collect();
+        use LiveState::{Now, Upcoming};
+        assert_eq!(
+            live,
+            [
+                Some(Now),
+                Some(Upcoming),
+                Some(Now),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Upcoming),
+                Some(Now)
+            ]
+        );
+        // The announced `h` (the ninth entry) says when it starts; the plain one doesn't.
+        assert_eq!(es[8].starts, Some(1_800_000_000));
+        assert_eq!(es[7].starts, None);
+        assert_eq!(es[9].watching, Some(863));
+        assert_eq!(es[0].watching, None);
+        let streamed: Vec<_> = es
+            .iter()
+            .filter(|v| v.streamed)
+            .map(|v| &v.id[..1])
+            .collect();
+        assert_eq!(streamed, ["d", "e"]);
+    }
+
+    #[test]
+    fn a_start_time_belongs_to_an_upcoming_stream_only() {
+        let v: Value = serde_json::from_str(
+            r#"{"entries":[
+                {"id":"aaaaaaaaaaa","live_status":"is_live","release_timestamp":1700000000},
+                {"id":"bbbbbbbbbbb","live_status":"was_live","release_timestamp":1700000000}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(entries(&v).iter().all(|v| v.starts.is_none()));
     }
 
     #[test]
@@ -1867,7 +1922,7 @@ print(json.dumps(parsed.ydl_opts["extractor_args"]))
         let found = yt.search("blender open movie", 5).unwrap();
         let video = found
             .iter()
-            .find(|v| !v.live)
+            .find(|v| v.live.is_none())
             .expect("a search finds a video that isn't live");
         assert!(!video.title.is_empty());
         let url = format!("https://www.youtube.com/watch?v={}", video.id);
