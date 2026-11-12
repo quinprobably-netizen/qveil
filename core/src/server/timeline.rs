@@ -770,7 +770,14 @@ impl LiveSession {
         self.asked();
         let ext = self.exts[kind.index()];
         let text = match &self.fragments {
-            Fragments::Numbered => playlist(&lock(&self.span), self.target, kind.prefix(), ext),
+            Fragments::Numbered => {
+                let span = lock(&self.span);
+                let head = span.head;
+                let text = playlist(&span, self.target, kind.prefix(), ext);
+                drop(span);
+                self.forget_stale_warm(kind, head);
+                text
+            }
             Fragments::Listed(list) => {
                 let durations: Vec<f64> = list.iter().map(|(_, d)| *d).collect();
                 listed_playlist(&durations, kind.prefix(), ext)
@@ -1064,6 +1071,21 @@ impl LiveSession {
                 f.drop_it();
             }
             trace!("dropped warm {} n={n}", kind.letter());
+        }
+    }
+
+    /// The player joins two segments back from the newest its playlist
+    /// lists, as it last loaded it (`head`). FFmpeg's reads at open can
+    /// take a while, and it may load the playlist again meanwhile: once
+    /// that is past the join's segments fetched ahead (see `warm_join`),
+    /// they are of no use, and only take from the circuit what it waits for.
+    fn forget_stale_warm(&self, kind: Kind, head: u64) {
+        let mut warm = lock(&self.warm[kind.index()]);
+        if warm.back().is_some_and(|(last, _)| head > last + 2) {
+            for (_, f) in warm.drain(..) {
+                f.drop_it();
+            }
+            trace!("stale warm {} head={head}", kind.letter());
         }
     }
 
@@ -1417,27 +1439,11 @@ impl LiveSession {
         if !matches!(self.fragments, Fragments::Numbered) {
             return;
         }
-        {
-            let mut span = lock(&self.span);
-            if head <= span.head || span.ended {
-                return;
-            }
+        let mut span = lock(&self.span);
+        if head > span.head && !span.ended {
             span.head = head;
             lock(&self.clock).moved = Instant::now();
             self.changed.notify_all();
-        }
-        // A player joins three segments back from the head it last saw:
-        // once that is past the join's segments fetched ahead (FFmpeg's
-        // reads at open can take a while), they are of no use, and only
-        // take from the circuit what the player waits for.
-        for kind in [Kind::Video, Kind::Audio] {
-            let mut warm = lock(&self.warm[kind.index()]);
-            if warm.back().is_some_and(|(last, _)| head > last + 2) {
-                for (_, f) in warm.drain(..) {
-                    f.drop_it();
-                }
-                trace!("stale warm {} head={head}", kind.letter());
-            }
         }
     }
 
@@ -2679,19 +2685,27 @@ cat '{}'"#,
 
     #[test]
     fn join_segments_the_head_has_moved_past_are_let_go() {
-        let st = stream(300, 0, 20);
+        let st = stream(1_000, 0, 20);
         st.s.warming.store(true, Ordering::Relaxed);
-        // Each segment takes about 6 s to come in, longer than the head
+        // Each segment takes about 13 s to come in, longer than the head
         // takes to move past them.
-        st.up.trickle(100);
+        st.up.trickle(200);
         let sid = st.open();
         wait_for("the join to start", Duration::from_secs(5), || {
             st.up.in_flight() == 2 * HELD
         });
-        // The player reloads the playlist (and with it the head) while it
-        // looks at the first segments.
-        wait_for("them to be let go", Duration::from_secs(5), || {
+        // Until the player has loaded a playlist with a newer head, they
+        // are where it joins: they stay.
+        st.listed(&sid);
+        let audio = format!("live/{sid}/audio.m3u8");
+        assert_eq!(st.get(&audio).0, 200);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(st.up.in_flight(), 2 * HELD);
+        // It reloads the playlists (and with them the head) while it looks
+        // at the first segments.
+        wait_for("them to be let go", Duration::from_secs(10), || {
             st.listed(&sid);
+            assert_eq!(st.get(&audio).0, 200);
             st.up.in_flight() == 0
         });
     }
