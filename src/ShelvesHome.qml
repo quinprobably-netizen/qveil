@@ -39,6 +39,23 @@ FocusScope {
     property int leadAction: 0
     property bool moved: false
     readonly property bool leadSelected: navigating && activeFocus && onLead && first !== null
+    // What is live now and about to start, on one line under the lead (see
+    // LiveLine). The keyboard reaches it between the lead and the first
+    // shelf; `liveAt` is which of its stops it is on there.
+    readonly property var liveEntries: backend.liveNow
+    readonly property bool hasLive: liveEntries.length > 0
+    property bool onLive: false
+    readonly property int liveGap: Style.u * 3
+    property int liveAt: 0
+    readonly property bool liveSelected: navigating && activeFocus && onLive && hasLive
+    onHasLiveChanged: {
+        if (!hasLive && onLive) {
+            onLive = false
+            if (first !== null && !moved)
+                onLead = true
+        }
+    }
+    onLiveEntriesChanged: liveAt = Math.max(0, Math.min(liveAt, liveEntries.length))
     onFirstChanged: {
         // A new video leads with Resume marked (Forget on the last must not
         // carry over to the next).
@@ -61,7 +78,8 @@ FocusScope {
     // empty: one row that scrolls sideways when there is no room for more.
     readonly property int latestRows: {
         const shelf = Style.control + Style.u * 2 + cardHeight + 18 + view.spacing
-        const lead = first !== null ? leadHeight + view.spacing : 0
+        const lead = (first !== null ? leadHeight + view.spacing : 0)
+                     + (hasLive ? Style.control + Style.u + (first !== null ? liveGap - view.spacing : 0) + view.spacing : 0)
         const free = view.height - view.topMargin - lead - (keys.length - 1) * shelf
                      - Style.control - Style.u * 2 - (Style.control + 2 * view.spacing)
         return Math.max(1, Math.min(6, Math.ceil(free / cardHeight)))
@@ -199,6 +217,11 @@ FocusScope {
     }
     function move(by) {
         navigating = true
+        if (onLive) {
+            // Along the line: its entries, then its "+N".
+            liveAt = Math.max(0, Math.min(liveStops() - 1, liveAt + by))
+            return
+        }
         if (onLead) {
             // Along the lead's actions.
             leadAction = Math.max(0, Math.min(2, leadAction + by))
@@ -216,14 +239,38 @@ FocusScope {
         if (onLead) {
             if (by > 0) {
                 onLead = false
+                // Down from the lead is the live line, when there is one.
+                onLive = hasLive
+                if (onLive)
+                    scrollTo(view.originY - view.topMargin)
+                else
+                    Qt.callLater(ensure)
+            }
+            return
+        }
+        if (onLive) {
+            // (Up with no lead stays: there is nothing above it.)
+            if (by < 0 && first !== null) {
+                onLive = false
+                onLead = true
+                leadAction = 0
+                scrollTo(view.originY - view.topMargin)
+            } else if (by > 0) {
+                onLive = false
+                row = 0
                 Qt.callLater(ensure)
             }
             return
         }
-        // Up from the top of the first shelf is the lead.
-        if (by < 0 && row === 0 && first !== null && !(keys[0] === "latest" && latestRows > 1 && column >= across)) {
-            onLead = true
-            leadAction = 0
+        // Up from the top of the first shelf is the live line, or the lead.
+        if (by < 0 && row === 0 && (first !== null || hasLive) && !(keys[0] === "latest" && latestRows > 1 && column >= across)) {
+            if (hasLive) {
+                onLive = true
+                liveAt = Math.min(liveAt, liveStops() - 1)
+            } else {
+                onLead = true
+                leadAction = 0
+            }
             scrollTo(view.originY - view.topMargin)
             return
         }
@@ -286,6 +333,11 @@ FocusScope {
             page.allRequested(key)
     }
     function pickCurrent() {
+        if (onLive && hasLive) {
+            if (liveLine())
+                liveLine().activate(liveAt)
+            return
+        }
         if (onLead && first !== null) {
             const kept = first
             if (leadAction === 1)
@@ -313,6 +365,21 @@ FocusScope {
             origin = originOf("latest")
         }
         return { list: Arrange.listed([video].concat(rest)), origin: origin }
+    }
+    // The live line, in the list's header.
+    function liveLine() {
+        return view.headerItem ? view.headerItem.line : null
+    }
+    function liveStops() {
+        return liveLine() ? liveLine().stops : liveEntries.length
+    }
+    // An entry on the live line: what comes after it is the rest of the line.
+    function pickLive(video) {
+        let at = 0
+        for (let i = 0; i < liveEntries.length; i++)
+            if (liveEntries[i].id === video.id)
+                at = i
+        page.activated(video, Arrange.listed(liveEntries), at, qsTr("Live now"))
     }
     function resume(kept) {
         const after = afterLead(kept)
@@ -396,10 +463,25 @@ FocusScope {
 
         // The lead: what you were in the middle of.
         header: Item {
+            readonly property alias line: liveLine
             width: view.width
             // (By whether there is a lead, not by whether it is showing: a
             // page that is hidden for a while must come back as it was.)
-            height: page.first !== null ? lead.height + view.spacing : 0
+            height: (page.first !== null ? lead.height + view.spacing : 0)
+                    + (page.hasLive ? liveLine.height + (page.first !== null ? page.liveGap - view.spacing : 0) + view.spacing : 0)
+
+            // What is live, under the lead.
+            LiveLine {
+                id: liveLine
+                // (Closer to the lead than the shelves are: it is about the same, what to watch now.)
+                y: page.first !== null ? lead.height + page.liveGap : 0
+                width: parent.width
+                height: implicitHeight
+                entries: page.liveEntries
+                current: page.liveSelected ? page.liveAt : -1
+                onPicked: video => page.pickLive(video)
+                onPointed: at => page.pointed(at)
+            }
 
             Rectangle {
                 id: lead
@@ -630,7 +712,7 @@ FocusScope {
             progress: page.progress
             estimateNote: isLens ? qsTr("Approximate: YouTube's search only says how long ago")
                                  : qsTr("Approximate: YouTube's feed for this channel was unavailable")
-            current: page.navigating && page.activeFocus && !page.onLead && page.row === index
+            current: page.navigating && page.activeFocus && !page.onLead && !page.onLive && page.row === index
             column: page.columns[modelData] || 0
             onActivated: (video, at) => page.pick(modelData, video, at)
             onChannelRequested: id => page.channelRequested(id)

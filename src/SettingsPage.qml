@@ -34,7 +34,7 @@ FocusScope {
     // and on which of them.
     property bool inRows: false
     property int rowAt: 0
-    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume, titleRow], playback: [qualityRow, aheadRow], home: [pictures, keptRow, topicsRow, shortsRow], about: [] })
+    readonly property var rowsIn: ({ privacy: [routeRow, historyRow, resume, titleRow], playback: [qualityRow, aheadRow], home: [pictures, keptRow, topicsRow, liveCheckRow, liveChatRow, shortsRow], about: [] })
     onCategoryChanged: {
         const had = pane.activeFocus
         inRows = false
@@ -384,6 +384,33 @@ FocusScope {
                     Choices {
                         Choice { objectName: "topics-off"; text: qsTr("Off"); current: !page.config.topicFeeds; patch: ({ topicFeeds: false }) }
                         Choice { objectName: "topics-on"; text: qsTr("On"); current: !!page.config.topicFeeds; patch: ({ topicFeeds: true }) }
+                    }
+                }
+                SettingRow {
+                    id: liveCheckRow
+                    objectName: "set-live-check"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === liveCheckRow
+                    width: parent.width
+                    name: qsTr("Check followed channels for live streams")
+                    note: qsTr("Reads each channel's Streams tab at every feed refresh: one more request per channel, in random order with pauses.")
+                    noteName: "set-live-check-note"
+                    Choices {
+                        Choice { objectName: "live-check-off"; text: qsTr("Off"); current: !page.config.liveCheck; patch: ({ liveCheck: false }) }
+                        Choice { objectName: "live-check-on"; text: qsTr("On"); current: !!page.config.liveCheck; patch: ({ liveCheck: true }) }
+                    }
+                }
+                SettingRow {
+                    id: liveChatRow
+                    objectName: "set-live-chat"
+                    marked: page.inRows && page.rowsIn[page.category][page.rowAt] === liveChatRow
+                    width: parent.width
+                    name: qsTr("Show live chat")
+                    note: qsTr("Loaded only while the Chat tab is open.")
+                    noteName: "set-live-chat-note"
+                    // (On unless the engine says it is off.)
+                    Choices {
+                        Choice { objectName: "live-chat-off"; text: qsTr("Off"); current: page.config.liveChat === false; patch: ({ liveChat: false }) }
+                        Choice { objectName: "live-chat-on"; text: qsTr("On"); current: page.config.liveChat !== false; patch: ({ liveChat: true }) }
                     }
                 }
                 SettingRow {

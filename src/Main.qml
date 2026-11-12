@@ -231,7 +231,7 @@ ApplicationWindow {
     // burst of requests for exactly your channels.
     function refresh() {
         if (page === "channel")
-            backend.openChannel(backend.channel.id)
+            backend.openChannel(backend.channel.id, backend.channelTab)
         else if (page === "search")
             backend.search(backend.query)
         else if (page === "lenses")
@@ -777,21 +777,46 @@ ApplicationWindow {
 
                 VideoPage {
                     id: channelPage
+                    objectName: "channel-page"
+                    readonly property bool streams: backend.channelTab === "streams"
                     anchors.fill: parent
                     visible: win.page === "channel" && !win.watching
                     thumbs: win.thumbs
                     progress: win.watched
                     heading: backend.channel.name || ""
-                    subheading: backend.channelVideos.count
-                                ? qsTr("%n recent videos", "", backend.channelVideos.count) : ""
+                    subheading: !backend.channelVideos.count ? ""
+                                : streams ? qsTr("%n streams", "", backend.channelVideos.count)
+                                : qsTr("%n recent videos", "", backend.channelVideos.count)
                     model: backend.channelVideos
                     arrange: win.arrangements.channel || ({})
                     watched: win.watchedIds
                     onArranged: setting => win.arrange("channel", setting)
                     estimateNote: qsTr("Approximate: YouTube's channel page only says how long ago")
                     loading: backend.busy.indexOf("channel") >= 0
-                    emptyText: qsTr("No videos.")
+                    emptyText: streams ? qsTr("No streams.") : qsTr("No videos.")
                     onActivated: (video, index) => win.playListed(backend.channel.name || "", video, channelPage.grid.list, index)
+
+                    // The channel's tabs, under its name: its uploads, and
+                    // its streams (running, announced, then past).
+                    extras: Row {
+                        // (The first word stands under the name, not its padding.)
+                        x: -Style.u * 3
+                        spacing: Style.u * 2
+                        TabWord {
+                            objectName: "channel-tab-videos"
+                            text: qsTr("Videos")
+                            underlined: true
+                            current: !channelPage.streams
+                            onClicked: backend.openChannel(backend.channel.id, "videos")
+                        }
+                        TabWord {
+                            objectName: "channel-tab-streams"
+                            text: qsTr("Streams")
+                            underlined: true
+                            current: channelPage.streams
+                            onClicked: backend.openChannel(backend.channel.id, "streams")
+                        }
+                    }
 
                     // Subscribe is the call to action; Subscribed is the same
                     // word switched on, with a check.

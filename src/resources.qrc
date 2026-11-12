@@ -54,6 +54,7 @@
         <file alias="ChannelsPage.qml">ChannelsPage.qml</file>
         <file alias="ResumeNotice.qml">ResumeNotice.qml</file>
         <file alias="Shelf.qml">Shelf.qml</file>
+        <file alias="LiveLine.qml">LiveLine.qml</file>
         <file alias="ShelvesHome.qml">ShelvesHome.qml</file>
         <file alias="TopBar.qml">TopBar.qml</file>
         <file alias="Choices.qml">Choices.qml</file>

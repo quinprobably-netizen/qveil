@@ -39,6 +39,9 @@ class Backend : public QObject {
     // refresh landing in the background doesn't rebuild the grid showing it.
     Q_PROPERTY(VideoModel *feed READ feed CONSTANT)
     Q_PROPERTY(QVariantMap feedInfo READ feedInfo NOTIFY feedChanged)
+    // What of the feed is live now, then what is announced to start within a
+    // day, soonest first: the feed's entries as they are, made again with it.
+    Q_PROPERTY(QVariantList liveNow READ liveNow NOTIFY feedChanged)
     // How far the running refresh is: channels done of channels to do. Both
     // are 0 while no refresh runs, or one that hasn't said how many there are.
     Q_PROPERTY(int refreshDone READ refreshDone NOTIFY refreshProgressChanged)
@@ -48,6 +51,8 @@ class Backend : public QObject {
     // The open channel's id, name and whether it is subscribed; its videos are `channelVideos`.
     Q_PROPERTY(QVariantMap channel READ channel NOTIFY channelChanged)
     Q_PROPERTY(VideoModel *channelVideos READ channelVideos CONSTANT)
+    // Which of the open channel's tabs `channelVideos` holds: "videos" or "streams".
+    Q_PROPERTY(QString channelTab READ channelTab NOTIFY channelChanged)
     Q_PROPERTY(QVariantList subs READ subs NOTIFY subsChanged)
     Q_PROPERTY(QVariantList history READ history NOTIFY historyChanged)
     // Where unfinished videos were stopped: [{id, pos, dur, at, title, channel, expires}], newest first.
@@ -114,12 +119,14 @@ public:
     QVariantMap privacy() const { return privacyOf(m_config); }
     VideoModel *feed() const { return m_feed; }
     QVariantMap feedInfo() const { return m_feedInfo; }
+    QVariantList liveNow() const { return m_liveNow; }
     int refreshDone() const { return m_refreshDone; }
     int refreshTotal() const { return m_refreshTotal; }
     VideoModel *results() const { return m_results; }
     QString query() const { return m_query; }
     QVariantMap channel() const { return m_channel; }
     VideoModel *channelVideos() const { return m_channelVideos; }
+    QString channelTab() const { return m_channelTab; }
     QVariantList subs() const { return m_subs; }
     QVariantList history() const { return m_history; }
     QVariantList resume() const { return m_resume; }
@@ -140,7 +147,10 @@ public:
     // must not repeat a burst of requests for exactly your channels.
     Q_INVOKABLE void refreshFeed(bool network, bool shorts);
     Q_INVOKABLE void search(const QString &query);
-    Q_INVOKABLE void openChannel(const QString &id);
+    // A channel's tab: "videos", or "streams" (its running, announced and
+    // past broadcasts). Each tab of the open channel is asked for once, when
+    // it is first opened; asking for the tab that shows reads it again.
+    Q_INVOKABLE void openChannel(const QString &id, const QString &tab = QStringLiteral("videos"));
     Q_INVOKABLE void loadSubs();
     Q_INVOKABLE void subscribe(const QString &input);
     Q_INVOKABLE void unsubscribe(const QString &id);
@@ -352,10 +362,14 @@ private:
     QVariantMap m_config;
     VideoModel *m_feed = new VideoModel(this);
     QVariantMap m_feedInfo;
+    QVariantList m_liveNow;
     VideoModel *m_results = new VideoModel(this);
     QString m_query;
     QVariantMap m_channel;
     VideoModel *m_channelVideos = new VideoModel(this);
+    QString m_channelTab = QStringLiteral("videos");
+    // The open channel's tabs that were read, by tab.
+    QHash<QString, QVariantList> m_channelTabs;
     QVariantList m_subs;
     QVariantList m_history;
     QVariantList m_resume;

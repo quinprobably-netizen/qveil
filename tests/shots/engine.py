@@ -156,6 +156,8 @@ state = {
                "topicFeeds": bool(os.environ.get("QVEIL_STANDIN_TOPICS")),
                "prepareNext": False,
                "keepThumbnails": False,
+               "liveCheck": False,
+               "liveChat": True,
                "configPath": "/dev/null", "privacy": PRIVACY,
                # QVEIL_STANDIN_IGNORED: keys of the settings file that were left out.
                "ignoredKeys": [k for k in os.environ.get("QVEIL_STANDIN_IGNORED", "").split(",") if k]},
@@ -287,6 +289,33 @@ def lens_videos(lens):
     return out
 
 
+def feed_entries():
+    """The feed. With QVEIL_STANDIN_LIVE, the live check has found two
+    streams running and three announced: two starting within a day (the
+    sooner one later in the feed) and one in three days."""
+    if not os.environ.get("QVEIL_STANDIN_LIVE"):
+        return FEED
+    marks = {"vid00000002": {"live": "now", "watching": 1200},
+             "vid00000009": {"live": "now"},
+             "vid00000003": {"live": "upcoming", "starts": NOW + 5 * HOUR},
+             "vid00000006": {"live": "upcoming", "starts": NOW + 3 * DAY},
+             "vid00000012": {"live": "upcoming", "starts": NOW + HOUR}}
+    return [dict(v, **marks.get(v["id"], {})) for v in FEED]
+
+
+def channel_streams(cid):
+    """A channel's Streams tab, as the engine answers it: running, then
+    upcoming, then past broadcasts."""
+    _, name = next((c for c in CHANNELS if c[0] == cid), (cid, "A channel"))
+    def stream(n, title, **mark):
+        return dict({"id": "str%08d" % n, "title": title, "channel": name, "channel_id": cid,
+                     "published": NOW - n * DAY, "duration": 0, "views": 0}, **mark)
+    return [stream(1, "Live: the long one, part 2", live="now", watching=860),
+            stream(2, "Questions, answered live", live="upcoming", starts=NOW + DAY),
+            stream(3, "Live: the long one, part 1", streamed=True, duration=11564, views=40000),
+            stream(4, "Live: reading the source", streamed=True, duration=9670, views=21000)]
+
+
 def png(seed, w=160, h=90):
     """A small picture that is different for every video: bands of two colours."""
     n = sum(ord(c) * (i + 3) for i, c in enumerate(seed))
@@ -388,7 +417,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "api/feed":
             # For the tests of what shows while the feed is still coming.
             time.sleep(float(os.environ.get("QVEIL_STANDIN_SLOW_FEED", "0")))
-            feed = {"channels": len(state["subs"]), "entries": FEED, "fallbacks": 0, "errors": [], "fresh": 0}
+            feed = {"channels": len(state["subs"]), "entries": feed_entries(), "fallbacks": 0, "errors": [], "fresh": 0}
             if "stream" in q:
                 self.lines([{"progress": {"done": 5, "total": 5}}, {"result": feed}])
             else:
@@ -418,7 +447,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send(400, {"error": "%r is not a channel ID" % cid, "code": "other"})
                 return
             name = dict(CHANNELS).get(cid, "A channel")
-            vids = [v for v in FEED if v["channel_id"] == cid] or FEED[:3]
+            vids = channel_streams(cid) if q.get("tab") == "streams" else [v for v in FEED if v["channel_id"] == cid] or FEED[:3]
             self.send(200, {"id": cid, "name": name, "subscribed": any(s["id"] == cid for s in state["subs"]), "videos": vids})
         elif path == "api/subs":
             self.send(200, state["subs"])
@@ -530,7 +559,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # What was got ready belongs to the route it was looked up on.
             if body.get("route", cfg["route"]) != cfg["route"]:
                 state["prepared"].clear()
-            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds", "prepareNext", "keepThumbnails"):
+            for key in ("route", "history", "thumbnails", "maxHeight", "resumeDays", "topicFeeds", "prepareNext", "keepThumbnails",
+                    "liveCheck", "liveChat"):
                 if key in body:
                     cfg[key] = body[key]
             # The engine saves the keys it has no setting for as they were,

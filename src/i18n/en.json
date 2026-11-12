@@ -35,6 +35,10 @@
     "one": "%n recent video",
     "other": "%n recent videos"
   },
+  "%n streams": {
+    "one": "%n stream",
+    "other": "%n streams"
+  },
   "Imported %n new channel(s)": {
     "one": "Imported %n new channel",
     "other": "Imported %n new channels"

@@ -3877,6 +3877,247 @@ private slots:
             QVERIFY(!card->property("metaText").toString().startsWith("live now"));
     }
 
+    // What the live line names, in order: the entries that fit on it.
+    static QStringList liveItems(const App &app)
+    {
+        QStringList said;
+        for (QQuickItem *entry : app.items("live-item"))
+            said << entry->property("label").toString();
+        return said;
+    }
+
+    void theLiveLineNamesWhatIsLiveAndNext()
+    {
+        // (A window this wide is drawn larger: its page is 1600 wide.)
+        App app(false, QSize(2400, 1400), {{"QVEIL_STANDIN_LIVE", "1"}});
+        READY(app);
+        QQuickItem *line = nullptr, *lead = app.item("lead");
+        QTRY_VERIFY((line = app.item("live-line")) && line->isVisible());
+        QTRY_VERIFY(lead->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest"));
+        // Under the lead, over the first shelf.
+        const qreal top = line->mapToScene(QPointF(0, 0)).y();
+        QVERIFY(top >= lead->mapToScene(QPointF(0, lead->height())).y());
+        QVERIFY(top + line->height() <= app.item("shelf-latest")->mapToScene(QPointF(0, 0)).y());
+
+        // "● LIVE NOW", in the accent; then what runs, by its channel and title;
+        // then what starts within a day, soonest first, by its day and time.
+        QStringList said;
+        App::texts(line, said);
+        QVERIFY2(said.contains("\u25cf LIVE NOW"), qPrintable(said.join(" | ")));
+        QCOMPARE(App::under(line, "live-mark")->property("color").value<QColor>(), QColor(app.theme->property("accent").toString()));
+        QTRY_COMPARE(liveItems(app).size(), 4);
+        const QStringList items = liveItems(app);
+        QCOMPARE(items.at(0), QString("Northlight Woodworks \u00b7 A dovetail box with four hand tools"));
+        QCOMPARE(items.at(1), QString("Kiln Notes \u00b7 Raku firing in the rain"));
+        const QRegularExpression dayTime("^\\S+ \\d\\d:\\d\\d \u00b7 ");
+        QVERIFY2(dayTime.match(items.at(2)).hasMatch() && items.at(2).endsWith(" \u00b7 The Long Ride"), qPrintable(items.at(2)));
+        QVERIFY2(dayTime.match(items.at(3)).hasMatch() && items.at(3).endsWith(" \u00b7 Signal & Noise"), qPrintable(items.at(3)));
+        // (In three days is not next.)
+        QVERIFY(!said.join("|").contains("Low Level Hours"));
+        // Everything fits: nothing is under a "+N".
+        QVERIFY(!app.item("live-more") || !app.item("live-more")->isVisible());
+        // A click opens what it names.
+        app.click(app.items("live-item").at(1));
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000009"));
+    }
+
+    void whatDoesNotFitOnTheLiveLineIsUnderPlusN()
+    {
+        App app(false, QSize(941, 900), {{"QVEIL_STANDIN_LIVE", "1"}});
+        READY(app);
+        QQuickItem *line = nullptr, *more = nullptr;
+        QTRY_VERIFY((line = app.item("live-line")) && line->isVisible());
+        QTRY_VERIFY((more = app.item("live-more")) && more->isVisible());
+        const QStringList shown = liveItems(app);
+        QVERIFY(!shown.isEmpty() && shown.size() < 4);
+        QCOMPARE(more->property("text").toString(), QString("+%1").arg(4 - shown.size()));
+        // The line stays inside the window.
+        QVERIFY(more->mapToScene(QPointF(more->width(), 0)).x() <= 941);
+        // The keyboard stops at it last, and Enter opens the rest; Escape closes them.
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+        QTest::keyClick(app.window, Qt::Key_J);
+        for (int i = 0; i < 6; ++i)
+            QTest::keyClick(app.window, Qt::Key_L);
+        QTRY_COMPARE(line->property("current").toInt(), shown.size());
+        QVERIFY(more->property("marked").toBool());
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_VERIFY(line->property("opened").toBool());
+        QTRY_COMPARE(app.items("live-rest").size(), 4 - shown.size());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!line->property("opened").toBool());
+        QCOMPARE(app.page(), QString("home"));
+
+        // The rest, in the same words, in a list it opens.
+        app.click(more);
+        QList<QQuickItem *> rest;
+        QTRY_COMPARE((rest = app.items("live-rest")).size(), 4 - shown.size());
+        QCOMPARE(rest.last()->property("label").toString().endsWith(" \u00b7 Signal & Noise"), true);
+        app.click(rest.last());
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000003"));
+    }
+
+    void theLiveLineIsAbsentWithNothingLive()
+    {
+        App app(false, QSize(2400, 1400));
+        READY(app);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_VERIFY(app.item("lead")->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QVERIFY(!app.item("live-line") || !app.item("live-line")->isVisible());
+        // The first shelf stands right under the lead.
+        QQuickItem *lead = app.item("lead");
+        const qreal gap = app.item("shelf-latest")->mapToScene(QPointF(0, 0)).y() - lead->mapToScene(QPointF(0, lead->height())).y();
+        // (In the scene's units: a large window is drawn larger.)
+        QQuickItem *shelves = app.item("shelves");
+        QCOMPARE(gap, shelves->mapToScene(QPointF(0, shelves->property("spacing").toReal())).y() - shelves->mapToScene(QPointF(0, 0)).y());
+        // And the keyboard goes from the lead to the first shelf, and back.
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_VERIFY(App::under(app.item("shelf-latest"), "card")->property("selected").toBool());
+        QVERIFY(!home->property("onLive").toBool());
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+    }
+
+    void theLiveLineIsReachableWithJAndOpensWithEnter()
+    {
+        App app(false, QSize(2400, 1400), {{"QVEIL_STANDIN_LIVE", "1"}});
+        READY(app);
+        QQuickItem *home = app.item("shelves-home"), *line = nullptr;
+        QTRY_VERIFY((line = app.item("live-line")) && line->isVisible());
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_VERIFY(app.item("shelves")->hasActiveFocus());
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+        const auto marked = [&] {
+            QStringList ids;
+            for (QQuickItem *card : app.items("card"))
+                if (card->property("selected").toBool())
+                    ids << card->property("videoId").toString();
+            return ids;
+        };
+        // From the lead, j is the line's first entry, and only that.
+        QCOMPARE(line->property("current").toInt(), -1);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(line->property("current").toInt(), 0);
+        QVERIFY(!home->property("leadSelected").toBool());
+        QVERIFY(marked().isEmpty());
+        QVERIFY(app.items("live-item").at(0)->property("marked").toBool());
+        // h and l move along it.
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTest::keyClick(app.window, Qt::Key_L);
+        QCOMPARE(line->property("current").toInt(), 2);
+        QTest::keyClick(app.window, Qt::Key_H);
+        QCOMPARE(line->property("current").toInt(), 1);
+        // j is the first shelf; k the line again, where it was; k again the lead.
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(marked().size(), 1);
+        QCOMPARE(line->property("current").toInt(), -1);
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTRY_COMPARE(line->property("current").toInt(), 1);
+        QVERIFY(marked().isEmpty());
+        QTest::keyClick(app.window, Qt::Key_K);
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+        QCOMPARE(line->property("current").toInt(), -1);
+        // Enter opens the entry it is on.
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_COMPARE(line->property("current").toInt(), 1);
+        QTest::keyClick(app.window, Qt::Key_Return);
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000009"));
+    }
+
+    void aChannelsStreamsTabAsksOnlyWhenOpened()
+    {
+        App app;
+        READY(app);
+        const QString low = "UCaaaaaaaaaaaaaaaaaaaaaa";
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, low));
+        QTRY_COMPARE(app.page(), QString("channel"));
+        QTRY_COMPARE(app.backend->channel().value("name").toString(), QString("Low Level Hours"));
+        QQuickItem *videos = app.item("channel-tab-videos"), *streams = app.item("channel-tab-streams");
+        QVERIFY(videos && videos->isVisible() && streams && streams->isVisible());
+        QCOMPARE(videos->property("text").toString(), QString("Videos"));
+        QCOMPARE(streams->property("text").toString(), QString("Streams"));
+        QVERIFY(videos->property("current").toBool());
+        QVERIFY(!streams->property("current").toBool());
+        // Under the channel's name, over the grid.
+        QQuickItem *page = app.item("channel-page");
+        QTRY_VERIFY(cardOf(page, "vid00000001"));
+        QVERIFY(videos->mapToScene(QPointF(0, videos->height())).y() < cardOf(page, "vid00000001")->mapToScene(QPointF(0, 0)).y());
+        QTest::qWait(200);
+        QCOMPARE(app.asked().filter("tab=streams").size(), 0);
+        const auto videosAsked = [&] { return app.asked().count("GET api/channel?id=" + low); };
+        QCOMPARE(videosAsked(), 1);
+
+        // Opened, the Streams tab asks once, and shows what it found in the same grid.
+        app.click(streams);
+        QTRY_COMPARE(app.asked("GET api/channel?id=" + low + "&tab=streams"), 1);
+        QTRY_VERIFY(streams->property("current").toBool());
+        QVERIFY(!videos->property("current").toBool());
+        QTRY_COMPARE(app.backend->channelVideos()->count(), 4);
+        QTRY_VERIFY(cardOf(page, "str00000001"));
+        QVERIFY(!cardOf(page, "vid00000001"));
+        // Back and forth, nothing is asked again.
+        app.click(videos);
+        QTRY_VERIFY(cardOf(page, "vid00000001"));
+        app.click(streams);
+        QTRY_VERIFY(cardOf(page, "str00000001"));
+        QTest::qWait(200);
+        QCOMPARE(app.asked("GET api/channel?id=" + low + "&tab=streams"), 1);
+        QCOMPARE(videosAsked(), 1);
+        // Refreshed, it is the tab that shows that is read again.
+        QMetaObject::invokeMethod(app.window, "refresh");
+        QTRY_COMPARE(app.asked("GET api/channel?id=" + low + "&tab=streams"), 2);
+        QCOMPARE(videosAsked(), 1);
+
+        // Another channel opens on its videos.
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCbbbbbbbbbbbbbbbbbbbbbb")));
+        QTRY_COMPARE(app.backend->channel().value("name").toString(), QString("Northlight Woodworks"));
+        QTRY_VERIFY(videos->property("current").toBool());
+        QVERIFY(!streams->property("current").toBool());
+        QTest::qWait(200);
+        QCOMPARE(app.asked().filter("tab=streams").size(), 2);
+    }
+
+    void theLiveSettingsSaveTheirKeys()
+    {
+        App app;
+        READY(app);
+        QTest::keyClick(app.window, Qt::Key_5);
+        app.click(app.item("settings-cat-home"));
+        QQuickItem *check = app.item("set-live-check"), *chat = app.item("set-live-chat");
+        QVERIFY(check && check->isVisible() && chat && chat->isVisible());
+        QCOMPARE(App::under(check, "setting-name")->property("text").toString(), QString("Check followed channels for live streams"));
+        QCOMPARE(app.item("set-live-check-note")->property("text").toString(),
+                 QString("Reads each channel's Streams tab at every feed refresh: one more request per channel, in random order with pauses."));
+        QCOMPARE(App::under(chat, "setting-name")->property("text").toString(), QString("Show live chat"));
+        QCOMPARE(app.item("set-live-chat-note")->property("text").toString(), QString("Loaded only while the Chat tab is open."));
+        // As the engine has them: the check off, chat on.
+        QVERIFY(app.item("live-check-off")->property("current").toBool());
+        QVERIFY(app.item("live-chat-on")->property("current").toBool());
+        const int posted = app.asked("POST api/config");
+
+        app.click(app.item("live-check-on"));
+        QTRY_VERIFY(app.backend->config().value("liveCheck").toBool());
+        QTRY_VERIFY(app.item("live-check-on")->property("current").toBool());
+        app.click(app.item("live-chat-off"));
+        QTRY_VERIFY(!app.backend->config().value("liveChat").toBool());
+        QTRY_VERIFY(app.item("live-chat-off")->property("current").toBool());
+        QCOMPARE(app.asked("POST api/config"), posted + 2);
+
+        // Both are rows the keyboard reaches, beside the topic feeds.
+        QObject *page = app.item("settings");
+        const QVariantList rows = page->property("rowsIn").toMap().value("home").toList();
+        QStringList names;
+        for (const QVariant &row : rows)
+            names << row.value<QObject *>()->objectName();
+        const int topics = names.indexOf("set-topics");
+        QVERIFY(topics >= 0);
+        QCOMPARE(names.mid(topics, 3), QStringList({"set-topics", "set-live-check", "set-live-chat"}));
+    }
+
     void aSortedGridKeepsItsPlaceWhenItsListChanges()
     {
         App app;

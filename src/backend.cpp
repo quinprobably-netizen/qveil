@@ -445,6 +445,39 @@ void Backend::loadFeed(bool network, bool shorts, const QString &channel) {
     });
 }
 
+namespace {
+
+// What of `entries` is live now (in the feed's order), then what is
+// announced to start within a day of `now`, soonest first. (What is past its
+// start and not yet running is still announced: it is about to start.)
+QVariantList liveOf(const QVariantList &entries, qint64 now) {
+    QVariantList running, upcoming;
+    QSet<QString> seen;
+    for (const QVariant &entry : entries) {
+        const QVariantMap video = entry.toMap();
+        const QString id = video.value("id").toString();
+        const QString live = video.value("live").toString();
+        if (id.isEmpty() || seen.contains(id))
+            continue;
+        if (live == "now") {
+            seen.insert(id);
+            running << video;
+        } else if (live == "upcoming") {
+            const qint64 starts = video.value("starts").toLongLong();
+            if (starts > 0 && starts - now < 86400) {
+                seen.insert(id);
+                upcoming << video;
+            }
+        }
+    }
+    std::stable_sort(upcoming.begin(), upcoming.end(), [](const QVariant &a, const QVariant &b) {
+        return a.toMap().value("starts").toLongLong() < b.toMap().value("starts").toLongLong();
+    });
+    return running + upcoming;
+}
+
+} // namespace
+
 void Backend::applyFeed(const QVariantMap &answer, bool network, bool shorts) {
     // Asked for before the Shorts choice changed, so its videos are the wrong
     // ones. A refresh that was still running has saved what it fetched, though,
@@ -455,7 +488,9 @@ void Backend::applyFeed(const QVariantMap &answer, bool network, bool shorts) {
         return;
     }
     newPage(m_feed);
-    m_feed->assign(answer.value("entries").toList());
+    const QVariantList entries = answer.value("entries").toList();
+    m_feed->assign(entries);
+    m_liveNow = liveOf(entries, QDateTime::currentSecsSinceEpoch());
     m_feedInfo = answer;
     m_feedInfo.remove("entries");
     if (network)
@@ -601,25 +636,51 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
     });
 }
 
-void Backend::openChannel(const QString &id) {
+void Backend::openChannel(const QString &id, const QString &tab) {
     if (id.isEmpty())
         return;
+    const QString which = tab == "streams" ? tab : QStringLiteral("videos");
     // Opening the channel that is already open (refresh) leaves its videos
     // where they are until the answer updates them.
     if (m_channel.value("id").toString() != id) {
         m_channel = QVariantMap{{"id", id}, {"name", QString()}};
+        m_channelTab = which;
+        m_channelTabs.clear();
         m_channelVideos->clear();
         newPage(m_channelVideos);
+        emit channelChanged();
+    } else if (m_channelTab != which) {
+        // Another tab of the open channel: what was read of it already is
+        // shown, and asked for only the first time.
+        m_channelTab = which;
+        newPage(m_channelVideos);
+        const auto kept = m_channelTabs.constFind(which);
+        if (kept != m_channelTabs.constEnd()) {
+            m_channelVideos->assign(*kept);
+            emit channelChanged();
+            return;
+        }
+        m_channelVideos->clear();
         emit channelChanged();
     }
     QUrlQuery q;
     q.addQueryItem("id", id);
-    call("GET", "api/channel", q, {}, "channel", [this](const QJsonValue &v) {
+    if (which == "streams")
+        q.addQueryItem("tab", which);
+    call("GET", "api/channel", q, {}, "channel", [this, id, which](const QJsonValue &v) {
         QJsonObject page = v.toObject();
+        const QVariantList videos = page.take("videos").toArray().toVariantList();
+        // (Answered for a tab that was left meanwhile, it is kept for when
+        // that tab is opened again, and not shown.)
+        if (m_channel.value("id").toString() != id)
+            return;
+        m_channelTabs.insert(which, videos);
+        if (m_channelTab != which)
+            return;
         // The videos of a channel opened again (refreshed) are a new page too;
         // the cards that stay keep the thumbnails they have.
         newPage(m_channelVideos);
-        m_channelVideos->assign(page.take("videos").toArray().toVariantList());
+        m_channelVideos->assign(videos);
         m_channel = page.toVariantMap();
         emit channelChanged();
     });
