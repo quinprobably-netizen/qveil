@@ -1,19 +1,29 @@
-//! `GET api/wait?v=<id>`: the waiting room of an announced stream, until it
-//! starts.
+//! `GET api/wait?v=<id>[&starts=<ts>]`: the waiting room of an announced
+//! stream, until it starts.
 //!
-//! The window opens it when a play says `waiting`, and the lines it reads are
-//! NDJSON: `{"state":"upcoming","starts":<Unix seconds or null>}` when the
-//! first lookup says when the stream is announced for (and again if that
-//! changes), then `{"state":"now"}` once a lookup finds it started (the window
-//! then plays it, once), or `{"state":"gave_up"}` six hours after the
-//! announced time, with the engine's words for it (`errors::GAVE_UP`) and
-//! their code. A lookup that fails, or a route that is left, ends it with the
-//! usual error line.
+//! The window opens it when a play says `waiting`, and passes the time that
+//! answer gave (`starts`, Unix seconds), so that the first lookup is at that
+//! time and not before. The lines it reads are NDJSON:
 //!
-//! The lookups follow `next_ask`'s schedule, each over the route in use, on
-//! an identity of its own (see `Runtime::pinned_ytdlp`), and stop with the
-//! window: a client that hangs up is noticed within a fraction of a second,
-//! also while the job is asleep between two lookups.
+//! - `{"state":"upcoming","starts":<Unix seconds or null>}`: at once if
+//!   `starts` was given, otherwise when the first lookup says when the stream
+//!   is announced for, and again whenever that changes. Also as a heartbeat,
+//!   whenever nothing else has been said for a while (see
+//!   `Runtime::wait_heartbeat`), so that the connection is never idle for
+//!   long: it is sent while the job sleeps, and while a lookup runs.
+//! - `{"state":"now"}` once a lookup finds the stream started (the window
+//!   then plays it, once, and that play opens it for real). The job ends.
+//! - `{"state":"gave_up", ...}` six hours after the announced time, with the
+//!   engine's words for it (`errors::GAVE_UP`) and their code. The job ends.
+//! - The usual error line, for something that is not a video and for a route
+//!   that was left. The job ends.
+//!
+//! The lookups follow `next_ask`'s schedule: one live lookup each, over the
+//! route in use, on an identity of its own (see `Runtime::pinned_ytdlp`). One
+//! that fails (a Tor circuit that stalled, a bot check, a timeout) says
+//! nothing and is made up for by the next. The job stops with the window: a
+//! client that hangs up is noticed within a fraction of a second, also while
+//! it is asleep between two lookups or in the middle of one.
 
 use super::Server;
 use super::http::{NDJSON_HEAD, Request, Watch};
@@ -23,10 +33,11 @@ use crate::inflight::ROUTE_CHANGED;
 use crate::live::Opening;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long after one ask the next follows (seconds).
 const EVERY: i64 = 60;
@@ -47,13 +58,13 @@ const LOOK_EVERY: Duration = Duration::from_millis(100);
 /// forward: there is none before it. Without an announced time there is no
 /// telling how late the stream is, so it is never given up on here.
 pub(super) fn next_ask(now: i64, starts: Option<i64>, asked_at: Option<i64>) -> Option<i64> {
-    let late = starts.map_or(0, |s| now - s);
+    let late = starts.map_or(0, |s| now.saturating_sub(s));
     if late >= GIVE_UP {
         return None;
     }
     let due = match asked_at {
         None => now,
-        Some(at) => at + if late < LATE { EVERY } else { EVERY_WHEN_LATE },
+        Some(at) => at.saturating_add(if late < LATE { EVERY } else { EVERY_WHEN_LATE }),
     };
     Some(starts.map_or(due, |s| due.max(s)))
 }
@@ -94,37 +105,52 @@ impl Clock {
         }
         Duration::from_millis((secs.unsigned_abs() * 1000 / self.speed.unsigned_abs()).max(1))
     }
+}
 
-    /// Sleeps until `at`, or until `wanted` says no, which it is asked every
-    /// tenth of a second.
-    fn sleep_until(&self, at: i64, wanted: &dyn Fn() -> bool) {
-        while wanted() {
-            let left = self.until(at);
-            if left.is_zero() {
-                return;
-            }
-            std::thread::sleep(left.min(LOOK_EVERY));
+/// The reply, a line at a time. A line can be written from where a lookup is
+/// waited for (the heartbeat), so what writing changes is behind cells.
+struct Lines<'a> {
+    out: RefCell<&'a mut TcpStream>,
+    started: Cell<bool>,
+    /// When the last line was written (or the reply began).
+    last: Cell<Instant>,
+    heartbeat: Duration,
+}
+
+impl<'a> Lines<'a> {
+    fn new(out: &'a mut TcpStream, heartbeat: Duration) -> Self {
+        Lines {
+            out: RefCell::new(out),
+            started: Cell::new(false),
+            last: Cell::new(Instant::now()),
+            heartbeat,
         }
     }
-}
 
-/// The reply, a line at a time.
-struct Lines<'a> {
-    out: &'a mut TcpStream,
-    started: bool,
-}
-
-impl Lines<'_> {
-    fn say(&mut self, line: &Value) -> Result<()> {
+    fn say(&self, line: &Value) -> Result<()> {
         let mut text = String::new();
-        if !self.started {
+        if !self.started.get() {
             text.push_str(NDJSON_HEAD);
         }
         text.push_str(&format!("{line}\n"));
-        self.out.write_all(text.as_bytes())?;
-        self.started = true;
+        self.out.borrow_mut().write_all(text.as_bytes())?;
+        self.started.set(true);
+        self.last.set(Instant::now());
         Ok(())
     }
+
+    /// Says that the stream is still announced for `starts`, if nothing has
+    /// been said for a heartbeat.
+    fn beat(&self, starts: Option<i64>) -> Result<()> {
+        if self.last.get().elapsed() >= self.heartbeat {
+            self.say(&upcoming(starts))?;
+        }
+        Ok(())
+    }
+}
+
+fn upcoming(starts: Option<i64>) -> Value {
+    json!({ "state": "upcoming", "starts": starts })
 }
 
 /// What the window is told when the stream never started: the engine's words
@@ -136,17 +162,16 @@ fn gave_up() -> Value {
 }
 
 impl Server {
-    /// `GET api/wait?v=<id>`: see the module's docs.
+    /// `GET api/wait?v=<id>[&starts=<ts>]`: see the module's docs. A `starts`
+    /// that isn't a number is taken as not given.
     pub(super) fn wait(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let watch = Watch::new(out);
-        let mut lines = Lines {
-            out,
-            started: false,
-        };
+        let lines = Lines::new(out, self.runtime().wait_heartbeat);
+        let announced = req.query.get("starts").and_then(|s| s.parse().ok());
         let waited = req.param("v").and_then(|target| {
             let v = ids::parse_video(target)
                 .with_context(|| format!("{target:?} isn't a YouTube video"))?;
-            self.wait_for_start(&v, &watch, &mut lines)
+            self.wait_for_start(&v, announced, &watch, &lines)
         });
         match waited {
             Ok(()) => Ok(()),
@@ -158,16 +183,37 @@ impl Server {
 
     /// Asks about `v` on `next_ask`'s schedule until it has started, the
     /// time to give up has come, or nobody is waiting (or the route was
-    /// left) any more.
-    fn wait_for_start(&self, v: &VideoRef, watch: &Watch, lines: &mut Lines) -> Result<()> {
+    /// left) any more. `announced` is when it is known to start, if it is.
+    fn wait_for_start(
+        &self,
+        v: &VideoRef,
+        announced: Option<i64>,
+        watch: &Watch,
+        lines: &Lines,
+    ) -> Result<()> {
         let rt = self.runtime();
         let clock = Clock::start(rt.wait_speed);
         let began = clock.now();
-        let wanted = || !watch.gone() && self.still_on(&rt);
-        let mut starts = None;
-        let mut asked = None;
+        let starts = Cell::new(announced);
         // What the window was last told the stream starts at.
-        let mut said: Option<Option<i64>> = None;
+        let mut said = None;
+        if announced.is_some() {
+            lines.say(&upcoming(announced))?;
+            said = Some(announced);
+        }
+        // Whether a heartbeat could not be written: nobody is reading.
+        let deaf = Cell::new(false);
+        // Asked while a lookup runs: whether to end it.
+        let abort = || {
+            if watch.gone() || !self.still_on(&rt) {
+                return true;
+            }
+            if lines.beat(starts.get()).is_err() {
+                deaf.set(true);
+            }
+            deaf.get()
+        };
+        let mut asked = None;
         loop {
             if watch.gone() {
                 return Ok(());
@@ -178,37 +224,42 @@ impl Server {
             let now = clock.now();
             // How late it is is measured from when the wait began if no time
             // was announced: a stream that never says is not waited for forever.
-            let Some(at) = next_ask(now, starts.or(Some(began)), asked) else {
+            let Some(at) = next_ask(now, starts.get().or(Some(began)), asked) else {
                 return lines.say(&gave_up());
             };
             if at > now {
-                clock.sleep_until(at, &wanted);
+                std::thread::sleep(clock.until(at).min(LOOK_EVERY));
+                lines.beat(starts.get())?;
                 // What was asked of it may have changed while it slept, or the
                 // time to give up have come.
                 continue;
             }
             asked = Some(now);
-            let found = rt.pinned_ytdlp().open_until(
-                &v.watch_url(),
-                &rt.cfg.format(),
-                rt.cfg.max_height,
-                &|| !wanted(),
-            );
-            if watch.gone() {
+            let found = rt
+                .pinned_ytdlp()
+                .live_until(&v.watch_url(), rt.cfg.max_height, &abort);
+            if watch.gone() || deaf.get() {
                 return Ok(());
             }
-            match self.guarded(&rt, found)? {
-                Opening::Upcoming { starts: when, .. } => {
-                    starts = when;
+            if !self.still_on(&rt) {
+                bail!(ROUTE_CHANGED);
+            }
+            match found {
+                Ok(Opening::Upcoming { starts: when, .. }) => {
+                    starts.set(when);
                     if said != Some(when) {
-                        lines.say(&json!({ "state": "upcoming", "starts": when }))?;
+                        lines.say(&upcoming(when))?;
                         said = Some(when);
                     }
                 }
-                // Started: a running stream, a finished one, or a video.
-                Opening::Live(_) | Opening::Plain(_) => {
+                // Started (a live lookup finds nothing else, but a video that
+                // is no stream any more has started too).
+                Ok(Opening::Live(_) | Opening::Plain(_)) => {
                     return lines.say(&json!({ "state": "now" }));
                 }
+                // A Tor circuit that stalled, a bot check, a timeout: the
+                // schedule goes on, and the next ask is another try.
+                Err(e) => note!("qveil: asking whether a stream has started failed: {e:#}"),
             }
         }
     }
@@ -218,6 +269,7 @@ impl Server {
 mod tests {
     use super::*;
     use crate::app;
+    use crate::app::Runtime;
     use crate::config::Config;
     use crate::errors::GAVE_UP;
     use crate::server::testkit::*;
@@ -261,10 +313,12 @@ mod tests {
         // first ask at once, then every minute.
         assert_eq!(next_ask(700, None, None), Some(700));
         assert_eq!(next_ask(700, None, Some(690)), Some(750));
+        // A time that is far off the scale is no reason to overflow.
+        assert_eq!(next_ask(700, Some(i64::MIN), Some(690)), None);
+        assert_eq!(next_ask(700, Some(i64::MAX), None), Some(i64::MAX));
     }
 
-    /// The lines of a wait that runs to its end.
-    fn waited(base: &str, query: &str) -> Vec<Value> {
+    fn request(base: &str, query: &str) -> TcpStream {
         let mut c = TcpStream::connect(addr(base)).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         write!(
@@ -273,8 +327,13 @@ mod tests {
             path(base, &format!("api/wait?{query}"))
         )
         .unwrap();
+        c
+    }
+
+    /// The lines of a wait that runs to its end.
+    fn waited(base: &str, query: &str) -> Vec<Value> {
         let mut all = String::new();
-        c.read_to_string(&mut all).unwrap();
+        request(base, query).read_to_string(&mut all).unwrap();
         let (head, body) = all.split_once("\r\n\r\n").unwrap();
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(head.contains("application/x-ndjson"), "{head}");
@@ -289,19 +348,15 @@ mod tests {
 
     impl Open {
         fn new(base: &str, query: &str) -> Self {
-            let mut c = TcpStream::connect(addr(base)).unwrap();
-            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            write!(
-                c,
-                "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
-                path(base, &format!("api/wait?{query}"))
-            )
-            .unwrap();
-            let mut r = BufReader::new(c);
+            let mut r = BufReader::new(request(base, query));
             let mut head = String::new();
-            while head.trim_end() != "" || head.is_empty() {
+            loop {
                 head.clear();
-                r.read_line(&mut head).unwrap();
+                let n = r.read_line(&mut head).unwrap();
+                assert!(n > 0, "the reply ended inside its head");
+                if head == "\r\n" {
+                    break;
+                }
             }
             Open(r)
         }
@@ -317,17 +372,38 @@ mod tests {
     /// `k` live lookups, and then that it is live, with the waiting room's
     /// minute shrunk to 50 ms.
     fn announced(k: usize, starts: i64) -> (Arc<Server>, String, TempDir, TempDir, LiveUpstream) {
+        announced_tuned(k, starts, |_| {})
+    }
+
+    /// `announced`, with `tune` changing the runtime too.
+    fn announced_tuned(
+        k: usize,
+        starts: i64,
+        tune: impl FnOnce(&mut Runtime),
+    ) -> (Arc<Server>, String, TempDir, TempDir, LiveUpstream) {
         let up = LiveUpstream::start(60_000, 0, 20);
         let bin = TempDir::new();
         let ytdlp = fake_live_ytdlp_upcoming(&bin.0, &up, k, starts)
             .display()
             .to_string();
+        serve(ytdlp, tune, bin, up)
+    }
+
+    fn serve(
+        ytdlp: String,
+        tune: impl FnOnce(&mut Runtime),
+        bin: TempDir,
+        up: LiveUpstream,
+    ) -> (Arc<Server>, String, TempDir, TempDir, LiveUpstream) {
         let (s, base, d) = server_tuned(
             Config {
                 ytdlp,
                 ..Config::default()
             },
-            |rt| rt.wait_speed = SPEED,
+            |rt| {
+                rt.wait_speed = SPEED;
+                tune(rt);
+            },
         );
         (s, base, d, bin, up)
     }
@@ -345,9 +421,8 @@ mod tests {
                 json!({"state":"now"})
             ]
         );
-        // Three asks a minute apart: a minute is 50 ms here. Each is the
-        // usual lookup and then the live one.
-        assert_eq!(runs(&bin.0), 6);
+        // Three asks a minute apart: a minute is 50 ms here.
+        assert_eq!(runs(&bin.0), 3);
         assert!(
             began.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -356,7 +431,25 @@ mod tests {
     }
 
     #[test]
-    fn waiting_asks_at_the_announced_time_and_not_before() {
+    fn each_ask_is_one_lookup() {
+        let starts = app::now() - 720;
+        let (_s, base, _d, bin, _up) = announced(2, starts);
+        waited(&base, &format!("v={ID}&starts={starts}"));
+        // Three asks, one yt-dlp call each, and each is the live lookup:
+        // not the usual one first, which a stream that is known to be one
+        // doesn't need.
+        assert_eq!(runs(&bin.0), 3);
+        for n in 1..=3 {
+            let conf = std::fs::read_to_string(bin.0.join(format!("conf{n}"))).unwrap();
+            assert!(
+                conf.lines().any(|l| l == "--live-from-start"),
+                "{n}: {conf}"
+            );
+        }
+    }
+
+    #[test]
+    fn waiting_without_a_known_start_asks_at_once_and_then_at_the_start() {
         // 20 minutes ahead is a second here.
         let starts = app::now() + 1200;
         let (_s, base, _d, bin, _up) = announced(1, starts);
@@ -371,9 +464,88 @@ mod tests {
         );
         // The first ask learns when it starts; the second is at that time,
         // not a minute (50 ms) later.
-        assert_eq!(runs(&bin.0), 4);
+        assert_eq!(runs(&bin.0), 2);
         assert!(
             began.elapsed() >= Duration::from_millis(900),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[test]
+    fn waiting_with_a_known_start_asks_first_at_the_start() {
+        // 20 minutes ahead is a second here.
+        let starts = app::now() + 1200;
+        let (_s, base, _d, bin, _up) = announced(0, starts);
+        let mut open = Open::new(&base, &format!("v={ID}&starts={starts}"));
+        // Said at once, before anyone has asked.
+        assert_eq!(open.line(), json!({"state":"upcoming","starts":starts}));
+        assert_eq!(runs(&bin.0), 0);
+        let began = Instant::now();
+        assert_eq!(open.line(), json!({"state":"now"}));
+        // The only ask is at the start.
+        assert_eq!(runs(&bin.0), 1);
+        assert!(
+            began.elapsed() >= Duration::from_millis(800),
+            "{:?}",
+            began.elapsed()
+        );
+
+        // A start that is past is asked at once, and a start that is no
+        // number is taken as none: both ask at once too.
+        for query in [
+            format!("&starts={}", app::now() - 720),
+            "&starts=soon".to_string(),
+        ] {
+            let before = runs(&bin.0);
+            let began = Instant::now();
+            let lines = waited(&base, &format!("v={ID}{query}"));
+            assert_eq!(lines.last(), Some(&json!({"state":"now"})), "{query}");
+            assert_eq!(runs(&bin.0), before + 1, "{query}");
+            assert!(began.elapsed() < Duration::from_millis(700), "{query}");
+        }
+    }
+
+    #[test]
+    fn a_failed_ask_is_tried_again_at_the_next_one() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let fake = fake_live_ytdlp_upcoming(&bin.0, &up, 1, app::now() - 720);
+        // The first two asks fail, as a Tor circuit that stalls or a bot
+        // check does; then it is the fake, which announces once and starts.
+        let wrapper = TempDir::new();
+        let ytdlp = crate::store::testing::script(
+            &wrapper.0.join("yt-dlp"),
+            &format!(
+                r#"d='{}'
+n=$(cat "$d/failed" 2>/dev/null || echo 0)
+if [ "$n" -lt 2 ]; then
+  echo $((n + 1)) > "$d/failed"
+  echo 'ERROR: [youtube] x: Sign in to confirm you are not a bot' >&2
+  exit 1
+fi
+exec '{}' "$@"
+"#,
+                wrapper.0.display(),
+                fake.display()
+            ),
+        );
+        let (_s, base, _d, _bin, _up) = serve(ytdlp, |_| {}, bin, up);
+        let began = Instant::now();
+        let lines = waited(&base, &format!("v={ID}"));
+        // Nothing was said of the failures.
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["state"], "upcoming");
+        assert_eq!(lines[1], json!({"state":"now"}));
+        assert_eq!(
+            std::fs::read_to_string(wrapper.0.join("failed"))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+        // A minute (50 ms) between asks: four of them.
+        assert!(
+            began.elapsed() >= Duration::from_millis(120),
             "{:?}",
             began.elapsed()
         );
@@ -392,7 +564,7 @@ mod tests {
         assert_eq!(lines[1]["error"], GAVE_UP);
         // Late by more than 30 minutes, so asked every 5, not every minute:
         // at most the first ask and one after it before the end.
-        let asked = runs(&bin.0) / 2;
+        let asked = runs(&bin.0);
         assert!((1..=2).contains(&asked), "{asked} asks");
     }
 
@@ -402,7 +574,7 @@ mod tests {
         let mut open = Open::new(&base, &format!("v={ID}"));
         assert_eq!(open.line()["state"], "upcoming");
         // It is asking every 50 ms.
-        wait_for("three asks", Duration::from_secs(5), || runs(&bin.0) >= 6);
+        wait_for("three asks", Duration::from_secs(5), || runs(&bin.0) >= 3);
         drop(open);
         // The ask that was going finishes; none follows it.
         std::thread::sleep(Duration::from_millis(400));
@@ -424,6 +596,59 @@ mod tests {
         let after = runs(&bin.0);
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(runs(&bin.0), after);
+    }
+
+    #[test]
+    fn waiting_sends_a_heartbeat() {
+        // Far ahead (a quarter of an hour here), so that nothing is asked.
+        let starts = app::now() + 1_000_000;
+        let (_s, base, _d, bin, _up) = announced_tuned(100_000, starts, |rt| {
+            rt.wait_heartbeat = Duration::from_millis(100);
+        });
+        let mut open = Open::new(&base, &format!("v={ID}&starts={starts}"));
+        let began = Instant::now();
+        for n in 0..4 {
+            assert_eq!(
+                open.line(),
+                json!({"state":"upcoming","starts":starts}),
+                "line {n}"
+            );
+        }
+        // One at once, and three more a heartbeat apart.
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(250), "{took:?}");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(runs(&bin.0), 0);
+    }
+
+    #[test]
+    fn the_heartbeat_goes_on_while_a_lookup_runs() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let ytdlp = hanging_ytdlp(&bin.0);
+        let (_s, base, _d, bin, _up) = serve(
+            ytdlp,
+            |rt| rt.wait_heartbeat = Duration::from_millis(100),
+            bin,
+            up,
+        );
+        // Nothing is known, and the first lookup hangs: it is all heartbeat.
+        let mut open = Open::new(&base, &format!("v={ID}"));
+        let began = Instant::now();
+        for n in 0..3 {
+            assert_eq!(
+                open.line(),
+                json!({"state":"upcoming","starts":null}),
+                "{n}"
+            );
+        }
+        assert!(began.elapsed() >= Duration::from_millis(150));
+        let pid = std::fs::read_to_string(bin.0.join("pid")).unwrap();
+        let alive = || std::path::Path::new(&format!("/proc/{}", pid.trim())).exists();
+        assert!(alive(), "the lookup was not running");
+        // The window leaves, and the lookup it was waiting for is ended.
+        drop(open);
+        wait_for("the lookup to end", Duration::from_secs(5), || !alive());
     }
 
     #[test]

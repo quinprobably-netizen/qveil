@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 /// killed mid-refresh loses at most this much of it.
 const SAVE_EVERY: Duration = Duration::from_secs(2);
 
+/// How long the waiting room (`GET api/wait`) may be silent before it says
+/// where the stream stands again, so that the window's connection to it
+/// never looks idle.
+const WAIT_HEARTBEAT: Duration = Duration::from_secs(25);
+
 /// How long a lens or topic refresh waits before each of its searches after
 /// the first, at random between these: searches that go out back to back,
 /// and in the same order each time, are easier to tell from a person's.
@@ -46,6 +51,9 @@ pub struct Runtime {
     /// How many times faster than the clock the waiting room's schedule runs
     /// (1: the minute is a minute); only tests change it (see `server::wait`).
     pub wait_speed: u32,
+    /// How often the waiting room repeats itself while it has nothing new
+    /// to say (`WAIT_HEARTBEAT`); only tests change it.
+    pub wait_heartbeat: Duration,
 }
 
 impl Runtime {
@@ -74,6 +82,7 @@ impl Runtime {
             save_every: SAVE_EVERY,
             pause: search_pause(),
             wait_speed: 1,
+            wait_heartbeat: WAIT_HEARTBEAT,
         })
     }
 
@@ -107,16 +116,18 @@ impl Runtime {
     /// This runtime, with what only tests change carried over from `from`:
     /// where the feeds and thumbnails are fetched, how often a refresh
     /// saves, the pause between searches, how fast the waiting room's clock
-    /// runs, and the test knobs of the route (see `Net::with_knobs_of`). A
-    /// settings change builds a new runtime from the config, and a test's
-    /// must keep using its local stand-ins instead of YouTube. In production
-    /// these are constants, so this changes nothing there.
+    /// runs and how often it repeats itself, and the test knobs of the route
+    /// (see `Net::with_knobs_of`). A settings change builds a new runtime
+    /// from the config, and a test's must keep using its local stand-ins
+    /// instead of YouTube. In production these are constants, so this
+    /// changes nothing there.
     pub fn carrying_test_bases(mut self, from: &Runtime) -> Self {
         self.feed_base.clone_from(&from.feed_base);
         self.thumb_base.clone_from(&from.thumb_base);
         self.save_every = from.save_every;
         self.pause = Arc::clone(&from.pause);
         self.wait_speed = from.wait_speed;
+        self.wait_heartbeat = from.wait_heartbeat;
         self.net = self.net.with_knobs_of(&from.net);
         self.yt.net = self.yt.net.with_knobs_of(&from.net);
         self
