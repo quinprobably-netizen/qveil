@@ -43,6 +43,7 @@ private slots:
                           "  function meta(a, b, c) { return Format.meta(a, b, c) }\n"
                           "  function waitLine(a, b, c) { return Format.waitLine(a, b) }\n"
                           "  function liveMeta(a, b, c) { return Format.liveMeta(a, b, c) }\n"
+                          "  function liveHint(a, b, c) { return Format.liveHint(a) }\n"
                           "}",
                           QUrl("qrc:/FormatStage.qml"));
         format.reset(component.create());
@@ -126,6 +127,22 @@ private slots:
         QCOMPARE(call("liveMeta", live(5), started + 14 * 60, true), QString("live now · 5 watching · started 14 min ago"));
         // And narrower still, the count without its word.
         QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60, 2), QString("live now · 1.2K · started 2 h ago"));
+    }
+
+    void whatAVideoSaysItIsGoesToTheEngineAsAHint()
+    {
+        // A card says it with a word.
+        QCOMPARE(call("liveHint", QVariantMap{{"id", "a"}, {"live", "now"}}), QString("now"));
+        QCOMPARE(call("liveHint", QVariantMap{{"id", "a"}, {"live", "upcoming"}}), QString("upcoming"));
+        // A play answer, with the state of its stream: a running one is, one that ended (or an ordinary video) is not.
+        QCOMPARE(call("liveHint", QVariantMap{{"id", "a"}, {"live", QVariantMap{{"state", "now"}}}}), QString("now"));
+        QCOMPARE(call("liveHint", QVariantMap{{"id", "a"}, {"live", QVariantMap{{"state", "ended"}}}}), QString(""));
+        QCOMPARE(call("liveHint", QVariantMap{{"id", "a"}}), QString(""));
+        // An answer that is a waiting room is for an announced stream.
+        QCOMPARE(call("liveHint", QVariantMap{{"id", "a"}, {"waiting", QVariantMap{{"starts", 5}}}}), QString("upcoming"));
+        // Whatever else the field says is no word of the engine's.
+        QCOMPARE(call("liveHint", QVariantMap{{"id", "a"}, {"live", "hide"}}), QString(""));
+        QCOMPARE(call("liveHint", QVariant()), QString(""));
     }
 };
 

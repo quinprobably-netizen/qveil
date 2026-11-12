@@ -783,11 +783,15 @@ void Backend::clearHistory() {
     });
 }
 
-void Backend::play(const QString &video, const QString &channel) {
+void Backend::play(const QString &video, const QString &channel, const QString &live) {
     QUrlQuery q;
     q.addQueryItem("v", video);
     if (!channel.isEmpty())
         q.addQueryItem("channel", channel);
+    // What the card says it is, so that the engine asks for a stream as one
+    // from the first lookup (only these two mean anything to it).
+    if (live == "now" || live == "upcoming")
+        q.addQueryItem("live", live);
     call("POST", "api/play", q, {}, "play", [this](const QJsonValue &v) {
         emit playReady(v.toObject().toVariantMap());
         if (m_config.value("history").toBool())
@@ -819,7 +823,7 @@ void Backend::checkLive(const QString &playlist) {
         const QString state = o.value("state").toString();
         // (A session that is gone says only that it has ended.)
         if (!state.isEmpty())
-            emit liveChecked(playlist, state, o.value("head").toInteger(-1), o.value("oldest").toInteger(-1));
+            emit liveChecked(playlist, state, o.value("edge").toDouble(-1));
     });
 }
 

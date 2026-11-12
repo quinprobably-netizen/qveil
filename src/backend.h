@@ -166,8 +166,10 @@ public:
     Q_INVOKABLE void loadConfig();
     Q_INVOKABLE void setConfig(const QVariantMap &patch);
     // `channel`: the channel's name on the card it was opened from, for an
-    // answer that has none of its own.
-    Q_INVOKABLE void play(const QString &video, const QString &channel = QString());
+    // answer that has none of its own. `live`: "now" or "upcoming" if the card
+    // says the video is a stream running or announced (see Format.liveHint),
+    // which the engine takes as where to begin its lookup.
+    Q_INVOKABLE void play(const QString &video, const QString &channel = QString(), const QString &live = QString());
     // Drops the answer of a video still being looked up, and hangs up on the
     // engine, which can then stop looking: the player it was for has been closed.
     Q_INVOKABLE void cancelPlay();
@@ -285,8 +287,9 @@ signals:
     void playReady(const QVariantMap &info);
     // What the engine said of the stream `playlist` (see checkLive): "now",
     // or "ended", which is also what a session it no longer has is; and the
-    // newest and oldest segment it lists (-1 when it didn't say).
-    void liveChecked(const QString &playlist, const QString &state, qint64 head, qint64 oldest);
+    // end of its newest segment on the player's clock, in seconds (-1 when it
+    // didn't say).
+    void liveChecked(const QString &playlist, const QString &state, double edge);
     // What the engine said of the stream being waited for: "upcoming", with
     // when it starts (0 if that isn't known), now and then while it waits;
     // "now" once it has started, which ends the wait. `note` is "bot_check"

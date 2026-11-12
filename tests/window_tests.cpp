@@ -1626,6 +1626,8 @@ private slots:
         app.backend->setConfig({{"route", "tor"}});
         QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
         QTRY_COMPARE(app.asked("POST api/play"), opened + 1);
+        // A video that is no stream is asked for with no word of one, both times.
+        QCOMPARE(app.askedLike("^POST api/play.*live="), 0);
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && !surface->property("pending").toBool(), 15000);
         QVERIFY(app.window->property("watching").toBool());
         QCOMPARE(surface->property("info").toMap().value("id").toString(), QString("vid00000002"));
@@ -4988,8 +4990,8 @@ private slots:
                + (live && live->isVisible() ? " " + live->property("text").toString() : QString());
     }
     // Where the stand-in engine says the running stream's live edge is, on
-    // the player's timeline (its oldest segment is 0, as the timeline's
-    // start is): the end of its newest segment, in seconds. -1 if it didn't say.
+    // the player's timeline: its state's `edge`, the end of its newest
+    // segment, in seconds. -1 if it didn't say.
     static double edgeOf(App &app)
     {
         const QString video = app.item("surface")->property("info").toMap().value("video").toString();
@@ -4998,7 +5000,7 @@ private slots:
         done.wait(5000);
         const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
         reply->deleteLater();
-        return o.contains("head") ? 2.0 * (o.value("head").toInt() - o.value("oldest").toInt() + 1) : -1;
+        return o.contains("edge") ? o.value("edge").toDouble() : -1;
     }
 
     void aLiveStreamOpensNearTheEdgeAndSaysLive()
@@ -5017,9 +5019,13 @@ private slots:
         // (as it is when FFmpeg opens the playlist at its end, about 13 s here).
         QVERIFY2(opening.elapsed() < 10000, qPrintable(QString::number(opening.elapsed())));
         QQuickItem *surface = app.item("surface");
-        // Three segments from the end, in one load: mpv was given the negative start.
+        // Three segments from the end, in one load: mpv was given the negative
+        // start as the answer gave it, which is what `join` says.
         QCOMPARE(surface->property("startedAt").toDouble(), -6.0);
+        QCOMPARE(surface->property("join").toDouble(), 6.0);
         QVERIFY(surface->property("live").toBool());
+        // The card said it is running, and so the engine was told.
+        QCOMPARE(app.askedLike("^POST api/play\\?v=live0000001&.*\\blive=now$"), 1);
         const double length = surface->property("length").toDouble(), position = mpv->property("position").toDouble();
         QVERIFY2(length >= 16 && position >= length - 8, qPrintable(QString("%1 of %2").arg(position).arg(length)));
         QVERIFY(surface->property("atEdge").toBool());
@@ -5163,7 +5169,9 @@ private slots:
         const QString clip = makeLiveClip(dir, 300);
         if (clip.isEmpty())
             QSKIP("ffmpeg couldn't make a stream to play");
-        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}, {"QVEIL_STANDIN_LIVE_FIRST", "100"}});
+        // (Its state's edge is 7 s short of the playlists' length, as a count
+        // of segments would have it: only the edge the engine says is the edge.)
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}, {"QVEIL_STANDIN_LIVE_FIRST", "100"}, {"QVEIL_STANDIN_LIVE_EDGE_SKEW", "-7"}});
         READY(app);
         QObject *mpv = playLive(app);
         QVERIFY(mpv);
@@ -5171,16 +5179,19 @@ private slots:
         QTRY_VERIFY(surface->property("atEdge").toBool());
         QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 0));
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 4 && !mpv->property("buffering").toBool(), 10000);
-        // The player's length falls behind the engine's edge by eight segments and more.
-        QTRY_VERIFY_WITH_TIMEOUT(edgeOf(app) - mpv->property("duration").toDouble() >= 16, 40000);
+        // The player's length falls behind the stream's end by eight segments and more.
+        QTRY_VERIFY_WITH_TIMEOUT(edgeOf(app) + 7 - mpv->property("duration").toDouble() >= 16, 40000);
         const double stale = mpv->property("duration").toDouble();
         QVERIFY(!surface->property("atEdge").toBool());
         QVERIFY2(!timeOf(app).contains("live"), qPrintable(timeOf(app)));
 
-        // Go live: three segments from the engine's edge, not from the player's length.
+        // Go live: the answer's `join` (three segments) from the engine's
+        // edge, not from the player's length, nor from a count of segments.
+        const double join = surface->property("join").toDouble();
+        QCOMPARE(join, 6.0);
         QTest::keyClick(app.window, Qt::Key_End);
         const double edge = edgeOf(app), target = surface->property("lastSeek").toDouble();
-        QVERIFY2(target >= edge - 3 * 2 - 2 && target <= edge - 3 * 2,
+        QVERIFY2(target >= edge - join - 2 && target <= edge - join,
                  qPrintable(QString("went to %1, the edge is at %2, the player's length %3").arg(target).arg(edge).arg(stale)));
         QVERIFY(target > stale);
         // And it gets there, once, and says it is live.
@@ -5200,6 +5211,70 @@ private slots:
         }
         QTest::keyClick(app.window, Qt::Key_End);
         QTRY_VERIFY_WITH_TIMEOUT(surface->property("atEdge").toBool() && !mpv->property("buffering").toBool(), 10000);
+        QCOMPARE(app.asked("POST api/play"), 1);
+    }
+
+    void atTheEdgeIsJudgedFromTheEnginesEdgeWithTheHysteresis()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir, 120);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        // The state's edge is 12 s short of what a count of segments says, so
+        // the player is at what the engine calls the edge a good while before
+        // a count would have it there. (And it has 40 s of stream when opened,
+        // so that there is room to seek behind the edge.)
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}, {"QVEIL_STANDIN_LIVE_FIRST", "20"}, {"QVEIL_STANDIN_LIVE_EDGE_SKEW", "-12"}});
+        READY(app);
+        QObject *mpv = playLive(app);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface"), *goLive = App::under(surface, "go-live");
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+        QTRY_VERIFY(surface->property("liveEdge").toDouble() > 0);
+        // A seek is judged anew once it has got there: at the edge within four
+        // segments (8 s) of the engine's edge, not behind it. (The window has
+        // the edge as of its last look, a segment old at most: a little nearer.)
+        const auto seekBehind = [&](double behind) {
+            QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, edgeOf(app) - behind));
+            QTRY_VERIFY_WITH_TIMEOUT(!mpv->property("buffering").toBool(), 10000);
+        };
+        // 16 s behind: 28 s behind a count of segments.
+        seekBehind(16);
+        QTRY_VERIFY(!surface->property("atEdge").toBool());
+        QTRY_VERIFY(goLive->isVisible());
+        QVERIFY2(timeOf(app).contains(" / ") && !timeOf(app).contains("live"), qPrintable(timeOf(app)));
+        seekBehind(11);
+        QTest::qWait(300);
+        QVERIFY(!surface->property("atEdge").toBool());
+        // 5 s behind: 17 s behind a count, which would not be at the edge.
+        seekBehind(5);
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+        QTRY_VERIFY(!goLive->isVisible());
+        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u25cf live")));
+
+        // The hysteresis, with nothing moving: the engine's edge is asked of
+        // no more, and put where the test says, with a player that waits.
+        surface->setProperty("liveCheckInterval", 100000);
+        QTest::qWait(500);
+        QMetaObject::invokeMethod(mpv, "togglePause");
+        QTRY_VERIFY(mpv->property("paused").toBool());
+        const double at = mpv->property("position").toDouble();
+        const auto edgeAt = [&](double behind) { surface->setProperty("liveEdge", at + behind); };
+        // At the edge, it stays to six segments (12 s) behind...
+        edgeAt(11.5);
+        QVERIFY(surface->property("atEdge").toBool());
+        // ...is behind past them...
+        edgeAt(12.5);
+        QVERIFY(!surface->property("atEdge").toBool());
+        // ...and is at the edge again only within four (8 s).
+        edgeAt(11.5);
+        QVERIFY(!surface->property("atEdge").toBool());
+        edgeAt(9);
+        QVERIFY(!surface->property("atEdge").toBool());
+        edgeAt(7.5);
+        QVERIFY(surface->property("atEdge").toBool());
+        edgeAt(11.5);
+        QVERIFY(surface->property("atEdge").toBool());
         QCOMPARE(app.asked("POST api/play"), 1);
     }
 
@@ -5224,6 +5299,8 @@ private slots:
         app.backend->setConfig({{"route", "tor"}});
         QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
         QTRY_COMPARE(app.asked("POST api/play"), 2);
+        // Asked as the running stream it is, as the play answer says, both times.
+        QCOMPARE(app.askedLike("^POST api/play\\?v=live0000001&.*\\blive=now$"), 2);
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && !surface->property("pending").toBool(), 20000);
         QVERIFY(app.window->property("watching").toBool());
         QVERIFY(surface->property("live").toBool());
@@ -5479,6 +5556,9 @@ private slots:
         QVERIFY2(waited >= 0, qPrintable(asked.join('\n')));
         QCOMPARE(asked.mid(0, waited).filter(QRegularExpression("^POST api/play")).size(), 1);
         QCOMPARE(asked.mid(waited).filter(QRegularExpression("^POST api/play")).size(), 1);
+        // The card said it was announced, and the play that follows its start says it is running.
+        QCOMPARE(asked.mid(0, waited).filter(QRegularExpression("^POST api/play\\?v=waiting0002&.*\\blive=upcoming$")).size(), 1);
+        QCOMPARE(asked.mid(waited).filter(QRegularExpression("^POST api/play\\?v=waiting0002&.*\\blive=now$")).size(), 1);
         QTest::qWait(1000);
         QCOMPARE(app.asked("POST api/play"), 2);
         QCOMPARE(app.askedLike("^GET api/wait"), 1);

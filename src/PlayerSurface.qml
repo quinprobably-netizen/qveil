@@ -50,26 +50,26 @@ FocusScope {
     readonly property bool live: !!info.live && info.live.state === "now"
     // How long one of its segments is, in seconds.
     readonly property real segment: live ? (info.live.segment || 5) : 0
-    // What the engine last said of a running stream (`live/<session>/state`):
-    // the newest segment it has, and the oldest it listed when first asked
-    // after the load. The player's timeline begins at that one (a playlist
-    // is opened at its first segment, see MpvItem.load), and for a stream
-    // older than its rewind window the oldest moves on while that doesn't.
-    // -1 until the engine has said.
-    property real liveHead: -1
-    property real liveOrigin: -1
+    // How far back from the end a running stream is joined, in seconds: the
+    // answer's `live.join`, which is where it starts (minus `start`). Three
+    // segments when the engine says nothing.
+    readonly property real join: live ? (info.live.join > 0 ? info.live.join : 3 * segment) : 0
     // The live edge on the player's timeline, in seconds: the end of the
-    // newest segment the engine has, 0 until it has said. Not mpv's duration,
-    // which is only as new as its last reload of the playlist; it doesn't
-    // reload while it plays far behind with its cache full, and minutes later
-    // that is still where it was rewound.
-    readonly property real liveEdge: live && liveHead >= 0 && liveOrigin >= 0 ? segment * (liveHead - liveOrigin + 1) : 0
+    // newest segment the engine has, as it last said (`live/<session>/state`),
+    // 0 until it has. Not mpv's duration, which is only as new as its last
+    // reload of the playlist; it doesn't reload while it plays far behind with
+    // its cache full, and minutes later that is still where it was rewound.
+    // Not a count of segments either: the segments are not all `segment`
+    // long on the player's clock (the playlist's lengths follow the media's,
+    // and a stream that was cut for a while is up to half a minute off a
+    // count over its five days), so only the engine knows.
+    property real liveEdge: 0
     // How far behind the edge it plays, in seconds.
     readonly property real behind: liveEdge > 0 ? liveEdge - mpv.position : 0
     // Whether it plays at the live edge: within four segments of the end of
     // the newest one, which is where it is joined and where Go live goes
-    // (three from the end), with a segment to spare for the edge, which
-    // grows a segment at a time. Once there, it stays until it is six behind:
+    // (`join` from the end, three segments), with a segment to spare for the
+    // edge, which grows a segment at a time. Once there, it stays until it is six behind:
     // the player falls a little behind as it opens (the edge moves on while
     // it loads) and whenever it waits for a segment, and a clock and button
     // that blinked in and out with that would say nothing. Until the engine
@@ -129,7 +129,8 @@ FocusScope {
         const i = info
         prepareAs({ id: i.id, title: i.title || "", channel: i.channel || "", channelId: i.channelId || "",
                   published: i.published || 0, batch: i.batch || 0 }, true)
-        backend.play(i.id, i.channel || "")
+        // (It has started: asked as a stream that is running.)
+        backend.play(i.id, i.channel || "", "now")
     }
     // Lets go of the wait, if there is one.
     function endWait() {
@@ -162,9 +163,9 @@ FocusScope {
         }
     }
 
-    // To the live edge, where a running stream is joined: three segments
-    // from the end of the newest the engine has. If it hasn't said yet, it
-    // is asked, and the seek follows its answer.
+    // To the live edge, where a running stream is joined: `join` seconds
+    // from the end of the newest segment the engine has (its `edge`). If it
+    // hasn't said yet, it is asked, and the seek follows its answer.
     function goLive() {
         if (!live)
             return
@@ -174,7 +175,7 @@ FocusScope {
             return
         }
         goLiveDue = false
-        seekTo(Math.max(0, liveEdge - 3 * segment))
+        seekTo(Math.max(0, liveEdge - join))
         atEdge = true
     }
 
@@ -295,8 +296,7 @@ FocusScope {
         lastPosition = from.lastPosition
         forgetWhenStarted = from.forgetWhenStarted
         liveEnded = from.liveEnded
-        liveHead = from.liveHead
-        liveOrigin = from.liveOrigin
+        liveEdge = from.liveEdge
         atEdge = from.atEdge
         note.shown = false
         active = true
@@ -306,8 +306,7 @@ FocusScope {
     }
     // Where the edge of the stream that was showing is, for none.
     function forgetEdge() {
-        liveHead = -1
-        liveOrigin = -1
+        liveEdge = 0
         goLiveDue = false
     }
 
@@ -455,14 +454,12 @@ FocusScope {
     }
     Connections {
         target: backend
-        function onLiveChecked(playlist, state, head, oldest) {
+        function onLiveChecked(playlist, state, edge) {
             if (!surface.active || !surface.live || playlist !== surface.info.video)
                 return
             if (state !== "ended") {
-                if (head >= 0)
-                    surface.liveHead = head
-                if (surface.liveOrigin < 0 && oldest >= 0)
-                    surface.liveOrigin = oldest
+                if (edge > 0)
+                    surface.liveEdge = edge
                 if (surface.goLiveDue && surface.liveEdge > 0)
                     surface.goLive()
                 return

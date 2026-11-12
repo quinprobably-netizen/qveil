@@ -150,6 +150,19 @@ function liveMeta(live, now, brief) {
     return parts.join(" · ")
 }
 
+// What a video says it is, for the engine's lookup: "now" for a stream that
+// is running, "upcoming" for one announced, "" for anything else. `video` is
+// a card's entry (`live` is the word), or a play answer (`live` is an object
+// with its state, and an announced stream's has `waiting`).
+function liveHint(video) {
+    const live = video && video.live
+    if (live === "now" || live === "upcoming")
+        return live
+    if (live && live.state === "now")
+        return "now"
+    return video && video.waiting ? "upcoming" : ""
+}
+
 // A thumbnail's address: `base` is the engine's thumbnail base (empty while
 // thumbnails are off or unavailable), `batch` the page the card came with.
 // The engine puts the thumbnails of one batch on one Tor circuit, as a

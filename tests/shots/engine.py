@@ -44,8 +44,14 @@ HOUR, DAY = 3600, 86400
 CLIP = os.environ.get("QVEIL_STANDIN_CLIP", "")
 LIVECLIP = os.environ.get("QVEIL_STANDIN_LIVECLIP", "")
 # (QVEIL_STANDIN_LIVE_FIRST: how many segments it has when it is opened, for
-# a stream longer than the player reads ahead.)
+# a stream longer than the player reads ahead. QVEIL_STANDIN_LIVE_EDGE_SKEW:
+# seconds its state's `edge` is off from the playlists' own length, as the
+# engine's is for a stream whose media clock has drifted from its count of
+# segments; so that a test can tell the window follows `edge`.)
 LIVE_SEGMENT, LIVE_FIRST = 2, int(os.environ.get("QVEIL_STANDIN_LIVE_FIRST", "8"))
+LIVE_EDGE_SKEW = float(os.environ.get("QVEIL_STANDIN_LIVE_EDGE_SKEW", "0"))
+# How many segments back from the newest a player joins a running stream.
+LIVE_JOIN = 3
 # When the running stream was opened (it grows from then), and whether it has ended.
 live = {"opened": 0.0, "ended": False, "sid": 0, "final": 0}
 # The waiting rooms open now, and the announced streams that have started.
@@ -107,6 +113,11 @@ def live_head():
         return live["final"]
     grown = int((time.monotonic() - live["opened"]) / LIVE_SEGMENT)
     return min(live_segments() - 1, LIVE_FIRST - 1 + grown)
+
+
+def live_edge():
+    """The end of the newest segment on the player's clock, as the state says it."""
+    return LIVE_SEGMENT * (live_head() + 1) + LIVE_EDGE_SKEW
 
 
 def live_playlist(track, ext):
@@ -657,7 +668,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not rest or rest[0] != str(live["sid"]):
             self.send(404, {"error": "no such session", "code": "other"})
         elif rest[1:] == ["state"]:
-            self.send(200, {"state": "ended" if live["ended"] else "now", "head": live_head(), "oldest": 0})
+            self.send(200, {"state": "ended" if live["ended"] else "now", "head": live_head(), "oldest": 0,
+                            "edge": live_edge()})
         elif rest[1:] in (["video.m3u8"], ["audio.m3u8"]):
             video = rest[1] == "video.m3u8"
             self.file(live_playlist("v" if video else "a", "mkv" if video else "m4a"), "application/vnd.apple.mpegurl")
@@ -889,10 +901,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 at = "%s/live/%d/" % (base, live["sid"])
                 cid, name = CHANNELS[0]
                 self.send(200, {"id": v, "title": "Live: the long one, part 2", "channel": name, "channelId": cid,
-                                "video": at + "video.m3u8", "audio": at + "audio.m3u8", "start": -3.0 * LIVE_SEGMENT,
+                                "video": at + "video.m3u8", "audio": at + "audio.m3u8", "start": -float(LIVE_JOIN * LIVE_SEGMENT),
                                 "description": "Questions from chat, and the long one.",
-                                "live": {"state": "now", "segment": float(LIVE_SEGMENT), "started": NOW - 2 * HOUR - 14 * 60 - 5,
-                                         "rewind": True, "watching": 1200}})
+                                "live": {"state": "now", "segment": float(LIVE_SEGMENT), "join": float(LIVE_JOIN * LIVE_SEGMENT),
+                                         "started": NOW - 2 * HOUR - 14 * 60 - 5, "rewind": True, "watching": 1200}})
                 return
             stream = base + "/s/x/v" if CLIP else ""
             if v.startswith("bare"):
