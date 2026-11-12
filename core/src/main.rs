@@ -39,6 +39,7 @@ mod ids;
 mod inflight;
 mod lens;
 mod live;
+mod media_time;
 mod net;
 mod pick;
 mod player;

@@ -243,6 +243,10 @@ pub struct LiveInfo {
     pub started: Option<i64>,
     /// Whether it can be rewound further than the last few segments.
     pub rewind: bool,
+    /// Where a running stream is joined: seconds back from the end of its
+    /// playlist, as the player's clock has them (the same as `start`, and
+    /// as the playlist's `#EXT-X-START` says). 0 for one that is over.
+    pub join: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watching: Option<u64>,
 }
@@ -344,25 +348,38 @@ impl Server {
     /// another route: the last bot check is the answer, and the window
     /// offers that switch. Not once `abort` says nobody waits for it, or
     /// the route has changed.
+    ///
+    /// A running stream that one identity was offered no fragments of (only
+    /// HLS, measured over Tor) is asked again too, once: another circuit is
+    /// as likely to get them as one past a bot check is.
     fn fresh_on_bot_check<T>(
         &self,
         rt: &Runtime,
         abort: &dyn Fn() -> bool,
         mut work: impl FnMut(Ytdlp) -> Result<T>,
     ) -> Result<T> {
-        let mut left = if rt.net.isolates() { BOT_RETRIES } else { 0 };
+        let isolates = rt.net.isolates();
+        let (mut bots, mut bare) = if isolates { (BOT_RETRIES, 1) } else { (0, 0) };
         loop {
-            match work(rt.pinned_ytdlp()) {
-                Err(e)
-                    if left > 0
-                        && errors::explain(&format!("{e:#}")).code == errors::Code::BotCheck
-                        && !abort()
-                        && self.still_on(rt) =>
-                {
-                    left -= 1;
-                    note!("qveil: YouTube asked for a bot check; asking again on a fresh circuit");
-                }
-                done => return done,
+            let done = work(rt.pinned_ytdlp());
+            let Err(e) = &done else { return done };
+            if abort() || !self.still_on(rt) {
+                return done;
+            }
+            let said = format!("{e:#}");
+            if bots > 0 && errors::explain(&said).code == errors::Code::BotCheck {
+                bots -= 1;
+                note!("qveil: YouTube asked for a bot check; asking again on a fresh circuit");
+            } else if bare > 0
+                && said.contains(crate::live::NO_FRAGMENTS)
+                && !said.contains(crate::live::ENDED)
+            {
+                bare -= 1;
+                note!(
+                    "qveil: a live stream came without fragments; asking again on a fresh circuit"
+                );
+            } else {
+                return done;
             }
         }
     }
@@ -595,6 +612,11 @@ impl Server {
             at: app::now(),
         });
         let running = !s.ended;
+        let join = if running {
+            (session.join_back() * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        };
         let duration = match &s.fragments {
             Fragments::Listed(list) => {
                 Some(list.iter().map(|(_, d)| d).sum::<f64>().round() as u64)
@@ -611,7 +633,7 @@ impl Server {
                 // A running stream isn't resumed: it has moved on. One that is
                 // over is a video like any other.
                 start: if running {
-                    Some(-3.0 * s.target)
+                    Some(-join)
                 } else {
                     v.start.map(|t| t as f64)
                 },
@@ -628,6 +650,7 @@ impl Server {
                     segment: s.target,
                     started: s.started,
                     rewind,
+                    join,
                     watching: s.watching,
                 }),
                 ..PlayInfo::default()

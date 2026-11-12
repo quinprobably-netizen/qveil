@@ -14,7 +14,7 @@
 
 use super::Server;
 use super::http::respond;
-use super::relay::{FAILED_FOR, RECOVER_EVERY, answer_within, content_range, stalled_read};
+use super::relay::{FAILED_FOR, RECOVER_EVERY, content_range, stalled_read};
 use crate::errors::{self, friendly};
 use crate::ids::VideoRef;
 use crate::live::{self, Fragments, LiveStreams, Opening, Track};
@@ -83,12 +83,96 @@ pub(super) fn oldest_for(head: u64, target: f64) -> u64 {
         .min(head)
 }
 
+/// How many segments back from the newest a player joins a running stream:
+/// it starts at the oldest of the last `JOIN`.
+pub(super) const JOIN: u64 = 3;
+
+/// The lengths a track's playlist gives its segments once the media's own
+/// clock has been read at both ends of the window (see `LiveSession::begin`):
+/// `early` for each segment before `anchor` (the join at open), so that the
+/// playlist's time of `anchor` is its media time; the target length from
+/// it on, which is what the stream makes on average. The two clocks drift
+/// apart over days (24.5 s over five, measured: the stream had breaks),
+/// and FFmpeg finds a segment by the playlist's lengths but plays it by its
+/// media time: without this, a start or seek near the edge lands several
+/// segments later than meant, on segments that don't exist yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Lengths {
+    pub anchor: u64,
+    pub early: f64,
+}
+
+impl Lengths {
+    /// From the media times `t0` of segment `oldest` and `t1` of `anchor`,
+    /// if they make sense: far enough apart to say something, and an
+    /// average length near the target.
+    pub(super) fn measured(
+        oldest: u64,
+        anchor: u64,
+        t0: f64,
+        t1: f64,
+        target: f64,
+    ) -> Option<Self> {
+        let k = anchor.checked_sub(oldest).filter(|k| *k >= 12)?;
+        let early = (t1 - t0) / k as f64;
+        ((early - target).abs() < 0.1 * target).then_some(Lengths { anchor, early })
+    }
+}
+
+/// How long segment `n` is in the playlist.
+fn length_of(lengths: Option<Lengths>, n: u64, target: f64) -> f64 {
+    match lengths {
+        Some(l) if n < l.anchor => l.early,
+        _ => target,
+    }
+}
+
+/// The playlist's length of segments `from..=to`.
+fn span_length(lengths: Option<Lengths>, from: u64, to: u64, target: f64) -> f64 {
+    if to < from {
+        return 0.0;
+    }
+    let all = (to - from + 1) as f64;
+    match lengths {
+        Some(l) if from < l.anchor => {
+            let early = (l.anchor.min(to + 1) - from) as f64;
+            early * l.early + (all - early) * target
+        }
+        _ => all * target,
+    }
+}
+
+/// Where the player's clock has the end of the newest segment: the
+/// playlist's length from its first segment through `span.head`.
+pub(super) fn edge(span: &Span, target: f64, lengths: Option<Lengths>) -> f64 {
+    span_length(lengths, span.oldest, span.head, target)
+}
+
 /// The playlist of a running (or just ended) stream's track: segment `n` is
-/// `{prefix}{n}.{ext}`, each `target` seconds long.
-pub(super) fn playlist(span: &Span, target: f64, prefix: &str, ext: &str) -> String {
-    let mut out = header("EVENT", target_duration(target), span.oldest);
+/// `{prefix}{n}.{ext}`, as long as `lengths` says (each `target` without).
+/// A running one says where to start (`#EXT-X-START`): the join, `JOIN`
+/// segments back from the end, for a player that is told to prefer it
+/// (FFmpeg's `prefer_x_start`).
+pub(super) fn playlist(
+    span: &Span,
+    target: f64,
+    lengths: Option<Lengths>,
+    prefix: &str,
+    ext: &str,
+) -> String {
+    let longest = lengths.map_or(target, |l| l.early.max(target));
+    let mut out = header("EVENT", target_duration(longest), span.oldest);
+    if !span.ended {
+        let from = (span.head + 1).saturating_sub(JOIN).max(span.oldest);
+        let back = span_length(lengths, from, span.head, target);
+        let _ = writeln!(out, "#EXT-X-START:TIME-OFFSET=-{back:.3},PRECISE=YES");
+    }
     for n in span.oldest..=span.head {
-        entry(&mut out, target, &format!("{prefix}{n}.{ext}"));
+        entry(
+            &mut out,
+            length_of(lengths, n, target),
+            &format!("{prefix}{n}.{ext}"),
+        );
     }
     if span.ended {
         out.push_str("#EXT-X-ENDLIST\n");
@@ -121,8 +205,19 @@ fn header(kind: &str, target: u64, first: u64) -> String {
 }
 
 fn entry(out: &mut String, duration: f64, uri: &str) {
+    // In milliseconds where that is exact; a measured length (see
+    // `Lengths`) to the microsecond, so that 86,000 of them still add up.
+    let short = format!("{duration:.3}");
+    let duration = if short
+        .parse::<f64>()
+        .is_ok_and(|d| (d - duration).abs() < 1e-9)
+    {
+        short
+    } else {
+        format!("{duration:.6}")
+    };
     // Writing to a String cannot fail.
-    let _ = write!(out, "#EXTINF:{duration:.3},\n{uri}\n");
+    let _ = write!(out, "#EXTINF:{duration},\n{uri}\n");
 }
 
 /// Segments of a track fetched ahead of the one the player asks for. One
@@ -401,6 +496,9 @@ struct Broken {
     text: String,
     /// It timed out: the connection stalled, rather than broke.
     stalled: bool,
+    /// Nothing came in on any request of the session either: the whole
+    /// circuit stalled, not one connection (see `stalled_since`).
+    circuit: bool,
     /// Making it again can't help (an answer that doesn't fit the bytes in
     /// so far, or one too large).
     fatal: bool,
@@ -411,6 +509,7 @@ impl Broken {
         Broken {
             text: text.into(),
             stalled: false,
+            circuit: false,
             fatal: false,
         }
     }
@@ -481,6 +580,12 @@ pub(super) struct LiveSession {
     ended_at_open: bool,
     /// `STALL` in milliseconds, which tests shorten.
     pub(super) stall_ms: AtomicU64,
+    /// When anything last came in, on any request: an answer's head or a
+    /// body's bytes (see `stalled_since`).
+    heard: Mutex<Instant>,
+    /// Each track's playlist lengths, once the media's clock has been read
+    /// (see `begin`).
+    lengths: Mutex<[Option<Lengths>; 2]>,
 }
 
 impl LiveSession {
@@ -533,6 +638,8 @@ impl LiveSession {
             target: s.target,
             ended_at_open: s.ended,
             stall_ms: AtomicU64::new(STALL.as_millis() as u64),
+            heard: Mutex::new(now),
+            lengths: Mutex::new([None, None]),
         })
     }
 
@@ -583,11 +690,39 @@ impl LiveSession {
         trace!("begin head={head} after_ms={}", ms(began));
         lock(&self.span).head = head;
         let mut oldest = oldest_for(head, self.target);
-        if oldest + 3 < head
-            && let Ok(a) = self.request(server, Method::HEAD, Kind::Audio, Some(oldest), None)
-            && matches!(a.status.as_u16(), 404 | 410)
-        {
-            oldest = head - 3;
+        if oldest + 3 < head {
+            // The start of the oldest segment and of the join, of each
+            // track, at once: whether the oldest is still there, and where
+            // both are on the media's clock (see `Lengths`).
+            let join = head + 1 - JOIN;
+            let [a0, v0, a1, v1] = self.peek_all([
+                (Kind::Audio, oldest),
+                (Kind::Video, oldest),
+                (Kind::Audio, join),
+                (Kind::Video, join),
+            ]);
+            if a0
+                .as_ref()
+                .is_some_and(|(status, _)| matches!(status, 404 | 410))
+            {
+                oldest = head - 3;
+            } else {
+                let at = |p: &Option<(u16, Vec<u8>)>| {
+                    p.as_ref().and_then(|(_, b)| crate::media_time::start_of(b))
+                };
+                let measure = |p0, p1| match (at(p0), at(p1)) {
+                    (Some(t0), Some(t1)) => Lengths::measured(oldest, join, t0, t1, self.target),
+                    _ => None,
+                };
+                let lengths = [measure(&v0, &v1), measure(&a0, &a1)];
+                trace!(
+                    "begin lengths v={:?} a={:?} offset_v={:?}",
+                    lengths[0].map(|l| l.early),
+                    lengths[1].map(|l| l.early),
+                    lengths[0].map(|l| (l.early - self.target) * (join - oldest) as f64)
+                );
+                *lock(&self.lengths) = lengths;
+            }
         }
         trace!("begin oldest={oldest} total_ms={}", ms(began));
         // After the look at the oldest segment, not beside it: on a slow
@@ -640,13 +775,111 @@ impl LiveSession {
         Err(failed.unwrap_or_else(|| anyhow::anyhow!(NO_HEAD)))
     }
 
-    /// Starts fetching the segments a player joins at, `head - 3..=head` of
+    /// The first `PEEK` bytes of each `(kind, n)`, all at once: the answer's
+    /// status and those bytes (none unless it was a success), or nothing if
+    /// it couldn't be had within a stall. Made once each, on the client
+    /// there is: what it says is a help, not a must (see `begin`).
+    fn peek_all<const N: usize>(
+        self: &Arc<Self>,
+        asked: [(Kind, u64); N],
+    ) -> [Option<(u16, Vec<u8>)>; N] {
+        let threads = asked.map(|(kind, n)| {
+            let s = Arc::clone(self);
+            std::thread::Builder::new()
+                .spawn(move || s.peek(kind, n))
+                .ok()
+        });
+        threads.map(|t| t.and_then(|t| t.join().ok().flatten()))
+    }
+
+    fn peek(&self, kind: Kind, n: u64) -> Option<(u16, Vec<u8>)> {
+        use crate::media_time::PEEK;
+        let up = lock(&self.upstream).clone();
+        let url = self.url(&up, kind, Some(n))?;
+        let t = Instant::now();
+        let r = self
+            .send(
+                &up,
+                &Method::GET,
+                &url,
+                Some(format!("bytes=0-{}", PEEK - 1)),
+            )
+            .ok()?;
+        let status = r.status().as_u16();
+        if let Some(h) = head_of(r.headers()) {
+            self.saw_head(h);
+        }
+        if !r.status().is_success() {
+            trace!("peek {} n={n} -> {status} ms={}", kind.letter(), ms(t));
+            return Some((status, Vec::new()));
+        }
+        let (tx, rx) = sync_channel(1);
+        let _ = std::thread::Builder::new().spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = r.take(PEEK).read_to_end(&mut bytes);
+            let _ = tx.send(bytes);
+        });
+        let bytes = rx.recv_timeout(self.stall()).ok()?;
+        self.hear();
+        trace!(
+            "peek {} n={n} -> {status} bytes={} ms={}",
+            kind.letter(),
+            bytes.len(),
+            ms(t)
+        );
+        Some((status, bytes))
+    }
+
+    /// Something came in (see `heard`).
+    fn hear(&self) {
+        *lock(&self.heard) = Instant::now();
+    }
+
+    /// Whether a request that has had nothing since `since` has stalled:
+    /// `Some(true)` once nothing at all has come in, on any request, for a
+    /// stall (the circuit is stuck), `Some(false)` once it alone has had
+    /// nothing for three while others' bytes came in (its connection is),
+    /// and `None` meanwhile. A request that waits behind others on a slow
+    /// circuit, which still brings their bytes, hasn't stalled: it is
+    /// congestion, which a fresh client or a lookup again would only add to
+    /// (measured: 8 requests on a 20 KB/s circuit waited more than 10 s for
+    /// their answers to start).
+    fn stalled_since(&self, since: Instant) -> Option<bool> {
+        let stall = self.stall();
+        let mine = since.elapsed();
+        if mine < stall {
+            return None;
+        }
+        let all = lock(&self.heard).elapsed().min(mine);
+        if all >= stall {
+            Some(true)
+        } else if mine >= stall * 3 {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// The playlist lengths of `kind` (see `Lengths`).
+    fn lengths_of(&self, kind: Kind) -> Option<Lengths> {
+        lock(&self.lengths)[kind.index()]
+    }
+
+    /// Where a running stream is joined, in seconds back from the end of its
+    /// video playlist: the start of the oldest of its last `JOIN` segments.
+    pub(super) fn join_back(&self) -> f64 {
+        let span = lock(&self.span);
+        let from = (span.head + 1).saturating_sub(JOIN).max(span.oldest);
+        span_length(self.lengths_of(Kind::Video), from, span.head, self.target)
+    }
+
+    /// Starts fetching the segments a player joins at, the last `JOIN` of
     /// both tracks, before it asks (see `begin`).
     fn warm_join(self: &Arc<Self>, server: &Arc<Server>, head: u64) {
         *lock(&self.warm_until) = Some(Instant::now() + WARM_FOR);
         for kind in [Kind::Video, Kind::Audio] {
             let mut warm = lock(&self.warm[kind.index()]);
-            for n in head.saturating_sub(HELD as u64 - 1)..=head {
+            for n in (head + 1).saturating_sub(JOIN)..=head {
                 let fetch = Arc::new(Fetch::new());
                 warm.push_back((n, Arc::clone(&fetch)));
                 self.fetch_in_background(server, kind, n, fetch);
@@ -776,7 +1009,13 @@ impl LiveSession {
             Fragments::Numbered => {
                 let span = lock(&self.span);
                 let head = span.head;
-                let text = playlist(&span, self.target, kind.prefix(), ext);
+                let text = playlist(
+                    &span,
+                    self.target,
+                    self.lengths_of(kind),
+                    kind.prefix(),
+                    ext,
+                );
                 drop(span);
                 self.forget_stale_warm(kind, head);
                 text
@@ -798,17 +1037,24 @@ impl LiveSession {
         if self.is_cancelled() {
             return respond(out, 404, "text/plain", b"stream expired");
         }
-        let (oldest, head, ended) = match &self.fragments {
+        let (oldest, head, ended, edge) = match &self.fragments {
             Fragments::Numbered => {
                 let span = lock(&self.span);
-                (span.oldest, span.head, span.ended)
+                let at = edge(&span, self.target, self.lengths_of(Kind::Video));
+                (span.oldest, span.head, span.ended, at)
             }
-            Fragments::Listed(list) => (0, list.len().saturating_sub(1) as u64, true),
+            Fragments::Listed(list) => (
+                0,
+                list.len().saturating_sub(1) as u64,
+                true,
+                list.iter().map(|(_, d)| d).sum(),
+            ),
         };
         let state = json!({
             "state": if ended { "ended" } else { "now" },
             "head": head,
             "oldest": oldest,
+            "edge": (edge * 1000.0).round() / 1000.0,
         });
         respond(out, 200, "application/json", state.to_string().as_bytes())
     }
@@ -1084,7 +1330,10 @@ impl LiveSession {
     /// they are of no use, and only take from the circuit what it waits for.
     fn forget_stale_warm(&self, kind: Kind, head: u64) {
         let mut warm = lock(&self.warm[kind.index()]);
-        if warm.back().is_some_and(|(last, _)| head > last + 2) {
+        if warm
+            .back()
+            .is_some_and(|(last, _)| (head + 1).saturating_sub(JOIN) > *last)
+        {
             for (_, f) in warm.drain(..) {
                 f.drop_it();
             }
@@ -1217,7 +1466,13 @@ impl LiveSession {
             let url = self.url(&up, kind, n).ok_or(Failure::Gone)?;
             let from = into.map_or(0, Fetch::len);
             let sent_at = Instant::now();
-            let answer = self.send(&up, &method, &url, from);
+            // Every segment is asked for as a range, from 0 too: then its
+            // answer says how long it is (a 206 has it in Content-Range),
+            // which googlevideo's whole answers mostly don't (80-95 % of
+            // them, measured), and its bytes can go to the player as they
+            // come instead of once it is all in (see `serve_segment`).
+            let range = into.map(|_| format!("bytes={from}-"));
+            let answer = self.send(&up, &method, &url, range);
             trace!(
                 "up {method} {} n={n:?} from={from} gen={} dial={} -> {} length={:?} redirected={} ms={}",
                 kind.letter(),
@@ -1283,7 +1538,11 @@ impl LiveSession {
                 failed.stalled
             );
             up = self
-                .recover(server, &up, failed.stalled.then_some(stalls))
+                .recover(
+                    server,
+                    &up,
+                    failed.stalled.then_some((stalls, failed.circuit)),
+                )
                 .ok_or(Failure::Broke(failed.text))?;
         }
     }
@@ -1356,6 +1615,7 @@ impl LiveSession {
                 }
                 Ok(Ok(bytes)) => {
                     quiet = Instant::now();
+                    self.hear();
                     let k = skip.min(bytes.len());
                     skip -= k;
                     let mut bytes = &bytes[k..];
@@ -1369,21 +1629,25 @@ impl LiveSession {
                     into.push(bytes);
                 }
                 Ok(Err(e)) => {
+                    let stalled = stalled_read(&e);
                     return Err(Broken {
-                        stalled: stalled_read(&e),
+                        stalled,
+                        circuit: stalled && self.stalled_since(quiet) == Some(true),
                         ..Broken::broke("The stream broke upstream.")
                     });
                 }
-                Err(RecvTimeoutError::Timeout) if quiet.elapsed() >= stall => {
-                    return Err(Broken {
-                        stalled: true,
-                        ..Broken::broke(format!(
-                            "The stream's server stopped sending for {} s.",
-                            stall.as_secs()
-                        ))
-                    });
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(circuit) = self.stalled_since(quiet) {
+                        return Err(Broken {
+                            stalled: true,
+                            circuit,
+                            ..Broken::broke(format!(
+                                "The stream's server stopped sending for {} s.",
+                                quiet.elapsed().as_secs()
+                            ))
+                        });
+                    }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(Broken::broke("The stream broke upstream."));
                 }
@@ -1402,38 +1666,67 @@ impl LiveSession {
         }
     }
 
-    /// Sends one request, for the bytes from `from` on if that isn't 0, and
-    /// waits `stall` for its answer to start.
+    /// Sends one request, for `range` if there is one, and waits for its
+    /// answer to start until it has stalled (see `stalled_since`).
     fn send(
         &self,
         up: &Upstream,
         method: &Method,
         url: &str,
-        from: u64,
+        range: Option<String>,
     ) -> Result<Response, Broken> {
         let mut rb = up.client.request(method.clone(), url);
         for (k, v) in &up.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        if from > 0 {
-            rb = rb.header(RANGE, format!("bytes={from}-"));
+        if let Some(range) = range {
+            rb = rb.header(RANGE, range);
         }
-        let within = self.stall();
-        match answer_within(rb, within) {
-            None => Err(Broken {
-                stalled: true,
-                ..Broken::broke(format!(
-                    "The stream's server didn't answer within {} s.",
-                    within.as_secs()
-                ))
-            }),
-            Some(Ok(r)) => Ok(r),
-            Some(Err(e)) => Err(Broken {
-                stalled: e.is_timeout(),
-                ..Broken::broke(friendly(
-                    &self.route.explain(&format!("{:#}", e.without_url())),
-                ))
-            }),
+        let (tx, rx) = sync_channel(1);
+        // If the thread can't be made, `rb` goes with it, and that is taken
+        // for a stall: made again.
+        let _ = std::thread::Builder::new().spawn(move || {
+            let _ = tx.send(rb.send());
+        });
+        let asked = Instant::now();
+        loop {
+            match rx.recv_timeout(WAIT_POLL.min(self.stall())) {
+                Ok(Ok(r)) => {
+                    self.hear();
+                    return Ok(r);
+                }
+                Ok(Err(e)) => {
+                    return Err(Broken {
+                        stalled: e.is_timeout(),
+                        circuit: e.is_timeout() && self.stalled_since(asked) == Some(true),
+                        ..Broken::broke(friendly(
+                            &self.route.explain(&format!("{:#}", e.without_url())),
+                        ))
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) if self.is_cancelled() => {
+                    return Err(Broken::broke("stream expired"));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(circuit) = self.stalled_since(asked) {
+                        return Err(Broken {
+                            stalled: true,
+                            circuit,
+                            ..Broken::broke(format!(
+                                "The stream's server didn't answer within {} s.",
+                                asked.elapsed().as_secs()
+                            ))
+                        });
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Broken {
+                        stalled: true,
+                        circuit: false,
+                        ..Broken::broke("too busy to ask the stream's server")
+                    });
+                }
+            }
         }
     }
 
@@ -1466,12 +1759,20 @@ impl LiveSession {
     /// client there is), as `Server::recover` does; a 403 (see `request`)
     /// does at once. `None` too once the session is over or the route has
     /// changed.
-    fn recover(&self, server: &Server, seen: &Upstream, stalls: Option<u32>) -> Option<Upstream> {
+    fn recover(
+        &self,
+        server: &Server,
+        seen: &Upstream,
+        stalls: Option<(u32, bool)>,
+    ) -> Option<Upstream> {
         if self.is_cancelled() || !server.runtime().net.same_route(&self.route) {
             return None;
         }
         let isolating = self.route.isolates();
-        let relook = isolating && stalls.is_some_and(|k| k >= 2);
+        // The whole circuit stuck: the URLs work only from its exit, which
+        // a fresh client of the identity would wait on again (measured: 4
+        // of 38 such requests answered). Looked up again at once.
+        let relook = isolating && stalls.is_some_and(|(k, circuit)| circuit || k >= 2);
         let _one = relook.then(|| lock(&self.refreshing));
         let mut up = lock(&self.upstream);
         if up.generation != seen.generation || up.dial != seen.dial || stalls.is_none() {
@@ -1637,6 +1938,7 @@ mod tests {
 #EXT-X-TARGETDURATION:5
 #EXT-X-PLAYLIST-TYPE:EVENT
 #EXT-X-MEDIA-SEQUENCE:10
+#EXT-X-START:TIME-OFFSET=-15.000,PRECISE=YES
 #EXTINF:5.000,
 v/10.mkv
 #EXTINF:5.000,
@@ -1655,15 +1957,67 @@ v/12.mkv
 
     #[test]
     fn a_running_playlist_is_an_event_list_of_known_segments() {
-        assert_eq!(playlist(&span(false), 5.0, "v/", "mkv"), RUNNING);
+        assert_eq!(playlist(&span(false), 5.0, None, "v/", "mkv"), RUNNING);
     }
 
     #[test]
     fn an_ended_playlist_ends_with_endlist() {
         assert_eq!(
-            playlist(&span(true), 5.0, "v/", "mkv"),
-            format!("{RUNNING}#EXT-X-ENDLIST\n")
+            playlist(&span(true), 5.0, None, "v/", "mkv"),
+            // Nothing to join at once it is over.
+            format!(
+                "{}#EXT-X-ENDLIST\n",
+                RUNNING.replace("#EXT-X-START:TIME-OFFSET=-15.000,PRECISE=YES\n", "")
+            )
         );
+    }
+
+    #[test]
+    fn measured_lengths_put_the_join_at_its_media_time() {
+        // Segment 100's media time is 24.5 s less than 100 lengths of 5 s,
+        // as a five-day-old stream's was.
+        let l = Lengths::measured(0, 1_000, 1_000.0, 1_000.0 + 5_000.0 - 24.5, 5.0).unwrap();
+        assert_eq!(l.anchor, 1_000);
+        let s = Span {
+            oldest: 0,
+            head: 1_002,
+            ended: false,
+        };
+        let text = playlist(&s, 5.0, Some(l), "v/", "mkv");
+        // The early ones are as long as the media says, to the microsecond;
+        // from the join on, the target.
+        assert!(text.contains("#EXTINF:4.975500,\nv/0.mkv\n"), "{text}");
+        assert!(text.contains("#EXTINF:4.975500,\nv/999.mkv\n"), "{text}");
+        assert!(text.contains("#EXTINF:5.000,\nv/1000.mkv\n"), "{text}");
+        assert!(
+            text.contains("#EXT-X-START:TIME-OFFSET=-15.000,PRECISE=YES\n"),
+            "{text}"
+        );
+        assert!(text.contains("#EXT-X-TARGETDURATION:5\n"), "{text}");
+        // The player's clock has the join where the media has it, and the
+        // edge 15 s after it.
+        let listed: f64 = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .map(|l| l.trim_end_matches(',').parse::<f64>().unwrap())
+            .sum();
+        assert!((listed - (5_000.0 - 24.5 + 15.0)).abs() < 1e-3, "{listed}");
+        assert!((edge(&s, 5.0, Some(l)) - listed).abs() < 1e-6);
+        assert_eq!(edge(&s, 5.0, None), 5_015.0);
+        // A window that moved past the anchor is the target throughout.
+        let later = Span { oldest: 1_001, ..s };
+        assert_eq!(edge(&later, 5.0, Some(l)), 10.0);
+    }
+
+    #[test]
+    fn lengths_that_make_no_sense_are_not_used() {
+        // Too close to say anything, or an average far off the target (a
+        // clock that jumped, say).
+        assert_eq!(Lengths::measured(0, 5, 0.0, 25.0, 5.0), None);
+        assert_eq!(Lengths::measured(0, 100, 0.0, 400.0, 5.0), None);
+        assert_eq!(Lengths::measured(0, 100, 600.0, 0.0, 5.0), None);
+        assert_eq!(Lengths::measured(100, 0, 0.0, 500.0, 5.0), None);
+        assert!(Lengths::measured(0, 100, 0.0, 498.0, 5.0).is_some());
     }
 
     #[test]
@@ -1700,7 +2054,9 @@ a/2.m4a
 
     #[test]
     fn the_target_duration_is_rounded_up() {
-        assert!(playlist(&span(false), 5.5, "v/", "mkv").contains("#EXT-X-TARGETDURATION:6\n"));
+        assert!(
+            playlist(&span(false), 5.5, None, "v/", "mkv").contains("#EXT-X-TARGETDURATION:6\n")
+        );
         assert!(listed_playlist(&[2.0, 6.2], "v/", "mp4").contains("#EXT-X-TARGETDURATION:7\n"));
     }
 }
@@ -1784,9 +2140,18 @@ mod serving {
             entries(&String::from_utf8(body).unwrap())
         }
 
-        /// How many of the upstream's requests were for `target`.
+        /// How many of the upstream's requests were for `target`, other
+        /// than `begin`'s looks at a segment's start (see `peek`).
         fn asked(&self, target: &str) -> usize {
-            self.up.requests().iter().filter(|r| *r == target).count()
+            let all = self.up.requests().iter().filter(|r| *r == target).count();
+            let peek = format!("bytes=0-{}", crate::media_time::PEEK - 1);
+            let peeks = self
+                .up
+                .ranges_of(target)
+                .iter()
+                .filter(|r| r.as_deref() == Some(peek.as_str()))
+                .count();
+            all - peeks
         }
 
         fn live_lookups(&self) -> u32 {
@@ -2017,7 +2382,10 @@ mod serving {
         assert_eq!(st.up.hanging(), 1);
         assert_eq!(
             st.up.ranges_of(&sq("v", 10)),
-            [None, Some("bytes=20000-".to_string())]
+            [
+                Some("bytes=0-".to_string()),
+                Some("bytes=20000-".to_string())
+            ]
         );
         // On Direct a fresh client keeps the URLs: nothing was looked up.
         assert_eq!(st.live_lookups(), 1);
@@ -2321,7 +2689,7 @@ mod serving {
         let held = st.session(&first);
         assert_eq!(st.segment(&first, "v", 5).0, 200);
         wait_for("the read-ahead", Duration::from_secs(5), || {
-            st.asked(&sq("v", 8)) == 1
+            st.asked(&sq("v", 8)) >= 1
         });
         // Playing something else ends it.
         let second = st.open();
@@ -2559,7 +2927,7 @@ cat '{}'"#,
         // It is over, as the window learns from its state too.
         assert_eq!(
             state(&st, &sid),
-            serde_json::json!({"state":"ended","head":2,"oldest":0})
+            serde_json::json!({"state":"ended","head":2,"oldest":0,"edge":12.5})
         );
     }
 
@@ -2602,18 +2970,28 @@ cat '{}'"#,
         }
     }
 
+    /// Sets the session of `sid` to stall after `stall_ms`, and the
+    /// upstream to send each segment over `trickle` ms per KiB: the other
+    /// segments of the read-ahead keep bringing bytes while one stalls.
+    fn congested(st: &Stream, sid: &str, stall_ms: u64, trickle: u64) {
+        st.session(sid).stall_ms.store(stall_ms, Ordering::Relaxed);
+        st.up.trickle(trickle);
+    }
+
     #[test]
-    fn a_stall_on_tor_is_made_again_on_the_same_identity_first() {
+    fn a_lone_stall_on_tor_is_made_again_on_the_same_identity_first() {
         let t = stream_on_tor(60_000, 0, 20, 0);
         let sid = sid_of(&t.play_live().1);
-        // Long enough that a busy machine doesn't stall the request made again.
-        t.st.session(&sid).stall_ms.store(1_000, Ordering::Relaxed);
+        congested(&t.st, &sid, 400, 60);
         t.st.up.freeze(10);
+        let asked = Instant::now();
         let (status, _, body) = t.st.segment(&sid, "v", 10);
         assert_eq!(status, 200);
         assert_eq!(body, live_segment("v", 10));
-        // A fresh connection on the identity the URLs are for: they still
-        // work from it, and nothing was looked up again.
+        // Only once it alone had had nothing for three stalls, while the
+        // read-ahead's bytes came: a fresh connection on the identity the
+        // URLs are for, and nothing looked up again.
+        assert!(asked.elapsed() >= Duration::from_millis(1_200));
         assert_eq!(t.st.asked(&sq("v", 10)), 2);
         assert_eq!(t.st.live_lookups(), 1);
         assert_eq!(t.identities().len(), 1, "{:?}", t.identities());
@@ -2623,8 +3001,7 @@ cat '{}'"#,
     fn a_segment_cut_on_tor_resumes_on_the_same_url_and_identity() {
         let t = stream_on_tor(60_000, 0, 20, 0);
         let sid = sid_of(&t.play_live().1);
-        // Long enough that a busy machine doesn't stall the request made again.
-        t.st.session(&sid).stall_ms.store(1_000, Ordering::Relaxed);
+        congested(&t.st, &sid, 400, 60);
         t.st.up.cut(10, 20_000);
         let (status, _, body) = t.st.segment(&sid, "v", 10);
         assert_eq!(status, 200);
@@ -2632,34 +3009,147 @@ cat '{}'"#,
         assert_eq!(body, live_segment("v", 10));
         assert_eq!(
             t.st.up.ranges_of(&sq("v", 10)),
-            [None, Some("bytes=20000-".to_string())]
+            [
+                Some("bytes=0-".to_string()),
+                Some("bytes=20000-".to_string())
+            ]
         );
         assert_eq!(t.st.live_lookups(), 1);
         assert_eq!(t.identities().len(), 1, "{:?}", t.identities());
     }
 
     #[test]
-    fn a_second_stall_in_a_row_on_tor_looks_the_stream_up_again_on_a_fresh_identity() {
+    fn a_second_lone_stall_in_a_row_on_tor_looks_the_stream_up_again() {
         let t = stream_on_tor(60_000, 0, 20, 0);
         let sid = sid_of(&t.play_live().1);
-        // Long enough that a busy machine doesn't stall the request made again.
-        t.st.session(&sid).stall_ms.store(1_000, Ordering::Relaxed);
-        // The circuit is stuck for good: the fresh connection on it stalls too.
+        congested(&t.st, &sid, 300, 60);
+        // Its connection is stuck, and the fresh one on that identity too.
         t.st.up.freeze_times(10, 2);
-        let asked = Instant::now();
         let (status, _, body) = t.st.segment(&sid, "v", 10);
         assert_eq!(status, 200);
         assert_eq!(body, live_segment("v", 10));
-        assert!(asked.elapsed() >= Duration::from_millis(2_000));
         assert_eq!(t.st.asked(&sq("v", 10)), 2);
         assert_eq!(t.st.live_lookups(), 2);
         // The third request was the new lookup's, over its own identity.
-        assert!(
-            t.st.up.requests().contains(&"/live/1/v&sq=10".to_string()),
-            "{:?}",
-            t.st.up.requests()
-        );
+        assert_eq!(t.st.asked("/live/1/v&sq=10"), 1);
         assert_eq!(t.identities().len(), 2, "{:?}", t.identities());
+    }
+
+    #[test]
+    fn a_whole_circuit_that_stalls_on_tor_is_looked_up_again_at_once() {
+        let t = stream_on_tor(60_000, 0, 20, 0);
+        let sid = sid_of(&t.play_live().1);
+        t.st.session(&sid).stall_ms.store(600, Ordering::Relaxed);
+        // Nothing comes in on anything of the identity any more.
+        t.st.up.kill_generation(0);
+        let (status, _, body) = t.st.segment(&sid, "v", 10);
+        assert_eq!(status, 200);
+        assert_eq!(body, live_segment("v", 10));
+        // No fresh connection on the dead circuit first: the URLs only work
+        // from its exit. Straight to a lookup again, on a fresh identity.
+        assert_eq!(t.st.asked(&sq("v", 10)), 1);
+        assert_eq!(t.st.asked("/live/1/v&sq=10"), 1);
+        assert_eq!(t.st.live_lookups(), 2);
+        assert_eq!(t.identities().len(), 2, "{:?}", t.identities());
+    }
+
+    #[test]
+    fn waiting_behind_others_on_a_slow_circuit_is_not_a_stall() {
+        let st = stream(60_000, 0, 20);
+        let sid = st.open();
+        congested(&st, &sid, 500, 40);
+        // Its answer starts after more than a stall, while the read-ahead's
+        // bytes come in.
+        st.up.slow_head(10, 1_200);
+        let (status, _, body) = st.segment(&sid, "v", 10);
+        assert_eq!(status, 200);
+        assert_eq!(body, live_segment("v", 10));
+        assert_eq!(st.asked(&sq("v", 10)), 1, "asked again");
+    }
+
+    #[test]
+    fn a_segment_without_a_length_still_goes_to_the_player_as_it_comes() {
+        let st = stream(60_000, 0, 20);
+        let sid = st.open();
+        // Whole answers say no length; about 2.6 s for the segment.
+        st.up.no_length();
+        st.up.trickle(40);
+        let mut c = TcpStream::connect(addr(&st.base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let asked = Instant::now();
+        write!(
+            c,
+            "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
+            path(&st.base, &format!("live/{sid}/v/10.mkv"))
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        let body_at = |raw: &[u8]| raw.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+        while body_at(&raw).is_none_or(|at| raw.len() < at + 4096) {
+            let mut buf = [0u8; 8192];
+            let k = c.read(&mut buf).unwrap();
+            assert!(k > 0, "the answer ended early");
+            raw.extend_from_slice(&buf[..k]);
+        }
+        // Its first bytes long before the whole of it: it was asked for as a
+        // range, whose answer says the length.
+        let early = asked.elapsed();
+        assert!(early < Duration::from_millis(1_500), "{early:?}");
+        c.read_to_end(&mut raw).unwrap();
+        assert_eq!(raw[body_at(&raw).unwrap()..], live_segment("v", 10));
+        assert_eq!(
+            st.up.ranges_of(&sq("v", 10)),
+            [Some("bytes=0-".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_playlists_say_the_media_time_and_where_to_join() {
+        let up = LiveUpstream::start(60_000, 0, 200);
+        // A stream that broke off for 24.5 s at segment 120.
+        up.clock(120, 24.5);
+        let bin = TempDir::new();
+        let ytdlp = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let st = stream_with(up, bin, ytdlp, Config::default());
+        let v = st.play();
+        let sid = sid_of(&v);
+        // The join, at the start of segment 198, is three segments (of a
+        // minute here) back from the end, as the playlist's own clock has it.
+        assert_eq!(v["start"], -180.0);
+        assert_eq!(v["live"]["join"], 180.0);
+        for (file, prefix) in [("video", "v/"), ("audio", "a/")] {
+            let (status, _, body) = st.get(&format!("live/{sid}/{file}.m3u8"));
+            assert_eq!(status, 200);
+            let text = String::from_utf8(body).unwrap();
+            assert!(
+                text.contains("#EXT-X-START:TIME-OFFSET=-180.000,PRECISE=YES\n"),
+                "{text}"
+            );
+            // Segment 198 starts where its media says: 198 minutes less 24.5 s.
+            let mut at = 0.0;
+            for pair in text.split("#EXTINF:").skip(1) {
+                let (len, rest) = pair.split_once(",\n").unwrap();
+                if rest.starts_with(&format!("{prefix}198.")) {
+                    break;
+                }
+                at += len.parse::<f64>().unwrap();
+            }
+            assert!((at - (11_880.0 - 24.5)).abs() < 1e-3, "{file}: {at}");
+        }
+        // And the window learns where the end is on that clock.
+        let edge = state(&st, &sid)["edge"].as_f64().unwrap();
+        assert!((edge - (12_060.0 - 24.5)).abs() < 1e-3, "{edge}");
+    }
+
+    #[test]
+    fn a_stream_whose_segments_say_no_time_keeps_the_target_lengths() {
+        let st = stream(60_000, 0, 200);
+        let v = st.play();
+        let (_, _, body) = st.get(&format!("live/{}/video.m3u8", sid_of(&v)));
+        let text = String::from_utf8(body).unwrap();
+        let lengths: Vec<&str> = text.lines().filter(|l| l.starts_with("#EXTINF:")).collect();
+        assert!(lengths.iter().all(|l| *l == "#EXTINF:60.000,"), "{text}");
+        assert_eq!(state(&st, &sid_of(&v))["edge"], 12_060.0);
     }
 
     #[test]
@@ -2667,9 +3157,9 @@ cat '{}'"#,
         let st = stream(60_000, 0, 20);
         st.s.warming.store(true, Ordering::Relaxed);
         let sid = st.open();
-        // The last four of each track, the player's first asks at its join.
+        // The last three of each track, the player's first asks at its join.
         wait_for("the join to come in", Duration::from_secs(5), || {
-            (17..=20).all(|n| st.asked(&sq("v", n)) == 1 && st.asked(&sq("a", n)) == 1)
+            (18..=20).all(|n| st.asked(&sq("v", n)) == 1 && st.asked(&sq("a", n)) == 1)
         });
         // FFmpeg reads the first segments when it opens the playlist, before
         // it goes to the join: that doesn't drop them.
@@ -2682,8 +3172,8 @@ cat '{}'"#,
             assert_eq!(st.asked(&sq("v", n)), 1, "{n}");
             assert_eq!(st.asked(&sq("a", n)), 1, "{n}");
         }
-        // The one before the join, which the player didn't need, was let go.
-        assert_eq!(st.asked(&sq("v", 17)), 1);
+        // Not the one before the join, which no player reads.
+        assert_eq!(st.asked(&sq("v", 17)), 0);
     }
 
     #[test]
@@ -2694,8 +3184,8 @@ cat '{}'"#,
         // takes to move past them.
         st.up.trickle(200);
         let sid = st.open();
-        wait_for("the join to start", Duration::from_secs(5), || {
-            st.up.in_flight() == 2 * HELD
+        wait_for("the join to start", Duration::from_secs(10), || {
+            st.up.in_flight() == 2 * JOIN as usize
         });
         // Until the player has loaded a playlist with a newer head, they
         // are where it joins: they stay.
@@ -2703,7 +3193,7 @@ cat '{}'"#,
         let audio = format!("live/{sid}/audio.m3u8");
         assert_eq!(st.get(&audio).0, 200);
         std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(st.up.in_flight(), 2 * HELD);
+        assert_eq!(st.up.in_flight(), 2 * JOIN as usize);
         // It reloads the playlists (and with them the head) while it looks
         // at the first segments.
         wait_for("them to be let go", Duration::from_secs(10), || {
@@ -2949,5 +3439,63 @@ exec '{inner}' "$@"
         // Asked again as live at once: no usual lookup in between.
         assert_eq!(runs(&st.bin.0), 1);
         assert_eq!(st.live_lookups(), 1);
+    }
+
+    /// A yt-dlp whose first live lookup finds the stream running but offers
+    /// only HLS, as one circuit was (measured), and then `inner`.
+    fn hls_first_ytdlp(dir: &std::path::Path, inner: &str) -> String {
+        std::fs::write(dir.join("hls-only.json"), HLS_ONLY).unwrap();
+        crate::store::testing::script(
+            &dir.join("yt-dlp-hls"),
+            &format!(
+                r#"d='{d}'
+echo x >> "$d/hls-runs"
+if [ ! -e "$d/hls-said" ]; then
+  touch "$d/hls-said"
+  cat "$d/hls-only.json"
+  exit 0
+fi
+exec '{inner}' "$@"
+"#,
+                d = dir.display()
+            ),
+        )
+    }
+
+    fn hls_runs(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("hls-runs")).map_or(0, |s| s.lines().count())
+    }
+
+    #[test]
+    fn a_running_stream_offered_without_fragments_is_asked_again_once_on_tor() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let inner = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let ytdlp = hls_first_ytdlp(&bin.0, &inner);
+        let hop = Hop::start();
+        let cfg = Config {
+            proxy: Some(hop.proxy()),
+            isolate_circuits: true,
+            ..Config::default()
+        };
+        let st = stream_with(up, bin, ytdlp, cfg);
+        let target = path(&st.base, &format!("{PLAY}&live=now"));
+        let (status, body) = http(&st.base, "POST", &target, "");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(hls_runs(&st.bin.0), 2);
+    }
+
+    #[test]
+    fn a_running_stream_offered_without_fragments_on_direct_says_so_at_once() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let inner = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let ytdlp = hls_first_ytdlp(&bin.0, &inner);
+        let st = stream_with(up, bin, ytdlp, Config::default());
+        let target = path(&st.base, &format!("{PLAY}&live=now"));
+        let (status, body) = http(&st.base, "POST", &target, "");
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("no fragments"), "{body}");
+        assert_eq!(hls_runs(&st.bin.0), 1);
     }
 }
