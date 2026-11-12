@@ -893,9 +893,20 @@ fn drain_tail(pipe: Option<impl Read + Send + 'static>, keep: usize) -> JoinHand
     })
 }
 
+/// The ways that yt-dlp says it found no format: older versions word it as
+/// `Requested format is not available`, and 2026.10.26 says
+/// `No video formats found!; please report this issue on ...` for a running
+/// stream with the manifests skipped (the stable part is matched, not the
+/// "please report" ending). Only when the live lookup that follows finds
+/// nothing either does this read as an outdated yt-dlp (see `explain`).
+const NO_FORMAT: &[&str] = &[
+    "Requested format is not available",
+    "No video formats found",
+];
+
 fn is_no_format(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Failed>()
-        .is_some_and(|f| f.raw.contains("Requested format is not available"))
+        .is_some_and(|f| NO_FORMAT.iter().any(|said| f.raw.contains(said)))
 }
 
 /// What yt-dlp says of a running stream when the manifests are skipped: it
@@ -2027,6 +2038,69 @@ fi
         );
         assert!(matches!(open(&yt, 1440).unwrap(), Opening::Live(s) if s.video.format_id == "271"));
         assert_eq!(runs(&dir), 2);
+    }
+
+    /// What yt-dlp 2026.10.26 says of a running stream with the manifests
+    /// skipped (measured against YouTube): not the words of a lost recording
+    /// or of a missing format, but its "please report this" ending.
+    const NO_VIDEO_FORMATS: &str = "echo 'ERROR: [youtube] aaaaaaaaaaa: No video formats found!; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U' >&2; exit 1";
+
+    #[test]
+    fn a_running_stream_that_says_no_video_formats_found_opens_as_live() {
+        let dir = TempDir::new();
+        let yt = live_fake(&dir, NO_VIDEO_FORMATS, r#"cat "$d/live.json""#);
+        let Opening::Live(s) = open(&yt, 1080).unwrap() else {
+            panic!("not live")
+        };
+        assert!(!s.ended);
+        assert_eq!(
+            (s.video.format_id.as_str(), s.audio.format_id.as_str()),
+            ("248", "140")
+        );
+        // The usual lookup (manifests skipped), then the live one.
+        assert_eq!(runs(&dir), 2);
+        assert!(spied(&dir, "conf1").contains("skip=hls,dash"));
+        assert!(
+            spied(&dir, "conf2")
+                .lines()
+                .any(|l| l == "--live-from-start")
+        );
+    }
+
+    #[test]
+    fn no_video_formats_found_on_a_plain_video_still_reads_as_outdated_when_the_live_lookup_finds_nothing()
+     {
+        // The live lookup ran, and an ordinary video has nothing for it
+        // either: what the usual lookup said is what there is to say, which
+        // is the friendly "yt-dlp is out of date" (never a silent success).
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            NO_VIDEO_FORMATS,
+            r#"echo '{"title":"T","formats":[{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","acodec":"mp4a"}]}'"#,
+        );
+        let e = open(&yt, 1080).unwrap_err();
+        assert_eq!(runs(&dir), 2, "{e:#}");
+        assert_eq!(
+            crate::errors::explain(&e.to_string()).code,
+            crate::errors::Code::YtdlpOutdated,
+            "{e:#}"
+        );
+        // When the live lookup fails itself, its error is the one shown, not
+        // "yt-dlp is out of date".
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            NO_VIDEO_FORMATS,
+            "echo 'ERROR: [youtube] x: Join this channel to get access to members-only content like this video.' >&2; exit 1",
+        );
+        let e = open(&yt, 1080).unwrap_err();
+        assert_eq!(runs(&dir), 2, "{e:#}");
+        assert_eq!(
+            crate::errors::explain(&e.to_string()).code,
+            crate::errors::Code::MembersOnly,
+            "{e:#}"
+        );
     }
 
     #[test]
