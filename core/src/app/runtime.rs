@@ -21,6 +21,10 @@ const SAVE_EVERY: Duration = Duration::from_secs(2);
 /// never looks idle.
 const WAIT_HEARTBEAT: Duration = Duration::from_secs(25);
 
+/// How long the live chat (`GET api/chat`) may be silent before it says it
+/// is still there (`{"heartbeat":true}`), for the same reason.
+const CHAT_HEARTBEAT: Duration = Duration::from_secs(25);
+
 /// How long a lens or topic refresh waits before each of its searches after
 /// the first, at random between these: searches that go out back to back,
 /// and in the same order each time, are easier to tell from a person's.
@@ -54,6 +58,9 @@ pub struct Runtime {
     /// How often the waiting room repeats itself while it has nothing new
     /// to say (`WAIT_HEARTBEAT`); only tests change it.
     pub wait_heartbeat: Duration,
+    /// How long the live chat may be silent before it says it is still
+    /// there (`CHAT_HEARTBEAT`); only tests change it.
+    pub chat_heartbeat: Duration,
 }
 
 impl Runtime {
@@ -83,6 +90,7 @@ impl Runtime {
             pause: search_pause(),
             wait_speed: 1,
             wait_heartbeat: WAIT_HEARTBEAT,
+            chat_heartbeat: CHAT_HEARTBEAT,
         })
     }
 
@@ -116,7 +124,7 @@ impl Runtime {
     /// This runtime, with what only tests change carried over from `from`:
     /// where the feeds and thumbnails are fetched, how often a refresh
     /// saves, the pause between searches, how fast the waiting room's clock
-    /// runs and how often it repeats itself, and the test knobs of the route
+    /// runs and how often it and the chat repeat themselves, and the test knobs of the route
     /// (see `Net::with_knobs_of`). A settings change builds a new runtime
     /// from the config, and a test's must keep using its local stand-ins
     /// instead of YouTube. In production these are constants, so this
@@ -128,6 +136,7 @@ impl Runtime {
         self.pause = Arc::clone(&from.pause);
         self.wait_speed = from.wait_speed;
         self.wait_heartbeat = from.wait_heartbeat;
+        self.chat_heartbeat = from.chat_heartbeat;
         self.net = self.net.with_knobs_of(&from.net);
         self.yt.net = self.yt.net.with_knobs_of(&from.net);
         self

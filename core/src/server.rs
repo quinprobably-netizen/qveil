@@ -20,9 +20,11 @@
 //! - `chapters`: a video's chapters, when the page data had to be asked for.
 //! - `timeline`: a live stream's playlists, and the session that serves their segments.
 //! - `wait`: the waiting room, until an announced stream starts.
+//! - `chat`: a running stream's live chat, read only.
 
 mod api;
 mod chapters;
+mod chat;
 mod comments;
 mod flights;
 mod http;
@@ -851,6 +853,7 @@ impl Server {
             ("GET", ["api", "comments"]) => self.comments(&mut stream, &req),
             ("GET", ["api", "chapters"]) => self.chapters(&mut stream, &req),
             ("GET", ["api", "wait"]) => self.wait(&mut stream, &req),
+            ("GET", ["api", "chat"]) => self.chat(&mut stream, &req),
             _ => self.json_api(&mut stream, &req, &segs),
         }
     }

@@ -679,6 +679,84 @@ impl Ytdlp {
             published: published(&v),
         })
     }
+
+    /// Starts reading the live chat of the stream at `url`: yt-dlp's
+    /// live-chat reader, which writes the chat to a file in the call's
+    /// private directory as it arrives (see `ChatReader::files`), until the
+    /// stream ends. Nothing else is downloaded. It runs for as long as the
+    /// stream does: there is no deadline, and whoever reads the chat stops
+    /// it, by dropping the reader, when nobody wants it any more. The route
+    /// closing stops it too (see `Inflight`).
+    pub fn chat(&self, url: &str) -> Result<ChatReader> {
+        crate::store::ensure_dir(&self.cache_dir)?;
+        let dir = PrivateDir::new("qveil-ytdlp-")?;
+        let output = format!("{}/{CHAT_NAME}.%(ext)s", dir.path().display());
+        let args = [
+            "--skip-download",
+            "--write-subs",
+            "--sub-langs",
+            "live_chat",
+            "-o",
+            &output,
+        ];
+        let call = Call::in_dir(dir, &self.net, &args, None, url)?;
+        let mut run = self.start(&mut self.command(&call), &call)?;
+        // Read so that yt-dlp never waits on a full pipe, for as long as the
+        // stream goes on; only the end of stderr is kept, for its error.
+        let _ = drain_tail(run.stdout.take(), 0);
+        let stderr = drain_tail(run.stderr.take(), STDERR_KEPT);
+        Ok(ChatReader { run, stderr, call })
+    }
+
+    /// How a chat reader that has ended went: an error if yt-dlp failed
+    /// (with what it said) or the registry stopped it (the route was left).
+    /// A reader that is still running is stopped first.
+    pub fn chat_ended(&self, reader: ChatReader) -> Result<()> {
+        let ChatReader { run, stderr, call } = reader;
+        run.kill();
+        let status = run.wait()?;
+        drop(call);
+        if let Some(why) = run.stopped() {
+            bail!(why.message());
+        }
+        if status.success() {
+            return Ok(());
+        }
+        Err(self.failure(&stderr.join().unwrap_or_default()))
+    }
+}
+
+/// What the chat file is named, before yt-dlp adds `.live_chat.json`.
+const CHAT_NAME: &str = "c";
+/// How much of what a chat reader says on stderr is kept: its last lines
+/// are its error, and over hours there is no telling how much it says.
+const STDERR_KEPT: usize = 16 << 10;
+
+/// yt-dlp reading a stream's live chat (see `Ytdlp::chat`). Dropping it
+/// stops yt-dlp, with everything it started, and removes its private files.
+pub struct ChatReader {
+    // The process goes before its files: fields drop in this order.
+    run: Run,
+    stderr: JoinHandle<Vec<u8>>,
+    call: Call,
+}
+
+impl ChatReader {
+    /// Where the chat is written: while the stream goes on, and once it has
+    /// ended (yt-dlp renames the file then). One JSON line per action.
+    pub fn files(&self) -> [PathBuf; 2] {
+        let part = self
+            .call
+            .dir
+            .path()
+            .join(format!("{CHAT_NAME}.live_chat.json.part"));
+        [part.clone(), part.with_extension("")]
+    }
+
+    /// Waits up to `limit` for yt-dlp to end. True once it has.
+    pub fn wait_exit(&self, limit: Duration) -> bool {
+        self.run.wait_exit(limit)
+    }
 }
 
 /// The private files of one yt-dlp call, removed when it is dropped.
@@ -698,6 +776,24 @@ impl Call {
     /// `args` are the call's own options, as they would be on the command
     /// line (`-f`, its selector, …).
     fn new(net: &Net, args: &[&str], extractor_args: Option<&str>, target: &str) -> Result<Self> {
+        Self::in_dir(
+            PrivateDir::new("qveil-ytdlp-")?,
+            net,
+            args,
+            extractor_args,
+            target,
+        )
+    }
+
+    /// `new`, in `dir`, which a call that writes files there (`Ytdlp::chat`)
+    /// had to know of to name them in `args`.
+    fn in_dir(
+        dir: PrivateDir,
+        net: &Net,
+        args: &[&str],
+        extractor_args: Option<&str>,
+        target: &str,
+    ) -> Result<Self> {
         // A target that began with `-` would be read as an option. Ours are
         // always `ytsearch…` or an https URL, so this can't happen.
         ensure!(
@@ -721,7 +817,6 @@ impl Call {
             text.push_str(&format!("--extractor-args {}\n", quote(e)));
         }
         text.push_str(&format!("{}\n", quote(&target)));
-        let dir = PrivateDir::new("qveil-ytdlp-")?;
         let config = dir.write("yt-dlp.conf", text.as_bytes())?;
         Ok(Call { dir, config })
     }
@@ -768,6 +863,30 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
             let _ = p.read_to_end(&mut buf);
         }
         buf
+    })
+}
+
+/// Like `drain`, for a process that may run for hours: only the last `keep`
+/// bytes of what it wrote are kept.
+fn drain_tail(pipe: Option<impl Read + Send + 'static>, keep: usize) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let Some(mut p) = pipe else { return kept };
+        let mut buf = [0u8; 8192];
+        loop {
+            match p.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    kept.extend_from_slice(&buf[..n]);
+                    if kept.len() > keep {
+                        kept.drain(..kept.len() - keep);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        kept
     })
 }
 
@@ -1344,6 +1463,56 @@ echo '{"entries":[]}'
         assert_eq!(spied(&dir, "dir-mode").trim(), "700");
         // And the directory is gone once yt-dlp has run.
         assert!(!Path::new(spied(&dir, "private-dir").trim()).exists());
+    }
+
+    #[test]
+    fn the_chat_reader_keeps_the_stream_and_the_proxy_password_out_of_argv() {
+        let dir = TempDir::new();
+        let yt = ytdlp(
+            script(&dir.0.join("yt-dlp"), SPY),
+            Some("http://user:SECRETPW@127.0.0.1:3128"),
+        );
+        let reader = yt
+            .chat("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            .unwrap();
+        let private = reader.files()[0].parent().unwrap().to_path_buf();
+        assert!(reader.wait_exit(Duration::from_secs(10)));
+
+        let argv = spied(&dir, "argv");
+        for needle in [
+            "SECRETPW",
+            "127.0.0.1:3128",
+            "youtube.com",
+            "dQw4w9WgXcQ",
+            "live_chat",
+            "--write-subs",
+            "--skip-download",
+            "%(ext)s",
+        ] {
+            assert!(!argv.contains(needle), "{needle} is in argv:\n{argv}");
+        }
+        // The chat file is written in the call's private directory.
+        assert_eq!(
+            spied(&dir, "private-dir").trim(),
+            private.display().to_string()
+        );
+        assert_eq!(
+            reader.files(),
+            [
+                private.join("c.live_chat.json.part"),
+                private.join("c.live_chat.json")
+            ]
+        );
+        assert_eq!(
+            spied(&dir, "config"),
+            format!(
+                "\u{feff}--proxy 'http://user:SECRETPW@127.0.0.1:3128'\n--skip-download\n--write-subs\n--sub-langs 'live_chat'\n-o '{}/c.%(ext)s'\n'https://www.youtube.com/watch?v=dQw4w9WgXcQ'\n",
+                private.display()
+            )
+        );
+        assert!(yt.chat_ended(reader).is_ok());
+        // And the directory, with the chat in it, is gone once it is done.
+        assert!(!private.exists());
     }
 
     #[test]

@@ -28,6 +28,7 @@ macro_rules! out {
 }
 
 mod app;
+mod chat;
 mod comments;
 mod config;
 mod errors;
