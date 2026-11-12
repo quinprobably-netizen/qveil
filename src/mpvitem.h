@@ -117,7 +117,11 @@ public:
 
     Renderer *createRenderer() const override;
 
-    Q_INVOKABLE void load(const QString &video, const QString &audio, double start);
+    // `start`: the second to begin at, from the end when negative (a running
+    // stream is joined a few segments back from its newest), 0 from the
+    // start. `live`: the streams are the engine's growing playlists of a live
+    // stream (see startLoad for what that changes).
+    Q_INVOKABLE void load(const QString &video, const QString &audio, double start, bool live = false);
     Q_INVOKABLE void stop();
     Q_INVOKABLE void togglePause();
     Q_INVOKABLE void seek(double seconds, bool relative);
@@ -212,6 +216,7 @@ private:
     quint64 m_asked = 0;
     QString m_video, m_audio;
     double m_start = 0;
+    bool m_live = false;
     double m_position = 0, m_duration = 0, m_cached = 0, m_volume = 100, m_speed = 1, m_renderScale = 1;
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false, m_started = false, m_handingOver = false;

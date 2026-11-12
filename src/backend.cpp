@@ -276,7 +276,8 @@ void Backend::refuse(const QString &task) {
 }
 
 bool Backend::newestOnly(const QString &task) {
-    static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "chapters", "lens", "read"};
+    static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "chapters", "lens", "read",
+                                     "live-state"};
     return tasks.contains(task);
 }
 
@@ -326,6 +327,13 @@ void Backend::request(const QByteArray &verb, const QString &path, const QUrlQue
             // playing it looks it up as usual, and says so if that fails too.
             if (task == "prepare")
                 return;
+            // Whether a stream has ended is asked again at the next check, and
+            // a session the engine no longer has (404) is one that is over.
+            if (task == "live-state") {
+                if (status == 404 && m_latest.value(task) == id)
+                    done(QJsonObject{{"state", "ended"}});
+                return;
+            }
             const QJsonObject body = doc.object();
             fail(body.value("error").toString(), body.value("code").toString(), failure(reply));
             if (m_latest.value(task) == id)
@@ -787,6 +795,24 @@ void Backend::prepare(const QString &video) {
 }
 
 void Backend::cancelPrepare() { supersede("prepare"); }
+
+void Backend::checkLive(const QString &playlist) {
+    // Only the engine's own link, from this engine: anything else is no
+    // stream of its, and nothing is ever asked of anywhere but the engine.
+    const QString prefix = m_base + "/live/", tail = "/video.m3u8";
+    if (!ready() || !playlist.startsWith(prefix) || !playlist.endsWith(tail))
+        return;
+    const QString session = playlist.mid(prefix.size(), playlist.size() - prefix.size() - tail.size());
+    if (session.isEmpty() || session.contains('/') || session.contains('?') || session.contains('#'))
+        return;
+    call("GET", "live/" + session + "/state", {}, {}, "live-state", [this, playlist](const QJsonValue &v) {
+        const QString state = v.toObject().value("state").toString();
+        if (!state.isEmpty())
+            emit liveChecked(playlist, state);
+    });
+}
+
+void Backend::stopLiveCheck() { supersede("live-state"); }
 
 void Backend::loadResume() {
     call("GET", "api/resume", {}, {}, "resume", [this](const QJsonValue &v) {

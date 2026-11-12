@@ -261,6 +261,18 @@ struct App {
         return lines;
     }
     int asked(const QString &start) { return asked().filter(QRegularExpression("^" + QRegularExpression::escape(start))).size(); }
+    // How many of what was asked match `pattern`.
+    int askedLike(const char *pattern) { return asked().filter(QRegularExpression(pattern)).size(); }
+
+    // Ends the running stream the stand-in engine serves (QVEIL_STANDIN_LIVECLIP).
+    void endTheStream()
+    {
+        const QString base = backend->thumbBase().chopped(QString("/thumb/").size());
+        QNetworkReply *reply = web.post(QNetworkRequest(QUrl(base + "/api/_live_end")), QByteArray());
+        QSignalSpy done(reply, &QNetworkReply::finished);
+        done.wait(5000);
+        reply->deleteLater();
+    }
 };
 
 // Something to play: a clip, made with ffmpeg in `dir`, which the stand-in
@@ -272,6 +284,27 @@ QString makeClip(const QTemporaryDir &dir, int seconds = 120)
     make.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", QString("testsrc2=d=%1:s=160x90:r=5").arg(seconds), "-f", "lavfi", "-i", "anullsrc",
                           "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", clip});
     return make.waitForFinished(60000) && make.exitCode() == 0 && QFile::exists(clip) ? clip : QString();
+}
+
+// A running stream to play: a folder of 2-second segments, each standing
+// alone as the engine's do (`v/<n>.mkv`, live WebM-style Matroska, and
+// `a/<n>.m4a`), made with ffmpeg in `dir`, which the stand-in engine lists in
+// growing EVENT playlists (QVEIL_STANDIN_LIVECLIP). Empty without ffmpeg.
+QString makeLiveClip(const QTemporaryDir &dir, int seconds = 60)
+{
+    const QString at = dir.filePath("live");
+    QDir().mkpath(at + "/v");
+    QDir().mkpath(at + "/a");
+    const QStringList cut{"-f", "segment", "-segment_time", "2", "-segment_format", "matroska", "-segment_format_options", "live=1",
+                          "-reset_timestamps", "0"};
+    QProcess video, audio;
+    video.start("ffmpeg", QStringList{"-loglevel", "error", "-f", "lavfi", "-i", QString("testsrc2=d=%1:s=160x90:r=10").arg(seconds),
+                                      "-c:v", "libx264", "-preset", "ultrafast", "-g", "20", "-keyint_min", "20", "-sc_threshold", "0"}
+                              + cut + QStringList{at + "/v/%d.mkv"});
+    audio.start("ffmpeg", QStringList{"-loglevel", "error", "-f", "lavfi", "-i", QString("sine=f=440:d=%1").arg(seconds), "-c:a", "aac"}
+                              + cut + QStringList{at + "/a/%d.m4a"});
+    const bool made = video.waitForFinished(60000) && audio.waitForFinished(60000) && video.exitCode() == 0 && audio.exitCode() == 0;
+    return made && QFile::exists(at + "/v/0.mkv") && QFile::exists(at + "/a/0.m4a") ? at : QString();
 }
 
 #define READY(app) QVERIFY2((app).ok, "the window didn't load, or the stand-in engine didn't start")
@@ -4783,6 +4816,198 @@ private slots:
         // The page is the channel's, under its ID, so that it can be subscribed to and refreshed.
         QTRY_COMPARE(app.backend->channel().value("id").toString(), QString("UCaaaaaaaaaaaaaaaaaaaaaa"));
         QVERIFY(!app.item("errorBar")->isVisible());
+    }
+
+    // --- Watching a stream that is running (W2). ---
+
+    // Plays the stand-in's running stream, with its state asked for every
+    // `check` ms, and waits for its first frame. The player, or null.
+    static QObject *playLive(App &app, int check = 10000)
+    {
+        QQuickItem *surface = app.item("surface");
+        surface->setProperty("liveCheckInterval", check);
+        app.play({{"id", "live0000001"}, {"title", "Live: the long one, part 2"}, {"live", "now"}});
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        if (!QTest::qWaitFor([mpv] { return mpv->property("started").toBool() && mpv->property("duration").toDouble() > 0; }, 20000))
+            return nullptr;
+        return mpv;
+    }
+    static QString timeOf(App &app) { return App::under(app.item("surface"), "seek-time")->property("text").toString(); }
+
+    void aLiveStreamOpensNearTheEdgeAndSaysLive()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QElapsedTimer opening;
+        opening.start();
+        QObject *mpv = playLive(app);
+        QVERIFY(mpv);
+        // At once: not once the stream has grown to where it was to start
+        // (as it is when FFmpeg opens the playlist at its end, about 13 s here).
+        QVERIFY2(opening.elapsed() < 8000, qPrintable(QString::number(opening.elapsed())));
+        QQuickItem *surface = app.item("surface");
+        // Three segments from the end, in one load: mpv was given the negative start.
+        QCOMPARE(surface->property("startedAt").toDouble(), -6.0);
+        QVERIFY(surface->property("live").toBool());
+        const double length = surface->property("length").toDouble(), position = mpv->property("position").toDouble();
+        QVERIFY2(length >= 16 && position >= length - 8, qPrintable(QString("%1 of %2").arg(position).arg(length)));
+        QVERIFY(surface->property("atEdge").toBool());
+        // At the edge the clock says how long the stream has run, and that it is live.
+        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u00b7 live")));
+        QVERIFY2(!timeOf(app).contains('/'), qPrintable(timeOf(app)));
+        QQuickItem *goLive = App::under(surface, "go-live");
+        QVERIFY(goLive && !goLive->isVisible());
+        // Under the title: how many are watching, and how long ago it started.
+        QVERIFY2(QRegularExpression(QString::fromUtf8("^1.2K watching \u00b7 started 2:14:\\d\\d ago$"))
+                     .match(app.item("watch-stats")->property("text").toString()).hasMatch(),
+                 qPrintable(app.item("watch-stats")->property("text").toString()));
+        // The seek bar grows with the stream.
+        QTRY_VERIFY_WITH_TIMEOUT(surface->property("length").toDouble() >= length + 2, 10000);
+        QVERIFY(surface->property("atEdge").toBool());
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void fallingBehindShowsGoLiveAndEndReturns()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QObject *mpv = playLive(app);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface"), *goLive = App::under(surface, "go-live");
+        QVERIFY(surface->property("atEdge").toBool());
+
+        // Back to the start of the stream: its first segments, of both tracks.
+        // (The player has the timeline from there: opened at the end, a seek
+        // to 0 would land on the picture's first segment it read, three from
+        // the end, while the sound went to the stream's start.)
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 4 && !mpv->property("buffering").toBool(), 10000);
+        QTRY_VERIFY(app.askedLike("^GET live/\\d+/v/0\\.mkv") >= 1 && app.askedLike("^GET live/\\d+/a/0\\.m4a") >= 1);
+        // Behind: the clock is where it is of how long, and Go live is offered, with its key.
+        QVERIFY(!surface->property("atEdge").toBool());
+        QTRY_VERIFY2(QRegularExpression("^0:0\\d / 0:\\d\\d$").match(timeOf(app)).hasMatch(), qPrintable(timeOf(app)));
+        QTRY_VERIFY(goLive->isVisible());
+        QCOMPARE(goLive->property("text").toString(), QString("Go live"));
+        QCOMPARE(goLive->property("trailing").toString(), QString("End"));
+
+        // End goes back to the edge.
+        QTest::keyClick(app.window, Qt::Key_End);
+        QTRY_VERIFY_WITH_TIMEOUT(surface->property("atEdge").toBool(), 10000);
+        QTRY_VERIFY(!goLive->isVisible());
+        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u00b7 live")));
+        const double length = surface->property("length").toDouble();
+        QVERIFY2(mpv->property("position").toDouble() >= length - 8, qPrintable(QString::number(mpv->property("position").toDouble())));
+
+        // L is still ten seconds on, and J ten back: behind again, and the button goes live too.
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_VERIFY_WITH_TIMEOUT(!surface->property("atEdge").toBool(), 10000);
+        QTRY_VERIFY(goLive->isVisible());
+        app.click(goLive);
+        QTRY_VERIFY_WITH_TIMEOUT(surface->property("atEdge").toBool(), 10000);
+        QTRY_VERIFY(!goLive->isVisible());
+        QCOMPARE(app.asked("POST api/play"), 1);
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void aLiveStreamSavesNoResumePosition()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QObject *mpv = playLive(app, 300);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface");
+        // What would note where a video is: a seek once it has rested, a pause, a step, leaving.
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 2));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 6 && !mpv->property("buffering").toBool(), 10000);
+        QTest::qWait(1200);
+        QTest::keyClick(app.window, Qt::Key_Space);
+        QTRY_VERIFY(mpv->property("paused").toBool());
+        QTest::keyClick(app.window, Qt::Key_Right);
+        QTest::qWait(1200);
+        // (The state is asked for while it runs.)
+        QTRY_VERIFY(app.askedLike("^GET live/\\d+/state") >= 1);
+        QVERIFY(app.goFromTheVideo("history"));
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/resume"), 0);
+        // Once it is left, its state is not asked for any more.
+        const int asked = app.askedLike("^GET live/\\d+/state");
+        QTest::qWait(1000);
+        QCOMPARE(app.askedLike("^GET live/\\d+/state"), asked);
+    }
+
+    void aRunningStreamGetsNoNextVideoReady()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        app.backend->setConfig({{"prepareNext", true}});
+        QTRY_VERIFY(app.backend->config().value("prepareNext").toBool());
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        // Played from a list with a video after it: its edge is always in
+        // its last 30 seconds, and nothing is looked up ahead for that.
+        QQuickItem *surface = app.item("surface");
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, QVariantMap({{"id", "live0000001"}, {"live", "now"}})),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && surface->property("atEdge").toBool(), 20000);
+        QTest::qWait(1500);
+        QCOMPARE(app.asked("POST api/prepare"), 0);
+    }
+
+    void whenTheStreamEndsItPlaysOnAsAFinishedVideo()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QObject *mpv = playLive(app, 300);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface"), *goLive = App::under(surface, "go-live");
+        QSignalSpy ended(surface, SIGNAL(liveEndedChanged()));
+        // Rewound when it ends.
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 4));
+        QTRY_VERIFY_WITH_TIMEOUT(goLive->isVisible(), 10000);
+        app.endTheStream();
+        // The window learns it from the engine, and the stream is a video like any other.
+        QTRY_VERIFY_WITH_TIMEOUT(surface->property("liveEnded").toBool(), 5000);
+        QCOMPARE(ended.count(), 1);
+        QVERIFY(!surface->property("live").toBool());
+        QVERIFY(!surface->property("atEdge").toBool());
+        QTRY_VERIFY(!goLive->isVisible());
+        QTRY_VERIFY2(QRegularExpression("^\\d:\\d\\d / \\d:\\d\\d$").match(timeOf(app)).hasMatch(), qPrintable(timeOf(app)));
+        QCOMPARE(surface->property("info").toMap().value("live").toMap().value("state").toString(), QString("ended"));
+        QVERIFY2(!app.item("watch-stats")->property("text").toString().contains("watching"),
+                 qPrintable(app.item("watch-stats")->property("text").toString()));
+        // Its state is not asked for any more.
+        const int checks = app.askedLike("^GET live/\\d+/state");
+        QTest::qWait(1000);
+        QCOMPARE(app.askedLike("^GET live/\\d+/state"), checks);
+        // It plays on to its end, with no reload, and ends as a video does.
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, surface->property("length").toDouble() - 3));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("ended").toBool(), 20000);
+        QTRY_VERIFY(app.item("ended")->isVisible());
+        QCOMPARE(app.asked("POST api/play"), 1);
+        // And where it got to is noted again, as for any video.
+        QTRY_VERIFY(app.asked("POST api/resume") >= 1);
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
     }
 };
 

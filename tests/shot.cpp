@@ -64,6 +64,13 @@ int main(int argc, char *argv[]) {
         {"watch-ended", "playListed(qsTr('Latest from your channels'), backend.feed.get(0), backend.feed, 0); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 2500; running: true; onTriggered: watch.surface.mpv.seek(59.8, false) }', win)"},
         {"watch-comments", "play(backend.feed.get(0)); watch.enterSheet('comments')"},
+        // A running stream (bin/shot makes its segments), at the edge, and
+        // fallen behind it; the controls brought up just before the still.
+        {"watch-live", "play({ id: 'live0000001', title: 'Live: the long one, part 2', channel: 'Low Level Hours', live: 'now' }); "
+                "Qt.createQmlObject('import QtQuick; Timer { interval: 4600; running: true; onTriggered: watch.surface.reveal() }', win)"},
+        {"watch-live-behind", "play({ id: 'live0000001', title: 'Live: the long one, part 2', channel: 'Low Level Hours', live: 'now' }); "
+                "Qt.createQmlObject('import QtQuick; Timer { interval: 3000; running: true; onTriggered: watch.surface.seekTo(4) }', win); "
+                "Qt.createQmlObject('import QtQuick; Timer { interval: 4600; running: true; onTriggered: watch.surface.reveal() }', win)"},
     };
     if (!views.contains(view)) {
         std::fprintf(stderr, "no view %s; there are: %s\n", argv[1], qPrintable(QStringList(views.keys()).join(", ")));

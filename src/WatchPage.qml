@@ -47,6 +47,16 @@ FocusScope {
     // How wide the sheet is when it stands beside the video.
     readonly property int sheetWidth: width >= 1180 ? 384 : 320
     readonly property bool subscribed: !!info.channelId && backend.subs.some(s => s.id === info.channelId)
+    // The clock a running stream's age is told by, a second at a time
+    // while it shows.
+    property real now: Date.now() / 1000
+    Timer {
+        interval: 1000
+        repeat: true
+        running: surface.live && page.visible
+        triggeredOnStart: true
+        onTriggered: page.now = Date.now() / 1000
+    }
 
     signal closed()
     signal channelRequested(string id)
@@ -207,7 +217,11 @@ FocusScope {
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
                     visible: text !== ""
-                    text: Format.meta(page.info, page.info.published || 0)
+                    // A running stream: how many watch and how long it has run. One
+                    // that has ended (or was over when opened) is a streamed video.
+                    text: surface.live ? Format.liveMeta(page.info.live, page.now)
+                        : Format.meta(page.info.live ? Object.assign({}, page.info, { streamed: true }) : page.info,
+                                      page.info.published || 0)
                     textFormat: Text.PlainText
                     color: Style.dim
                     font.family: Style.font
@@ -339,9 +353,10 @@ FocusScope {
         readonly property var next: page.list && page.index >= 0 && page.index + 1 < page.list.count
             ? page.list.get(page.index + 1) : null
         readonly property var clock: page.playing || surface
-        // (A stream, on now or yet to begin, has nothing to get ready.)
+        // (A stream, on now or yet to begin, has nothing to get ready. Nor
+        // has one that is running here: its edge is always near its end.)
         readonly property bool due: !!backend.config.prepareNext && !!next && !!next.id && !next.live
-            && clock.length > 0 && clock.length - clock.mpv.position <= 30
+            && !clock.live && clock.length > 0 && clock.length - clock.mpv.position <= 30
         // The video that was asked for, so it is asked for once.
         property string asked: ""
         onDueChanged: consider()

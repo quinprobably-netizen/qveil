@@ -33,6 +33,7 @@ Popup {
                 [["Space", "K"], qsTr("Play or pause")],
                 [["Left", "Right"], qsTr("5 seconds back or on")],
                 [["J", "L"], qsTr("10 seconds back or on")],
+                [["End"], qsTr("Go live, in a running stream")],
                 [["[", "]"], qsTr("Chapter before or after")],
                 [["<", ">"], qsTr("Slower or faster")],
                 [["Up", "Down"], qsTr("Volume")],

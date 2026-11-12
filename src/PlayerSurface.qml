@@ -38,7 +38,32 @@ FocusScope {
     readonly property var chapters: info.chapters && info.chapters.length > 0 ? info.chapters
         : (info.chaptersLater && backend.chapters.video === info.id ? (backend.chapters.items || []) : [])
     // What the player says once it knows; until then, what the engine said.
-    readonly property real length: mpv.duration > 0 ? mpv.duration : (info.duration || 0)
+    // (The length mpv gives a growing playlist is only as new as its last
+    // reload of it, so a running stream is at least as long as where it is.)
+    readonly property real length: mpv.duration > 0 ? Math.max(mpv.duration, live ? mpv.position : 0) : (info.duration || 0)
+
+    // A stream that is running (the answer's `live.state` is "now"), until
+    // the engine says it has ended. Its seek bar spans the whole stream so far
+    // and grows, and where it is isn't kept for resuming.
+    readonly property bool live: !!info.live && info.live.state === "now"
+    // How long one of its segments is, in seconds.
+    readonly property real segment: live ? (info.live.segment || 5) : 0
+    // Whether it plays at the live edge: within three segments of the newest
+    // one there is (whose start is a segment before the end), which is where
+    // it is joined and where Go live goes (three segments from the end), with
+    // a segment to spare for the length, which grows a segment at a time.
+    readonly property bool atEdge: live && length - mpv.position <= 4 * segment
+    // Set once a stream that was running when it was opened has ended: it
+    // is a video like any other from then on (and the Comments tab returns).
+    property bool liveEnded: false
+    // How often the engine is asked whether a running stream has ended, in ms.
+    property int liveCheckInterval: 10000
+
+    // To the live edge, where a running stream is joined.
+    function goLive() {
+        if (live)
+            seekTo(Math.max(0, length - 3 * segment))
+    }
 
     // The channel's name and the age that were looked up apart (see
     // `openAt`) fill what the video has none of.
@@ -83,6 +108,7 @@ FocusScope {
         lastPosition = 0
         startedAt = 0
         lastSeek = -1
+        liveEnded = false
         pending = true
         active = true
         reveal()
@@ -99,10 +125,12 @@ FocusScope {
         const card = info.id === i.id ? { channel: info.channel || "", published: info.published || 0 } : {}
         info = Object.assign({ batch: info.batch || 0 }, card, i)
         active = true
-        const resumed = at === undefined && !(i.start > 0) && i.resume > 0
-        startedAt = at !== undefined ? at : (i.start > 0 ? i.start : (i.resume > 0 ? i.resume : 0))
+        liveEnded = false
+        // (A running stream's start is negative: that many seconds before its end.)
+        const resumed = at === undefined && !i.start && i.resume > 0
+        startedAt = at !== undefined ? at : (i.start ? i.start : (i.resume > 0 ? i.resume : 0))
         lastSeek = -1
-        lastPosition = startedAt
+        lastPosition = Math.max(0, startedAt)
         note.shown = resumed
         if (resumed)
             noteTimer.restart()
@@ -113,7 +141,7 @@ FocusScope {
         mpv.volume = savedVolume
         // A video without a stream has nothing to load (and makes no sound).
         if (i.video)
-            mpv.load(i.video, i.audio || "", startedAt)
+            mpv.load(i.video, i.audio || "", startedAt, !!i.live)
         reveal()
     }
 
@@ -129,6 +157,7 @@ FocusScope {
         lastSeek = from.lastSeek
         lastPosition = from.lastPosition
         forgetWhenStarted = from.forgetWhenStarted
+        liveEnded = from.liveEnded
         note.shown = false
         active = true
         from.release()
@@ -150,6 +179,9 @@ FocusScope {
         pending = false
         mpv.stop()
         active = false
+        // Nobody is waiting for what the engine says of the stream now.
+        if (live)
+            backend.stopLiveCheck()
         info = ({})
         note.shown = false
         forgetWhenStarted = false
@@ -199,9 +231,10 @@ FocusScope {
     }
 
     // Tells the engine where the video is, so that it can be picked up
-    // again. Nothing is said before the player knows the length.
+    // again. Nothing is said before the player knows the length, nor while
+    // a stream runs: it has moved on by the time it would be picked up.
     function report() {
-        if (active && !pending && info.id && mpv.duration > 0)
+        if (active && !pending && info.id && mpv.duration > 0 && !live)
             backend.noteResume(info, mpv.position, mpv.duration)
     }
 
@@ -250,6 +283,32 @@ FocusScope {
         repeat: true
         running: surface.active && !surface.pending && !mpv.paused && !mpv.ended
         onTriggered: surface.report()
+    }
+
+    // While a stream runs, every so often: has it ended? The engine knows
+    // (its playlists get their end), and says so at `live/<session>/state`.
+    Timer {
+        objectName: "live-check"
+        interval: surface.liveCheckInterval
+        repeat: true
+        running: surface.active && !surface.pending && surface.live
+        onTriggered: backend.checkLive(surface.info.video)
+    }
+    Connections {
+        target: backend
+        function onLiveChecked(playlist, state) {
+            if (!surface.active || !surface.live || playlist !== surface.info.video || state !== "ended")
+                return
+            // It plays on to its end with what it has (the playlists are
+            // closed), and is a video like any other from here.
+            const was = surface.info
+            surface.info = Object.assign({}, was, {
+                live: Object.assign({}, was.live, { state: "ended" }),
+                streamed: true,
+                published: was.published || was.live.started || 0
+            })
+            surface.liveEnded = true
+        }
     }
 
     // The video's thumbnail until its first frame: the engine has it from
@@ -443,6 +502,8 @@ FocusScope {
                 width: parent.width
                 position: mpv.position
                 length: surface.length
+                live: surface.live
+                atEdge: surface.atEdge
                 cached: mpv.cached
                 chapters: surface.chapters
                 onMoved: seconds => surface.seekTo(seconds)
@@ -462,6 +523,7 @@ FocusScope {
                     }
                     Text {
                         id: timeText
+                        objectName: "seek-time"
                         anchors.verticalCenter: parent.verticalCenter
                         text: bar.time
                         textFormat: Text.PlainText
@@ -469,11 +531,22 @@ FocusScope {
                         font.family: Style.font
                         font.pixelSize: Style.small
                     }
+                    // Behind a running stream's edge: the way back to it.
+                    Act {
+                        id: goLiveAct
+                        objectName: "go-live"
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: surface.live && !surface.atEdge
+                        text: qsTr("Go live")
+                        trailing: surface.compact ? "" : "End"
+                        onClicked: surface.goLive()
+                    }
                     Text {
                         objectName: "seek-chapter"
                         // What is left beside the controls at the right; too little, and it steps aside.
                         readonly property real room: leftControls.parent.width - rightControls.width - playAct.width
-                            - timeText.width - 2 * leftControls.spacing - Style.u * 4
+                            - timeText.width - (goLiveAct.visible ? goLiveAct.width + leftControls.spacing : 0)
+                            - 2 * leftControls.spacing - Style.u * 4
                         anchors.verticalCenter: parent.verticalCenter
                         width: Math.max(0, Math.min(implicitWidth, room))
                         elide: Text.ElideRight

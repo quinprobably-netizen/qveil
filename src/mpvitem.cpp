@@ -615,11 +615,12 @@ void MpvItem::command(const QList<QByteArray> &args) {
     mpv_command_async(m_core->handle, 0, argv.data());
 }
 
-void MpvItem::load(const QString &video, const QString &audio, double start) {
+void MpvItem::load(const QString &video, const QString &audio, double start, bool live) {
     ensureCore();
     m_video = video;
     m_audio = audio;
     m_start = start;
+    m_live = live;
     ++m_asked;
 
     m_loading = true;
@@ -684,9 +685,48 @@ void MpvItem::startLoad() {
     files.format = MPV_FORMAT_NODE_ARRAY;
     files.u.list = &list;
     mpv_set_property(m_core->handle, "audio-files", MPV_FORMAT_NODE, &files);
-    mpv_set_property_string(m_core->handle, "start", m_start > 0 ? QByteArray::number(m_start).constData() : "none");
+    // A negative start counts from the end: mpv reads "-15" as 15 s before it.
+    mpv_set_property_string(m_core->handle, "start", m_start != 0 ? QByteArray::number(m_start).constData() : "none");
     mpv_set_property_string(m_core->handle, "pause", "no");
-    command({"loadfile", m_video.toUtf8(), "replace"});
+    if (!m_live) {
+        command({"loadfile", m_video.toUtf8(), "replace"});
+        return;
+    }
+    // A live stream's playlists, with options for this file only (mpv puts
+    // them back once it is over), for both tracks: FFmpeg's HLS reader gets
+    // them through demuxer-lavf-o.
+    //  - live_start_index=0: a playlist without an end is opened at its first
+    //    segment, not three from its last (FFmpeg's default). From there, the
+    //    whole stream so far is the timeline, the same one for sound and
+    //    picture, and `start` seeks within it. Opened at the end, the
+    //    timeline begins there instead: mpv waits for the stream to grow to
+    //    the start it was given (13 s on the stand-in, against 1 s), and a
+    //    seek back reaches the picture's first segment only, while the sound
+    //    goes to the stream's.
+    //  - seg_max_retry: a segment that fails (a slow one over Tor runs into
+    //    the network timeout) is asked for again, not skipped: a skip is a gap.
+    // FFmpeg's Matroska reader warns at every segment's boundary ("Seek to
+    // desired resync point failed"), and nothing is lost there; those
+    // warnings stay out of every log through msg-level all=no (see MpvCore),
+    // which holds ffmpeg/demuxer below error too.
+    QByteArray url = m_video.toUtf8(), options = "live_start_index=0,seg_max_retry=10";
+    mpv_node values[1]{}, nodes[4]{};
+    char *keys[] = {const_cast<char *>("name"), const_cast<char *>("url"), const_cast<char *>("flags"), const_cast<char *>("options")};
+    char *optionKeys[] = {const_cast<char *>("demuxer-lavf-o")};
+    values[0].format = MPV_FORMAT_STRING;
+    values[0].u.string = options.data();
+    mpv_node_list optionList{1, values, optionKeys};
+    nodes[0].format = nodes[1].format = nodes[2].format = MPV_FORMAT_STRING;
+    nodes[0].u.string = const_cast<char *>("loadfile");
+    nodes[1].u.string = url.data();
+    nodes[2].u.string = const_cast<char *>("replace");
+    nodes[3].format = MPV_FORMAT_NODE_MAP;
+    nodes[3].u.list = &optionList;
+    mpv_node_list commandList{4, nodes, keys};
+    mpv_node command{};
+    command.format = MPV_FORMAT_NODE_MAP;
+    command.u.list = &commandList;
+    mpv_command_node_async(m_core->handle, 0, &command);
 }
 
 void MpvItem::stop() {
@@ -791,6 +831,7 @@ void MpvItem::takeState(MpvItem *from) {
     m_video = from->m_video;
     m_audio = from->m_audio;
     m_start = from->m_start;
+    m_live = from->m_live;
     m_cachePaused = from->m_cachePaused;
     m_seeking = from->m_seeking;
     m_loading = from->m_loading;

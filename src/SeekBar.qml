@@ -22,7 +22,12 @@ Column {
                 found = i
         return found
     }
-    readonly property string time: Format.clock(position) + " / " + Format.clock(length)
+    // A stream that is running, and whether it plays at its live edge: there
+    // the clock says how long it has run, and that it is live.
+    property bool live: false
+    property bool atEdge: false
+    readonly property string time: live && atEdge ? qsTr("%1 · live").arg(Format.clock(length))
+                                                  : Format.clock(position) + " / " + Format.clock(length)
     // "3/7 Reborrowing"
     readonly property string chapterText: chapter >= 0 ? (chapter + 1) + "/" + chapters.length + " " + chapters[chapter].title : ""
     signal moved(real seconds)

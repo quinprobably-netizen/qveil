@@ -9,6 +9,13 @@ which comes from anywhere but this file. Nothing here touches the network.
 window asked for (and what it didn't). With QVEIL_STANDIN_CLIP set to a media
 file, a played video's stream is that file; without it a played video has no
 stream, so nothing is decoded and nothing is heard.
+
+With QVEIL_STANDIN_LIVECLIP set to a folder of segments (`v/<n>.mkv` and
+`a/<n>.m4a`, LIVE_SEGMENT seconds each, numbered from 0), a video whose ID
+starts with "live" is a running stream, as the engine plays one: two EVENT
+playlists that list LIVE_FIRST segments when it is opened and one more each
+LIVE_SEGMENT seconds, and `live/<sid>/state`. `POST api/_live_end` ends it:
+the playlists get `#EXT-X-ENDLIST`, and the state says "ended".
 """
 import http.server
 import json
@@ -22,6 +29,38 @@ import zlib
 NOW = int(time.time())
 HOUR, DAY = 3600, 86400
 CLIP = os.environ.get("QVEIL_STANDIN_CLIP", "")
+LIVECLIP = os.environ.get("QVEIL_STANDIN_LIVECLIP", "")
+LIVE_SEGMENT, LIVE_FIRST = 2, 8
+# When the running stream was opened (it grows from then), and whether it has ended.
+live = {"opened": 0.0, "ended": False, "sid": 0, "final": 0}
+
+
+def live_segments():
+    """How many segments there are of both tracks."""
+    def count(track, ext):
+        n = 0
+        while os.path.exists(os.path.join(LIVECLIP, track, "%d.%s" % (n, ext))):
+            n += 1
+        return n
+    return min(count("v", "mkv"), count("a", "m4a"))
+
+
+def live_head():
+    """The newest segment the stream has: it grows on a clock, up to the last one there is."""
+    if live["ended"]:
+        return live["final"]
+    grown = int((time.monotonic() - live["opened"]) / LIVE_SEGMENT)
+    return min(live_segments() - 1, LIVE_FIRST - 1 + grown)
+
+
+def live_playlist(track, ext):
+    out = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:%d" % LIVE_SEGMENT,
+           "#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-MEDIA-SEQUENCE:0"]
+    for n in range(live_head() + 1):
+        out += ["#EXTINF:%d.000," % LIVE_SEGMENT, "%s/%d.%s" % (track, n, ext)]
+    if live["ended"]:
+        out.append("#EXT-X-ENDLIST")
+    return ("\n".join(out) + "\n").encode()
 
 CHANNELS = [
     ("UCaaaaaaaaaaaaaaaaaaaaaa", "Low Level Hours"),
@@ -407,6 +446,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def file(self, data, kind):
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def live(self, rest):
+        """A running stream's playlists, segments and state, as the engine serves them."""
+        if not rest or rest[0] != str(live["sid"]):
+            self.send(404, {"error": "no such session", "code": "other"})
+        elif rest[1:] == ["state"]:
+            self.send(200, {"state": "ended" if live["ended"] else "now", "head": live_head(), "oldest": 0})
+        elif rest[1:] in (["video.m3u8"], ["audio.m3u8"]):
+            video = rest[1] == "video.m3u8"
+            self.file(live_playlist("v" if video else "a", "mkv" if video else "m4a"), "application/vnd.apple.mpegurl")
+        elif len(rest) == 3 and rest[1] in ("v", "a"):
+            name = os.path.basename(rest[2])
+            n = name.split(".")[0]
+            if not n.isdigit() or int(n) > live_head():
+                self.send(404, {"error": "no such segment", "code": "other"})
+                return
+            with open(os.path.join(LIVECLIP, rest[1], name), "rb") as f:
+                self.file(f.read(), "video/x-matroska" if rest[1] == "v" else "audio/mp4")
+        else:
+            self.send(404, {"error": "not found", "code": "other"})
+
     def do_GET(self):
         path, q = self.parts()
         base = "http://%s/t" % self.headers.get("Host", "127.0.0.1")
@@ -544,6 +610,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif path.startswith("s/") and CLIP:
             self.stream()
+        elif path.startswith("live/") and LIVECLIP:
+            self.live(path.split("/")[1:])
         else:
             self.send(404, {"error": "not found", "code": "other"})
 
@@ -554,6 +622,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "api/_die":
             # For the tests of what the window does when the engine is gone.
             os._exit(3)
+        if path == "api/_live_end":
+            # The running stream ends: its playlists are closed with what they have.
+            live.update(final=live_head(), ended=True)
+            self.send(200, {})
+            return
         if path == "api/config":
             cfg = state["config"]
             # What was got ready belongs to the route it was looked up on.
@@ -592,6 +665,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if v in ("bot_check", "tor_down", "proxy_refused", "rate_limited", "age_restricted", "route_changed") \
                     or v in os.environ.get("QVEIL_STANDIN_PLAY_FAILS", "").split(","):
                 self.send(500, {"error": "The engine's words for " + v, "code": v})
+                return
+            if v.startswith("live") and LIVECLIP:
+                live.update(opened=time.monotonic(), ended=False, sid=live["sid"] + 1)
+                at = "%s/live/%d/" % (base, live["sid"])
+                cid, name = CHANNELS[0]
+                self.send(200, {"id": v, "title": "Live: the long one, part 2", "channel": name, "channelId": cid,
+                                "video": at + "video.m3u8", "audio": at + "audio.m3u8", "start": -3.0 * LIVE_SEGMENT,
+                                "description": "Questions from chat, and the long one.",
+                                "live": {"state": "now", "segment": float(LIVE_SEGMENT), "started": NOW - 2 * HOUR - 14 * 60 - 5,
+                                         "rewind": True, "watching": 1200}})
                 return
             stream = base + "/s/x/v" if CLIP else ""
             if v.startswith("bare"):

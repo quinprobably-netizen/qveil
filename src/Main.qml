@@ -548,6 +548,8 @@ ApplicationWindow {
     Shortcut { sequence: "Right"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.nudge(5) }
     Shortcut { sequence: "J"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.nudge(-10) }
     Shortcut { sequence: "L"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: player.nudge(10) }
+    // To the edge of a running stream (L stays ten seconds on).
+    Shortcut { sequence: "End"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering && player.live; onActivated: player.goLive() }
     Shortcut { sequence: "Up"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.steering; onActivated: { player.mpv.volume = player.mpv.volume + 5; player.reveal() } }
     Shortcut { sequence: "I"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.playing; onActivated: win.togglePip() }
     Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.watching; onActivated: watch.theatre = !watch.theatre }
@@ -913,7 +915,7 @@ ApplicationWindow {
                 // time makes it as long as that is.
                 BusyLine {
                     objectName: "progress"
-                    readonly property var tasks: backend.busy.filter(t => ["play", "prepare", "config", "config-write", "read", "resume", "resume-note", "lenses"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0 && t !== "topics-list" && t !== "history" && t !== "history-write")
+                    readonly property var tasks: backend.busy.filter(t => ["play", "prepare", "config", "config-write", "read", "resume", "resume-note", "lenses", "live-state"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0 && t !== "topics-list" && t !== "history" && t !== "history-write")
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top
