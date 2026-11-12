@@ -1,19 +1,26 @@
 #!/bin/sh
 # Takes a still of the window in one of its views:
 #
-#   bin/shot <view> <out.png>
+#   bin/shot <view> <out.png> [width height]
 #
 # The app is built as it is in the tree and run against the stand-in engine
 # (tests/shots/engine.py), inside a headless compositor of its own, so it
 # renders on the GPU without opening anything on the desktop. Views: home,
-# feed, narrow, lenses, channels, history, settings, settings-about, search,
-# watch, watch-comments, watch-live, watch-live-behind, watch-chat, waiting,
-# pip (the small window itself, with the video in it).
+# home-live (with the live line), home-tor, feed, narrow, lenses, lens-edit,
+# channels, channel-streams (a channel's Streams tab), history, history-on,
+# settings, settings-about, settings-home, search, sort, help, route, watch,
+# watch-comments, watch-ended, theatre, watch-live, watch-live-behind,
+# watch-chat, waiting (an announced stream's room), pip (the small window
+# itself, with the video in it).
+#
+# A window is 1280x720 unless it is given a size (941 508, 1920 1080, ...):
+# then it is exactly that, even larger than the headless screen.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-view="${1:?usage: bin/shot <view> <out.png>}"
-out="${2:?usage: bin/shot <view> <out.png>}"
+view="${1:?usage: bin/shot <view> <out.png> [width height]}"
+out="${2:?usage: bin/shot <view> <out.png> [width height]}"
+size="${3:+$3 ${4:?usage: bin/shot <view> <out.png> [width height]}}"
 case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
 mkdir -p "$(dirname "$out")" "$ROOT/build/shot"
 
@@ -50,10 +57,22 @@ if [ ! -f "$pictures/12.png" ] && command -v magick >/dev/null; then
 fi
 [ -f "$pictures/12.png" ] && export QVEIL_STANDIN_THUMBS="$pictures"
 
+# The live check has found streams, running and announced.
+[ "$view" = home-live ] && export QVEIL_STANDIN_LIVE=1
+
 if [ "$view" = narrow ]; then
   # A headless compositor has one size of screen; a narrow window is drawn
   # without one instead (no blur, which the layout doesn't need).
-  QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software ./qveil_shot "$view" "$out" 950 520
+  # shellcheck disable=SC2086
+  QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software ./qveil_shot "$view" "$out" ${size:-950 520}
+elif [ -n "$size" ]; then
+  # The compositor makes a Wayland window as large as its screen; under X11
+  # (cage runs Xwayland) a window that bypasses the window manager keeps the
+  # size it asks for, which tests/shot.cpp does when it is given one.
+  # shellcheck disable=SC2086
+  env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
+    WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 QT_QPA_PLATFORM=xcb \
+    cage -- ./qveil_shot "$view" "$out" $size 2>&1 | grep -E "saved|couldn't|qml|QML|Error" || true
 else
   env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
     WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 QT_QPA_PLATFORM=wayland \

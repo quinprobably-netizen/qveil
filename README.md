@@ -162,10 +162,21 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - **Thumbnails** are shown as they are. If a wall of clickbait is not what
   you want to look at, the settings can frost them (blurred and muted until
   you point at one), or not load thumbnails at all.
-- **Live streams aren't supported yet.** qveil relays one plain download per
-  video, and a live stream (or a video offered only as HLS/DASH) is a playlist
-  whose segments the player would fetch itself, around your route. qveil says
-  so instead of playing it.
+- **Live streams** play through your route like any video: qveil fetches the
+  segments itself, a few seconds ahead of what plays, so nothing goes around
+  the route. You can rewind to the start of a running stream (up to 5 days
+  back) with the ordinary seek bar; behind the edge, **Go live** (`End`) takes
+  you back. A stream that is announced but not yet running waits in a room of
+  its own with a countdown, and starts once, from the beginning, when it does.
+  Each channel has a **Streams** tab (running, announced, then past
+  broadcasts), loaded only when you open it. The **chat** of a running stream
+  is the first tab of the side sheet: read only and text only (no avatars,
+  badges or emoji pictures are fetched), and open only while the tab is (it
+  can be turned off in Settings). Home names what is live, and what starts
+  within a day, in one line under the lead, once something has turned up: the
+  opt-in **Check followed channels for live streams** in Settings (off by
+  default) looks at each channel's Streams tab at every feed refresh, which is
+  one more request per channel.
 - **Moving from YouTube**: drop a Google Takeout `subscriptions.csv`, or a
   NewPipe or FreeTube export, anywhere on the window. It's read offline.
 - It is made for a tiling window manager: its size follows the tile it is in
@@ -196,7 +207,8 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 | `I` | Picture in picture, and back |
 | `T` | Theatre |
 | `F` | Fullscreen |
-| `C` | Comments, with the keyboard in the sheet (`Esc` gives it back) |
+| `C` | Comments (the chat, in a running stream), with the keyboard in the sheet (`Esc` gives it back) |
+| `End` | Back to the live edge, in a running stream |
 | `N` | Next video |
 | `U` | Unsubscribe, on the channels page (asked twice) |
 | `Esc` | Back |

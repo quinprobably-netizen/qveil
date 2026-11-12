@@ -56,6 +56,11 @@ int main(int argc, char *argv[]) {
         {"help", "help.open()"},
         {"route", "route.open()"},
         {"home-tor", "backend.setConfig({ route: 'tor' })"},
+        // Home with the live line (bin/shot sets QVEIL_STANDIN_LIVE for it):
+        // streams running and announced, among the shelves.
+        {"home-live", ""},
+        // A channel's Streams tab: running, announced, then past broadcasts.
+        {"channel-streams", "openChannel('UCaaaaaaaaaaaaaaaaaaaaaa'); backend.openChannel('UCaaaaaaaaaaaaaaaaaaaaaa', 'streams')"},
         {"theatre", "playListed(qsTr('Latest from your channels'), backend.feed.get(0), backend.feed, 0); watch.theatre = true"},
         {"history-on", "backend.setConfig({ history: true }); backend.loadHistory(); go('history')"},
         {"lens-edit", "go('lenses'); lensesPage.editLens()"},
@@ -107,7 +112,22 @@ int main(int argc, char *argv[]) {
     auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (!window)
         return 1;
-    window->resize(size);
+    // A size that was asked for is the window's, whatever the compositor
+    // would make of it. Cage maximizes a window, or one larger than its
+    // screen, but leaves alone one that bypasses the window manager (under
+    // X11, as bin/shot runs it): this one is as large as it is told to be,
+    // even larger than the headless screen (a still is taken from the scene,
+    // not from the screen).
+    if (argc > 4) {
+        window->hide();
+        window->setFlags(window->flags() | Qt::X11BypassWindowManagerHint);
+        window->setMinimumSize(size);
+        window->setMaximumSize(size);
+        window->resize(size);
+        window->show();
+    } else {
+        window->resize(size);
+    }
     backend.start();
 
     // Once the engine is there and the first page has loaded: go to the
