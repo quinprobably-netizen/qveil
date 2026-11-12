@@ -1416,11 +1416,27 @@ impl LiveSession {
         if !matches!(self.fragments, Fragments::Numbered) {
             return;
         }
-        let mut span = lock(&self.span);
-        if head > span.head && !span.ended {
+        {
+            let mut span = lock(&self.span);
+            if head <= span.head || span.ended {
+                return;
+            }
             span.head = head;
             lock(&self.clock).moved = Instant::now();
             self.changed.notify_all();
+        }
+        // A player joins three segments back from the head it last saw:
+        // once that is past the join's segments fetched ahead (FFmpeg's
+        // reads at open can take a while), they are of no use, and only
+        // take from the circuit what the player waits for.
+        for kind in [Kind::Video, Kind::Audio] {
+            let mut warm = lock(&self.warm[kind.index()]);
+            if warm.back().is_some_and(|(last, _)| head > last + 2) {
+                for (_, f) in warm.drain(..) {
+                    f.drop_it();
+                }
+                trace!("stale warm {} head={head}", kind.letter());
+            }
         }
     }
 
@@ -2580,7 +2596,8 @@ cat '{}'"#,
     fn a_stall_on_tor_is_made_again_on_the_same_identity_first() {
         let t = stream_on_tor(60_000, 0, 20, 0);
         let sid = sid_of(&t.play_live().1);
-        t.st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
+        // Long enough that a busy machine doesn't stall the request made again.
+        t.st.session(&sid).stall_ms.store(1_000, Ordering::Relaxed);
         t.st.up.freeze(10);
         let (status, _, body) = t.st.segment(&sid, "v", 10);
         assert_eq!(status, 200);
@@ -2596,7 +2613,8 @@ cat '{}'"#,
     fn a_segment_cut_on_tor_resumes_on_the_same_url_and_identity() {
         let t = stream_on_tor(60_000, 0, 20, 0);
         let sid = sid_of(&t.play_live().1);
-        t.st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
+        // Long enough that a busy machine doesn't stall the request made again.
+        t.st.session(&sid).stall_ms.store(1_000, Ordering::Relaxed);
         t.st.up.cut(10, 20_000);
         let (status, _, body) = t.st.segment(&sid, "v", 10);
         assert_eq!(status, 200);
@@ -2614,14 +2632,15 @@ cat '{}'"#,
     fn a_second_stall_in_a_row_on_tor_looks_the_stream_up_again_on_a_fresh_identity() {
         let t = stream_on_tor(60_000, 0, 20, 0);
         let sid = sid_of(&t.play_live().1);
-        t.st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
+        // Long enough that a busy machine doesn't stall the request made again.
+        t.st.session(&sid).stall_ms.store(1_000, Ordering::Relaxed);
         // The circuit is stuck for good: the fresh connection on it stalls too.
         t.st.up.freeze_times(10, 2);
         let asked = Instant::now();
         let (status, _, body) = t.st.segment(&sid, "v", 10);
         assert_eq!(status, 200);
         assert_eq!(body, live_segment("v", 10));
-        assert!(asked.elapsed() >= Duration::from_millis(600));
+        assert!(asked.elapsed() >= Duration::from_millis(2_000));
         assert_eq!(t.st.asked(&sq("v", 10)), 2);
         assert_eq!(t.st.live_lookups(), 2);
         // The third request was the new lookup's, over its own identity.
@@ -2655,6 +2674,25 @@ cat '{}'"#,
         }
         // The one before the join, which the player didn't need, was let go.
         assert_eq!(st.asked(&sq("v", 17)), 1);
+    }
+
+    #[test]
+    fn join_segments_the_head_has_moved_past_are_let_go() {
+        let st = stream(300, 0, 20);
+        st.s.warming.store(true, Ordering::Relaxed);
+        // Each segment takes about 6 s to come in, longer than the head
+        // takes to move past them.
+        st.up.trickle(100);
+        let sid = st.open();
+        wait_for("the join to start", Duration::from_secs(5), || {
+            st.up.in_flight() == 2 * HELD
+        });
+        // The player reloads the playlist (and with it the head) while it
+        // looks at the first segments.
+        wait_for("them to be let go", Duration::from_secs(5), || {
+            st.listed(&sid);
+            st.up.in_flight() == 0
+        });
     }
 
     #[test]
