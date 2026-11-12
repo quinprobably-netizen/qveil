@@ -570,11 +570,10 @@ impl LiveSession {
     ///
     /// Both tracks' bases are asked at once, and the first answer with the
     /// head is taken (the other track's host is reached meanwhile, for the
-    /// requests that follow). As soon as the head is known, the segments
-    /// the player joins at (the last `HELD` of each track) start coming in,
-    /// while the rest of this, the answer and the player's start take
-    /// their time: its first requests find them on their way (see
-    /// `take_warm`).
+    /// requests that follow). Once it is known where the stream is, the
+    /// segments the player joins at (the last `HELD` of each track) start
+    /// coming in, while the answer and the player's start take their time:
+    /// its first requests find them on their way (see `take_warm`).
     pub(super) fn begin(self: &Arc<Self>, server: &Arc<Server>) -> Result<bool> {
         if !matches!(self.fragments, Fragments::Numbered) {
             return Ok(true);
@@ -583,10 +582,6 @@ impl LiveSession {
         let head = self.first_head(server)?;
         trace!("begin head={head} after_ms={}", ms(began));
         lock(&self.span).head = head;
-        // (Off only in the tests that count every request upstream.)
-        if !self.ended_at_open && server.warming.load(Ordering::Relaxed) {
-            self.warm_join(server, head);
-        }
         let mut oldest = oldest_for(head, self.target);
         if oldest + 3 < head
             && let Ok(a) = self.request(server, Method::HEAD, Kind::Audio, Some(oldest), None)
@@ -595,6 +590,14 @@ impl LiveSession {
             oldest = head - 3;
         }
         trace!("begin oldest={oldest} total_ms={}", ms(began));
+        // After the look at the oldest segment, not beside it: on a slow
+        // circuit, eight segments coming in held its answer up for longer
+        // than a stall (measured), and the player only asks for the join
+        // once FFmpeg has read the playlist's first segments, seconds after
+        // the answer. (Off only in the tests that count every request upstream.)
+        if !self.ended_at_open && server.warming.load(Ordering::Relaxed) {
+            self.warm_join(server, head);
+        }
         let mut span = lock(&self.span);
         span.oldest = oldest;
         span.head = span.head.max(head);
