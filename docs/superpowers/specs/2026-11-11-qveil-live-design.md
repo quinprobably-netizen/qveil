@@ -126,8 +126,14 @@ numbers stay stable across lookups). In place of a byte range it holds:
     `#EXT-X-TARGETDURATION`;
   - one entry per segment, from the oldest kept up to the newest;
   - `#EXT-X-ENDLIST` once the stream has ended.
-- **Segments** at `/live/<session>/{v,a}/<n>`. The engine fetches segment
-  `n` over the route and hands its bytes on unchanged.
+- **Segments** at `/live/<session>/v/<n>.mkv` (or `.mp4` for H.264) and
+  `/live/<session>/a/<n>.m4a`, since FFmpeg refuses other extensions. The
+  engine fetches segment `n` over the route and hands its bytes on
+  unchanged.
+  - One 1440p segment takes longer over Tor than it plays (appendix, 2).
+    So while mpv reads forward, the timeline keeps the next 3 segments of
+    each track fetching in parallel, held in memory (at most 4 per track).
+    A seek drops that read-ahead.
   - The playlists list only segments the engine knows exist, so mpv never
     asks ahead of the stream. A failed segment would be skipped by FFmpeg,
     which is a gap.
@@ -365,4 +371,75 @@ Each plan is executed with a fresh agent per task and one review per track
 
 ## Appendix: phase 0 measurements
 
-To be filled in by the first task of the engine plan.
+Measured 2026-11-11 over Tor, with yt-dlp 2026.10.26, mpv 0.41.0 and
+FFmpeg 9.0.2. The test stream was a public 24/7 webcam (`EO_1LWqsCNE`,
+about 600 watching). About 12 yt-dlp calls were made; two hit a bot check
+and one a 429, and a fresh circuit got past each.
+
+1. **Formats** (`--live-from-start -J`): all use protocol
+   `http_dash_segments_generator`, `target_duration` 5, client
+   `tv_samsung`, and `downloader_options.http_chunk_size` 10 MiB.
+   - Video: VP9 WebM at 144–2160p, (2160p 313 at 12 Mbps, 1440p 271 at
+     6 Mbps, 1080p 248 at 2.9 Mbps), or H.264 MP4 at 144–1080p (137 at
+     5 Mbps).
+   - Audio: AAC MP4 only (140 at 128 kbps/44.1 kHz, 139 at 64 kbps). There
+     is no Opus, so **the lossy link is AAC 128 kbps**. 30 fps.
+2. **Fragments.** The segment URL is the format's `url` plus `&sq=<n>`.
+   - A HEAD of the bare `url` answers 302 with `X-Head-Seqnum`,
+     `X-Head-Time-Millis` and `X-Walltime-Ms`. The final host after the
+     redirect reported a different (later) head than the first one, so
+     read the head from the **final** response. Every fragment response
+     also carries `X-Head-Seqnum` and `X-Sequence-Num`.
+   - Every fragment stands alone: the WebM ones carry their own EBML header,
+     and the MP4 ones their own `moov`. No `#EXT-X-MAP` is needed.
+     Timestamps are the stream's own clock (start_time 2384045.5 s), equal
+     in audio and video.
+   - Size: 1440p fragments are 3.5–5.7 MB per 5 s, audio 82 KB. **One
+     1440p fragment took 6–7 s on one Tor connection**, longer than it
+     plays. Eight fetched in parallel all finished. So the timeline must
+     fetch ahead in parallel.
+3. **How far back.** Fragments 86,500 back (5 days) were served, and
+   `sq` 0, 100,000 and 300,000 answered 404 at a head of about 476,800.
+   The window is 432,000 s, the same as yt-dlp's `MAX_DURATION`. For a
+   stream older than that, the playlist starts at `head - 432000/target`,
+   plus a margin.
+4. **mpv on a growing playlist** (real fragments, served by a local stand-in
+   that grows the playlist by one entry every 5 s and then ends it):
+   - `duration` grew from 10 to 15 to 20 s, and playback ran to the end
+     with 0 dropped frames.
+   - A seek back worked.
+   - A start 3 s from the end waited about 4 s for the next reload, so a
+     join has to be about three segments back.
+   - FFmpeg only takes segment links that end in a known extension
+     (`allowed_segment_extensions`, which does **not** include `webm`).
+     Name them `<n>.mkv` (WebM is Matroska), `<n>.m4a` and `<n>.mp4`.
+   - Parsing a playlist of 86,400 entries (5 days at 5 s) takes about 95 ms
+     more than a short one, per reload every 5 s. No grouping is needed.
+   - At each WebM fragment boundary the Matroska reader warns "Found
+     unknown-length element … Seek to desired resync point failed". All
+     600 of 600 frames still come through, with no timestamp gaps. Keep
+     these warnings out of the window's log.
+5. **Audio in step.** The audio playlist given as an external audio file
+   (as a node list, as qveil does; the command-line `--audio-files` splits
+   on `:`) kept `avsync` within 15 µs through growth, a seek and the end.
+6. **Streams tab** (flat, `-I 1:5`):
+   - Entries carry `live_status` (`is_live` or `was_live`).
+   - Past streams carry `timestamp`, `duration` and `view_count`.
+   - Live entries carry no viewer count. "watching" therefore comes only
+     from searches and lookups (`concurrent_view_count`), and a live-check
+     card shows "live now" alone.
+   - No upcoming entry was at hand.
+7. **Chat.** `--skip-download --write-subs --sub-langs live_chat` keeps
+   writing `<name>.live_chat.json.part`, one JSON line per action. There
+   were 11 lines in 90 s on a quiet stream.
+   - The line shape is `replayChatItemAction.actions[].addChatItemAction.item`,
+     holding either:
+     - `liveChatTextMessageRenderer`: `authorName.simpleText`,
+       `message.runs[]` (each run is `text`, or `emoji` with
+       `shortcuts[0]`), and `authorBadges` (owner);
+     - `liveChatPaidMessageRenderer`: `purchaseAmountText.simpleText`.
+   - The first try hit a bot check on the watch page, and a fresh circuit
+     worked.
+8. **Announced streams.** None was at hand. The fake yt-dlp in the tests
+   follows today's handling (`is_upcoming`, `release_timestamp`), and the
+   first real one is checked by hand.
