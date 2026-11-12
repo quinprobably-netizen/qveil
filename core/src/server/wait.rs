@@ -15,12 +15,15 @@
 //!   then plays it, once, and that play opens it for real). The job ends.
 //! - `{"state":"gave_up", ...}` six hours after the announced time, with the
 //!   engine's words for it (`errors::GAVE_UP`) and their code. The job ends.
-//! - The usual error line, for something that is not a video and for a route
-//!   that was left. The job ends.
+//! - The usual error line, for something that is not a video, for a route
+//!   that was left, and for a lookup that no later one can answer otherwise
+//!   (the stream was made private or members-only, is age-restricted or not
+//!   offered in the route's region, was taken down, or ended without a
+//!   recording: see `errors::for_good`). The job ends.
 //!
 //! The lookups follow `next_ask`'s schedule: one live lookup each, over the
-//! route in use, on an identity of its own (see `Runtime::pinned_ytdlp`). One
-//! that fails (a Tor circuit that stalled, a bot check, a timeout) says
+//! route in use, on an identity of its own (see `Runtime::pinned_ytdlp`). Any
+//! other that fails (a Tor circuit that stalled, a bot check, a timeout) says
 //! nothing and is made up for by the next. The job stops with the window: a
 //! client that hangs up is noticed within a fraction of a second, also while
 //! it is asleep between two lookups or in the middle of one.
@@ -257,6 +260,9 @@ impl Server {
                 Ok(Opening::Live(_) | Opening::Plain(_)) => {
                     return lines.say(&json!({ "state": "now" }));
                 }
+                // Private, members-only, out of region, age-restricted,
+                // taken down: no ask after this one will find it started.
+                Err(e) if errors::for_good(&format!("{e:#}")) => return Err(e),
                 // A Tor circuit that stalled, a bot check, a timeout: the
                 // schedule goes on, and the next ask is another try.
                 Err(e) => note!("qveil: asking whether a stream has started failed: {e:#}"),
@@ -511,8 +517,8 @@ mod tests {
         let up = LiveUpstream::start(60_000, 0, 20);
         let bin = TempDir::new();
         let fake = fake_live_ytdlp_upcoming(&bin.0, &up, 1, app::now() - 720);
-        // The first two asks fail, as a Tor circuit that stalls or a bot
-        // check does; then it is the fake, which announces once and starts.
+        // The first two asks fail, as a bot check or a limit on how fast
+        // does; then it is the fake, which announces once and starts.
         let wrapper = TempDir::new();
         let ytdlp = crate::store::testing::script(
             &wrapper.0.join("yt-dlp"),
@@ -521,7 +527,11 @@ mod tests {
 n=$(cat "$d/failed" 2>/dev/null || echo 0)
 if [ "$n" -lt 2 ]; then
   echo $((n + 1)) > "$d/failed"
-  echo 'ERROR: [youtube] x: Sign in to confirm you are not a bot' >&2
+  if [ "$n" -eq 0 ]; then
+    echo 'ERROR: [youtube] x: Sign in to confirm you are not a bot' >&2
+  else
+    echo 'ERROR: [youtube] x: HTTP Error 429: Too Many Requests' >&2
+  fi
   exit 1
 fi
 exec '{}' "$@"
@@ -549,6 +559,63 @@ exec '{}' "$@"
             "{:?}",
             began.elapsed()
         );
+    }
+
+    #[test]
+    fn a_stream_that_no_ask_can_find_started_ends_the_wait_with_why() {
+        let bin = TempDir::new();
+        let ytdlp = crate::store::testing::script(
+            &bin.0.join("yt-dlp"),
+            &format!(
+                r#"d='{}'
+n=$(cat "$d/runs" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$d/runs"
+cat "$d/says" >&2
+exit 1
+"#,
+                bin.0.display()
+            ),
+        );
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let home = TempDir::new();
+        let (_s, base, _d, _bin, _up) = serve(ytdlp, |_| {}, home, up);
+        for (says, code) in [
+            (
+                "Private video. Sign in if you've been granted access to this video",
+                "private",
+            ),
+            (
+                "Join this channel to get access to members-only content like this video",
+                "members_only",
+            ),
+            (
+                "The uploader has not made this video available in your country",
+                "region",
+            ),
+            (
+                "Sign in to confirm your age. This video may be inappropriate for some users.",
+                "age_restricted",
+            ),
+            (
+                "Video unavailable. This video has been removed by the uploader",
+                "other",
+            ),
+            (
+                "This live stream recording is not available.",
+                "no_recording",
+            ),
+        ] {
+            std::fs::write(bin.0.join("says"), format!("ERROR: [youtube] x: {says}\n")).unwrap();
+            let before = runs(&bin.0);
+            let lines = waited(&base, &format!("v={ID}"));
+            // One ask, and its answer is the last word: no "checking every
+            // minute" for six hours.
+            assert_eq!(lines.len(), 1, "{says}: {lines:?}");
+            assert_eq!(lines[0]["code"], code, "{says}: {lines:?}");
+            assert!(lines[0]["error"].as_str().is_some(), "{says}");
+            assert!(lines[0].get("state").is_none(), "{says}: {lines:?}");
+            assert_eq!(runs(&bin.0), before + 1, "{says}");
+        }
     }
 
     #[test]

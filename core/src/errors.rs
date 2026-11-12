@@ -88,6 +88,30 @@ impl Explained {
 pub const GAVE_UP: &str =
     "The stream hasn't started, and qveil stopped waiting for it after 6 hours.";
 
+/// Whether `err` says the video is gone: removed by its uploader or by
+/// YouTube, or unavailable, in yt-dlp's words.
+pub fn unavailable(err: &str) -> bool {
+    const GONE: &[&str] = &[
+        "Video unavailable",
+        "This video is unavailable",
+        "This video has been removed",
+        "This video is no longer available",
+    ];
+    GONE.iter().any(|needle| err.contains(needle))
+}
+
+/// Whether asking about the video again can't change the answer `err` is:
+/// it is private, members-only, age-restricted, not offered in this
+/// route's region, gone, or a stream that ended without a recording. A bot
+/// check, a limit on how fast, a stalled circuit or a timeout may well be
+/// different the next time.
+pub fn for_good(err: &str) -> bool {
+    matches!(
+        explain(err).code,
+        Code::Private | Code::MembersOnly | Code::Region | Code::AgeRestricted | Code::NoRecording
+    ) || unavailable(err)
+}
+
 /// The body of an error reply: `{"error": <text>, "code": <code>}`.
 pub fn body(err: &str) -> Value {
     let e = explain(err);
@@ -278,6 +302,33 @@ fn already_explained(err: &str) -> Code {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_answers_that_can_not_change_are_for_good() {
+        for err in [
+            "ERROR: [youtube] x: Private video. Sign in if you've been granted access",
+            "ERROR: [youtube] x: Join this channel to get access to members-only content",
+            "ERROR: [youtube] x: The uploader has not made this video available in your country",
+            "ERROR: [youtube] x: Sign in to confirm your age",
+            "ERROR: [youtube] x: Video unavailable. This video has been removed by the uploader",
+            "ERROR: [youtube] x: This video is no longer available because the account was terminated",
+            "ERROR: [youtube] x: This live stream recording is not available.",
+            // And once already explained.
+            "This video is private; only the people it was shared with can watch it.",
+        ] {
+            assert!(for_good(err), "{err}");
+        }
+        for err in [
+            "ERROR: [youtube] x: Sign in to confirm you're not a bot",
+            "ERROR: [youtube] x: HTTP Error 429: Too Many Requests",
+            "yt-dlp timed out after 90 s",
+            "The proxy refused the connection (Tor listens on 127.0.0.1:9050).",
+            crate::live::NO_FRAGMENTS,
+            "ERROR: [youtube] x: This live event will begin in 2 hours.",
+        ] {
+            assert!(!for_good(err), "{err}");
+        }
+    }
 
     #[test]
     fn tor_is_only_blamed_for_a_refusal_at_its_own_address() {
