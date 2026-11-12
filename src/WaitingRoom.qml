@@ -19,6 +19,13 @@ Item {
     // engine's words for it in `message`. (Not `state`: an Item has one.)
     property string phase: "upcoming"
     property string message: ""
+    // While it is waited for: the engine's asks meet a bot check (it goes on
+    // asking, on a fresh connection each time).
+    property bool botCheck: false
+    // Whether another route may get past what the room says: offered here,
+    // never taken by itself.
+    property bool offersRoute: false
+    signal routeRequested()
 
     // The clock the countdown is told by, a second at a time while it shows.
     property real now: Date.now() / 1000
@@ -91,6 +98,29 @@ Item {
             color: room.over ? Style.fg : Style.dim
             font.family: Style.font
             font.pixelSize: room.over ? Style.body : Style.small
+        }
+        // A quiet line under it, while YouTube stands in the way.
+        Text {
+            objectName: "waiting-note"
+            width: parent.width
+            topPadding: Style.u
+            visible: !room.over && room.botCheck
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            text: qsTr("YouTube asked to confirm this isn't a bot \u00b7 still trying on a fresh connection")
+            textFormat: Text.PlainText
+            color: Style.dim
+            font.family: Style.font
+            font.pixelSize: Style.small
+        }
+        // The same offer as the window's error makes, for the same reasons.
+        Act {
+            objectName: "waiting-route"
+            anchors.horizontalCenter: parent.horizontalCenter
+            visible: room.offersRoute
+            text: qsTr("Change route")
+            filled: true
+            onClicked: room.routeRequested()
         }
     }
 }

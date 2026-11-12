@@ -62,6 +62,8 @@ FocusScope {
     signal channelRequested(string id)
     signal videoRequested(var video, var list, int index)
     signal pipRequested()
+    // The waiting room offered another route, and it was taken.
+    signal routeRequested()
     signal fullscreenToggled()
     signal copied(string text)
 
@@ -338,6 +340,7 @@ FocusScope {
             onNextRequested: page.playNext()
             onClosed: page.closed()
             onPipRequested: page.pipRequested()
+            onRouteRequested: page.routeRequested()
             onTheatreToggled: page.theatre = !page.theatre
             onFullscreenToggled: page.fullscreenToggled()
         }

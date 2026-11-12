@@ -221,6 +221,8 @@ Rectangle {
             list.forceActiveFocus()
         }
         onAboutToHide: if (line.Window.window && line.Window.window.openMenu === rest) line.Window.window.openMenu = null
+        // The keyboard goes back to what is showing once it has gone (see SortMenu).
+        onClosed: if (line.Window.window && typeof line.Window.window.afterPopup === "function") line.Window.window.afterPopup()
 
         background: Rectangle {
             color: Style.bg

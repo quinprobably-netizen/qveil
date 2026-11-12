@@ -11,6 +11,10 @@
 //!   whenever nothing else has been said for a while (see
 //!   `Runtime::wait_heartbeat`), so that the connection is never idle for
 //!   long: it is sent while the job sleeps, and while a lookup runs.
+//! - `{"state":"upcoming","starts":...,"note":"bot_check"}` once an ask has
+//!   met a bot check, and as the heartbeat after it, until an ask gets an
+//!   answer again (then the plain line above, without `note`). The job goes
+//!   on asking, each time on a fresh identity; nothing switches the route.
 //! - `{"state":"now"}` once a lookup finds the stream started (the window
 //!   then plays it, once, and that play opens it for real). The job ends.
 //! - `{"state":"gave_up", ...}` six hours after the announced time, with the
@@ -23,8 +27,9 @@
 //!
 //! The lookups follow `next_ask`'s schedule: one live lookup each, over the
 //! route in use, on an identity of its own (see `Runtime::pinned_ytdlp`). Any
-//! other that fails (a Tor circuit that stalled, a bot check, a timeout) says
-//! nothing and is made up for by the next. The job stops with the window: a
+//! other that fails (a Tor circuit that stalled, a bot check, a timeout) is
+//! made up for by the next; of those only the bot check is said (`note`),
+//! since another route may get past it, which only the user can choose. The job stops with the window: a
 //! client that hangs up is noticed within a fraction of a second, also while
 //! it is asleep between two lookups or in the middle of one.
 
@@ -118,6 +123,9 @@ struct Lines<'a> {
     /// When the last line was written (or the reply began).
     last: Cell<Instant>,
     heartbeat: Duration,
+    /// Whether the last ask met a bot check (see the module's docs): every
+    /// "upcoming" line says so while it did.
+    bot_check: Cell<bool>,
 }
 
 impl<'a> Lines<'a> {
@@ -127,6 +135,7 @@ impl<'a> Lines<'a> {
             started: Cell::new(false),
             last: Cell::new(Instant::now()),
             heartbeat,
+            bot_check: Cell::new(false),
         }
     }
 
@@ -146,14 +155,20 @@ impl<'a> Lines<'a> {
     /// been said for a heartbeat.
     fn beat(&self, starts: Option<i64>) -> Result<()> {
         if self.last.get().elapsed() >= self.heartbeat {
-            self.say(&upcoming(starts))?;
+            self.upcoming(starts)?;
         }
         Ok(())
     }
-}
 
-fn upcoming(starts: Option<i64>) -> Value {
-    json!({ "state": "upcoming", "starts": starts })
+    /// Says that the stream is announced for `starts`, and whether the last
+    /// ask met a bot check.
+    fn upcoming(&self, starts: Option<i64>) -> Result<()> {
+        let mut line = json!({ "state": "upcoming", "starts": starts });
+        if self.bot_check.get() {
+            line["note"] = json!(errors::Code::BotCheck.as_str());
+        }
+        self.say(&line)
+    }
 }
 
 /// What the window is told when the stream never started: the engine's words
@@ -201,7 +216,7 @@ impl Server {
         // What the window was last told the stream starts at.
         let mut said = None;
         if announced.is_some() {
-            lines.say(&upcoming(announced))?;
+            lines.upcoming(announced)?;
             said = Some(announced);
         }
         // Whether a heartbeat could not be written: nobody is reading.
@@ -250,8 +265,10 @@ impl Server {
             match found {
                 Ok(Opening::Upcoming { starts: when, .. }) => {
                     starts.set(when);
-                    if said != Some(when) {
-                        lines.say(&upcoming(when))?;
+                    // (Also when only the bot check is over.)
+                    let checked = lines.bot_check.replace(false);
+                    if said != Some(when) || checked {
+                        lines.upcoming(when)?;
                         said = Some(when);
                     }
                 }
@@ -264,8 +281,18 @@ impl Server {
                 // taken down: no ask after this one will find it started.
                 Err(e) if errors::for_good(&format!("{e:#}")) => return Err(e),
                 // A Tor circuit that stalled, a bot check, a timeout: the
-                // schedule goes on, and the next ask is another try.
-                Err(e) => note!("qveil: asking whether a stream has started failed: {e:#}"),
+                // schedule goes on, and the next ask is another try. A bot
+                // check is said, so that the window can offer another route.
+                Err(e) => {
+                    note!("qveil: asking whether a stream has started failed: {e:#}");
+                    let text = format!("{e:#}");
+                    if errors::explain(&text).code == errors::Code::BotCheck
+                        && !lines.bot_check.replace(true)
+                    {
+                        lines.upcoming(starts.get())?;
+                        said = Some(starts.get());
+                    }
+                }
             }
         }
     }
@@ -543,10 +570,16 @@ exec '{}' "$@"
         let (_s, base, _d, _bin, _up) = serve(ytdlp, |_| {}, bin, up);
         let began = Instant::now();
         let lines = waited(&base, &format!("v={ID}"));
-        // Nothing was said of the failures.
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(lines[0]["state"], "upcoming");
-        assert_eq!(lines[1], json!({"state":"now"}));
+        // The bot check is said (another route may get past it), the limit
+        // is not, and the first answer after them says the check is over.
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            json!({"state":"upcoming","starts":null,"note":"bot_check"})
+        );
+        assert_eq!(lines[1]["state"], "upcoming");
+        assert!(lines[1].get("note").is_none(), "{lines:?}");
+        assert_eq!(lines[2], json!({"state":"now"}));
         assert_eq!(
             std::fs::read_to_string(wrapper.0.join("failed"))
                 .unwrap()
@@ -558,6 +591,62 @@ exec '{}' "$@"
             began.elapsed() >= Duration::from_millis(120),
             "{:?}",
             began.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_bot_check_while_waiting_is_said_until_an_ask_gets_past_it() {
+        let starts = app::now() - 720;
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let fake = fake_live_ytdlp_upcoming(&bin.0, &up, 1, starts);
+        // Two asks meet a bot check; then the fake answers the time that was
+        // already known, and then that it has started.
+        let wrapper = TempDir::new();
+        let ytdlp = crate::store::testing::script(
+            &wrapper.0.join("yt-dlp"),
+            &format!(
+                r#"d='{}'
+n=$(cat "$d/failed" 2>/dev/null || echo 0)
+if [ "$n" -lt 2 ]; then
+  echo $((n + 1)) > "$d/failed"
+  echo 'ERROR: [youtube] x: Sign in to confirm you{}re not a bot. Use --cookies-from-browser or --cookies for the authentication.' >&2
+  exit 1
+fi
+exec '{}' "$@"
+"#,
+                wrapper.0.display(),
+                '\u{2019}',
+                fake.display()
+            ),
+        );
+        let (_s, base, _d, _bin, _up) = serve(
+            ytdlp,
+            |rt| rt.wait_heartbeat = Duration::from_millis(30),
+            bin,
+            up,
+        );
+        let lines = waited(&base, &format!("v={ID}&starts={starts}"));
+        let plain = json!({"state":"upcoming","starts":starts});
+        let checked = json!({"state":"upcoming","starts":starts,"note":"bot_check"});
+        // Said at once, then the check, kept on every heartbeat while the
+        // asks meet it, then the plain line again once one gets past it
+        // (and never an error line: the job goes on to the start).
+        assert_eq!(lines.first(), Some(&plain), "{lines:?}");
+        assert_eq!(lines.last(), Some(&json!({"state":"now"})), "{lines:?}");
+        let middle = &lines[1..lines.len() - 1];
+        let a = middle.iter().position(|l| *l == checked);
+        let b = middle.iter().position(|l| *l == plain);
+        assert!(matches!((a, b), (Some(a), Some(b)) if a < b), "{lines:?}");
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a, 0, "{lines:?}");
+        assert!(middle[a..b].iter().all(|l| *l == checked), "{lines:?}");
+        assert!(middle[b..].iter().all(|l| *l == plain), "{lines:?}");
+        assert_eq!(
+            std::fs::read_to_string(wrapper.0.join("failed"))
+                .unwrap()
+                .trim(),
+            "2"
         );
     }
 
@@ -704,8 +793,10 @@ exec '{}' "$@"
         let (_s, base, _d, bin, _up) = announced_tuned(100_000, starts, |rt| {
             rt.wait_heartbeat = Duration::from_millis(100);
         });
-        let mut open = Open::new(&base, &format!("v={ID}&starts={starts}"));
+        // (From before the request: the reply's head comes with its first
+        // line, so the clock can't start once that has been read.)
         let began = Instant::now();
+        let mut open = Open::new(&base, &format!("v={ID}&starts={starts}"));
         for n in 0..4 {
             assert_eq!(
                 open.line(),
@@ -715,7 +806,7 @@ exec '{}' "$@"
         }
         // One at once, and three more a heartbeat apart.
         let took = began.elapsed();
-        assert!(took >= Duration::from_millis(250), "{took:?}");
+        assert!(took >= Duration::from_millis(300), "{took:?}");
         assert!(took < Duration::from_secs(3), "{took:?}");
         assert_eq!(runs(&bin.0), 0);
     }
@@ -732,8 +823,10 @@ exec '{}' "$@"
             up,
         );
         // Nothing is known, and the first lookup hangs: it is all heartbeat.
-        let mut open = Open::new(&base, &format!("v={ID}"));
+        // (The clock starts before the request: the reply's head comes with
+        // its first line.)
         let began = Instant::now();
+        let mut open = Open::new(&base, &format!("v={ID}"));
         for n in 0..3 {
             assert_eq!(
                 open.line(),
@@ -741,7 +834,12 @@ exec '{}' "$@"
                 "{n}"
             );
         }
-        assert!(began.elapsed() >= Duration::from_millis(150));
+        // Three heartbeats, each a heartbeat after the line before.
+        assert!(
+            began.elapsed() >= Duration::from_millis(300),
+            "{:?}",
+            began.elapsed()
+        );
         let pid = std::fs::read_to_string(bin.0.join("pid")).unwrap();
         let alive = || std::path::Path::new(&format!("/proc/{}", pid.trim())).exists();
         assert!(alive(), "the lookup was not running");

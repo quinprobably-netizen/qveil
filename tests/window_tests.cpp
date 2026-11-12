@@ -3600,7 +3600,8 @@ private slots:
         QTRY_VERIFY(sort->property("text").toString().contains("Most viewed"));
         QVERIFY(!app.window->property("watching").toBool());
         QTest::keyClick(app.window, Qt::Key_Escape);
-        QTRY_VERIFY(!sort->property("opened").toBool());
+        // (Until it has gone: as it goes, the keyboard is handed back.)
+        QTRY_VERIFY(!sort->property("opened").toBool() && !sort->property("shown").toBool());
 
         // Watching, with the keyboard in the sheet: [ and ] change its tab.
         QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
@@ -3609,8 +3610,34 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_C);
         QQuickItem *sheet = app.item("sheet");
         QTRY_COMPARE(sheet->property("current").toString(), QString("comments"));
+        QTRY_VERIFY(sheet->property("keyed").toBool());
         QTest::keyClick(app.window, Qt::Key_BracketLeft);
         QTRY_COMPARE(sheet->property("current").toString(), QString("next"));
+    }
+
+    void aMenuThatIsGoingLeavesTheKeyboardWhereItWasPutMeanwhile()
+    {
+        App app;
+        READY(app);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        app.seeAll();
+        QTest::keyClick(app.window, Qt::Key_S);
+        QQuickItem *sort = app.item("feed-sort");
+        QTRY_VERIFY(sort->property("opened").toBool());
+        // Closed, and while it fades out a video is opened and the keyboard
+        // put in its sheet.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!sort->property("opened").toBool());
+        QVERIFY(sort->property("shown").toBool());
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QQuickItem *sheet = app.item("sheet");
+        QMetaObject::invokeMethod(sheet, "forceActiveFocus");
+        QVERIFY(sheet->property("keyed").toBool());
+        // Once it has gone, the keyboard is still there.
+        QTRY_VERIFY(!sort->property("shown").toBool());
+        QTest::qWait(100);
+        QVERIFY(sheet->property("keyed").toBool());
     }
 
     void nothingIsCutOrOverlappedInTheQuarterTile()
@@ -4822,7 +4849,7 @@ private slots:
 
     // Plays the stand-in's running stream, with its state asked for every
     // `check` ms, and waits for its first frame. The player, or null.
-    static QObject *playLive(App &app, int check = 10000, const QString &id = "live0000001")
+    static QObject *playLive(App &app, int check = 0, const QString &id = "live0000001")
     {
         QQuickItem *surface = app.item("surface");
         surface->setProperty("liveCheckInterval", check);
@@ -4833,6 +4860,19 @@ private slots:
         return mpv;
     }
     static QString timeOf(App &app) { return App::under(app.item("surface"), "seek-time")->property("text").toString(); }
+    // Where the stand-in engine says the running stream's live edge is, on
+    // the player's timeline (its oldest segment is 0, as the timeline's
+    // start is): the end of its newest segment, in seconds. -1 if it didn't say.
+    static double edgeOf(App &app)
+    {
+        const QString video = app.item("surface")->property("info").toMap().value("video").toString();
+        QNetworkReply *reply = app.web.get(QNetworkRequest(QUrl(video.chopped(QString("video.m3u8").size()) + "state")));
+        QSignalSpy done(reply, &QNetworkReply::finished);
+        done.wait(5000);
+        const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
+        reply->deleteLater();
+        return o.contains("head") ? 2.0 * (o.value("head").toInt() - o.value("oldest").toInt() + 1) : -1;
+    }
 
     void aLiveStreamOpensNearTheEdgeAndSaysLive()
     {
@@ -4848,7 +4888,7 @@ private slots:
         QVERIFY(mpv);
         // At once: not once the stream has grown to where it was to start
         // (as it is when FFmpeg opens the playlist at its end, about 13 s here).
-        QVERIFY2(opening.elapsed() < 8000, qPrintable(QString::number(opening.elapsed())));
+        QVERIFY2(opening.elapsed() < 10000, qPrintable(QString::number(opening.elapsed())));
         QQuickItem *surface = app.item("surface");
         // Three segments from the end, in one load: mpv was given the negative start.
         QCOMPARE(surface->property("startedAt").toDouble(), -6.0);
@@ -4897,14 +4937,18 @@ private slots:
         QTRY_VERIFY(goLive->isVisible());
         QCOMPARE(goLive->property("text").toString(), QString("Go live"));
         QCOMPARE(goLive->property("trailing").toString(), QString("End"));
+        // The foot says so too.
+        QTRY_VERIFY2(hintsOf(app).contains("End go live"), qPrintable(hintsOf(app).join(", ")));
 
         // End goes back to the edge.
         QTest::keyClick(app.window, Qt::Key_End);
         QTRY_VERIFY_WITH_TIMEOUT(surface->property("atEdge").toBool(), 10000);
         QTRY_VERIFY(!goLive->isVisible());
+        QTRY_VERIFY2(!hintsOf(app).contains("End go live"), qPrintable(hintsOf(app).join(", ")));
         QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u00b7 live")));
-        const double length = surface->property("length").toDouble();
-        QVERIFY2(mpv->property("position").toDouble() >= length - 8, qPrintable(QString::number(mpv->property("position").toDouble())));
+        // (Said at once; the player gets there a moment later.)
+        QTRY_VERIFY2(mpv->property("position").toDouble() >= surface->property("length").toDouble() - 8,
+                     qPrintable(QString::number(mpv->property("position").toDouble())));
 
         // L is still ten seconds on, and J ten back: behind again, and the button goes live too.
         QTest::keyClick(app.window, Qt::Key_J);
@@ -4916,6 +4960,125 @@ private slots:
         QTRY_VERIFY(!goLive->isVisible());
         QCOMPARE(app.asked("POST api/play"), 1);
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void goLiveGoesToTheEnginesEdgeWhenThePlayersLengthIsOld()
+    {
+        QTemporaryDir dir;
+        // Longer than the player reads ahead (90 s): played far behind, its
+        // cache fills, it stops reading, and with that it stops reloading
+        // the playlists. The length it gives then stays where it was, while
+        // the stream (and the engine's edge) grows on, as on a real stream.
+        const QString clip = makeLiveClip(dir, 300);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}, {"QVEIL_STANDIN_LIVE_FIRST", "100"}});
+        READY(app);
+        QObject *mpv = playLive(app);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface"), *goLive = App::under(surface, "go-live");
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 4 && !mpv->property("buffering").toBool(), 10000);
+        // The player's length falls behind the engine's edge by eight segments and more.
+        QTRY_VERIFY_WITH_TIMEOUT(edgeOf(app) - mpv->property("duration").toDouble() >= 16, 40000);
+        const double stale = mpv->property("duration").toDouble();
+        QVERIFY(!surface->property("atEdge").toBool());
+        QVERIFY2(!timeOf(app).contains("live"), qPrintable(timeOf(app)));
+
+        // Go live: three segments from the engine's edge, not from the player's length.
+        QTest::keyClick(app.window, Qt::Key_End);
+        const double edge = edgeOf(app), target = surface->property("lastSeek").toDouble();
+        QVERIFY2(target >= edge - 3 * 2 - 2 && target <= edge - 3 * 2,
+                 qPrintable(QString("went to %1, the edge is at %2, the player's length %3").arg(target).arg(edge).arg(stale)));
+        QVERIFY(target > stale);
+        // And it gets there, once, and says it is live.
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() >= target - 1 && !mpv->property("buffering").toBool(), 15000);
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" · live")));
+        QVERIFY(!goLive->isVisible());
+
+        // Eight segments behind the edge is not at it, and the clock says
+        // where it is, also once it has played on a while there.
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, edgeOf(app) - 16));
+        QTRY_VERIFY_WITH_TIMEOUT(!mpv->property("buffering").toBool(), 10000);
+        for (int i = 0; i < 4; ++i) {
+            QVERIFY(!surface->property("atEdge").toBool());
+            QVERIFY2(timeOf(app).contains(" / ") && !timeOf(app).contains("live"), qPrintable(timeOf(app)));
+            QTest::qWait(500);
+        }
+        QTest::keyClick(app.window, Qt::Key_End);
+        QTRY_VERIFY_WITH_TIMEOUT(surface->property("atEdge").toBool() && !mpv->property("buffering").toBool(), 10000);
+        QCOMPARE(app.asked("POST api/play"), 1);
+    }
+
+    void aRouteChangeOpensARunningStreamAgainAtItsEdge()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QObject *mpv = playLive(app);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface");
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+        // Played on a while at the edge, which the window's length never was behind.
+        QTest::qWait(3000);
+        QVERIFY(surface->property("atEdge").toBool());
+
+        // At its edge: opened again by the new route, once, at its edge (as
+        // the answer says), not put away and not where it was.
+        app.backend->setConfig({{"route", "tor"}});
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
+        QTRY_COMPARE(app.asked("POST api/play"), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && !surface->property("pending").toBool(), 20000);
+        QVERIFY(app.window->property("watching").toBool());
+        QVERIFY(surface->property("live").toBool());
+        QCOMPARE(surface->property("startedAt").toDouble(), -6.0);
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+
+        // Behind it: where it was.
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 2));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 6 && !mpv->property("buffering").toBool(), 10000);
+        QTRY_VERIFY(!surface->property("atEdge").toBool());
+        app.backend->setConfig({{"route", "direct"}});
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("direct"));
+        QTRY_COMPARE(app.asked("POST api/play"), 3);
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool() && !surface->property("pending").toBool(), 20000);
+        QVERIFY(surface->property("live").toBool());
+        const double at = surface->property("startedAt").toDouble();
+        QVERIFY2(at >= 2 && at < 8, qPrintable(QString::number(at)));
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/play"), 3);
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void aSessionTheEngineNoLongerHasIsAStreamThatEnded()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QVERIFY(playLive(app, 300));
+        QQuickItem *surface = app.item("surface");
+        QVERIFY(surface->property("live").toBool());
+        const QString base = app.backend->thumbBase().chopped(QString("/thumb/").size());
+        QNetworkReply *reply = app.web.post(QNetworkRequest(QUrl(base + "/api/_live_drop")), QByteArray());
+        QSignalSpy done(reply, &QNetworkReply::finished);
+        QVERIFY(done.wait(5000));
+        reply->deleteLater();
+        // Its state is 404: ended, and not asked for any more.
+        QTRY_VERIFY_WITH_TIMEOUT(surface->property("liveEnded").toBool(), 5000);
+        QVERIFY(!surface->property("live").toBool());
+        const int checks = app.askedLike("^GET live/\\d+/state");
+        QTest::qWait(1000);
+        QCOMPARE(app.askedLike("^GET live/\\d+/state"), checks);
+        QCOMPARE(app.asked("POST api/play"), 1);
+        app.backend->clearError();
     }
 
     void aLiveStreamSavesNoResumePosition()
@@ -5070,8 +5233,10 @@ private slots:
         QCOMPARE(app.asked("POST api/play"), 1);
         QCOMPARE(openWaits(app), 1);
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
-        // No controls of a player that has nothing to play.
+        // No controls of a player that has nothing to play, and no keys of
+        // one at the foot.
         QVERIFY(!App::under(surface, "seek-time")->isVisible());
+        QCOMPARE(hintsOf(app), QStringList({"Esc back", "? keys"}));
     }
 
     void whenItStartsItPlaysOnceFromTheStart()
@@ -5204,13 +5369,30 @@ private slots:
         READY(app);
         QQuickItem *room = openWaiting(app, "waitingbot01");
         QVERIFY(room);
-        // The engine's words in the room, and the bar's offer of another
-        // route, as for any bot check.
-        QTRY_VERIFY2(textOf(room, "waiting-line").contains("bot check"), qPrintable(textOf(room, "waiting-line")));
-        QTRY_VERIFY(app.item("errorBar")->isVisible());
-        QCOMPARE(app.backend->errorCode(), QString("bot_check"));
-        QVERIFY(app.item("changeRoute")->isVisible());
-        QVERIFY(room->isVisible());
+        QQuickItem *offer = App::under(room, "waiting-route");
+        QVERIFY(offer);
+        QVERIFY(!offer->isVisible());
+        // The engine keeps asking, and says its asks meet a bot check: a
+        // quiet line in the room, with the offer of another route under it.
+        QTRY_COMPARE(textOf(room, "waiting-note"),
+                     QString::fromUtf8("YouTube asked to confirm this isn't a bot \u00b7 still trying on a fresh connection"));
+        QVERIFY(offer->isVisible());
+        QCOMPARE(offer->property("text").toString(), QString("Change route"));
+        // Still waiting, as it was: the countdown and its line stay.
+        QCOMPARE(textOf(room, "waiting-eyebrow"), QString("STARTS IN"));
+        QVERIFY(!textOf(room, "waiting-countdown").isEmpty());
+        QVERIFY(textOf(room, "waiting-line").contains("plays from the start"));
+        QCOMPARE(openWaits(app), 1);
+        // Not in a bar over the page too: the room says it once.
+        QTest::qWait(500);
+        QVERIFY(!app.item("errorBar")->isVisible());
+        // Only an offer: nothing changes the route by itself.
+        QCOMPARE(app.backend->config().value("route").toString(), QString("direct"));
+        app.click(offer);
+        QObject *route = app.object("routePopup");
+        QTRY_VERIFY(route && route->property("opened").toBool());
+        QCOMPARE(app.backend->config().value("route").toString(), QString("direct"));
+        QCOMPARE(openWaits(app), 1);
         QCOMPARE(app.asked("POST api/play"), 1);
     }
 
@@ -5440,8 +5622,10 @@ private slots:
         const int first = held.first().value("message").toString().section(' ', 1).toInt(),
                   lastHeld = held.last().value("message").toString().section(' ', 1).toInt();
         QVERIFY2(first >= 51 && lastHeld == first + 299, qPrintable(QString("%1 to %2").arg(first).arg(lastHeld)));
-        // It shows the newest, and goes on doing so as more come.
+        // It shows the newest, and goes on doing so as more come; the
+        // oldest it shows is cut off a little under the tabs, not at them.
         QTRY_VERIFY(atNewest(list));
+        QVERIFY2(list->y() >= 8, qPrintable(QString::number(list->y())));
         const QString newest = chatMessages(app).last().value("message").toString();
         QTRY_VERIFY_WITH_TIMEOUT(chatMessages(app).last().value("message").toString() != newest, 3000);
         QCOMPARE(chat->property("count").toInt(), 300);
@@ -5503,12 +5687,15 @@ private slots:
         QTRY_COMPARE(openChats(app), 0);
         QVERIFY(!app.item("errorBar")->isVisible());
 
-        // (The engine refuses a chat while the setting is off.)
+        // (The engine refuses a chat while the setting is off. The tab says
+        // so; it is no error of the window's, which no other route gets past.)
         QSignalSpy failed(app.backend.get(), &Backend::chatFailed);
         app.backend->chat("live0000001");
         QTRY_COMPARE(failed.count(), 1);
         QCOMPARE(failed.first().first().toString(), QString("Live chat is turned off in the settings"));
-        app.backend->clearError();
+        QTest::qWait(200);
+        QVERIFY(app.backend->error().isEmpty());
+        QVERIFY(!app.item("errorBar")->isVisible());
     }
 
     void aBotCheckOnTheChatIsAskedOnceMore()

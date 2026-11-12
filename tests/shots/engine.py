@@ -15,7 +15,8 @@ With QVEIL_STANDIN_LIVECLIP set to a folder of segments (`v/<n>.mkv` and
 starts with "live" is a running stream, as the engine plays one: two EVENT
 playlists that list LIVE_FIRST segments when it is opened and one more each
 LIVE_SEGMENT seconds, and `live/<sid>/state`. `POST api/_live_end` ends it:
-the playlists get `#EXT-X-ENDLIST`, and the state says "ended".
+the playlists get `#EXT-X-ENDLIST`, and the state says "ended". `POST
+api/_live_drop` forgets its session, as an engine that no longer has it.
 
 A video whose ID starts with "waiting" is an announced stream: its play
 answers `waiting` and no streams, and `GET api/wait` is its waiting room (see
@@ -42,7 +43,9 @@ NOW = int(time.time())
 HOUR, DAY = 3600, 86400
 CLIP = os.environ.get("QVEIL_STANDIN_CLIP", "")
 LIVECLIP = os.environ.get("QVEIL_STANDIN_LIVECLIP", "")
-LIVE_SEGMENT, LIVE_FIRST = 2, 8
+# (QVEIL_STANDIN_LIVE_FIRST: how many segments it has when it is opened, for
+# a stream longer than the player reads ahead.)
+LIVE_SEGMENT, LIVE_FIRST = 2, int(os.environ.get("QVEIL_STANDIN_LIVE_FIRST", "8"))
 # When the running stream was opened (it grows from then), and whether it has ended.
 live = {"opened": 0.0, "ended": False, "sid": 0, "final": 0}
 # The waiting rooms open now, and the announced streams that have started.
@@ -520,8 +523,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         until the window hangs up. With QVEIL_STANDIN_WAIT_NOW_MS set, the
         stream starts that many ms after the room opened: "now", and the job
         ends. A "waitinggaveup…" stream is given up on, and a
-        "waitingmembers…" one turns out to be for members only, and a
-        "waitingbot…" one meets a bot check."""
+        "waitingmembers…" one turns out to be for members only. A
+        "waitingbot…" one meets a bot check at every ask: as the engine does
+        (core/src/server/wait.rs, whose docs list the lines), the wait goes
+        on, and its lines say so (`note`), until the window hangs up."""
         v = q.get("v", "")
         raw = q.get("starts", "")
         starts = int(raw) if raw.lstrip("-").isdigit() else None
@@ -539,13 +544,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             waits["open"] += 1
         try:
             say({"state": "upcoming", "starts": starts})
+            note = {}
+            if v.startswith("waitingbot"):
+                time.sleep(0.3)
+                note = {"note": "bot_check"}
+                say(dict({"state": "upcoming", "starts": starts}, **note))
             if v.startswith("waitinggaveup"):
                 time.sleep(0.3)
                 say({"state": "gave_up", "error": GAVE_UP, "code": "gave_up"})
-                return
-            if v.startswith("waitingbot"):
-                time.sleep(0.3)
-                say({"error": BOT_CHECK, "code": "bot_check"})
                 return
             if v.startswith("waitingmembers"):
                 time.sleep(0.3)
@@ -559,7 +565,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     say({"state": "now"})
                     return
                 if time.monotonic() - last >= beat:
-                    say({"state": "upcoming", "starts": starts})
+                    say(dict({"state": "upcoming", "starts": starts}, **note))
                     last = time.monotonic()
                 time.sleep(0.05)
         except OSError:
@@ -811,6 +817,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "api/_live_end":
             # The running stream ends: its playlists are closed with what they have.
             live.update(final=live_head(), ended=True)
+            self.send(200, {})
+            return
+        if path == "api/_live_drop":
+            # The engine no longer has the running stream's session: all of it is 404.
+            live.update(sid=live["sid"] + 1000)
             self.send(200, {})
             return
         if path == "api/config":

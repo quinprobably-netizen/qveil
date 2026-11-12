@@ -308,13 +308,15 @@ ApplicationWindow {
     // ended the streams it had over the old one. It is looked up again and
     // opened by the new route, at the place it had got to, where it was (in
     // the small window too). One that had played to its end has nothing to
-    // carry on from, and is put away.
+    // carry on from, and is put away. A running stream never has (it grows
+    // while it plays): one that played at its edge opens at its edge again,
+    // as the answer says, and one that played behind it where it was.
     function reopen() {
         const from = player
         if (!from.active)
             return
         const info = from.info
-        const over = from.length > 0 && from.lastPosition >= from.length - 2
+        const over = !from.live && from.length > 0 && from.lastPosition >= from.length - 2
         if (!from.pending && over) {
             if (pip)
                 pipWindow.end()
@@ -323,7 +325,9 @@ ApplicationWindow {
             return
         }
         // (One that was still being looked up begins as it was going to.)
-        const as = from.pending ? openingAs : { id: info.id, at: from.mpv.started ? from.lastPosition : from.startedAt, forget: false }
+        const as = from.pending ? openingAs
+            : from.live && from.atEdge ? null
+            : { id: info.id, at: from.mpv.started ? from.lastPosition : from.startedAt, forget: false }
         play(info, playList, playIndex)
         openingAs = as
         // The popup the route was chosen in keeps the keyboard.
@@ -689,8 +693,9 @@ ApplicationWindow {
                 // ends where this begins.
                 visible: !(win.watching && win.fullscreen)
                 height: visible ? implicitHeight : 0
-                context: win.watching ? "watch" : win.page
+                context: win.watching ? (watch.surface.waiting ? "waiting" : "watch") : win.page
                 chat: watch.sheet.tabsNow[0] === "chat"
+                behind: win.watching && watch.surface.live && !watch.surface.atEdge
                 z: 3
                 onRouteClicked: win.toggleRoute()
             }
@@ -877,6 +882,7 @@ ApplicationWindow {
                     onVideoRequested: (video, list, index) => win.play(video, list, index)
                     onFullscreenToggled: win.toggleFullscreen()
                     onPipRequested: win.togglePip()
+                    onRouteRequested: win.openRoute()
                     onCopied: text => {
                         win.copy(text)
                         toast.show(qsTr("Link copied. qveil doesn't open browsers."))

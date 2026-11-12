@@ -19,6 +19,8 @@ Act {
     readonly property bool sourceIsNewest: sourceLabel === qsTr("Newest")
     signal changed(var setting)
     readonly property bool opened: menu.opened
+    // Until it has gone: it fades out after it has closed.
+    readonly property bool shown: menu.visible
     function open() { menu.open() }
 
     function sortName(key) {
@@ -118,6 +120,11 @@ Act {
         }
         // (As it starts to go, not when it has gone: the next Escape is the page's.)
         onAboutToHide: if (control.Window.window && control.Window.window.openMenu === menu) control.Window.window.openMenu = null
+        // Once it has gone, the keyboard goes back to what is showing: as it
+        // goes, Qt hands it to the window's content, which would take it
+        // from wherever it was put meanwhile (a video opened by the click
+        // that closed it).
+        onClosed: if (control.Window.window && typeof control.Window.window.afterPopup === "function") control.Window.window.afterPopup()
 
         background: Rectangle {
             color: Style.bg

@@ -39,8 +39,10 @@ FocusScope {
         : (info.chaptersLater && backend.chapters.video === info.id ? (backend.chapters.items || []) : [])
     // What the player says once it knows; until then, what the engine said.
     // (The length mpv gives a growing playlist is only as new as its last
-    // reload of it, so a running stream is at least as long as where it is.)
-    readonly property real length: mpv.duration > 0 ? Math.max(mpv.duration, live ? mpv.position : 0) : (info.duration || 0)
+    // reload of it, so a running stream is at least as long as where it is,
+    // and as its live edge.)
+    readonly property real length: mpv.duration > 0 ? Math.max(mpv.duration, live ? Math.max(mpv.position, liveEdge) : 0)
+                                                    : (live && liveEdge > 0 ? liveEdge : (info.duration || 0))
 
     // A stream that is running (the answer's `live.state` is "now"), until
     // the engine says it has ended. Its seek bar spans the whole stream so far
@@ -48,16 +50,58 @@ FocusScope {
     readonly property bool live: !!info.live && info.live.state === "now"
     // How long one of its segments is, in seconds.
     readonly property real segment: live ? (info.live.segment || 5) : 0
-    // Whether it plays at the live edge: within three segments of the newest
-    // one there is (whose start is a segment before the end), which is where
-    // it is joined and where Go live goes (three segments from the end), with
-    // a segment to spare for the length, which grows a segment at a time.
-    readonly property bool atEdge: live && length - mpv.position <= 4 * segment
+    // What the engine last said of a running stream (`live/<session>/state`):
+    // the newest segment it has, and the oldest it listed when first asked
+    // after the load. The player's timeline begins at that one (a playlist
+    // is opened at its first segment, see MpvItem.load), and for a stream
+    // older than its rewind window the oldest moves on while that doesn't.
+    // -1 until the engine has said.
+    property real liveHead: -1
+    property real liveOrigin: -1
+    // The live edge on the player's timeline, in seconds: the end of the
+    // newest segment the engine has, 0 until it has said. Not mpv's duration,
+    // which is only as new as its last reload of the playlist; it doesn't
+    // reload while it plays far behind with its cache full, and minutes later
+    // that is still where it was rewound.
+    readonly property real liveEdge: live && liveHead >= 0 && liveOrigin >= 0 ? segment * (liveHead - liveOrigin + 1) : 0
+    // How far behind the edge it plays, in seconds.
+    readonly property real behind: liveEdge > 0 ? liveEdge - mpv.position : 0
+    // Whether it plays at the live edge: within four segments of the end of
+    // the newest one, which is where it is joined and where Go live goes
+    // (three from the end), with a segment to spare for the edge, which
+    // grows a segment at a time. Once there, it stays until it is six behind:
+    // the player falls a little behind as it opens (the edge moves on while
+    // it loads) and whenever it waits for a segment, and a clock and button
+    // that blinked in and out with that would say nothing. Until the engine
+    // has said where the edge is, and the first frame is up, it is there if
+    // it was opened there; while it seeks or waits for a segment it stays
+    // what it was (the position is the old one until it has got there).
+    property bool atEdge: false
+    function judgeEdge() {
+        if (!live)
+            atEdge = false
+        else if (liveEdge <= 0 || !mpv.started)
+            atEdge = startedAt < 0
+        else if (!mpv.buffering)
+            atEdge = behind <= (atEdge ? 6 : 4) * segment
+    }
+    onBehindChanged: judgeEdge()
+    onLiveChanged: judgeEdge()
+    onStartedAtChanged: judgeEdge()
+    Connections {
+        target: mpv
+        function onStartedChanged() { surface.judgeEdge() }
+        function onBufferingChanged() { surface.judgeEdge() }
+    }
     // Set once a stream that was running when it was opened has ended: it
     // is a video like any other from then on (and the Comments tab returns).
     property bool liveEnded: false
-    // How often the engine is asked whether a running stream has ended, in ms.
-    property int liveCheckInterval: 10000
+    // How often the engine is asked where a running stream's edge is, and
+    // whether it has ended, in ms: 0 for once a segment, which keeps the
+    // edge as new as the stream.
+    property int liveCheckInterval: 0
+    // Go live was asked for before the engine had said where the edge is.
+    property bool goLiveDue: false
 
     // An announced stream that hasn't started (the answer said `waiting`):
     // the waiting room shows in place of the player, which loads nothing.
@@ -68,6 +112,11 @@ FocusScope {
     property real waitStarts: 0
     property string waitState: ""
     property string waitMessage: ""
+    // "bot_check" while the engine's asks meet a bot check (it keeps asking),
+    // or the code of what ended the wait; "" otherwise. Both may be got past
+    // on another route, which the room offers (see routeRequested).
+    property string waitNote: ""
+    readonly property bool waitOffersRoute: waitState === "upcoming" ? waitNote === "bot_check" : backend.offersRouteFor(waitNote)
     // Set when the stream that was waited for has started: its play answer
     // opens it at its start, not at its edge.
     property bool fromStart: false
@@ -88,16 +137,19 @@ FocusScope {
             backend.stopWait()
         waitState = ""
         waitMessage = ""
+        waitNote = ""
         waitStarts = 0
     }
     Connections {
         target: backend
-        function onWaitState(state, starts) {
+        function onWaitState(state, starts, note) {
             if (!surface.waiting || surface.waitState !== "upcoming")
                 return
-            if (state === "upcoming" && starts > 0)
-                surface.waitStarts = starts
-            else if (state === "now")
+            if (state === "upcoming") {
+                if (starts > 0)
+                    surface.waitStarts = starts
+                surface.waitNote = note
+            } else if (state === "now")
                 // (Not from inside the engine's answer, which this hangs up on.)
                 Qt.callLater(surface.begin)
         }
@@ -106,13 +158,24 @@ FocusScope {
                 return
             surface.waitState = code === "gave_up" ? "gave_up" : "failed"
             surface.waitMessage = message
+            surface.waitNote = code
         }
     }
 
-    // To the live edge, where a running stream is joined.
+    // To the live edge, where a running stream is joined: three segments
+    // from the end of the newest the engine has. If it hasn't said yet, it
+    // is asked, and the seek follows its answer.
     function goLive() {
-        if (live)
-            seekTo(Math.max(0, length - 3 * segment))
+        if (!live)
+            return
+        if (liveEdge <= 0) {
+            goLiveDue = true
+            backend.checkLive(info.video)
+            return
+        }
+        goLiveDue = false
+        seekTo(Math.max(0, liveEdge - 3 * segment))
+        atEdge = true
     }
 
     // The channel's name and the age that were looked up apart (see
@@ -135,6 +198,8 @@ FocusScope {
 
     signal closed()
     signal pipRequested()
+    // The waiting room's offer of another route was taken.
+    signal routeRequested()
     signal theatreToggled()
     signal fullscreenToggled()
 
@@ -161,6 +226,7 @@ FocusScope {
         startedAt = 0
         lastSeek = -1
         liveEnded = false
+        forgetEdge()
         pending = true
         active = true
         reveal()
@@ -183,6 +249,7 @@ FocusScope {
         info = Object.assign({ batch: info.batch || 0 }, card, i)
         active = true
         liveEnded = false
+        forgetEdge()
         // (A running stream's start is negative: that many seconds before its end.)
         const resumed = at === undefined && !i.start && i.resume > 0
         startedAt = at !== undefined ? at : (i.start ? i.start : (i.resume > 0 ? i.resume : 0))
@@ -224,12 +291,22 @@ FocusScope {
         lastPosition = from.lastPosition
         forgetWhenStarted = from.forgetWhenStarted
         liveEnded = from.liveEnded
+        liveHead = from.liveHead
+        liveOrigin = from.liveOrigin
+        atEdge = from.atEdge
         note.shown = false
         active = true
         from.release()
         reveal()
         return true
     }
+    // Where the edge of the stream that was showing is, for none.
+    function forgetEdge() {
+        liveHead = -1
+        liveOrigin = -1
+        goLiveDue = false
+    }
+
     // Lets go of the video that another surface adopted: it is still
     // playing, so where it is isn't told from here.
     function release() { finish(false) }
@@ -247,18 +324,24 @@ FocusScope {
         pending = false
         mpv.stop()
         active = false
-        // Nobody is waiting for what the engine says of the stream now.
-        if (live)
+        // Nobody is waiting for what the engine says of the stream now. (One
+        // that was handed over is still asked about, by the other surface.)
+        if (live && stopping)
             backend.stopLiveCheck()
         info = ({})
+        forgetEdge()
         note.shown = false
         forgetWhenStarted = false
         if (was)
             closed()
     }
 
+    // (A seek of a running stream is judged anew once it has got there: is
+    // it at the edge? See atEdge.)
     function seekTo(seconds) {
         lastSeek = seconds
+        if (live)
+            atEdge = false
         note.shown = false
         mpv.seek(seconds, false)
         reveal()
@@ -266,6 +349,8 @@ FocusScope {
     }
     // A step back or forward, by the keyboard.
     function nudge(seconds) {
+        if (live)
+            atEdge = false
         mpv.seek(seconds, true)
         reveal()
         afterSeek.restart()
@@ -353,20 +438,31 @@ FocusScope {
         onTriggered: surface.report()
     }
 
-    // While a stream runs, every so often: has it ended? The engine knows
-    // (its playlists get their end), and says so at `live/<session>/state`.
+    // While a stream runs, once a segment from when it is opened: where is
+    // its edge, and has it ended? The engine knows (its playlists get their
+    // end), and says so at `live/<session>/state`.
     Timer {
         objectName: "live-check"
-        interval: surface.liveCheckInterval
+        interval: surface.liveCheckInterval > 0 ? surface.liveCheckInterval : Math.max(1000, surface.segment * 1000)
         repeat: true
+        triggeredOnStart: true
         running: surface.active && !surface.pending && surface.live
         onTriggered: backend.checkLive(surface.info.video)
     }
     Connections {
         target: backend
-        function onLiveChecked(playlist, state) {
-            if (!surface.active || !surface.live || playlist !== surface.info.video || state !== "ended")
+        function onLiveChecked(playlist, state, head, oldest) {
+            if (!surface.active || !surface.live || playlist !== surface.info.video)
                 return
+            if (state !== "ended") {
+                if (head >= 0)
+                    surface.liveHead = head
+                if (surface.liveOrigin < 0 && oldest >= 0)
+                    surface.liveOrigin = oldest
+                if (surface.goLiveDue && surface.liveEdge > 0)
+                    surface.goLive()
+                return
+            }
             // It plays on to its end with what it has (the playlists are
             // closed), and is a video like any other from here.
             const was = surface.info
@@ -393,11 +489,17 @@ FocusScope {
 
     WaitingRoom {
         anchors.fill: parent
+        // (Over the area that pauses on a click, so that its offer can be
+        // pressed; a click anywhere else in it goes through.)
+        z: 1
         visible: surface.waiting
         info: surface.info
         starts: surface.waitStarts
         phase: surface.waitState || "upcoming"
         message: surface.waitMessage
+        botCheck: surface.waitState === "upcoming" && surface.waitNote === "bot_check"
+        offersRoute: surface.waitOffersRoute
+        onRouteRequested: surface.routeRequested()
     }
 
     Column {

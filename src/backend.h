@@ -106,6 +106,7 @@ public:
     static QVariantMap privacyOf(const QVariantMap &config);
     // Whether another route may get past an error with this code.
     static bool offersRoute(const QString &code);
+    Q_INVOKABLE bool offersRouteFor(const QString &code) const { return offersRoute(code); }
 
     // Starts the engine. Also how it is brought back after it dies.
     void start();
@@ -272,12 +273,14 @@ signals:
     void routeChanged();
     void playReady(const QVariantMap &info);
     // What the engine said of the stream `playlist` (see checkLive): "now",
-    // or "ended", which is also what a session it no longer has is.
-    void liveChecked(const QString &playlist, const QString &state);
+    // or "ended", which is also what a session it no longer has is; and the
+    // newest and oldest segment it lists (-1 when it didn't say).
+    void liveChecked(const QString &playlist, const QString &state, qint64 head, qint64 oldest);
     // What the engine said of the stream being waited for: "upcoming", with
     // when it starts (0 if that isn't known), now and then while it waits;
-    // "now" once it has started, which ends the wait.
-    void waitState(const QString &state, qint64 starts);
+    // "now" once it has started, which ends the wait. `note` is "bot_check"
+    // while the engine's asks meet a bot check (it goes on asking), else "".
+    void waitState(const QString &state, qint64 starts, const QString &note);
     // The wait is over without the stream having started: it was given up
     // on (`code` "gave_up"), or can't be played at all (members-only, not in
     // this region, …), in the engine's words. Shown in the room, not as the

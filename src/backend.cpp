@@ -819,9 +819,11 @@ void Backend::checkLive(const QString &playlist) {
     if (session.isEmpty() || session.contains('/') || session.contains('?') || session.contains('#'))
         return;
     call("GET", "live/" + session + "/state", {}, {}, "live-state", [this, playlist](const QJsonValue &v) {
-        const QString state = v.toObject().value("state").toString();
+        const QJsonObject o = v.toObject();
+        const QString state = o.value("state").toString();
+        // (A session that is gone says only that it has ended.)
         if (!state.isEmpty())
-            emit liveChecked(playlist, state);
+            emit liveChecked(playlist, state, o.value("head").toInteger(-1), o.value("oldest").toInteger(-1));
     });
 }
 
@@ -843,7 +845,7 @@ void Backend::wait(const QString &video, qint64 starts) {
                 const QVariantMap o = line.toMap();
                 const QString state = o.value("state").toString();
                 if (!state.isEmpty())
-                    emit waitState(state, o.value("starts").toLongLong());
+                    emit waitState(state, o.value("starts").toLongLong(), o.value("note").toString());
             }
         },
         {},
@@ -852,12 +854,9 @@ void Backend::wait(const QString &video, qint64 starts) {
             // it again on the new one (see routeChanged).
             if (code == "route_changed")
                 return;
+            // The room says what happened, and offers another route where
+            // that may help: not the window's error too (the same words twice).
             emit waitFailed(message, code);
-            // The room says what happened. One that another route may get
-            // past (a bot check) is the window's error too, which offers to
-            // change the route, as it does everywhere else.
-            if (offersRoute(code))
-                setError(message, code);
         });
 }
 
@@ -912,8 +911,11 @@ void Backend::openChat(const QString &video, int tries) {
                 });
                 return;
             }
+            // The tab says what happened; one that another route may get
+            // past is the window's error too, which offers to change it.
             emit chatFailed(message, code);
-            setError(message, code);
+            if (offersRoute(code))
+                setError(message, code);
         });
     // (Not ready: refused at once, and never the latest.)
     if (m_replies.contains("chat"))

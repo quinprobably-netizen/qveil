@@ -101,14 +101,15 @@ Item {
     }
 
     // The messages, the newest at the foot. While there are few, they stand
-    // at the foot too, over the footer.
+    // at the foot too, over the footer. Once they fill the tab, the oldest
+    // shown is cut a little under the tabs' rule, not right at it.
     ListView {
         id: list
         objectName: "chat-list"
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: note.visible ? note.top : foot.top
-        height: Math.min(contentHeight + topMargin + bottomMargin, note.visible ? note.y : foot.y)
+        height: Math.min(contentHeight + topMargin + bottomMargin, (note.visible ? note.y : foot.y) - Style.u * 2)
         topMargin: Style.u * 2
         bottomMargin: Style.u * 2
         clip: true
