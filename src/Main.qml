@@ -86,6 +86,12 @@ ApplicationWindow {
             watch.sheet.turn(by)
         else if (!watching && page === "lenses")
             lensesPage.step(by)
+        else if (!watching && page === "channel" && backend.channel.id) {
+            // A channel's Videos and Streams.
+            const tab = by < 0 ? "videos" : "streams"
+            if (backend.channelTab !== tab)
+                backend.openChannel(backend.channel.id, tab)
+        }
     }
     readonly property var pages: ({ home: feedPage, search: searchPage, channel: channelPage,
                                     channels: subsPage, history: historyPage,
@@ -563,7 +569,7 @@ ApplicationWindow {
     Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && !win.watching && win.page === "home"; onActivated: feedPage.openCurrent() }
     Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet && win.watching; onActivated: watch.playNext() }
     // [ and ]: the chapter before or after while the video has the keyboard;
-    // otherwise the tab before or after (lenses, the full feed, the sheet).
+    // otherwise the tab before or after (lenses, a channel's, the sheet).
     Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.tabStep(-1) }
     Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: !win.typing && !win.quiet; onActivated: win.tabStep(1) }
     // K pauses and plays, as it does on YouTube, while the video has the keyboard.
@@ -830,6 +836,7 @@ ApplicationWindow {
                     // Subscribe is the call to action; Subscribed is the same
                     // word switched on, with a check.
                     Act {
+                        objectName: "channel-subscribe"
                         readonly property bool isOn: !!backend.channel.subscribed
                         visible: !!backend.channel.name
                         text: isOn ? qsTr("Subscribed") : qsTr("Subscribe")

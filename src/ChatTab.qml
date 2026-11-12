@@ -102,7 +102,8 @@ Item {
 
     // The messages, the newest at the foot. While there are few, they stand
     // at the foot too, over the footer. Once they fill the tab, the oldest
-    // shown is cut a little under the tabs' rule, not right at it.
+    // shown is cut a little under the tabs' rule, not right at it, and a
+    // whole line at a time: a line is shown in full or not at all.
     ListView {
         id: list
         objectName: "chat-list"
@@ -134,63 +135,87 @@ Item {
             objectName: "chat-message"
             width: ListView.view.width
             height: words.height
+            // How tall one of its lines is.
+            readonly property real lineStep: words.height / Math.max(1, words.lineCount)
+            // How much of it is past the top and the foot of the list, in
+            // whole lines: what is left of a line that is partly out goes too.
+            readonly property real topCut: wholeLines(ListView.view.contentY - y)
+            readonly property real footCut: wholeLines(y + height - ListView.view.contentY - ListView.view.height)
+            function wholeLines(out) {
+                return out > 0.5 ? Math.min(height, Math.ceil((out - 0.5) / lineStep) * lineStep) : 0
+            }
 
-            // A Super Chat's mark.
-            Rectangle {
-                objectName: "chat-rule"
-                x: Style.u * 3
-                width: 2
-                height: parent.height
-                visible: line.paid
-                color: Style.warn
-            }
-            Row {
-                id: head
-                x: words.x
-                spacing: Style.u * 3 / 2
-                Text {
-                    objectName: "chat-amount"
-                    visible: line.paid
-                    text: line.amount
-                    textFormat: Text.PlainText
-                    color: Style.warn
-                    font.family: Style.font
-                    font.pixelSize: Style.small
-                    font.weight: Style.strong
-                }
-                Text {
-                    objectName: "chat-author"
-                    // A long name leaves room for the words.
-                    width: Math.min(implicitWidth, words.width * 0.6)
-                    text: line.author
-                    textFormat: Text.PlainText
-                    elide: Text.ElideRight
-                    // The channel's owner stands out; everyone else is muted.
-                    color: line.owner ? Style.accent : Style.faint
-                    font.family: Style.font
-                    font.pixelSize: Style.small
-                }
-            }
-            // The words, as they were written: plain text, never markup.
-            // Their first line starts after the name.
-            Text {
-                id: words
-                objectName: "chat-text"
-                x: Style.u * 3 + (line.paid ? 2 + Style.u * 2 : 0)
-                width: parent.width - x - Style.u * 3
-                // Where its first line starts, as it was last laid out.
-                property real indent: 0
-                text: line.message
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-                color: Style.fg
-                font.family: Style.font
-                font.pixelSize: Style.small
-                onLineLaidOut: l => {
-                    if (l.number === 0) {
-                        l.x = line.lead
-                        l.width = Math.max(1, width - line.lead)
-                        indent = l.x
+            Item {
+                id: shown
+                objectName: "chat-shown"
+                y: line.topCut
+                width: parent.width
+                height: Math.max(0, line.height - line.topCut - line.footCut)
+                clip: line.topCut > 0 || line.footCut > 0
+                // (Where it would be uncut.)
+                Item {
+                    y: -line.topCut
+                    width: line.width
+                    height: line.height
+
+                    // A Super Chat's mark.
+                    Rectangle {
+                        objectName: "chat-rule"
+                        x: Style.u * 3
+                        width: 2
+                        height: parent.height
+                        visible: line.paid
+                        color: Style.warn
+                    }
+                    Row {
+                        id: head
+                        x: words.x
+                        spacing: Style.u * 3 / 2
+                        Text {
+                            objectName: "chat-amount"
+                            visible: line.paid
+                            text: line.amount
+                            textFormat: Text.PlainText
+                            color: Style.warn
+                            font.family: Style.font
+                            font.pixelSize: Style.small
+                            font.weight: Style.strong
+                        }
+                        Text {
+                            objectName: "chat-author"
+                            // A long name leaves room for the words.
+                            width: Math.min(implicitWidth, words.width * 0.6)
+                            text: line.author
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            // The channel's owner stands out; everyone else is muted.
+                            color: line.owner ? Style.accent : Style.faint
+                            font.family: Style.font
+                            font.pixelSize: Style.small
+                        }
+                    }
+                    // The words, as they were written: plain text, never markup.
+                    // Their first line starts after the name.
+                    Text {
+                        id: words
+                        objectName: "chat-text"
+                        x: Style.u * 3 + (line.paid ? 2 + Style.u * 2 : 0)
+                        width: parent.width - x - Style.u * 3
+                        // Where its first line starts, as it was last laid out.
+                        property real indent: 0
+                        text: line.message
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        color: Style.fg
+                        font.family: Style.font
+                        font.pixelSize: Style.small
+                        onLineLaidOut: l => {
+                            if (l.number === 0) {
+                                l.x = line.lead
+                                l.width = Math.max(1, width - line.lead)
+                                indent = l.x
+                            }
+                        }
                     }
                 }
             }

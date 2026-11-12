@@ -66,7 +66,8 @@ Rectangle {
             visible: text !== ""
             text: act.trailing
             textFormat: Text.PlainText
-            color: Style.faint
+            // (On the accent's fill, the word's own colour, dimmed.)
+            color: act.primary ? Qt.rgba(Style.accentText.r, Style.accentText.g, Style.accentText.b, 0.7) : Style.faint
             font.family: Style.font
             font.pixelSize: Style.small
         }

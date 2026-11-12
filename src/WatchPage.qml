@@ -47,11 +47,15 @@ FocusScope {
     // How wide the sheet is when it stands beside the video.
     readonly property int sheetWidth: width >= 1180 ? 384 : 320
     readonly property bool subscribed: !!info.channelId && backend.subs.some(s => s.id === info.channelId)
-    // The clock a running stream's age is told by, a second at a time
-    // while it shows.
+    // The clock a running stream's age is told by ("started 2 h 14 min
+    // ago"): a minute at a time while it shows, as that is all it says.
     property real now: Date.now() / 1000
     Timer {
-        interval: 1000
+        // (A stream opened straight after another is told from now, not
+        // from the last minute's tick.)
+        readonly property string stream: page.info.id || ""
+        onStreamChanged: if (running) { page.now = Date.now() / 1000; restart() }
+        interval: 60000
         repeat: true
         running: surface.live && page.visible
         triggeredOnStart: true
@@ -187,6 +191,7 @@ FocusScope {
                 width: parent.width
                 height: Style.control
                 Row {
+                    id: channelRow
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.u * 3
@@ -218,15 +223,27 @@ FocusScope {
                     }
                 }
                 Text {
+                    id: stats
                     objectName: "watch-stats"
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
+                    // What it has beside the channel's name and button: never under them.
+                    readonly property real room: parent.width - channelRow.width - Style.u * 3
+                    width: Math.max(0, Math.min(implicitWidth, room))
+                    elide: Text.ElideRight
                     visible: text !== ""
-                    // A running stream: how many watch and how long it has run. One
-                    // that has ended (or was over when opened) is a streamed video.
-                    // One that is announced: when it is scheduled for.
+                    // A running stream: how many watch and how long it has run
+                    // (in whole hours where the minutes don't fit). One that has
+                    // ended (or was over when opened) is a streamed video. One
+                    // that is announced: when it is scheduled for.
+                    readonly property string liveText: Format.liveMeta(page.info.live, page.now)
+                    TextMetrics {
+                        id: liveWidth
+                        font: stats.font
+                        text: stats.liveText
+                    }
                     text: surface.waiting ? (surface.waitStarts > 0 ? qsTr("Scheduled for %1").arg(Format.dayTime(surface.waitStarts)) : "")
-                        : surface.live ? Format.liveMeta(page.info.live, page.now)
+                        : surface.live ? (liveWidth.advanceWidth <= room ? liveText : Format.liveMeta(page.info.live, page.now, true))
                         : Format.meta(page.info.live ? Object.assign({}, page.info, { streamed: true }) : page.info,
                                       page.info.published || 0)
                     textFormat: Text.PlainText

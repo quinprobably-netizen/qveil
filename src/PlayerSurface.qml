@@ -684,6 +684,7 @@ FocusScope {
                 length: surface.length
                 live: surface.live
                 atEdge: surface.atEdge
+                started: surface.live ? (surface.info.live.started || 0) : 0
                 cached: mpv.cached
                 chapters: surface.chapters
                 onMoved: seconds => surface.seekTo(seconds)
@@ -706,17 +707,23 @@ FocusScope {
                         objectName: "seek-time"
                         anchors.verticalCenter: parent.verticalCenter
                         text: bar.time
+                        // (A little further from the Go live chip than the row's spacing.)
+                        rightPadding: goLiveAct.visible ? Style.u : 0
                         textFormat: Text.PlainText
                         color: Style.fg
                         font.family: Style.font
                         font.pixelSize: Style.small
                     }
-                    // Behind a running stream's edge: the way back to it.
+                    // Behind a running stream's edge: the way back to it, a
+                    // chip in the accent's fill (as the cards' "● LIVE" is)
+                    // with its key dimmed inside it.
                     Act {
                         id: goLiveAct
                         objectName: "go-live"
                         anchors.verticalCenter: parent.verticalCenter
                         visible: surface.live && !surface.atEdge
+                        primary: true
+                        radius: 0
                         text: qsTr("Go live")
                         trailing: surface.compact ? "" : "End"
                         onClicked: surface.goLive()

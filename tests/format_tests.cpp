@@ -42,6 +42,7 @@ private slots:
                           "  function dayTime(a, b, c) { return Format.dayTime(a) }\n"
                           "  function meta(a, b, c) { return Format.meta(a, b, c) }\n"
                           "  function waitLine(a, b, c) { return Format.waitLine(a, b) }\n"
+                          "  function liveMeta(a, b, c) { return Format.liveMeta(a, b, c) }\n"
                           "}",
                           QUrl("qrc:/FormatStage.qml"));
         format.reset(component.create());
@@ -107,6 +108,22 @@ private slots:
         QCOMPARE(call("waitLine", starts, starts + 29 * 60 + 59), QString("Should have started 29 min ago · checking every minute"));
         QCOMPARE(call("waitLine", starts, starts + 30 * 60), QString("Should have started 30 min ago · checking every 5 minutes"));
         QCOMPARE(call("waitLine", starts, starts + 3 * 3600 + 34 * 60), QString("Should have started 3 h 34 min ago · checking every 5 minutes"));
+    }
+
+    void aRunningStreamSaysHowLongAgoItStartedInWordsNotAClock()
+    {
+        const qint64 started = 1800000000;
+        const auto live = [&](int watching) { return QVariantMap{{"started", started}, {"watching", watching}}; };
+        // As the cards say a time: minutes, then hours and minutes; never seconds.
+        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60 + 12), QString("1.2K watching · started 2 h 14 min ago"));
+        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60 + 59), QString("1.2K watching · started 2 h 14 min ago"));
+        QCOMPARE(call("liveMeta", QVariantMap{{"started", started}}, started + 3 * 3600 + 20), QString("started 3 h ago"));
+        QCOMPARE(call("liveMeta", live(5), started + 14 * 60 + 5), QString("5 watching · started 14 min ago"));
+        QCOMPARE(call("liveMeta", live(5), started + 12), QString("5 watching · started 1 min ago"));
+        QCOMPARE(call("liveMeta", QVariantMap{{"watching", 860}}, started), QString("860 watching"));
+        // Where that won't fit, whole hours.
+        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60, true), QString("1.2K watching · started 2 h ago"));
+        QCOMPARE(call("liveMeta", live(5), started + 14 * 60, true), QString("5 watching · started 14 min ago"));
     }
 };
 

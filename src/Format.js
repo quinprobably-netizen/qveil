@@ -125,15 +125,27 @@ function meta(video, date, brief) {
     return parts.join(" · ")
 }
 
+// How long ago a stream started, in the words the cards use for time (not a
+// clock, which reads as a length): "14 min", "2 h", "2 h 14 min". At least a
+// minute, and it changes once a minute. `brief`: whole hours only, past one.
+function ranFor(seconds, brief) {
+    const minutes = Math.max(1, Math.floor(Math.max(0, seconds) / 60))
+    if (minutes < 60)
+        return qsTr("%1 min").arg(minutes)
+    const h = Math.floor(minutes / 60), m = minutes % 60
+    return m > 0 && !brief ? qsTr("%1 h %2 min").arg(h).arg(m) : qsTr("%1 h").arg(h)
+}
+
 // The line under a running stream's title, from the play answer's `live`:
-// "1.2K watching · started 2:14:05 ago". `now`: the time, in Unix seconds.
-function liveMeta(live, now) {
+// "1.2K watching · started 2 h 14 min ago" ("started 2 h ago" when `brief`,
+// for where that won't fit). `now`: the time, in Unix seconds.
+function liveMeta(live, now, brief) {
     const parts = []
     const n = count(live && live.watching)
     if (n)
         parts.push(qsTr("%1 watching").arg(n))
     if (live && live.started > 0)
-        parts.push(qsTr("started %1 ago").arg(clock(Math.max(0, now - live.started))))
+        parts.push(qsTr("started %1 ago").arg(ranFor(now - live.started, brief)))
     return parts.join(" · ")
 }
 

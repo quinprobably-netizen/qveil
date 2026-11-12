@@ -77,8 +77,17 @@ FocusScope {
             Row {
                 id: actionRow
                 anchors.right: parent.right
-                // The last word stands at the edge, not its button's padding inside it.
-                anchors.rightMargin: -Style.actPad
+                // The last word stands at the edge, not its button's padding inside
+                // it; a button that is filled ("Subscribed") ends at the edge itself.
+                readonly property var last: {
+                    let found = null
+                    for (let i = 0; i < children.length; i++)
+                        if (children[i].visible)
+                            found = children[i]
+                    return found
+                }
+                objectName: "page-actions"
+                anchors.rightMargin: last && (last.filled === true || last.primary === true) ? 0 : -Style.actPad
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.u
                 SortMenu {

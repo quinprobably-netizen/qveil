@@ -5,7 +5,8 @@ import "Format.js" as Format
 
 // One line under home's lead that names what is live: "● LIVE NOW", then
 // each running stream by its channel and title, then what is announced to
-// start within a day by its day and time. What doesn't fit on the line is
+// start within a day by its day and time. As many as fit are named, the
+// last of them cut short if it must be; what doesn't fit on the line is
 // under a "+N" at its end, which opens the rest as a list. No pictures.
 Rectangle {
     id: line
@@ -20,8 +21,10 @@ Rectangle {
     // The pointer moved over the line, at this point of the window.
     signal pointed(point at)
 
-    // How many entries fit, and how many places the keyboard can stop at.
-    readonly property int shown: fit()
+    // How the entries are laid out on it (see plan), how many of them are
+    // shown, and how many places the keyboard can stop at.
+    readonly property var layout: plan()
+    readonly property int shown: layout.shown
     readonly property int stops: shown + (shown < entries.length ? 1 : 0)
     readonly property bool opened: rest.opened
 
@@ -52,17 +55,35 @@ Rectangle {
     readonly property real moreWidth: metrics.advanceWidth("+" + entries.length) + Style.actPad * 2 + 2
     // The room the entries have, after the mark.
     readonly property real room: width - pad * 2 - mark.implicitWidth
-    function fit() {
+    // As many entries as fit, each whole, and then one more cut short (its
+    // title ends in "…") when its channel and a little of its title fit
+    // too; the rest are under the "+N". (The first is always there, cut
+    // short if it must be.) { shown, widths }: how many, and how wide each
+    // shown one is, its "/" included.
+    readonly property real leastTail: Math.ceil(metrics.advanceWidth(" \u00b7 abcd\u2026"))
+    function plan() {
         const n = entries.length
+        const widths = []
         let used = 0
         for (let i = 0; i < n; i++) {
-            used += gap + (i > 0 ? sepWidth : 0) + Math.ceil(metrics.advanceWidth(labelOf(entries[i]))) + 1
+            const sep = i > 0 ? sepWidth : 0
+            const whole = sep + Math.ceil(metrics.advanceWidth(labelOf(entries[i]))) + 1
             const after = i + 1 < n ? gap + moreWidth : 0
-            if (used + after > room)
-                // (The first is always there, cut short if it must be.)
-                return Math.max(1, i)
+            const left = room - used - gap
+            if (whole + after <= left) {
+                widths.push(whole)
+                used += gap + whole
+                continue
+            }
+            const cut = left - after
+            const least = sep + Math.ceil(metrics.advanceWidth(headOf(entries[i]))) + leastTail
+            if (i === 0 || cut >= least) {
+                widths.push(Math.max(0, Math.min(whole, cut)))
+                return { shown: i + 1, widths: widths }
+            }
+            return { shown: i, widths: widths }
         }
-        return n
+        return { shown: n, widths: widths }
     }
 
     visible: entries.length > 0
@@ -115,9 +136,8 @@ Rectangle {
                 readonly property bool marked: line.current === index
                 visible: index < line.shown
                 height: row.height
-                // The first is cut short when even it doesn't fit.
-                width: Math.min(sep.width + words.implicitWidth,
-                                index === 0 ? Math.max(0, line.room - line.gap - (line.shown < line.entries.length ? line.gap + line.moreWidth : 0)) : Infinity)
+                // The last that is shown is cut short when it doesn't fit whole.
+                width: index < line.layout.widths.length ? Math.min(sep.width + words.implicitWidth, line.layout.widths[index]) : 0
 
                 Text {
                     id: sep

@@ -30,7 +30,7 @@ Rectangle {
         home: [["h j k l", qsTr("move")], ["/", qsTr("search")], ["?", qsTr("keys")]],
         lenses: [["h j k l", qsTr("move")], ["r", qsTr("refresh")], ["?", qsTr("keys")]],
         channels: [["j k", qsTr("move")], ["u", qsTr("unsubscribe")], ["?", qsTr("keys")]],
-        channel: [["h j k l", qsTr("move")], ["s", qsTr("sort")], ["?", qsTr("keys")]],
+        channel: [["h j k l", qsTr("move")], ["[ ]", qsTr("tab")], ["s", qsTr("sort")], ["?", qsTr("keys")]],
         history: [["j k", qsTr("move")], ["Enter", qsTr("play")], ["?", qsTr("keys")]],
         search: [["h j k l", qsTr("move")], ["s", qsTr("sort")], ["?", qsTr("keys")]],
         settings: [["j k", qsTr("move")], ["Enter", qsTr("open")], ["?", qsTr("keys")]],
@@ -40,9 +40,19 @@ Rectangle {
         waiting: [["Esc", qsTr("back")], ["?", qsTr("keys")]]
     })
     // Fewer keys where the window is narrow: the first two, and the help.
+    // Watching, fullscreen goes first, and then whichever of next and the
+    // comments matters less: next, while a running stream's chat is on C. Go
+    // live, while it plays behind, never goes. (A channel's four are short,
+    // and all of them fit.)
     readonly property var shownHints: {
         const all = hints[context] || hints.home
-        return width < 1000 && all.length > 3 ? all.slice(0, 2).concat([all[all.length - 1]]) : all
+        if (width >= 1000 || all.length <= 3 || context === "channel")
+            return all
+        if (context === "watch") {
+            const dropped = ["f", chat ? "n" : "c"]
+            return all.filter(hint => dropped.indexOf(hint[0]) < 0)
+        }
+        return all.slice(0, 2).concat([all[all.length - 1]])
     }
     // Whether the keys have room beside the facts.
     readonly property bool roomy: left.width + right.width + Style.gutter * 3 <= width

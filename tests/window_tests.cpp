@@ -438,7 +438,7 @@ private slots:
         QTest::keyClick(app.window, Qt::Key_5);
         QTRY_COMPARE(hintsOf(app), (QStringList{"j k move", "Enter open", "? keys"}));
         QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
-        QTRY_COMPARE(hintsOf(app), (QStringList{"h j k l move", "s sort", "? keys"}));
+        QTRY_COMPARE(hintsOf(app), (QStringList{"h j k l move", "[ ] tab", "s sort", "? keys"}));
         // Every key it names does what it says: the help lists them all, and the window binds them.
         app.play({{"id", "vid00000002"}});
         QTRY_COMPARE(hintsOf(app), (QStringList{"space pause", "n next", "c comments", "f fullscreen", "? keys"}));
@@ -3994,6 +3994,19 @@ private slots:
         QCOMPARE(more->property("text").toString(), QString("+%1").arg(4 - shown.size()));
         // The line stays inside the window.
         QVERIFY(more->mapToScene(QPointF(more->width(), 0)).x() <= 941);
+        // It names as many as fit, the last cut short, before the "+N": the
+        // band isn't left empty past it.
+        QVERIFY2(shown.size() >= 2, qPrintable(shown.join(" | ")));
+        bool cutShort = false;
+        std::function<void(QQuickItem *)> look = [&](QQuickItem *item) {
+            cutShort = cutShort || (item->inherits("QQuickText") && item->property("truncated").toBool());
+            for (QQuickItem *child : item->childItems())
+                look(child);
+        };
+        look(app.items("live-item").last());
+        QVERIFY(cutShort);
+        const qreal lineEnd = line->mapToScene(QPointF(line->width(), 0)).x(), moreEnd = more->mapToScene(QPointF(more->width(), 0)).x();
+        QVERIFY2(lineEnd - moreEnd <= 12 + 2, qPrintable(QString("%1 left empty").arg(lineEnd - moreEnd)));
         // The keyboard stops at it last, and Enter opens the rest; Escape closes them.
         QQuickItem *home = app.item("shelves-home");
         QTRY_VERIFY(home->property("leadSelected").toBool());
@@ -4086,6 +4099,46 @@ private slots:
         QTRY_COMPARE(line->property("current").toInt(), 1);
         QTest::keyClick(app.window, Qt::Key_Return);
         QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000009"));
+    }
+
+    void bracketsChangeAChannelsTabAndTheFootSaysSo()
+    {
+        App app;
+        READY(app);
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+        QTRY_COMPARE(app.page(), QString("channel"));
+        QQuickItem *videos = app.item("channel-tab-videos"), *streams = app.item("channel-tab-streams");
+        QTRY_VERIFY(videos->property("current").toBool());
+        QTRY_VERIFY(hintsOf(app).contains("[ ] tab"));
+        // ] is the tab after (Streams), [ the one before; past the ends, nothing.
+        QTest::keyClick(app.window, Qt::Key_BracketRight);
+        QTRY_VERIFY(streams->property("current").toBool());
+        QTRY_VERIFY(cardOf(app.item("channel-page"), "str00000001"));
+        QTest::keyClick(app.window, Qt::Key_BracketRight);
+        QTest::qWait(100);
+        QVERIFY(streams->property("current").toBool());
+        QTest::keyClick(app.window, Qt::Key_BracketLeft);
+        QTRY_VERIFY(videos->property("current").toBool());
+        QTRY_VERIFY(cardOf(app.item("channel-page"), "vid00000001"));
+        QCOMPARE(app.page(), QString("channel"));
+    }
+
+    void aChannelsTabKeyIsNamedAndItsSubscribeEndsAtTheMargin()
+    {
+        // (A window this wide is drawn larger: its margin is 24 × 1.5.)
+        for (const auto &[size, margin] : {std::pair{QSize(941, 508), 24.0}, std::pair{QSize(1920, 1080), 36.0}}) {
+            App app(false, size);
+            READY(app);
+            QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+            QTRY_COMPARE(app.page(), QString("channel"));
+            QTRY_COMPARE(hintsOf(app), (QStringList{"h j k l move", "[ ] tab", "s sort", "? keys"}));
+            QVERIFY(app.item("status-line")->property("roomy").toBool());
+            QQuickItem *subscribe = nullptr;
+            QTRY_VERIFY((subscribe = app.item("channel-subscribe")) && subscribe->isVisible());
+            QVERIFY(subscribe->property("filled").toBool());
+            // Its fill ends where the page's content does, not past it.
+            QTRY_COMPARE(subscribe->mapToScene(QPointF(subscribe->width(), 0)).x(), size.width() - margin);
+        }
     }
 
     void aChannelsStreamsTabAsksOnlyWhenOpened()
@@ -4896,13 +4949,15 @@ private slots:
         const double length = surface->property("length").toDouble(), position = mpv->property("position").toDouble();
         QVERIFY2(length >= 16 && position >= length - 8, qPrintable(QString("%1 of %2").arg(position).arg(length)));
         QVERIFY(surface->property("atEdge").toBool());
-        // At the edge the clock says how long the stream has run, and that it is live.
-        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u00b7 live")));
-        QVERIFY2(!timeOf(app).contains('/'), qPrintable(timeOf(app)));
+        // At the edge the clock says how long the stream has run (since it
+        // started, 2:14:05 ago: not the player's timeline, which is only what
+        // can be rewound), and that it is live; the bar is full.
+        QTRY_VERIFY2(QRegularExpression(QString::fromUtf8("^2:1[45]:\\d\\d \u00b7 live$")).match(timeOf(app)).hasMatch(), qPrintable(timeOf(app)));
+        QCOMPARE(App::under(surface, "seek")->property("fraction").toReal(), 1.0);
         QQuickItem *goLive = App::under(surface, "go-live");
         QVERIFY(goLive && !goLive->isVisible());
         // Under the title: how many are watching, and how long ago it started.
-        QVERIFY2(QRegularExpression(QString::fromUtf8("^1.2K watching \u00b7 started 2:14:\\d\\d ago$"))
+        QVERIFY2(QRegularExpression(QString::fromUtf8("^1.2K watching \u00b7 started 2 h 1[45] min ago$"))
                      .match(app.item("watch-stats")->property("text").toString()).hasMatch(),
                  qPrintable(app.item("watch-stats")->property("text").toString()));
         // The seek bar grows with the stream.
@@ -4960,6 +5015,62 @@ private slots:
         QTRY_VERIFY(!goLive->isVisible());
         QCOMPARE(app.asked("POST api/play"), 1);
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void inTheNarrowTileTheLiveKeysStayAndGoLiveIsAChip()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(941, 508), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QObject *mpv = playLive(app);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface"), *goLive = App::under(surface, "go-live"), *line = app.item("status-line");
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+        // At the edge: the chat's key outranks next, and fullscreen goes first.
+        QTRY_COMPARE(hintsOf(app), (QStringList{"space pause", "c chat", "? keys"}));
+        QVERIFY(line->property("roomy").toBool());
+        // Under the title, how long it has run stays clear of the channel's
+        // button: in whole hours, where the minutes don't fit beside it.
+        QQuickItem *stats = app.item("watch-stats"), *channel = app.item("watch-channel");
+        QTRY_VERIFY(stats->property("text").toString().contains("started"));
+        qreal rowEnd = channel->mapToScene(QPointF(channel->width(), 0)).x();
+        for (QQuickItem *sibling : channel->parentItem()->childItems())
+            if (sibling->isVisible())
+                rowEnd = qMax(rowEnd, sibling->mapToScene(QPointF(sibling->width(), 0)).x());
+        QVERIFY2(stats->mapToScene(QPointF(0, 0)).x() >= rowEnd, qPrintable(stats->property("text").toString()));
+        QVERIFY(!stats->property("truncated").toBool());
+
+        // Behind: Go live's key is never the one that goes.
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(!surface->property("atEdge").toBool(), 10000);
+        QTRY_COMPARE(hintsOf(app), (QStringList{"space pause", "End go live", "c chat", "? keys"}));
+        QVERIFY(line->property("roomy").toBool());
+
+        // Go live is a chip in the accent's fill with square corners, its key
+        // dimmed inside it, a little apart from the clock.
+        QTRY_VERIFY(goLive->isVisible());
+        QVERIFY(goLive->property("primary").toBool());
+        QCOMPARE(goLive->property("color").value<QColor>(), QColor(app.theme->property("accent").toString()));
+        QCOMPARE(goLive->property("radius").toReal(), 0.0);
+        QQuickItem *key = nullptr;
+        std::function<void(QQuickItem *)> find = [&](QQuickItem *item) {
+            if (item->property("text").toString() == "End" && item->inherits("QQuickText"))
+                key = item;
+            for (QQuickItem *child : item->childItems())
+                find(child);
+        };
+        find(goLive);
+        QVERIFY(key && key->isVisible());
+        const QColor ink(app.theme->property("accentForeground").toString()), dimmed = key->property("color").value<QColor>();
+        QVERIFY2(near(QColor(dimmed.red(), dimmed.green(), dimmed.blue()), ink) && qAbs(dimmed.alphaF() - 0.7) < 0.02,
+                 qPrintable(dimmed.name(QColor::HexArgb)));
+        QQuickItem *time = App::under(surface, "seek-time");
+        // (Once the row has laid it out.)
+        const auto gap = [&] { return goLive->mapToScene(QPointF(0, 0)).x() - time->mapToScene(QPointF(time->property("contentWidth").toReal(), 0)).x(); };
+        QTRY_VERIFY2(qAbs(gap() - 12) < 1, qPrintable(QString::number(gap())));
     }
 
     void goLiveGoesToTheEnginesEdgeWhenThePlayersLengthIsOld()
@@ -5653,6 +5764,54 @@ private slots:
         const QString then = chatMessages(app).last().value("message").toString();
         QTRY_VERIFY_WITH_TIMEOUT(chatMessages(app).last().value("message").toString() != then, 3000);
         QTRY_VERIFY(atNewest(list));
+    }
+
+    void theChatShowsWholeLinesOnly()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(941, 508), {{"QVEIL_STANDIN_LIVECLIP", clip}, {"QVEIL_STANDIN_CHAT_STILL", "1"}});
+        READY(app);
+        QVERIFY(playLive(app));
+        QQuickItem *chat = app.item("chat"), *list = app.item("chat-list");
+        QTRY_VERIFY(chat->property("count").toInt() >= 8);
+        // (Laid out, and at the newest.)
+        QTRY_VERIFY(atNewest(list) && list->property("contentHeight").toReal() > list->height());
+        // What of each message shows lies within the list, and begins and ends
+        // where its lines do. How many had a line cut off at the top.
+        const auto cutAtTop = [&](int &cut) {
+            const QRectF view = list->mapRectToScene(QRectF(0, 0, list->width(), list->height()));
+            for (QQuickItem *message : app.items("chat-message")) {
+                QQuickItem *shown = App::under(message, "chat-shown");
+                const qreal step = message->property("lineStep").toReal();
+                if (shown->height() <= 0)
+                    continue;
+                const QRectF r = shown->mapRectToScene(QRectF(0, 0, shown->width(), shown->height()));
+                if (r.top() < view.top() - 0.5 || r.bottom() > view.bottom() + 0.5)
+                    return QString("%1 shows %2 to %3, outside %4 to %5").arg(message->property("author").toString())
+                        .arg(r.top()).arg(r.bottom()).arg(view.top()).arg(view.bottom());
+                const auto whole = [step](qreal at) { const qreal lines = at / step; return qAbs(lines - qRound(lines)) < 0.01; };
+                if (!whole(shown->y()) || !whole(shown->height()))
+                    return QString("%1 shows from %2, %3 high, in lines of %4").arg(message->property("author").toString())
+                        .arg(shown->y()).arg(shown->height()).arg(step);
+                if (shown->y() > 0)
+                    ++cut;
+            }
+            return QString();
+        };
+        int cut = 0;
+        QString wrong = cutAtTop(cut);
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        // Wherever it is scrolled to.
+        for (int i = 0; i < 8 && list->property("contentY").toReal() > list->property("originY").toReal(); ++i) {
+            list->setProperty("contentY", list->property("contentY").toReal() - 23);
+            wrong = cutAtTop(cut);
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+        }
+        // (And some of those positions did cut a line short at the top.)
+        QVERIFY(cut > 0);
     }
 
     void withChatOffThereIsNoChatTab()
