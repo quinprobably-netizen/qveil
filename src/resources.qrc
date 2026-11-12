@@ -42,6 +42,7 @@
         <file alias="ChaptersTab.qml">ChaptersTab.qml</file>
         <file alias="UpNextTab.qml">UpNextTab.qml</file>
         <file alias="WatchPage.qml">WatchPage.qml</file>
+        <file alias="ChatTab.qml">ChatTab.qml</file>
         <file alias="CommentsTab.qml">CommentsTab.qml</file>
         <file alias="CommentItem.qml">CommentItem.qml</file>
         <file alias="Area.qml">Area.qml</file>

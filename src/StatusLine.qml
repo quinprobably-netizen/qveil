@@ -12,6 +12,8 @@ Rectangle {
     // Where the window is: a page's key (home, lenses, channels, channel,
     // history, search, settings), or "watch" while a video has the window.
     property string context: "home"
+    // Whether C reaches a running stream's chat, in place of the comments.
+    property bool chat: false
     // The route's word was pressed.
     signal routeClicked()
     // What the route's popup hangs from.
@@ -28,7 +30,7 @@ Rectangle {
         history: [["j k", qsTr("move")], ["Enter", qsTr("play")], ["?", qsTr("keys")]],
         search: [["h j k l", qsTr("move")], ["s", qsTr("sort")], ["?", qsTr("keys")]],
         settings: [["j k", qsTr("move")], ["Enter", qsTr("open")], ["?", qsTr("keys")]],
-        watch: [["space", qsTr("pause")], ["n", qsTr("next")], ["c", qsTr("comments")], ["f", qsTr("fullscreen")], ["?", qsTr("keys")]]
+        watch: [["space", qsTr("pause")], ["n", qsTr("next")], ["c", chat ? qsTr("chat") : qsTr("comments")], ["f", qsTr("fullscreen")], ["?", qsTr("keys")]]
     })
     // Fewer keys where the window is narrow: the first two, and the help.
     readonly property var shownHints: {

@@ -87,7 +87,8 @@ FocusScope {
         backend.closeComments()
         backend.closeChapters()
         expanded = false
-        sheet.current = "next"
+        // (A running stream's, taken back from the small window: its chat.)
+        sheet.current = sheet.first()
         flick.contentY = 0
         return true
     }
@@ -99,7 +100,9 @@ FocusScope {
         theatre = false
         if (full)
             return
-        sheet.current = tab === "chapters" && !sheet.hasChapters ? "next" : tab
+        // (While a stream runs its chat stands where the comments were.)
+        const at = sheet.tabsNow.indexOf(tab)
+        sheet.current = at >= 0 ? tab : tab === "comments" ? sheet.tabsNow[0] : "next"
         sheet.forceActiveFocus()
         // Under the video, it is brought into view.
         if (narrow)
@@ -277,6 +280,8 @@ FocusScope {
         height: page.beside ? page.height - Style.u * 5 - Style.gutter : below.height
         commentCount: comments.count
         hasChapters: surface.chapters.length > 0 || !!page.info.chaptersLater
+        live: surface.live
+        chatOn: backend.config.liveChat !== false
 
         chapters: ChaptersTab {
             anchors.fill: parent
@@ -286,6 +291,13 @@ FocusScope {
             current: bar.chapter
             keyed: sheet.keyed
             onChapterPicked: seconds => surface.seekTo(seconds)
+        }
+        chat: ChatTab {
+            anchors.fill: parent
+            keyed: sheet.keyed
+            video: page.info.id || ""
+            // Only while it shows, of a stream that runs, in this window.
+            active: sheet.visible && sheet.current === "chat" && sheet.live && sheet.chatOn && page.active
         }
         comments: CommentsTab {
             id: comments

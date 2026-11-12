@@ -7,8 +7,8 @@
 # (tests/shots/engine.py), inside a headless compositor of its own, so it
 # renders on the GPU without opening anything on the desktop. Views: home,
 # feed, narrow, lenses, channels, history, settings, settings-about, search,
-# watch, watch-comments, watch-live, watch-live-behind, waiting, pip (the small
-# window itself, with the video in it).
+# watch, watch-comments, watch-live, watch-live-behind, watch-chat, waiting,
+# pip (the small window itself, with the video in it).
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -40,6 +40,8 @@ if [ ! -f "$live/a/29.m4a" ] && command -v ffmpeg >/dev/null; then
   ffmpeg -loglevel error -f lavfi -i sine=f=440:d=60 -c:a aac $cut "$live/a/%d.m4a" || rm -rf "$live"
 fi
 [ -f "$live/a/29.m4a" ] && export QVEIL_STANDIN_LIVECLIP="$live"
+# A live chat that reads like one, and goes on.
+export QVEIL_STANDIN_CHAT_STILL=1
 
 # Pictures to stand in for thumbnails, made once.
 pictures="$ROOT/build/shot/pictures"

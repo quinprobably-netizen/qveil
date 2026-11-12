@@ -4822,11 +4822,11 @@ private slots:
 
     // Plays the stand-in's running stream, with its state asked for every
     // `check` ms, and waits for its first frame. The player, or null.
-    static QObject *playLive(App &app, int check = 10000)
+    static QObject *playLive(App &app, int check = 10000, const QString &id = "live0000001")
     {
         QQuickItem *surface = app.item("surface");
         surface->setProperty("liveCheckInterval", check);
-        app.play({{"id", "live0000001"}, {"title", "Live: the long one, part 2"}, {"live", "now"}});
+        app.play({{"id", id}, {"title", "Live: the long one, part 2"}, {"live", "now"}});
         QObject *mpv = surface->property("mpv").value<QObject *>();
         if (!QTest::qWaitFor([mpv] { return mpv->property("started").toBool() && mpv->property("duration").toDouble() > 0; }, 20000))
             return nullptr;
@@ -5196,6 +5196,351 @@ private slots:
         QTRY_VERIFY2(textOf(room, "waiting-line").contains("members only"), qPrintable(textOf(room, "waiting-line")));
         QVERIFY(!app.item("errorBar")->isVisible());
         QCOMPARE(app.asked("POST api/play"), 2);
+    }
+
+    void aBotCheckInTheWaitingRoomOffersAnotherRoute()
+    {
+        App app;
+        READY(app);
+        QQuickItem *room = openWaiting(app, "waitingbot01");
+        QVERIFY(room);
+        // The engine's words in the room, and the bar's offer of another
+        // route, as for any bot check.
+        QTRY_VERIFY2(textOf(room, "waiting-line").contains("bot check"), qPrintable(textOf(room, "waiting-line")));
+        QTRY_VERIFY(app.item("errorBar")->isVisible());
+        QCOMPARE(app.backend->errorCode(), QString("bot_check"));
+        QVERIFY(app.item("changeRoute")->isVisible());
+        QVERIFY(room->isVisible());
+        QCOMPARE(app.asked("POST api/play"), 1);
+    }
+
+    // --- The live chat (T1). ---
+
+    // How many chats the stand-in engine has open.
+    static int openChats(App &app)
+    {
+        const QString base = app.backend->thumbBase().chopped(QString("/thumb/").size());
+        QNetworkReply *reply = app.web.get(QNetworkRequest(QUrl(base + "/api/_chats")));
+        QSignalSpy done(reply, &QNetworkReply::finished);
+        done.wait(5000);
+        const int open = QJsonDocument::fromJson(reply->readAll()).object().value("open").toInt(-1);
+        reply->deleteLater();
+        return open;
+    }
+    // The messages the chat tab holds, oldest first, as {author, message, owner, amount}.
+    static QList<QVariantMap> chatMessages(App &app)
+    {
+        QList<QVariantMap> found;
+        auto *model = qobject_cast<QAbstractItemModel *>(app.item("chat-list")->property("model").value<QObject *>());
+        if (!model)
+            return found;
+        const QHash<int, QByteArray> roles = model->roleNames();
+        for (int row = 0; row < model->rowCount(); ++row) {
+            QVariantMap m;
+            for (auto it = roles.begin(); it != roles.end(); ++it)
+                m.insert(QString::fromUtf8(it.value()), model->data(model->index(row, 0), it.key()));
+            found << m;
+        }
+        return found;
+    }
+    // The message on screen whose author is `author`.
+    static QQuickItem *chatLine(App &app, const QString &author)
+    {
+        for (QQuickItem *line : app.items("chat-message"))
+            if (line->property("author").toString() == author)
+                return line;
+        return nullptr;
+    }
+    static bool near(const QColor &a, const QColor &b)
+    {
+        return qAbs(a.red() - b.red()) <= 1 && qAbs(a.green() - b.green()) <= 1 && qAbs(a.blue() - b.blue()) <= 1
+               && qAbs(a.alpha() - b.alpha()) <= 2;
+    }
+    // Whether the chat's list shows its newest message, at the foot.
+    static bool atNewest(QQuickItem *list)
+    {
+        const qreal y = list->property("contentY").toReal(), h = list->height();
+        const qreal end = list->property("originY").toReal() + list->property("contentHeight").toReal();
+        return y + h >= end - 2;
+    }
+
+    void aLiveStreamOpensOnTheChatTab()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QVERIFY(playLive(app, 300));
+        QQuickItem *sheet = app.item("sheet"), *chat = app.item("tab-chat"), *next = app.item("tab-next"),
+                   *comments = app.item("tab-comments");
+        // Chat, then Up next (and Chapters, for a stream that has them); no Comments.
+        QCOMPARE(sheet->property("current").toString(), QString("chat"));
+        QCOMPARE(sheet->property("tabsNow").toStringList(), QStringList({"chat", "next"}));
+        QVERIFY(chat->isVisible() && next->isVisible() && !comments->isVisible());
+        QVERIFY(chat->x() < next->x());
+        QCOMPARE(chat->property("text").toString(), QString("Chat"));
+        QVERIFY(app.item("chat")->isVisible());
+        // C, the comments' key, takes the keyboard to the chat, and says so.
+        QStringList foot;
+        App::texts(app.item("status-line"), foot);
+        QVERIFY2(foot.contains("chat") && !foot.contains("comments"), qPrintable(foot.join('|')));
+        QMetaObject::invokeMethod(sheet, "turn", Q_ARG(QVariant, 1));
+        QTRY_COMPARE(sheet->property("current").toString(), QString("next"));
+        QTest::keyClick(app.window, Qt::Key_C);
+        QTRY_COMPARE(sheet->property("current").toString(), QString("chat"));
+        QVERIFY(sheet->property("keyed").toBool());
+        QTest::keyClick(app.window, Qt::Key_Escape);
+
+        // Once it ends, Comments is back, and the chat goes.
+        app.endTheStream();
+        QTRY_VERIFY_WITH_TIMEOUT(app.item("surface")->property("liveEnded").toBool(), 5000);
+        QTRY_VERIFY(!chat->isVisible());
+        QVERIFY(comments->isVisible());
+        QCOMPARE(sheet->property("tabsNow").toStringList(), QStringList({"next", "comments"}));
+        QCOMPARE(sheet->property("current").toString(), QString("next"));
+        QTRY_COMPARE(openChats(app), 0);
+        QVERIFY(!app.item("errorBar")->isVisible());
+    }
+
+    void chatShowsMessagesSuperChatsAndOwner()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QVERIFY(playLive(app));
+        QTRY_COMPARE(app.items("chat-message").size(), 4);
+        const QColor fg(app.theme->foreground()), accent(app.theme->accent()), warn("#e0a93b");
+        QColor faint = fg;
+        faint.setAlphaF(0.40);
+
+        // Someone: the name muted, the words as they are.
+        QQuickItem *someone = chatLine(app, "mara_k");
+        QVERIFY(someone);
+        QQuickItem *who = App::under(someone, "chat-author");
+        QVERIFY2(near(who->property("color").value<QColor>(), faint), qPrintable(who->property("color").value<QColor>().name(QColor::HexArgb)));
+        QCOMPARE(App::under(someone, "chat-text")->property("text").toString(), QString("is that cone 10 already?"));
+        QVERIFY(!App::under(someone, "chat-rule")->isVisible());
+        QVERIFY(!App::under(someone, "chat-amount")->isVisible());
+        // The channel's owner: the name in the accent.
+        QQuickItem *owner = chatLine(app, "Low Level Hours");
+        QVERIFY(owner);
+        QVERIFY(near(App::under(owner, "chat-author")->property("color").value<QColor>(), accent));
+        // A Super Chat: a thin warn rule, and its amount in warn, bold.
+        QQuickItem *paid = chatLine(app, "ottoleaf");
+        QVERIFY(paid);
+        QQuickItem *rule = App::under(paid, "chat-rule"), *amount = App::under(paid, "chat-amount");
+        QVERIFY(rule->isVisible());
+        QCOMPARE(rule->width(), 2.0);
+        QVERIFY(near(rule->property("color").value<QColor>(), warn));
+        QVERIFY(amount->isVisible());
+        QCOMPARE(amount->property("text").toString(), QString("$5.00"));
+        QVERIFY(near(amount->property("color").value<QColor>(), warn));
+        QCOMPARE(amount->property("font").value<QFont>().weight(), QFont::DemiBold);
+        QVERIFY(near(App::under(paid, "chat-author")->property("color").value<QColor>(), faint));
+        // Markup is text: nothing in a message is read as rich text.
+        QQuickItem *markup = chatLine(app, "pell");
+        QVERIFY(markup);
+        QCOMPARE(App::under(markup, "chat-text")->property("text").toString(), QString("<b>not bold</b> & <a href='x'>no link</a>"));
+        for (QQuickItem *line : app.items("chat-message"))
+            for (const char *part : {"chat-text", "chat-author", "chat-amount"})
+                QCOMPARE(App::under(line, part)->property("textFormat").toInt(), 0 /* Text.PlainText */);
+        // The words stand after the name, on its line.
+        QQuickItem *text = App::under(someone, "chat-text");
+        QCOMPARE(text->property("lineCount").toInt(), 1);
+        QVERIFY(text->property("contentWidth").toReal() + who->width() <= someone->width());
+        // (Nothing of the words lies under the name: their first line, as it
+        // was laid out last, starts after it, and so the words reach past it.)
+        for (const char *name : {"mara_k", "ottoleaf", "Low Level Hours"}) {
+            QQuickItem *line = chatLine(app, name), *words = App::under(line, "chat-text"), *head = App::under(line, "chat-author");
+            const qreal after = words->mapFromItem(head, QPointF(head->width(), 0)).x();
+            QVERIFY2(words->property("indent").toReal() >= after, qPrintable(QString("%1 %2").arg(words->property("indent").toReal()).arg(after)));
+            QVERIFY(words->property("contentWidth").toReal() > after);
+        }
+
+        QCOMPARE(app.item("chat-footer")->property("text").toString(), QString::fromUtf8("Read only · text, no pictures fetched"));
+        QVERIFY(app.item("chat-footer")->isVisible());
+        QVERIFY(!app.item("errorBar")->isVisible());
+    }
+
+    void chatOnlyRunsWhileItsTabIsShown()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        // A video that isn't live has no chat.
+        app.play(app.backend->feed()->get(0));
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QTest::qWait(300);
+        QCOMPARE(app.asked("GET api/chat"), 0);
+
+        QVERIFY(playLive(app));
+        QQuickItem *sheet = app.item("sheet");
+        QTRY_COMPARE(openChats(app), 1);
+        QCOMPARE(app.asked("GET api/chat?v=live0000001"), 1);
+        // Another tab: the chat is hung up on, and not asked for again.
+        QMetaObject::invokeMethod(sheet, "turn", Q_ARG(QVariant, 1));
+        QTRY_COMPARE(openChats(app), 0);
+        QVERIFY(!app.backend->busy().contains("chat"));
+        QTest::qWait(500);
+        QCOMPARE(app.asked("GET api/chat"), 1);
+        // Back to it: asked again.
+        app.click(app.item("tab-chat"));
+        QTRY_COMPARE(openChats(app), 1);
+        QCOMPARE(app.asked("GET api/chat"), 2);
+        // In theatre the sheet is put away, and the chat with it.
+        app.item("watch")->setProperty("theatre", true);
+        QTRY_COMPARE(openChats(app), 0);
+        app.item("watch")->setProperty("theatre", false);
+        QTRY_COMPARE(openChats(app), 1);
+        QCOMPARE(app.asked("GET api/chat"), 3);
+        // In the small window it isn't read (the chat stays in this one), and
+        // back here the stream is on its chat again.
+        QMetaObject::invokeMethod(app.window, "togglePip");
+        QTRY_VERIFY(app.pip()->isVisible());
+        QTRY_COMPARE(openChats(app), 0);
+        QMetaObject::invokeMethod(app.window, "togglePip");
+        QTRY_VERIFY(!app.pip()->isVisible());
+        QTRY_COMPARE(sheet->property("current").toString(), QString("chat"));
+        QTRY_COMPARE(openChats(app), 1);
+        QCOMPARE(app.asked("GET api/chat"), 4);
+        app.window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(app.window));
+        // Leaving the stream hangs up too.
+        QVERIFY(app.goFromTheVideo("history"));
+        QTRY_COMPARE(openChats(app), 0);
+        QTest::qWait(500);
+        QCOMPARE(app.asked("GET api/chat"), 4);
+        QVERIFY(!app.item("errorBar")->isVisible());
+    }
+
+    void chatKeepsTheNewest300()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}, {"QVEIL_STANDIN_CHAT_MORE", "350"},
+                                         {"QVEIL_STANDIN_CHAT_EVERY", "0.25"}});
+        READY(app);
+        QVERIFY(playLive(app));
+        QQuickItem *chat = app.item("chat"), *list = app.item("chat-list");
+        // 354 came at once: the oldest went.
+        QTRY_COMPARE(chat->property("count").toInt(), 300);
+        QList<QVariantMap> held = chatMessages(app);
+        QCOMPARE(held.size(), 300);
+        // (More may have come since: they are the newest 300 in a row, the first four among the gone.)
+        const int first = held.first().value("message").toString().section(' ', 1).toInt(),
+                  lastHeld = held.last().value("message").toString().section(' ', 1).toInt();
+        QVERIFY2(first >= 51 && lastHeld == first + 299, qPrintable(QString("%1 to %2").arg(first).arg(lastHeld)));
+        // It shows the newest, and goes on doing so as more come.
+        QTRY_VERIFY(atNewest(list));
+        const QString newest = chatMessages(app).last().value("message").toString();
+        QTRY_VERIFY_WITH_TIMEOUT(chatMessages(app).last().value("message").toString() != newest, 3000);
+        QCOMPARE(chat->property("count").toInt(), 300);
+        QTRY_VERIFY(atNewest(list));
+
+        // Scrolled up, it stays where it was read.
+        for (int i = 0; i < 4; ++i)
+            QMetaObject::invokeMethod(chat, "step", Q_ARG(QVariant, -1));
+        QVERIFY(!atNewest(list));
+        int top = -1;
+        QMetaObject::invokeMethod(list, "indexAt", Q_RETURN_ARG(int, top), Q_ARG(qreal, 10),
+                                  Q_ARG(qreal, list->property("contentY").toReal() + 1));
+        QVERIFY(top >= 0);
+        const QString reading = chatMessages(app).value(top).value("message").toString();
+        const QString last = chatMessages(app).last().value("message").toString();
+        QTRY_VERIFY_WITH_TIMEOUT(chatMessages(app).last().value("message").toString() != last, 3000);
+        QTest::qWait(600);
+        QVERIFY(!atNewest(list));
+        QMetaObject::invokeMethod(list, "indexAt", Q_RETURN_ARG(int, top), Q_ARG(qreal, 10),
+                                  Q_ARG(qreal, list->property("contentY").toReal() + 1));
+        QCOMPARE(chatMessages(app).value(top).value("message").toString(), reading);
+        // Enter goes back to the newest, which it then follows again.
+        QMetaObject::invokeMethod(chat, "activate");
+        QTRY_VERIFY(atNewest(list));
+        const QString then = chatMessages(app).last().value("message").toString();
+        QTRY_VERIFY_WITH_TIMEOUT(chatMessages(app).last().value("message").toString() != then, 3000);
+        QTRY_VERIFY(atNewest(list));
+    }
+
+    void withChatOffThereIsNoChatTab()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        app.backend->setConfig({{"liveChat", false}});
+        QTRY_VERIFY(!app.backend->config().value("liveChat").toBool());
+        QVERIFY(playLive(app));
+        QQuickItem *sheet = app.item("sheet");
+        QCOMPARE(sheet->property("tabsNow").toStringList(), QStringList({"next"}));
+        QCOMPARE(sheet->property("current").toString(), QString("next"));
+        QVERIFY(!app.item("tab-chat")->isVisible());
+        QTest::qWait(500);
+        QCOMPARE(app.asked("GET api/chat"), 0);
+
+        // Turned on: the tab is there, and opens when chosen (not by itself).
+        app.backend->setConfig({{"liveChat", true}});
+        QTRY_VERIFY(app.item("tab-chat")->isVisible());
+        QCOMPARE(sheet->property("current").toString(), QString("next"));
+        QCOMPARE(app.asked("GET api/chat"), 0);
+        app.click(app.item("tab-chat"));
+        QTRY_COMPARE(openChats(app), 1);
+        // Turned off while it shows: the tab goes, and so does the chat.
+        app.backend->setConfig({{"liveChat", false}});
+        QTRY_VERIFY(!app.item("tab-chat")->isVisible());
+        QCOMPARE(sheet->property("current").toString(), QString("next"));
+        QTRY_COMPARE(openChats(app), 0);
+        QVERIFY(!app.item("errorBar")->isVisible());
+
+        // (The engine refuses a chat while the setting is off.)
+        QSignalSpy failed(app.backend.get(), &Backend::chatFailed);
+        app.backend->chat("live0000001");
+        QTRY_COMPARE(failed.count(), 1);
+        QCOMPARE(failed.first().first().toString(), QString("Live chat is turned off in the settings"));
+        app.backend->clearError();
+    }
+
+    void aBotCheckOnTheChatIsAskedOnceMore()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        // Once: asked again by itself, on a fresh request, and nothing is said.
+        QVERIFY(playLive(app, 10000, "livebotonce1"));
+        QTRY_COMPARE(app.items("chat-message").size(), 4);
+        QCOMPARE(app.asked("GET api/chat?v=livebotonce1"), 2);
+        QVERIFY(!app.item("errorBar")->isVisible());
+        QVERIFY(!app.item("chat-note")->isVisible());
+
+        // Twice: a line in the tab with Try again, and the bar offers another route.
+        QVERIFY(playLive(app, 10000, "livebot00001"));
+        QTRY_VERIFY(app.item("chat-retry") && app.item("chat-retry")->isVisible());
+        QCOMPARE(app.asked("GET api/chat?v=livebot00001"), 2);
+        QVERIFY(app.item("chat-note")->isVisible());
+        QVERIFY(app.items("chat-message").isEmpty());
+        QTRY_VERIFY(app.item("errorBar")->isVisible());
+        QCOMPARE(app.backend->errorCode(), QString("bot_check"));
+        QVERIFY(app.item("changeRoute")->isVisible());
+        QTest::qWait(500);
+        QCOMPARE(app.asked("GET api/chat?v=livebot00001"), 2);
+        // Try again asks again (and once more, as before).
+        app.click(app.item("chat-retry"));
+        QTRY_COMPARE(app.asked("GET api/chat?v=livebot00001"), 4);
+        QTRY_VERIFY(app.item("chat-retry")->isVisible());
     }
 };
 

@@ -690,6 +690,7 @@ ApplicationWindow {
                 visible: !(win.watching && win.fullscreen)
                 height: visible ? implicitHeight : 0
                 context: win.watching ? "watch" : win.page
+                chat: watch.sheet.tabsNow[0] === "chat"
                 z: 3
                 onRouteClicked: win.toggleRoute()
             }

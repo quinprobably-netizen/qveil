@@ -277,7 +277,7 @@ void Backend::refuse(const QString &task) {
 
 bool Backend::newestOnly(const QString &task) {
     static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "chapters", "lens", "read",
-                                     "live-state", "wait"};
+                                     "live-state", "wait", "chat"};
     return tasks.contains(task);
 }
 
@@ -364,10 +364,16 @@ void Backend::adoptConfig(const QVariantMap &next, bool routeSet) {
     emit configChanged();
     if (!moved)
         return;
+    leaveRoute();
+}
+
+void Backend::leaveRoute() {
     // A video that was still being looked up went through the old route, so
-    // its answer must not open a player now. Nor is a stream waited for on it.
+    // its answer must not open a player now. Nor is a stream waited for, or
+    // its chat read, on it.
     supersede("play");
     supersede("wait");
+    supersede("chat");
     emit routeChanged();
 }
 
@@ -392,9 +398,7 @@ void Backend::setConfig(const QVariantMap &patch) {
                   m_configShown = n;
                   adoptConfig(next, newProxy);
               } else if (newProxy) {
-                  supersede("play");
-                  supersede("wait");
-                  emit routeChanged();
+                  leaveRoute();
               }
               // Fewer days, or none, takes kept positions with it.
               if (patch.contains("resumeDays"))
@@ -846,12 +850,77 @@ void Backend::wait(const QString &video, qint64 starts) {
         [this](const QString &message, const QString &code) {
             // The user left the route it was waited for on; the window opens
             // it again on the new one (see routeChanged).
-            if (code != "route_changed")
-                emit waitFailed(message, code);
+            if (code == "route_changed")
+                return;
+            emit waitFailed(message, code);
+            // The room says what happened. One that another route may get
+            // past (a bot check) is the window's error too, which offers to
+            // change the route, as it does everywhere else.
+            if (offersRoute(code))
+                setError(message, code);
         });
 }
 
 void Backend::stopWait() { supersede("wait"); }
+
+void Backend::chat(const QString &video) { openChat(video, 0); }
+
+void Backend::openChat(const QString &video, int tries) {
+    QUrlQuery q;
+    q.addQueryItem("v", video);
+    // The engine sends a heartbeat after 25 s of quiet, well inside the idle
+    // timeout (see wait()).
+    static_assert(IdleTimeoutMs >= 60000, "a chat is silent for up to 25 s between two lines");
+    // Which request this is, and whether it failed: only the latest one that
+    // didn't is said to have ended.
+    auto mine = std::make_shared<quint64>(0);
+    auto failed = std::make_shared<bool>(false);
+    stream(
+        "api/chat", q, "chat",
+        [this](const QVariantList &lines) {
+            QVariantList messages;
+            for (const QVariant &line : lines) {
+                const QVariantMap o = line.toMap();
+                // (The heartbeat only keeps the connection alive.)
+                if (o.contains("heartbeat"))
+                    continue;
+                const QVariant amount = o.value("amount");
+                messages << QVariantMap{{"author", o.value("author").toString()},
+                                        {"text", o.value("text").toString()},
+                                        {"owner", o.value("owner").toBool()},
+                                        {"amount", amount.isNull() ? QString() : amount.toString()}};
+            }
+            if (!messages.isEmpty())
+                emit chatLines(messages);
+        },
+        [this, mine, failed] {
+            if (!*failed && *mine != 0 && m_latest.value("chat") == *mine)
+                emit chatEnded();
+        },
+        [this, video, tries, mine, failed](const QString &message, const QString &code) {
+            *failed = true;
+            // The user left the route; the window opens the stream, and its
+            // chat, again on the new one (see routeChanged).
+            if (code == "route_changed")
+                return;
+            // Asked once more, unless it was left meanwhile. (Not from inside
+            // the reply that is finishing.)
+            if (code == "bot_check" && tries == 0) {
+                QTimer::singleShot(0, this, [this, video, mine] {
+                    if (m_latest.value("chat") == *mine)
+                        openChat(video, 1);
+                });
+                return;
+            }
+            emit chatFailed(message, code);
+            setError(message, code);
+        });
+    // (Not ready: refused at once, and never the latest.)
+    if (m_replies.contains("chat"))
+        *mine = m_latest.value("chat");
+}
+
+void Backend::stopChat() { supersede("chat"); }
 
 void Backend::loadResume() {
     call("GET", "api/resume", {}, {}, "resume", [this](const QJsonValue &v) {

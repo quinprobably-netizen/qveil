@@ -185,6 +185,14 @@ public:
     Q_INVOKABLE void wait(const QString &video, qint64 starts = 0);
     // Hangs up on the wait: the room was left.
     Q_INVOKABLE void stopWait();
+    // A running stream's live chat, read only and text only, for as long as
+    // the Chat tab shows: chatLines() hands on its messages as they come.
+    // One chat at a time: a new one, or stopChat(), hangs up on the one
+    // before. A bot check is met by asking once more, on a fresh request
+    // (and so, over Tor, a fresh identity); a second one is a failure.
+    Q_INVOKABLE void chat(const QString &video);
+    // Hangs up on the chat: its tab was left, or the stream.
+    Q_INVOKABLE void stopChat();
     Q_INVOKABLE void loadResume();
     // Tells the engine where `video` (id, title, channel) is. Says nothing
     // until the player knows how long the video is.
@@ -275,6 +283,14 @@ signals:
     // this region, …), in the engine's words. Shown in the room, not as the
     // window's error.
     void waitFailed(const QString &message, const QString &code);
+    // Messages of the live chat (see chat()), oldest first: {author, text,
+    // owner, amount}, with `amount` empty but for a Super Chat.
+    void chatLines(const QVariantList &lines);
+    // The chat is over without a failure: the stream ended, or the setting
+    // was turned off.
+    void chatEnded();
+    // The chat failed, in the engine's words (also the window's error).
+    void chatFailed(const QString &message, const QString &code);
     // The latest request of `task` failed (the error itself is in `error`).
     void taskFailed(const QString &task);
     void notice(const QString &text);
@@ -349,6 +365,11 @@ private:
     // Takes a config from the engine, and says so if it moved the route.
     // `routeSet` is true when the window itself just asked for that route.
     void adoptConfig(const QVariantMap &next, bool routeSet);
+    // One request of the chat; `tries` is how many came before it.
+    void openChat(const QString &video, int tries);
+    // Hangs up on what is played, waited for or read over a route that was
+    // left: the engine ends them, and the window opens them again.
+    void leaveRoute();
 
     QProcessEnvironment m_environment;
     QString m_corePath;

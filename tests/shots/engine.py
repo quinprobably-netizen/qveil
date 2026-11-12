@@ -21,6 +21,10 @@ A video whose ID starts with "waiting" is an announced stream: its play
 answers `waiting` and no streams, and `GET api/wait` is its waiting room (see
 `Handler.wait`). Once the room has said "now", playing it again answers the
 running stream above. `GET api/_waits` says how many rooms are open.
+
+`GET api/chat` is a running stream's live chat (see `Handler.chat`), refused
+with 409 while the `liveChat` setting is off. `GET api/_chats` says how many
+chats are open.
 """
 import http.server
 import json
@@ -47,6 +51,30 @@ waits = {"open": 0, "started": set(), "lock": threading.Lock()}
 # end of its ID: an hour and three quarters ahead, a little late, very late,
 # or not known.
 WAIT_STARTS = {"late": -12 * 60, "verylate": -40 * 60, "none": None}
+# The live chat (`GET api/chat`): its first messages (someone, the channel's
+# owner, a Super Chat, and markup that must show as it was typed), and the
+# chats open now, with how often each video's was asked for.
+CHAT = [
+    {"author": "mara_k", "text": "is that cone 10 already?", "owner": False, "amount": None},
+    {"author": "Low Level Hours", "text": "not yet, about cone 8. another hour", "owner": True, "amount": None},
+    {"author": "ottoleaf", "text": "for the gas bill :fire:", "owner": False, "amount": "$5.00"},
+    {"author": "pell", "text": "<b>not bold</b> & <a href='x'>no link</a>", "owner": False, "amount": None},
+]
+# What a still of the chat shows after those (QVEIL_STANDIN_CHAT_STILL).
+CHAT_STILL = [
+    ("junebug", "what's the allocator doing on free, exactly?", None),
+    ("tomás", "first time catching one of these live", None),
+    ("rook_s", "watching from the night shift :wave:", None),
+    ("Low Level Hours", "on free it goes back to the size class list, I'll show it in a sec", None),
+    ("ivy", "the flame graph on the left is genius", None),
+    ("pell", "more of these streams please", "$2.00"),
+    ("mara_k", ":clap: :clap:", None),
+    ("ottoleaf", "does the arena ever give memory back to the OS?", None),
+    ("junebug", "thanks!", None),
+]
+chats = {"open": 0, "asked": {}, "lock": threading.Lock()}
+BOT_CHECK = "YouTube is asking this IP to sign in (bot check). Try another route or try later."
+CHAT_OFF = "Live chat is turned off in the settings"
 GAVE_UP = "The stream hasn't started, and qveil stopped waiting for it after 6 hours."
 MEMBERS_ONLY = "This video is for the channel's members only; qveil never signs in, so it can't be played."
 
@@ -424,7 +452,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query, keep_blank_values=True).items()}
         path = u.path.split("/t/", 1)[-1]
-        if path not in ("api/_log", "api/_waits") and not path.startswith("thumb/"):
+        if path not in ("api/_log", "api/_waits", "api/_chats") and not path.startswith("thumb/"):
             state["log"].append("%s %s%s" % (self.command, path, "?" + u.query if u.query else ""))
         return path, q
 
@@ -492,7 +520,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         until the window hangs up. With QVEIL_STANDIN_WAIT_NOW_MS set, the
         stream starts that many ms after the room opened: "now", and the job
         ends. A "waitinggaveup…" stream is given up on, and a
-        "waitingmembers…" one turns out to be for members only."""
+        "waitingmembers…" one turns out to be for members only, and a
+        "waitingbot…" one meets a bot check."""
         v = q.get("v", "")
         raw = q.get("starts", "")
         starts = int(raw) if raw.lstrip("-").isdigit() else None
@@ -514,6 +543,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 time.sleep(0.3)
                 say({"state": "gave_up", "error": GAVE_UP, "code": "gave_up"})
                 return
+            if v.startswith("waitingbot"):
+                time.sleep(0.3)
+                say({"error": BOT_CHECK, "code": "bot_check"})
+                return
             if v.startswith("waitingmembers"):
                 time.sleep(0.3)
                 say({"error": MEMBERS_ONLY, "code": "members_only"})
@@ -534,6 +567,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             with waits["lock"]:
                 waits["open"] -= 1
+
+    def chat(self, q):
+        """`GET api/chat`, as the engine answers it: CHAT at once, then
+        QVEIL_STANDIN_CHAT_MORE numbered messages in the same go, then one
+        more every QVEIL_STANDIN_CHAT_EVERY seconds (none if unset), with a
+        heartbeat every QVEIL_STANDIN_CHAT_BEAT seconds (25 by default) of
+        silence (with QVEIL_STANDIN_CHAT_STILL, CHAT_STILL in place of the
+        markup), until the window hangs up or the stream ends. A
+        "livebotonce…" stream's chat meets a bot check the first time it is
+        asked for, and a "livebot…" one every time."""
+        if not state["config"]["liveChat"]:
+            self.send(409, {"error": CHAT_OFF, "code": "other"})
+            return
+        v = q.get("v", "")
+        more = int(os.environ.get("QVEIL_STANDIN_CHAT_MORE", "0"))
+        every = float(os.environ.get("QVEIL_STANDIN_CHAT_EVERY", "0") or 0)
+        beat = float(os.environ.get("QVEIL_STANDIN_CHAT_BEAT", "25"))
+        with chats["lock"]:
+            chats["asked"][v] = chats["asked"].get(v, 0) + 1
+            asked = chats["asked"][v]
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+
+        def say(lines):
+            self.wfile.write("".join(json.dumps(line) + "\n" for line in lines).encode())
+            self.wfile.flush()
+
+        with chats["lock"]:
+            chats["open"] += 1
+        try:
+            if v.startswith("livebotonce") and asked == 1 or v.startswith("livebot") and not v.startswith("livebotonce"):
+                time.sleep(0.2)
+                say([{"error": BOT_CHECK, "code": "bot_check"}])
+                return
+            n = 0
+
+            def message():
+                return {"author": "viewer%d" % n, "text": "message %d" % n, "owner": False, "amount": None}
+            batch = list(CHAT)
+            if os.environ.get("QVEIL_STANDIN_CHAT_STILL"):
+                batch = batch[:3] + [{"author": a, "text": t, "owner": a == CHANNELS[0][1], "amount": m}
+                                     for a, t, m in CHAT_STILL]
+            for _ in range(more):
+                n += 1
+                batch.append(message())
+            say(batch)
+            last = said = time.monotonic()
+            while not self.hung_up() and not live["ended"]:
+                now = time.monotonic()
+                if every and now - said >= every:
+                    n += 1
+                    say([message()])
+                    said = last = now
+                elif now - last >= beat:
+                    say([{"heartbeat": True}])
+                    last = now
+                time.sleep(0.02)
+        except OSError:
+            pass
+        finally:
+            with chats["lock"]:
+                chats["open"] -= 1
 
     def live(self, rest):
         """A running stream's playlists, segments and state, as the engine serves them."""
@@ -564,6 +660,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(200, {"open": waits["open"]})
         elif path == "api/wait":
             self.wait(q)
+        elif path == "api/_chats":
+            self.send(200, {"open": chats["open"]})
+        elif path == "api/chat":
+            self.chat(q)
         elif path == "api/config":
             self.send(200, state["config"])
         elif path == "api/feed":

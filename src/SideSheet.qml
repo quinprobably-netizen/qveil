@@ -2,29 +2,55 @@ import QtQuick
 import Qveil
 
 // Beside the video: what it says about itself, what people say about it,
-// and what comes next. One of them at a time.
+// and what comes next. One of them at a time. While a stream runs, its live
+// chat stands first in place of the comments, which return once it ends.
 Rectangle {
     id: sheet
     objectName: "sheet"
 
-    // "next", "comments" or "chapters".
+    // "chat", "next", "comments" or "chapters".
     property string current: "next"
+    // Whether the video is a stream that is running now, and whether its
+    // chat may be shown (the setting).
+    property bool live: false
+    property bool chatOn: true
     // How many comments the video has, when that is known.
     property var commentCount: undefined
     // Whether the video has chapters: without them there is no tab for them.
     property bool hasChapters: false
+    property alias chat: chatSlot.data
     property alias next: nextSlot.data
     property alias comments: commentsSlot.data
     property alias chapters: chaptersSlot.data
-    readonly property var tabsNow: hasChapters ? ["next", "comments", "chapters"] : ["next", "comments"]
+    readonly property var tabsNow: tabsOf(live, chatOn, hasChapters)
+    function tabsOf(live, chatOn, hasChapters) {
+        return (live ? (chatOn ? ["chat", "next"] : ["next"]) : ["next", "comments"]).concat(hasChapters ? ["chapters"] : [])
+    }
     // Whether the keyboard is in the sheet.
     readonly property bool keyed: activeFocus
     // What is in the tab that is showing (it takes step(by) and activate()).
     readonly property Item shown: {
-        const slot = current === "comments" ? commentsSlot : current === "chapters" ? chaptersSlot : nextSlot
+        const slot = current === "chat" ? chatSlot : current === "comments" ? commentsSlot
+            : current === "chapters" ? chaptersSlot : nextSlot
         return slot.children.length > 0 ? slot.children[0] : null
     }
-    onHasChaptersChanged: if (!hasChapters && current === "chapters") current = "next"
+    // The tab a video opens on: a running stream's chat, else Up next.
+    function first() { return tabsOf(live, chatOn, hasChapters)[0] }
+    // A tab that has gone leaves Up next showing. (Not the comments, in
+    // place of the chat of a stream that ended: those are a lookup of their
+    // own, made only when asked for.) A stream that starts running opens on
+    // its chat. (From what the tabs are now: `tabsNow` may not have heard yet.)
+    function settle() {
+        if (tabsOf(live, chatOn, hasChapters).indexOf(current) < 0)
+            current = "next"
+    }
+    onHasChaptersChanged: settle()
+    onChatOnChanged: settle()
+    onLiveChanged: {
+        if (live && chatOn)
+            current = "chat"
+        settle()
+    }
 
     function turn(by) {
         const at = tabsNow.indexOf(current)
@@ -60,6 +86,15 @@ Rectangle {
         anchors.right: parent.right
         anchors.top: parent.top
         TabWord {
+            objectName: "tab-chat"
+            underlined: true
+            activeFocusOnTab: false
+            visible: sheet.live && sheet.chatOn
+            text: qsTr("Chat")
+            current: sheet.current === "chat"
+            onClicked: sheet.current = "chat"
+        }
+        TabWord {
             objectName: "tab-next"
             underlined: true
             activeFocusOnTab: false
@@ -71,6 +106,7 @@ Rectangle {
             objectName: "tab-comments"
             underlined: true
             activeFocusOnTab: false
+            visible: !sheet.live
             text: sheet.commentCount > 0 ? qsTr("Comments %1").arg(Number(sheet.commentCount).toLocaleString(Qt.locale(), "f", 0))
                                          : qsTr("Comments")
             current: sheet.current === "comments"
@@ -99,6 +135,11 @@ Rectangle {
         anchors.top: under.bottom
         anchors.bottom: parent.bottom
         visible: sheet.current === "next"
+    }
+    Item {
+        id: chatSlot
+        anchors.fill: nextSlot
+        visible: sheet.current === "chat"
     }
     Item {
         id: commentsSlot
