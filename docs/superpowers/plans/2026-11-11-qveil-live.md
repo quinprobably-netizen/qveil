@@ -76,28 +76,30 @@ holds the measured facts that this plan's values come from.
 
 1. **Tor stalls on one fragment at the edge.** The stalled fetch is redone
    on a fresh client within `FIRST_WITHIN`. The player sees a slow
-   segment, never a skipped one. Pinned in Task E5 by
+   segment, never a skipped one. Pinned in Task 5 by
    `a_frozen_fragment_is_fetched_again_not_skipped`.
 2. **The user leaves a live video.** Within two segment lengths the
    upstream sees no more requests: head polling, read-ahead and chat's
-   yt-dlp all stop. Pinned in Task E5 by
-   `nothing_is_fetched_after_the_session_is_cancelled` and in Task E8 by
+   yt-dlp all stop. Pinned in Task 5 by
+   `nothing_is_fetched_after_the_session_is_cancelled` and in Task 8 by
    `chat_stops_when_the_window_hangs_up`.
 3. **The route changes while a live stream plays.** The session ends and is
-   not looked up again on the old route. Pinned in Task E5 by
+   not looked up again on the old route. Pinned in Task 5 by
    `a_live_session_is_not_looked_up_again_on_a_route_the_user_left`.
 4. **The stream ends while the user has rewound.** `#EXT-X-ENDLIST` is
    added, and playback goes on to the real end with no reload. Pinned in
-   Task E5 by `an_ended_stream_gets_endlist_and_keeps_every_segment`.
+   Task 5 by `an_ended_stream_gets_endlist_and_keeps_every_segment`.
 5. **A refresh is pressed again during a live check.** It joins the
-   running check, and no channel is asked twice. Pinned in Task E7 by
+   running check, and no channel is asked twice. Pinned in Task 7 by
    `a_second_refresh_joins_the_running_live_check`.
 
 ---
 
 ## Engine track
 
-### Task E1: Stream status on every video
+Tasks 1–9 are the engine (also called E1–E9 in this plan; "(E2)" means Task 2). Tasks 10–15 are the window.
+
+### Task 1: Stream status on every video
 
 **Files:**
 - Modify: `core/src/video.rs`
@@ -138,7 +140,7 @@ holds the measured facts that this plan's values come from.
 - [ ] **Step 5:** Commit: "Videos say whether they are live, upcoming or a
   past stream".
 
-### Task E2: Live lookup
+### Task 2: Live lookup
 
 **Files:**
 - Create: `core/src/live.rs` (types and format choice; `mod live;` in
@@ -215,7 +217,7 @@ holds the measured facts that this plan's values come from.
 - [ ] **Step 5:** Commit: "A live, announced or manifest-only video is
   looked up as live instead of refused".
 
-### Task E3: Playlists
+### Task 3: Playlists
 
 **Files:**
 - Create: `core/src/server/timeline.rs` (pure part only in this task;
@@ -265,7 +267,7 @@ holds the measured facts that this plan's values come from.
 - [ ] **Step 4:** Run them. Expect a PASS.
 - [ ] **Step 5:** Commit: "The engine writes a live stream's playlists".
 
-### Task E4: Fake googlevideo for live
+### Task 4: Fake googlevideo for live
 
 **Files:**
 - Modify: `core/src/server/testkit.rs`
@@ -298,7 +300,7 @@ holds the measured facts that this plan's values come from.
   **Step 4:** Run it. Expect a PASS.
 - [ ] **Step 5:** Commit: "Test kit: a live googlevideo stand-in".
 
-### Task E5: Serving a live session
+### Task 5: Serving a live session
 
 **Files:**
 - Modify: `core/src/server/timeline.rs` (session runtime)
@@ -381,7 +383,7 @@ holds the measured facts that this plan's values come from.
 - [ ] **Step 5:** Commit: "Live streams play through an engine-built
   timeline".
 
-### Task E6: Waiting room
+### Task 6: Waiting room
 
 **Files:**
 - Create: `core/src/server/wait.rs`
@@ -419,7 +421,7 @@ holds the measured facts that this plan's values come from.
 - [ ] **Step 5:** Commit: "Announced streams are waited for, then played
   once".
 
-### Task E7: Live check, Streams tab, settings
+### Task 7: Live check, Streams tab, settings
 
 **Files:**
 - Modify: `core/src/ytdlp.rs` (`channel_streams`)
@@ -465,7 +467,7 @@ holds the measured facts that this plan's values come from.
 - [ ] **Step 5:** Commit: "Followed channels can be checked for live
   streams, and a channel lists its streams".
 
-### Task E8: Live chat
+### Task 8: Live chat
 
 **Files:**
 - Create: `core/src/chat.rs`
@@ -509,7 +511,7 @@ holds the measured facts that this plan's values come from.
   **Step 4:** Run them. Expect a PASS.
 - [ ] **Step 5:** Commit: "Live chat, read only, text only".
 
-### Task E9: Privacy text and README
+### Task 9: Privacy text and README
 
 **Files:**
 - Modify: `core/src/privacy.rs`
@@ -550,7 +552,7 @@ The engine API is final after E9. Each window task also extends
 already exists, and its entries change to `live:"now"` and `"upcoming"`
 with `starts` and `watching`.
 
-### Task W1: Cards and lists (L2)
+### Task 10: Cards and lists (L2)
 
 **Files:**
 - Modify: `src/videomodel.cpp/.h`: drop the live filter at cpp:80; add
@@ -587,7 +589,7 @@ with `starts` and `watching`.
   **Step 4:** `bin/test`. Expect a PASS.
 - [ ] **Step 5:** Commit: "Cards mark live, upcoming and past streams".
 
-### Task W2: Home live line (H3), channel Streams tab (C1), settings
+### Task 11: Home live line (H3), channel Streams tab (C1), settings
 
 **Files:**
 - Create: `src/LiveLine.qml`
@@ -629,7 +631,7 @@ with `starts` and `watching`.
 - [ ] **Step 5:** Commit: "Home names live streams; channels list their
   streams; live settings".
 
-### Task W3: Watching live (W2)
+### Task 12: Watching live (W2)
 
 **Files:**
 - Modify:
@@ -667,7 +669,7 @@ with `starts` and `watching`.
   **Step 4:** `bin/test`. Expect a PASS.
 - [ ] **Step 5:** Commit: "Live playback: the edge, Go live, and End".
 
-### Task W4: Waiting room (R1)
+### Task 13: Waiting room (R1)
 
 **Files:**
 - Create: `src/WaitingRoom.qml`
@@ -702,7 +704,7 @@ with `starts` and `watching`.
   **Step 4:** `bin/test`. Expect a PASS.
 - [ ] **Step 5:** Commit: "The waiting room".
 
-### Task W5: Chat tab (T1)
+### Task 14: Chat tab (T1)
 
 **Files:**
 - Create: `src/ChatTab.qml`
@@ -738,7 +740,7 @@ with `starts` and `watching`.
   **Step 4:** `bin/test`. Expect a PASS.
 - [ ] **Step 5:** Commit: "Live chat in the side sheet".
 
-### Task W6: Stills and the measured check
+### Task 15: Stills and the measured check
 
 **Files:**
 - Modify: `tests/shot.cpp` (views `home-live`, `channel-streams`,
