@@ -31,8 +31,30 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Whether the timeline says what it does on stderr, one `qveil-trace` line
+/// per event: each request upstream, each segment served, each recovery.
+/// Only with `QVEIL_LIVE_TRACE=1`, for measuring. No URL is ever in it.
+fn tracing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QVEIL_LIVE_TRACE").is_some_and(|v| v == "1"))
+}
+
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if tracing() {
+            let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            note!("qveil-trace {:.3} {}", at.as_secs_f64(), format_args!($($arg)*));
+        }
+    };
+}
+
+/// Milliseconds since `t`, for the trace.
+fn ms(t: Instant) -> u128 {
+    t.elapsed().as_millis()
+}
 
 /// How far back a running stream can be rewound: five days.
 pub(super) const WINDOW_SECS: f64 = 432_000.0;
@@ -182,6 +204,14 @@ impl Kind {
 
     fn index(self) -> usize {
         self as usize
+    }
+
+    /// `v` or `a`, as in a segment's path.
+    fn letter(self) -> &'static str {
+        match self {
+            Kind::Video => "v",
+            Kind::Audio => "a",
+        }
     }
 
     /// Where a playlist's segments are, next to it.
@@ -520,11 +550,13 @@ impl LiveSession {
         if !matches!(self.fragments, Fragments::Numbered) {
             return Ok(true);
         }
+        let began = Instant::now();
         let head = match self.request(server, Method::HEAD, Kind::Video, None, None) {
             Ok(a) if a.status.is_success() => a.head.context(NO_HEAD)?,
             Ok(a) => bail!("The stream's server answered {}.", a.status.as_u16()),
             Err(f) => bail!("{f}"),
         };
+        trace!("begin head={head} after_ms={}", ms(began));
         let mut oldest = oldest_for(head, self.target);
         if oldest + 3 < head
             && let Ok(a) = self.request(server, Method::HEAD, Kind::Audio, Some(oldest), None)
@@ -532,6 +564,7 @@ impl LiveSession {
         {
             oldest = head - 3;
         }
+        trace!("begin oldest={oldest} total_ms={}", ms(began));
         let mut span = lock(&self.span);
         span.oldest = oldest;
         span.head = span.head.max(head);
@@ -717,6 +750,7 @@ impl LiveSession {
             }
             None => return respond(out, 404, "text/plain", b"not there yet"),
         }
+        let asked = Instant::now();
         let reading = self.slot(server, kind, n);
         let fetch = &reading.0;
         // The answer starts once upstream's has said how long the segment
@@ -747,20 +781,38 @@ impl LiveSession {
              Cache-Control: no-store\r\nConnection: close\r\n\r\n",
             content_type(ext),
         )?;
+        trace!(
+            "serve {} n={n} len={length} head_ms={}",
+            kind.letter(),
+            ms(asked)
+        );
         let mut sent = 0;
-        while (sent as u64) < length {
+        let how = loop {
+            if sent as u64 >= length {
+                break "done";
+            }
             // A fetch that fails part way, or a session that ends, leaves
             // the answer short: the player knows it from the length.
             let Ok(g) = self.when(fetch, |g| g.bytes.len() > sent || g.done.is_some()) else {
-                return Ok(());
+                break "cancelled";
             };
             if g.bytes.len() <= sent {
-                return Ok(());
+                break "short";
             }
             let part = g.bytes[sent..g.bytes.len().min(sent + 4 * CHUNK)].to_vec();
             drop(g);
-            out.write_all(&part)?;
+            if out.write_all(&part).is_err() {
+                break "hung-up";
+            }
             sent += part.len();
+        };
+        trace!(
+            "served {} n={n} len={length} sent={sent} ms={} end={how}",
+            kind.letter(),
+            ms(asked)
+        );
+        if how == "hung-up" {
+            bail!("the player hung up");
         }
         Ok(())
     }
@@ -857,6 +909,7 @@ impl LiveSession {
         let reading_on = held
             .front()
             .is_some_and(|(first, _)| (*first..=first + HELD as u64).contains(&n));
+        let before = held.len();
         held.retain(|(m, f)| {
             let keep = reading_on && *m >= n && !f.broke();
             if !keep {
@@ -864,13 +917,21 @@ impl LiveSession {
             }
             keep
         });
+        let dropped = before - held.len();
+        let mut started = Vec::new();
         for m in n..=until {
             if held.iter().all(|(k, _)| *k != m) {
                 let fetch = Arc::new(Fetch::new());
                 held.push_back((m, Arc::clone(&fetch)));
                 self.fetch_in_background(server, kind, m, fetch);
+                started.push(m);
             }
         }
+        trace!(
+            "slot {} n={n} seek={} dropped={dropped} started={started:?}",
+            kind.letter(),
+            !reading_on && before > 0
+        );
         held.make_contiguous().sort_by_key(|(m, _)| *m);
         while held.len() > HELD {
             if let Some((_, f)) = held.pop_back() {
@@ -894,7 +955,19 @@ impl LiveSession {
     ) {
         let (s, server, into) = (Arc::clone(self), Arc::clone(server), Arc::clone(&fetch));
         let spawned = std::thread::Builder::new().spawn(move || {
-            into.finish(s.fetch_segment(&server, kind, n, &into));
+            let t = Instant::now();
+            let how = s.fetch_segment(&server, kind, n, &into);
+            trace!(
+                "fetched {} n={n} bytes={} ms={} how={}",
+                kind.letter(),
+                into.len(),
+                ms(t),
+                match &how {
+                    Ok(()) => "ok".to_string(),
+                    Err(f) => format!("{f:?}").chars().take(60).collect(),
+                }
+            );
+            into.finish(how);
         });
         if spawned.is_err() {
             fetch.finish(Err(Failure::Broke("too busy to fetch the stream".into())));
@@ -984,7 +1057,22 @@ impl LiveSession {
             }
             let url = self.url(&up, kind, n).ok_or(Failure::Gone)?;
             let from = into.map_or(0, Fetch::len);
-            let failed = match self.send(&up, &method, &url, from) {
+            let sent_at = Instant::now();
+            let answer = self.send(&up, &method, &url, from);
+            trace!(
+                "up {method} {} n={n:?} from={from} gen={} dial={} -> {} redirected={} ms={}",
+                kind.letter(),
+                up.generation,
+                up.dial,
+                match &answer {
+                    Ok(r) => r.status().as_u16().to_string(),
+                    Err(b) if b.stalled => "stalled".to_string(),
+                    Err(_) => "broke".to_string(),
+                },
+                answer.as_ref().is_ok_and(|r| r.url().as_str() != url),
+                ms(sent_at)
+            );
+            let failed = match answer {
                 Ok(r) if r.status() == StatusCode::FORBIDDEN && !relooked => {
                     relooked = true;
                     drop(r);
@@ -1026,6 +1114,11 @@ impl LiveSession {
             if failed.fatal || strikes >= STRIKES || tries >= TRIES {
                 return Err(Failure::Broke(failed.text));
             }
+            trace!(
+                "failed {method} {} n={n:?} stalled={} strikes={strikes} tries={tries}",
+                kind.letter(),
+                failed.stalled
+            );
             up = self
                 .recover(server, &up, failed.stalled)
                 .ok_or(Failure::Broke(failed.text))?;
@@ -1217,6 +1310,7 @@ impl LiveSession {
         if !self.may_recover() {
             return Some(up.clone());
         }
+        trace!("recover stalled={stalled} isolating={isolating}");
         if isolating {
             drop(up);
             return match self.relook(server, seen.generation) {
@@ -1273,7 +1367,9 @@ impl LiveSession {
         }
         let yt = rt.pinned_ytdlp();
         let abort = || self.is_cancelled();
+        let t = Instant::now();
         let found = yt.live_until(&self.source.watch_url(), self.max_height, &abort);
+        trace!("relook ms={} ok={}", ms(t), found.is_ok());
         let found = server.guarded(&rt, found).and_then(|o| match o {
             Opening::Live(s) => Ok(s),
             _ => bail!(NOT_LIVE),
