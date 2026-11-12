@@ -1152,6 +1152,8 @@ EOF
 ///   head is a 404.
 /// - A generation refused by `forbid_until_relooked` is a 403, whatever the
 ///   request.
+/// - A segment asked for with `Range: bytes=a-` is a 206 of its bytes from
+///   `a` on.
 ///
 /// The generation is the one in the URL that `fake_live_ytdlp` printed: one
 /// more for each lookup. Every request target is kept (`requests`).
@@ -1172,6 +1174,17 @@ struct LiveShared {
     dropped: AtomicU64,
     /// The segment whose next request hangs.
     frozen: Mutex<Option<u64>>,
+    /// The segment whose next request stops after this many bytes of its
+    /// body, and hangs.
+    cut: Mutex<Option<(u64, usize)>>,
+    /// Bodies are sent 1 KiB at a time, this many ms apart (0: at once).
+    trickle_ms: AtomicU64,
+    /// Segment bodies being sent now.
+    in_flight: AtomicUsize,
+    /// Each segment request's target and Range header, in order.
+    ranged: Mutex<Vec<(String, Option<String>)>>,
+    /// Once ended, a live lookup says the stream kept no recording.
+    unrecorded: AtomicBool,
     /// Generations up to this one answer 403 (-1: none).
     forbidden: AtomicI64,
     /// The newest generation any request named (-1: none yet).
@@ -1203,6 +1216,8 @@ impl LiveShared {
 const LIVE_ENDED: &str = "live-ended";
 /// What a fake yt-dlp keeps in its folder: the next generation to give.
 const LIVE_GEN: &str = "live-gen";
+/// The marker a fake yt-dlp finds once the stream is over and kept nothing.
+const LIVE_UNRECORDED: &str = "live-unrecorded";
 
 /// What a segment of the stand-in is: its track's name and number
 /// (`v-5`) repeated to 64 KiB.
@@ -1230,6 +1245,11 @@ impl LiveUpstream {
             ended: Mutex::new(None),
             dropped: AtomicU64::new(0),
             frozen: Mutex::new(None),
+            cut: Mutex::new(None),
+            trickle_ms: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
+            ranged: Mutex::default(),
+            unrecorded: AtomicBool::new(false),
             forbidden: AtomicI64::new(-1),
             newest: AtomicI64::new(-1),
             hanging: AtomicUsize::new(0),
@@ -1268,6 +1288,47 @@ impl LiveUpstream {
         for home in homes.iter() {
             std::fs::write(home.join(LIVE_ENDED), "").unwrap();
         }
+    }
+
+    /// `end`, and YouTube kept no recording of it: a live lookup made from
+    /// now on fails, saying so, as one of a stream without an archive does.
+    pub fn end_unrecorded(&self) {
+        self.live.unrecorded.store(true, Ordering::SeqCst);
+        for home in self.live.homes.lock().unwrap().iter() {
+            std::fs::write(home.join(LIVE_UNRECORDED), "").unwrap();
+        }
+        self.end();
+    }
+
+    /// The first request that would be answered with segment `n` (of either
+    /// track) sends its head and the first `at` bytes of its body, and then
+    /// nothing, as a Tor circuit that stalls part way does, until the client
+    /// hangs up or the `LiveUpstream` is dropped (it counts as `hanging`).
+    pub fn cut(&self, n: u64, at: usize) {
+        *self.live.cut.lock().unwrap() = Some((n, at));
+    }
+
+    /// Segment bodies are sent 1 KiB at a time, `ms` apart, from now on.
+    pub fn trickle(&self, ms: u64) {
+        self.live.trickle_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// How many segment bodies are being sent now.
+    pub fn in_flight(&self) -> usize {
+        self.live.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The Range headers of the requests for `target`, in order (`None` for
+    /// one without).
+    pub fn ranges_of(&self, target: &str) -> Vec<Option<String>> {
+        self.live
+            .ranged
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| t == target)
+            .map(|(_, r)| r.clone())
+            .collect()
     }
 
     /// Segments below `n` are gone (404), as those past the rewind window
@@ -1322,6 +1383,9 @@ impl LiveUpstream {
         if self.live.ended.lock().unwrap().is_some() {
             std::fs::write(home.join(LIVE_ENDED), "").unwrap();
         }
+        if self.live.unrecorded.load(Ordering::SeqCst) {
+            std::fs::write(home.join(LIVE_UNRECORDED), "").unwrap();
+        }
     }
 }
 
@@ -1342,10 +1406,16 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
     let mut words = line.split_whitespace();
     let head_only = words.next() == Some("HEAD");
     let target = words.next().unwrap_or("/").to_string();
+    let mut range = None;
     loop {
         let mut h = String::new();
         if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
             break;
+        }
+        if let Some((k, v)) = h.split_once(':')
+            && k.trim().eq_ignore_ascii_case("range")
+        {
+            range = Some(v.trim().to_string());
         }
     }
     live.seen.lock().unwrap().push(target.clone());
@@ -1398,6 +1468,10 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
     if n < first || n > live.head() {
         return reply(&mut conn, "404 Not Found", "", b"");
     }
+    live.ranged
+        .lock()
+        .unwrap()
+        .push((target.clone(), range.clone()));
     let hold = {
         let mut frozen = live.frozen.lock().unwrap();
         let hold = *frozen == Some(n);
@@ -1412,17 +1486,80 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
         live.hanging.fetch_sub(1, Ordering::SeqCst);
         return;
     }
+    let cut = {
+        let mut cut = live.cut.lock().unwrap();
+        match *cut {
+            Some((m, at)) if m == n => {
+                *cut = None;
+                Some(at)
+            }
+            _ => None,
+        }
+    };
     let ctype = if track == "v" {
         "video/webm"
     } else {
         "audio/mp4"
     };
-    reply(
-        &mut conn,
-        "200 OK",
-        &format!("Content-Type: {ctype}\r\n{}X-Sequence-Num: {n}\r\n", head()),
-        &live_segment(track, n),
+    let whole = live_segment(track, n);
+    let from = range
+        .as_deref()
+        .and_then(|r| r.strip_prefix("bytes="))
+        .and_then(|r| r.strip_suffix('-'))
+        .and_then(|a| a.parse::<usize>().ok())
+        .filter(|a| *a < whole.len());
+    let (status, extra, body) = match from {
+        Some(a) => (
+            "206 Partial Content",
+            format!(
+                "Content-Range: bytes {a}-{}/{}\r\n",
+                whole.len() - 1,
+                whole.len()
+            ),
+            &whole[a..],
+        ),
+        None => ("200 OK", String::new(), &whole[..]),
+    };
+    let _ = write!(
+        conn,
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{}X-Sequence-Num: {n}\r\n{extra}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        head(),
+        body.len()
     );
+    if head_only {
+        return;
+    }
+    live.in_flight.fetch_add(1, Ordering::SeqCst);
+    let sent = match cut {
+        Some(at) => conn
+            .write_all(&body[..at.min(body.len())])
+            .and_then(|()| conn.flush()),
+        None => send_body(&mut conn, live, body),
+    };
+    live.in_flight.fetch_sub(1, Ordering::SeqCst);
+    if cut.is_some() && sent.is_ok() {
+        live.hanging.fetch_add(1, Ordering::SeqCst);
+        hang(&mut conn, live);
+        live.hanging.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Sends `body`, at once or a trickle (see `LiveUpstream::trickle`), until
+/// the client hangs up or the `LiveUpstream` is dropped.
+fn send_body(conn: &mut TcpStream, live: &LiveShared, body: &[u8]) -> std::io::Result<()> {
+    let ms = live.trickle_ms.load(Ordering::SeqCst);
+    if ms == 0 {
+        return conn.write_all(body);
+    }
+    for piece in body.chunks(1024) {
+        if live.released.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        conn.write_all(piece)?;
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    Ok(())
 }
 
 /// Holds `conn` open, answering nothing, until the client hangs up or the
@@ -1489,6 +1626,10 @@ if ! grep -qx -- --live-from-start "$conf"; then
   exit 1
 fi
 bump live-lookups > /dev/null
+if [ -e "$d/@UNRECORDED@" ]; then
+  echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2
+  exit 1
+fi
 if [ "$asked" -lt @UPCOMING@ ]; then
   echo '{"title":"A live cam","channel":"Cam","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","live_status":"is_upcoming","is_upcoming":true,"release_timestamp":@STARTS@}'
   exit 0
@@ -1512,6 +1653,7 @@ EOF
     .replace("@STARTS@", &starts.to_string())
     .replace("@GEN@", LIVE_GEN)
     .replace("@ENDED@", LIVE_ENDED)
+    .replace("@UNRECORDED@", LIVE_UNRECORDED)
     .replace("@TARGET@", &(up.live.target_ms as f64 / 1000.0).to_string())
     .replace("@BASE@", &up.base);
     crate::store::testing::script(&dir.join("yt-dlp"), &script).into()

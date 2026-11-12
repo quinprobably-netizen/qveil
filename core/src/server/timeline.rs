@@ -14,22 +14,24 @@
 
 use super::Server;
 use super::http::respond;
-use super::relay::{FAILED_FOR, FIRST_WITHIN, RECOVER_EVERY, answer_within, stalled_read};
-use crate::errors::friendly;
+use super::relay::{FAILED_FOR, RECOVER_EVERY, answer_within, content_range, stalled_read};
+use crate::errors::{self, friendly};
 use crate::ids::VideoRef;
-use crate::live::{Fragments, LiveStreams, Opening, Track};
+use crate::live::{Fragments, LiveStreams, NO_FRAGMENTS, Opening, Track};
 use crate::net::Net;
 use crate::util::lock;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, Response};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, RANGE};
 use reqwest::{Method, StatusCode};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// How far back a running stream can be rewound: five days.
@@ -127,6 +129,39 @@ const CHECK_AT_MOST: Duration = Duration::from_secs(300);
 const SEGMENT_MAX: u64 = 64 << 20;
 /// How often a request that waits looks at the cancel flag.
 const WAIT_POLL: Duration = Duration::from_millis(250);
+/// How long a request may go without a byte coming in before it is taken to
+/// have stalled: its answer not starting, or a segment's body stopping part
+/// way. It is then made again on a fresh client (see `recover`), a segment
+/// from the byte it stopped at. The player gets the bytes as they come, so
+/// its own network timeout (60 s) counts from the last of them, and a stall
+/// with its redo fits well inside it: the player sees a slow segment, never
+/// a skipped one.
+const STALL: Duration = Duration::from_secs(10);
+/// A request made again this many times in a row without a byte more coming
+/// in is given up on.
+const STRIKES: u32 = 2;
+/// The most requests one fetch makes, however much each brings.
+const TRIES: u32 = 8;
+/// How much of a body is read, or written to the player, at a time.
+const CHUNK: usize = 64 << 10;
+
+/// What a lookup again says of a stream that is no live stream any more.
+const NOT_LIVE: &str = "This video is no longer a live stream; open it again.";
+
+/// Whether a check lookup that failed with `err` means the stream is over:
+/// it ended and YouTube kept no recording (or none that can be fetched in
+/// fragments), it is no live stream any more, or it was made private or
+/// members-only, or taken down. A bot check, a timeout or a stalled circuit
+/// says nothing of it.
+fn ends_it(err: &str) -> bool {
+    use errors::Code;
+    matches!(
+        errors::explain(err).code,
+        Code::NoRecording | Code::Private | Code::MembersOnly
+    ) || errors::unavailable(err)
+        || err.contains(NO_FRAGMENTS)
+        || err.contains(NOT_LIVE)
+}
 
 /// What the engine's own words end with when the head's response said nothing of it.
 const NO_HEAD: &str = "The stream's server didn't say how far the stream has got.";
@@ -186,7 +221,7 @@ impl Upstream {
 }
 
 /// Why a segment couldn't be had.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Failure {
     /// It is not there any more (or a listed one never was): 410.
     Gone,
@@ -207,26 +242,154 @@ impl std::fmt::Display for Failure {
     }
 }
 
-/// A segment being fetched, or fetched.
-type Fetch = OnceLock<Result<Vec<u8>, Failure>>;
+/// A segment being fetched, or fetched: the bytes in so far, which each
+/// request serving it passes on to the player as they come, and kept once
+/// they are all in (a player that asks again gets them from here).
+struct Fetch {
+    got: Mutex<Got>,
+    /// Told when bytes come in, and when it is done.
+    grew: Condvar,
+    /// It is no longer held (a seek dropped it, or the player read past
+    /// it): it stops being fetched once no request is serving it.
+    dropped: AtomicBool,
+    /// The requests serving it now (see `Reading`).
+    readers: AtomicUsize,
+}
+
+#[derive(Default)]
+struct Got {
+    bytes: Vec<u8>,
+    /// How long the whole segment is, once upstream has said.
+    length: Option<u64>,
+    /// Set once it is done: all of it in, or why not.
+    done: Option<Result<(), Failure>>,
+}
+
+impl Fetch {
+    fn new() -> Self {
+        Fetch {
+            got: Mutex::default(),
+            grew: Condvar::new(),
+            dropped: AtomicBool::new(false),
+            readers: AtomicUsize::new(0),
+        }
+    }
+
+    fn failed(why: Failure) -> Self {
+        let f = Fetch::new();
+        f.finish(Err(why));
+        f
+    }
+
+    fn len(&self) -> u64 {
+        lock(&self.got).bytes.len() as u64
+    }
+
+    fn length(&self) -> Option<u64> {
+        lock(&self.got).length
+    }
+
+    /// Whether it failed upstream, and is to be fetched again if asked for.
+    fn broke(&self) -> bool {
+        matches!(lock(&self.got).done, Some(Err(Failure::Broke(_))))
+    }
+
+    /// Upstream says the segment is `length` long: false if an earlier
+    /// answer said otherwise (the bytes in so far are then of another cut).
+    fn set_length(&self, length: u64) -> bool {
+        let mut got = lock(&self.got);
+        match got.length {
+            Some(known) => known == length,
+            None => {
+                got.length = Some(length);
+                let more = usize::try_from(length)
+                    .unwrap_or(0)
+                    .saturating_sub(got.bytes.len());
+                got.bytes.reserve(more);
+                self.grew.notify_all();
+                true
+            }
+        }
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        lock(&self.got).bytes.extend_from_slice(bytes);
+        self.grew.notify_all();
+    }
+
+    fn finish(&self, how: Result<(), Failure>) {
+        let mut got = lock(&self.got);
+        if got.done.is_none() {
+            if how.is_ok() && got.length.is_none() {
+                got.length = Some(got.bytes.len() as u64);
+            }
+            got.done = Some(how);
+        }
+        self.grew.notify_all();
+    }
+
+    fn drop_it(&self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+
+    /// Dropped, and nobody is reading it: fetching the rest is waste.
+    fn unwanted(&self) -> bool {
+        self.dropped.load(Ordering::Acquire) && self.readers.load(Ordering::Acquire) == 0
+    }
+}
+
+/// A request serving a fetch, for as long as it does (see `Fetch::readers`).
+struct Reading(Arc<Fetch>);
+
+impl Reading {
+    fn new(fetch: &Arc<Fetch>) -> Self {
+        fetch.readers.fetch_add(1, Ordering::AcqRel);
+        Reading(Arc::clone(fetch))
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.readers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// A track's segments held: the one asked for last and those ahead of it,
 /// in order.
 type Held = VecDeque<(u64, Arc<Fetch>)>;
 
-/// What a request failed with before its answer was read.
+/// What a request failed with before it was done.
 struct Broken {
     text: String,
     /// It timed out: the connection stalled, rather than broke.
     stalled: bool,
+    /// Making it again can't help (an answer that doesn't fit the bytes in
+    /// so far, or one too large).
+    fatal: bool,
 }
 
-/// An upstream answer, read: its status, the head it said, and its body
-/// (none for a HEAD or an error).
+impl Broken {
+    fn broke(text: impl Into<String>) -> Self {
+        Broken {
+            text: text.into(),
+            stalled: false,
+            fatal: false,
+        }
+    }
+
+    fn fatal(text: impl Into<String>) -> Self {
+        Broken {
+            fatal: true,
+            ..Broken::broke(text)
+        }
+    }
+}
+
+/// What a request was answered with: its status and the head it said. The
+/// body of a segment's is in its fetch.
 struct Answer {
     status: StatusCode,
     head: Option<u64>,
-    body: Vec<u8>,
 }
 
 /// When things last happened, for the head's watcher.
@@ -274,8 +437,8 @@ pub(super) struct LiveSession {
     target: f64,
     /// The stream had ended when it was looked up.
     ended_at_open: bool,
-    /// `FIRST_WITHIN` in milliseconds, which tests shorten.
-    pub(super) first_within_ms: AtomicU64,
+    /// `STALL` in milliseconds, which tests shorten.
+    pub(super) stall_ms: AtomicU64,
 }
 
 impl LiveSession {
@@ -321,7 +484,7 @@ impl LiveSession {
             exts: [s.video.ext, s.audio.ext],
             target: s.target,
             ended_at_open: s.ended,
-            first_within_ms: AtomicU64::new(FIRST_WITHIN.as_millis() as u64),
+            stall_ms: AtomicU64::new(STALL.as_millis() as u64),
         }
     }
 
@@ -333,8 +496,8 @@ impl LiveSession {
         Duration::from_secs_f64(self.target)
     }
 
-    fn first_within(&self) -> Duration {
-        Duration::from_millis(self.first_within_ms.load(Ordering::Relaxed))
+    fn stall(&self) -> Duration {
+        Duration::from_millis(self.stall_ms.load(Ordering::Relaxed))
     }
 
     /// Ends the session: every thread of it stops before its next request,
@@ -360,14 +523,14 @@ impl LiveSession {
         if !matches!(self.fragments, Fragments::Numbered) {
             return Ok(true);
         }
-        let head = match self.request(server, Method::HEAD, Kind::Video, None) {
+        let head = match self.request(server, Method::HEAD, Kind::Video, None, None) {
             Ok(a) if a.status.is_success() => a.head.context(NO_HEAD)?,
             Ok(a) => bail!("The stream's server answered {}.", a.status.as_u16()),
             Err(f) => bail!("{f}"),
         };
         let mut oldest = oldest_for(head, self.target);
         if oldest + 3 < head
-            && let Ok(a) = self.request(server, Method::HEAD, Kind::Audio, Some(oldest))
+            && let Ok(a) = self.request(server, Method::HEAD, Kind::Audio, Some(oldest), None)
             && matches!(a.status.as_u16(), 404 | 410)
         {
             oldest = head - 3;
@@ -429,7 +592,7 @@ impl LiveSession {
             };
             if poll {
                 // A failure is the next poll's to put right.
-                let _ = self.request(server, Method::HEAD, Kind::Video, None);
+                let _ = self.request(server, Method::HEAD, Kind::Video, None, None);
             }
             // Judged on the head as this poll left it: after a while of
             // nobody playing, the head is old until the first poll.
@@ -441,15 +604,25 @@ impl LiveSession {
                 c.moved.elapsed() >= check_in && checked.is_none_or(|t| t.elapsed() >= check_in)
             };
             if check {
-                match self.check_end(server) {
-                    Ok(true) => {
-                        lock(&self.span).ended = true;
-                        self.notify();
-                        return;
+                let ended = match self.check_end(server) {
+                    _ if self.is_cancelled() => return,
+                    Ok(ended) => ended,
+                    // A stream that ended without a recording, or was made
+                    // private or taken down as it ended, is never "ended"
+                    // to a lookup: the lookup fails, and that is the end.
+                    // The URLs the session has stay; they serve what is left.
+                    Err(e) if ends_it(&format!("{e:#}")) => true,
+                    Err(e) => {
+                        note!("qveil: couldn't check whether a live stream has ended: {e:#}");
+                        false
                     }
-                    Ok(false) => {}
-                    Err(e) if self.is_cancelled() => drop(e),
-                    Err(e) => note!("qveil: couldn't check whether a live stream has ended: {e:#}"),
+                };
+                if ended {
+                    // The last head, should the polls before have missed it.
+                    let _ = self.request(server, Method::HEAD, Kind::Video, None, None);
+                    lock(&self.span).ended = true;
+                    self.notify();
+                    return;
                 }
                 checked = Some(Instant::now());
                 check_in = (check_in * 2).min(CHECK_AT_MOST.max(still));
@@ -480,6 +653,30 @@ impl LiveSession {
             }
         };
         respond(out, 200, "application/vnd.apple.mpegurl", text.as_bytes())
+    }
+
+    /// `GET live/<sid>/state`: where the stream is, for the window, which
+    /// can't tell from the player when it has ended:
+    /// `{"state":"now"|"ended","head":<n>,"oldest":<n>}`, the newest and
+    /// oldest segments listed. Asking it doesn't count as playing: it keeps
+    /// no head polls going (the player's own reloads do that).
+    pub(super) fn serve_state(&self, out: &mut TcpStream) -> Result<()> {
+        if self.is_cancelled() {
+            return respond(out, 404, "text/plain", b"stream expired");
+        }
+        let (oldest, head, ended) = match &self.fragments {
+            Fragments::Numbered => {
+                let span = lock(&self.span);
+                (span.oldest, span.head, span.ended)
+            }
+            Fragments::Listed(list) => (0, list.len().saturating_sub(1) as u64, true),
+        };
+        let state = json!({
+            "state": if ended { "ended" } else { "now" },
+            "head": head,
+            "oldest": oldest,
+        });
+        respond(out, 200, "application/json", state.to_string().as_bytes())
     }
 
     /// `GET live/<sid>/v/<n>.<ext>` (or `a/`): segment `n`'s bytes, as
@@ -513,25 +710,73 @@ impl LiveSession {
             }
             None => return respond(out, 404, "text/plain", b"not there yet"),
         }
-        let fetch = self.slot(server, kind, n);
-        match self.wait(&fetch) {
-            Ok(body) => {
-                write!(
-                    out,
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
-                     Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-                    content_type(ext),
-                    body.len()
-                )?;
-                out.write_all(body)?;
-                Ok(())
-            }
+        let reading = self.slot(server, kind, n);
+        let fetch = &reading.0;
+        // The answer starts once upstream's has said how long the segment
+        // is (or, if it never says, once it is all in), and the bytes follow
+        // as they come.
+        let length = match self.when(fetch, |g| g.length.is_some() || g.done.is_some()) {
+            Ok(g) => match (&g.done, g.length) {
+                (Some(Err(f)), _) => Err(f.clone()),
+                (_, Some(length)) => Ok(length),
+                (_, None) => Err(Failure::Broke("The stream broke upstream.".into())),
+            },
+            Err(f) => Err(f),
+        };
+        let length = match length {
+            Ok(length) => length,
             Err(Failure::Gone) => {
                 self.gone(n);
-                respond(out, 410, "text/plain", Failure::Gone.to_string().as_bytes())
+                return respond(out, 410, "text/plain", Failure::Gone.to_string().as_bytes());
             }
-            Err(Failure::Cancelled) => respond(out, 404, "text/plain", b"stream expired"),
-            Err(f @ Failure::Broke(_)) => respond(out, 502, "text/plain", f.to_string().as_bytes()),
+            Err(Failure::Cancelled) => return respond(out, 404, "text/plain", b"stream expired"),
+            Err(f @ Failure::Broke(_)) => {
+                return respond(out, 502, "text/plain", f.to_string().as_bytes());
+            }
+        };
+        write!(
+            out,
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {length}\r\n\
+             Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+            content_type(ext),
+        )?;
+        let mut sent = 0;
+        while (sent as u64) < length {
+            // A fetch that fails part way, or a session that ends, leaves
+            // the answer short: the player knows it from the length.
+            let Ok(g) = self.when(fetch, |g| g.bytes.len() > sent || g.done.is_some()) else {
+                return Ok(());
+            };
+            if g.bytes.len() <= sent {
+                return Ok(());
+            }
+            let part = g.bytes[sent..g.bytes.len().min(sent + 4 * CHUNK)].to_vec();
+            drop(g);
+            out.write_all(&part)?;
+            sent += part.len();
+        }
+        Ok(())
+    }
+
+    /// Waits until what is in of `fetch` is `ready`, or it is done: what is
+    /// in, still locked. `Cancelled` once the session ends.
+    fn when<'a>(
+        &self,
+        fetch: &'a Fetch,
+        ready: impl Fn(&Got) -> bool,
+    ) -> Result<MutexGuard<'a, Got>, Failure> {
+        let mut got = lock(&fetch.got);
+        loop {
+            if ready(&got) {
+                return Ok(got);
+            }
+            if self.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            got = match fetch.grew.wait_timeout(got, WAIT_POLL) {
+                Ok((got, _)) => got,
+                Err(e) => e.into_inner().0,
+            };
         }
     }
 
@@ -589,10 +834,13 @@ impl LiveSession {
     }
 
     /// The fetch of `kind`'s segment `n`, started if it isn't held, with
-    /// the next `AHEAD` (those that exist) started beside it. A request that
-    /// isn't for one of the held segments, or the one after them, is a seek,
-    /// and what was held goes. A fetch that failed is started again.
-    fn slot(self: &Arc<Self>, server: &Arc<Server>, kind: Kind, n: u64) -> Arc<Fetch> {
+    /// the next `AHEAD` (those that exist) started beside it, and the caller
+    /// counted as reading it. A request that isn't for one of the held
+    /// segments, or the one after them, is a seek, and what was held goes.
+    /// A fetch that failed is started again. One that goes stops being
+    /// fetched once nobody reads it: a seek, or many, leaves no more than
+    /// `HELD` fetches of a track running.
+    fn slot(self: &Arc<Self>, server: &Arc<Server>, kind: Kind, n: u64) -> Reading {
         let last = match &self.fragments {
             Fragments::Numbered => lock(&self.span).head,
             Fragments::Listed(list) => list.len().saturating_sub(1) as u64,
@@ -602,10 +850,13 @@ impl LiveSession {
         let reading_on = held
             .front()
             .is_some_and(|(first, _)| (*first..=first + HELD as u64).contains(&n));
-        if !reading_on {
-            held.clear();
-        }
-        held.retain(|(m, f)| *m >= n && !matches!(f.get(), Some(Err(Failure::Broke(_)))));
+        held.retain(|(m, f)| {
+            let keep = reading_on && *m >= n && !f.broke();
+            if !keep {
+                f.drop_it();
+            }
+            keep
+        });
         for m in n..=until {
             if held.iter().all(|(k, _)| *k != m) {
                 let fetch = Arc::new(Fetch::new());
@@ -614,11 +865,17 @@ impl LiveSession {
             }
         }
         held.make_contiguous().sort_by_key(|(m, _)| *m);
-        held.truncate(HELD);
-        held.iter()
+        while held.len() > HELD {
+            if let Some((_, f)) = held.pop_back() {
+                f.drop_it();
+            }
+        }
+        let fetch = held
+            .iter()
             .find(|(m, _)| *m == n)
             .map(|(_, f)| Arc::clone(f))
-            .unwrap_or_else(|| Arc::new(Fetch::from(Err(Failure::Broke("not held".into())))))
+            .unwrap_or_else(|| Arc::new(Fetch::failed(Failure::Broke("not held".into()))));
+        Reading::new(&fetch)
     }
 
     fn fetch_in_background(
@@ -630,40 +887,28 @@ impl LiveSession {
     ) {
         let (s, server, into) = (Arc::clone(self), Arc::clone(server), Arc::clone(&fetch));
         let spawned = std::thread::Builder::new().spawn(move || {
-            let _ = into.set(s.fetch_segment(&server, kind, n));
-            s.notify();
+            into.finish(s.fetch_segment(&server, kind, n, &into));
         });
         if spawned.is_err() {
-            let _ = fetch.set(Err(Failure::Broke("too busy to fetch the stream".into())));
+            fetch.finish(Err(Failure::Broke("too busy to fetch the stream".into())));
         }
     }
 
-    /// Waits for `fetch` to be done, or the session to end.
-    fn wait<'a>(&self, fetch: &'a Fetch) -> Result<&'a [u8], &'a Failure> {
-        static CANCELLED: Failure = Failure::Cancelled;
-        let mut span = lock(&self.span);
-        loop {
-            if let Some(done) = fetch.get() {
-                return done.as_deref();
-            }
-            if self.is_cancelled() {
-                return Err(&CANCELLED);
-            }
-            span = match self.changed.wait_timeout(span, WAIT_POLL) {
-                Ok((span, _)) => span,
-                Err(e) => e.into_inner().0,
-            };
-        }
-    }
-
-    /// Segment `n` of `kind`. Missing near the head is asked for again once,
-    /// half a segment length later; missing anywhere else, it is gone.
-    fn fetch_segment(&self, server: &Server, kind: Kind, n: u64) -> Result<Vec<u8>, Failure> {
+    /// Segment `n` of `kind`, into `into`. Missing near the head is asked
+    /// for again once, half a segment length later; missing anywhere else,
+    /// it is gone.
+    fn fetch_segment(
+        &self,
+        server: &Server,
+        kind: Kind,
+        n: u64,
+        into: &Fetch,
+    ) -> Result<(), Failure> {
         let mut again = true;
         loop {
-            let a = self.request(server, Method::GET, kind, Some(n))?;
+            let a = self.request(server, Method::GET, kind, Some(n), Some(into))?;
             if a.status.is_success() {
-                return Ok(a.body);
+                return Ok(());
             }
             if !matches!(a.status.as_u16(), 404 | 410) {
                 return Err(Failure::Broke(format!(
@@ -704,29 +949,35 @@ impl LiveSession {
         }
     }
 
-    /// One request for `kind`'s segment `n`, or with no `n` for its base
-    /// (which says where the head is), read to its end for a GET. It is
-    /// made again once on a fresh client if it stalls or breaks (see
-    /// `recover`): the player is better off with a slow segment than with
-    /// one skipped, which is a gap. A 403 means the URLs have stopped
-    /// working, and the stream is looked up again (once, shared by the
-    /// requests refused together). Nothing goes out once the session has
-    /// ended.
+    /// One request for `kind`'s segment `n`, its body read into `into`, or
+    /// with no `n` a HEAD of its base (which says where the head is). One
+    /// that stalls (no byte for `stall`) or breaks is made again on a fresh
+    /// client (see `recover`), a segment's from the byte it had got to, so
+    /// that what is in stays and nothing comes twice: the player is better
+    /// off with a slow segment than with one skipped, which is a gap. Made
+    /// again `STRIKES` times in a row without a byte more, it is given up
+    /// on. A 403 means the URLs have stopped working, and the stream is
+    /// looked up again (once, shared by the requests refused together).
+    /// Nothing goes out once the session has ended, or once nobody wants
+    /// the segment any more.
     fn request(
         &self,
         server: &Server,
         method: Method,
         kind: Kind,
         n: Option<u64>,
+        into: Option<&Fetch>,
     ) -> Result<Answer, Failure> {
         let mut up = lock(&self.upstream).clone();
-        let (mut redone, mut relooked) = (false, false);
+        let mut relooked = false;
+        let (mut strikes, mut tries) = (0, 0);
         loop {
-            if self.is_cancelled() {
+            if self.is_cancelled() || into.is_some_and(Fetch::unwanted) {
                 return Err(Failure::Cancelled);
             }
             let url = self.url(&up, kind, n).ok_or(Failure::Gone)?;
-            let failed = match self.send(&up, &method, &url) {
+            let from = into.map_or(0, Fetch::len);
+            let failed = match self.send(&up, &method, &url, from) {
                 Ok(r) if r.status() == StatusCode::FORBIDDEN && !relooked => {
                     relooked = true;
                     drop(r);
@@ -743,33 +994,137 @@ impl LiveSession {
                     {
                         self.saw_head(h);
                     }
-                    if !status.is_success() || method == Method::HEAD {
-                        return Ok(Answer {
-                            status,
-                            head,
-                            body: Vec::new(),
-                        });
-                    }
-                    match read_body(r) {
-                        Ok(body) => {
-                            lock(&self.clock).fetched = Some(Instant::now());
-                            return Ok(Answer { status, head, body });
-                        }
-                        Err(e) => e,
+                    match into {
+                        Some(into) if status.is_success() => match self.read_into(r, into, from) {
+                            Ok(()) => {
+                                lock(&self.clock).fetched = Some(Instant::now());
+                                return Ok(Answer { status, head });
+                            }
+                            Err(e) => e,
+                        },
+                        _ => return Ok(Answer { status, head }),
                     }
                 }
                 Err(e) => e,
             };
-            if self.is_cancelled() {
+            if self.is_cancelled() || into.is_some_and(Fetch::unwanted) {
                 return Err(Failure::Cancelled);
             }
-            if redone {
+            tries += 1;
+            strikes = if into.is_some_and(|f| f.len() > from) {
+                0
+            } else {
+                strikes + 1
+            };
+            if failed.fatal || strikes >= STRIKES || tries >= TRIES {
                 return Err(Failure::Broke(failed.text));
             }
-            redone = true;
             up = self
                 .recover(server, &up, failed.stalled)
                 .ok_or(Failure::Broke(failed.text))?;
+        }
+    }
+
+    /// Reads the body of `r`, an answer to a request for a segment from
+    /// byte `from` on, into `into`, as it comes. Stops when it is all in,
+    /// when no byte has come for `stall` (it stalled), when the session
+    /// ends or nobody wants it, or when it doesn't fit the bytes in so far.
+    /// An answer that starts before `from` (a server that ignored the
+    /// range) has what is in already skipped.
+    fn read_into(&self, r: Response, into: &Fetch, from: u64) -> Result<(), Broken> {
+        const CHANGED: &str = "The stream's server sent another version of this part.";
+        let (start, length) = if r.status() == StatusCode::PARTIAL_CONTENT {
+            let (start, _, total) = content_range(&r).ok_or(Broken::fatal(CHANGED))?;
+            (start, Some(total))
+        } else {
+            (0, r.content_length())
+        };
+        if start > from {
+            return Err(Broken::fatal(CHANGED));
+        }
+        if let Some(length) = length {
+            if length > SEGMENT_MAX {
+                return Err(Broken::fatal("This part of the stream is too large."));
+            }
+            if !into.set_length(length) {
+                return Err(Broken::fatal(CHANGED));
+            }
+        }
+        let mut skip = usize::try_from(from - start).unwrap_or(usize::MAX);
+        // Read on a thread of its own, so that a read that never returns is
+        // noticed here and left behind (the client's idle timeout ends it).
+        // Once this stops taking what it reads, it hangs up.
+        let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(4);
+        let _ = std::thread::Builder::new().spawn(move || {
+            let mut r = r.take(SEGMENT_MAX);
+            loop {
+                let mut buf = vec![0; CHUNK];
+                let read = match r.read(&mut buf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    read => read,
+                };
+                let last = !matches!(read, Ok(k) if k > 0);
+                if tx
+                    .send(read.map(|k| {
+                        buf.truncate(k);
+                        buf
+                    }))
+                    .is_err()
+                    || last
+                {
+                    return;
+                }
+            }
+        });
+        let stall = self.stall();
+        let mut quiet = Instant::now();
+        loop {
+            if self.is_cancelled() || into.unwanted() {
+                return Err(Broken::broke("stream expired"));
+            }
+            match rx.recv_timeout(WAIT_POLL.min(stall)) {
+                Ok(Ok(bytes)) if bytes.is_empty() => {
+                    return match into.length() {
+                        Some(length) if into.len() < length => {
+                            Err(Broken::broke("The stream broke upstream."))
+                        }
+                        _ => Ok(()),
+                    };
+                }
+                Ok(Ok(bytes)) => {
+                    quiet = Instant::now();
+                    let k = skip.min(bytes.len());
+                    skip -= k;
+                    let mut bytes = &bytes[k..];
+                    let room = into
+                        .length()
+                        .unwrap_or(SEGMENT_MAX)
+                        .saturating_sub(into.len());
+                    if bytes.len() as u64 > room {
+                        bytes = &bytes[..usize::try_from(room).unwrap_or(0)];
+                    }
+                    into.push(bytes);
+                }
+                Ok(Err(e)) => {
+                    return Err(Broken {
+                        stalled: stalled_read(&e),
+                        ..Broken::broke("The stream broke upstream.")
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) if quiet.elapsed() >= stall => {
+                    return Err(Broken {
+                        stalled: true,
+                        ..Broken::broke(format!(
+                            "The stream's server stopped sending for {} s.",
+                            stall.as_secs()
+                        ))
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Broken::broke("The stream broke upstream."));
+                }
+            }
         }
     }
 
@@ -784,25 +1139,37 @@ impl LiveSession {
         }
     }
 
-    /// Sends one request, and waits `first_within` for its answer to start.
-    fn send(&self, up: &Upstream, method: &Method, url: &str) -> Result<Response, Broken> {
+    /// Sends one request, for the bytes from `from` on if that isn't 0, and
+    /// waits `stall` for its answer to start.
+    fn send(
+        &self,
+        up: &Upstream,
+        method: &Method,
+        url: &str,
+        from: u64,
+    ) -> Result<Response, Broken> {
         let mut rb = up.client.request(method.clone(), url);
         for (k, v) in &up.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        let within = self.first_within();
+        if from > 0 {
+            rb = rb.header(RANGE, format!("bytes={from}-"));
+        }
+        let within = self.stall();
         match answer_within(rb, within) {
             None => Err(Broken {
                 stalled: true,
-                text: format!(
+                ..Broken::broke(format!(
                     "The stream's server didn't answer within {} s.",
                     within.as_secs()
-                ),
+                ))
             }),
             Some(Ok(r)) => Ok(r),
             Some(Err(e)) => Err(Broken {
                 stalled: e.is_timeout(),
-                text: friendly(&self.route.explain(&format!("{:#}", e.without_url()))),
+                ..Broken::broke(friendly(
+                    &self.route.explain(&format!("{:#}", e.without_url())),
+                ))
             }),
         }
     }
@@ -902,7 +1269,7 @@ impl LiveSession {
         let found = yt.live_until(&self.source.watch_url(), self.max_height, &abort);
         let found = server.guarded(&rt, found).and_then(|o| match o {
             Opening::Live(s) => Ok(s),
-            _ => bail!("This video is no longer a live stream; open it again."),
+            _ => bail!(NOT_LIVE),
         });
         let s = match found {
             Ok(s) => s,
@@ -937,18 +1304,6 @@ fn head_of(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// A segment's whole body, `SEGMENT_MAX` at most.
-fn read_body(r: Response) -> Result<Vec<u8>, Broken> {
-    let mut body = Vec::new();
-    match r.take(SEGMENT_MAX).read_to_end(&mut body) {
-        Ok(_) => Ok(body),
-        Err(e) => Err(Broken {
-            stalled: stalled_read(&e),
-            text: "The stream broke upstream.".into(),
-        }),
-    }
-}
-
 /// What a segment is served as: WebM video is named `mkv` for FFmpeg, but
 /// it is still WebM.
 fn content_type(ext: &str) -> &'static str {
@@ -969,6 +1324,14 @@ impl Server {
         };
         match self.live_session(sid) {
             Some(s) => s.serve_playlist(out, kind),
+            None => respond(out, 404, "text/plain", b"stream expired"),
+        }
+    }
+
+    /// `GET live/<sid>/state`.
+    pub(super) fn live_state(&self, out: &mut TcpStream, sid: &str) -> Result<()> {
+        match self.live_session(sid) {
+            Some(s) => s.serve_state(out),
             None => respond(out, 404, "text/plain", b"stream expired"),
         }
     }
@@ -1336,9 +1699,7 @@ mod serving {
     fn a_frozen_fragment_is_fetched_again_not_skipped() {
         let st = stream(60_000, 0, 20);
         let sid = st.open();
-        st.session(&sid)
-            .first_within_ms
-            .store(300, Ordering::Relaxed);
+        st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
         st.up.freeze(10);
         let asked = Instant::now();
         let (status, _, body) = st.segment(&sid, "v", 10);
@@ -1356,6 +1717,159 @@ mod serving {
         // And nothing was looked up again for it on Direct: a fresh client
         // keeps the URLs.
         assert_eq!(st.live_lookups(), 1);
+    }
+
+    #[test]
+    fn a_segment_that_stops_halfway_resumes_where_it_stopped() {
+        let st = stream(60_000, 0, 20);
+        let sid = st.open();
+        st.session(&sid).stall_ms.store(300, Ordering::Relaxed);
+        st.up.cut(10, 20_000);
+        let asked = Instant::now();
+        let (status, headers, body) = st.segment(&sid, "v", 10);
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-length"], (64 << 10).to_string());
+        // Every byte once, in order: none lost or twice at the resume point.
+        assert_eq!(body, live_segment("v", 10));
+        assert!(asked.elapsed() >= Duration::from_millis(300));
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            asked.elapsed()
+        );
+        // The stalled request still hangs; the second asked only for the rest.
+        assert_eq!(st.up.hanging(), 1);
+        assert_eq!(
+            st.up.ranges_of(&sq("v", 10)),
+            [None, Some("bytes=20000-".to_string())]
+        );
+        // On Direct a fresh client keeps the URLs: nothing was looked up.
+        assert_eq!(st.live_lookups(), 1);
+    }
+
+    #[test]
+    fn a_segment_goes_to_the_player_as_it_comes_in() {
+        let st = stream(60_000, 0, 20);
+        let sid = st.open();
+        st.session(&sid).stall_ms.store(1_500, Ordering::Relaxed);
+        st.up.cut(10, 20_000);
+        let mut c = TcpStream::connect(addr(&st.base)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let asked = Instant::now();
+        write!(
+            c,
+            "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
+            path(&st.base, &format!("live/{sid}/v/10.mkv"))
+        )
+        .unwrap();
+        // The head and the bytes before the stall come while it stalls, not
+        // after the whole segment is in: the player's clock never runs out.
+        let mut raw = Vec::new();
+        let body_at = |raw: &[u8]| raw.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+        while body_at(&raw).is_none_or(|at| raw.len() < at + 20_000) {
+            let mut buf = [0u8; 8192];
+            let k = c.read(&mut buf).unwrap();
+            assert!(k > 0, "the answer ended early");
+            raw.extend_from_slice(&buf[..k]);
+        }
+        let early = asked.elapsed();
+        assert!(early < Duration::from_millis(1_200), "{early:?}");
+        assert!(raw.starts_with(b"HTTP/1.1 200"));
+        c.read_to_end(&mut raw).unwrap();
+        assert!(asked.elapsed() >= Duration::from_millis(1_500));
+        let at = body_at(&raw).unwrap();
+        assert_eq!(raw[at..], live_segment("v", 10));
+    }
+
+    #[test]
+    fn seeking_again_and_again_leaves_no_more_fetches_running_than_are_held() {
+        let st = stream(60_000, 0, 100);
+        let sid = st.open();
+        // Each segment takes about 6 s to come in.
+        st.up.trickle(100);
+        for n in [10, 30, 50, 70, 90] {
+            // The player asks, and seeks on before the segment is in.
+            let mut c = TcpStream::connect(addr(&st.base)).unwrap();
+            write!(
+                c,
+                "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
+                path(&st.base, &format!("live/{sid}/v/{n}.mkv"))
+            )
+            .unwrap();
+            wait_for("its read-ahead to start", Duration::from_secs(5), || {
+                (n..=n + 3).all(|m| st.asked(&sq("v", m)) == 1)
+            });
+            drop(c);
+        }
+        // Twenty were started; only the last seek's are still wanted.
+        wait_for(
+            "the fetches the seeks dropped to stop",
+            Duration::from_secs(3),
+            || st.up.in_flight() <= HELD,
+        );
+        for _ in 0..10 {
+            assert!(st.up.in_flight() <= HELD, "{}", st.up.in_flight());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Those of the last seek go on, for the player to read on with.
+        assert_eq!(st.up.in_flight(), HELD);
+        // And none that was dropped was asked for again.
+        for n in [10, 30, 50, 70, 90] {
+            assert_eq!(st.asked(&sq("v", n)), 1, "{n}");
+        }
+    }
+
+    #[test]
+    fn a_stream_that_ends_without_a_recording_gets_endlist_too() {
+        let st = stream(200, 0, 10);
+        let sid = st.open();
+        assert!(!st.listed(&sid).1);
+        // The check lookup fails ("recording is not available"): that is
+        // how such a stream says it has ended.
+        st.up.end_unrecorded();
+        let last = st.up.head();
+        wait_for("the playlist to end", Duration::from_secs(10), || {
+            st.listed(&sid).1
+        });
+        assert_eq!(st.listed(&sid).0, (0..=last).collect::<Vec<_>>());
+        assert!(st.live_lookups() >= 2);
+        // The URLs it had still serve what there is.
+        assert_eq!(st.segment(&sid, "v", last).2, live_segment("v", last));
+    }
+
+    fn state(st: &Stream, sid: &str) -> Value {
+        let (status, headers, body) = st.get(&format!("live/{sid}/state"));
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-type"], "application/json");
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn the_window_can_ask_whether_the_stream_has_ended() {
+        let st = stream(200, 0, 10);
+        let sid = st.open();
+        let listed = st.listed(&sid).0;
+        let now = state(&st, &sid);
+        assert_eq!(now["state"], "now");
+        assert_eq!(now["oldest"], 0);
+        let head = now["head"].as_u64().unwrap();
+        assert!(
+            head >= *listed.last().unwrap() && head <= st.up.head(),
+            "{now}"
+        );
+        st.up.end();
+        // The player goes on reloading the playlist meanwhile.
+        wait_for("the state to say ended", Duration::from_secs(10), || {
+            st.listed(&sid);
+            state(&st, &sid)["state"] == "ended"
+        });
+        let ended = state(&st, &sid);
+        assert_eq!(ended["head"], st.up.head());
+        assert_eq!(ended["head"].as_u64(), st.listed(&sid).0.last().copied());
+        // A session that is over, or never was, has none.
+        assert_eq!(st.get("live/nope/state").0, 404);
+        st.session(&sid).cancel();
+        assert_eq!(st.get(&format!("live/{sid}/state")).0, 404);
     }
 
     #[test]
@@ -1671,5 +2185,10 @@ cat '{}'"#,
         assert_eq!(st.segment(&sid, "v", 3).0, 404);
         // Its head is never polled: it has none.
         assert!(st.up.requests().iter().all(|r| r.contains("sq=")));
+        // It is over, as the window learns from its state too.
+        assert_eq!(
+            state(&st, &sid),
+            serde_json::json!({"state":"ended","head":2,"oldest":0})
+        );
     }
 }

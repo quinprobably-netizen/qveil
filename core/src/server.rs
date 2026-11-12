@@ -830,6 +830,7 @@ impl Server {
             ("GET", ["live", sid, file @ ("video.m3u8" | "audio.m3u8")]) => {
                 self.live_playlist(&mut stream, sid, file)
             }
+            ("GET", ["live", sid, "state"]) => self.live_state(&mut stream, sid),
             ("GET", ["live", sid, track @ ("v" | "a"), name]) => {
                 self.live_segment(&mut stream, sid, track, name)
             }
