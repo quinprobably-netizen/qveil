@@ -18,6 +18,7 @@
 //! - `lookups`: the lookups of the videos played lately, to play them again.
 //! - `warm`: the start of a video's streams, fetched when it is opened.
 //! - `chapters`: a video's chapters, when the page data had to be asked for.
+//! - `timeline`: a live stream's playlists: which segments the player is told exist.
 
 mod api;
 mod chapters;
@@ -31,6 +32,7 @@ mod relay;
 #[cfg(test)]
 mod testkit;
 mod thumbs;
+mod timeline;
 mod warm;
 
 use crate::app::{self, Runtime, Watched};
