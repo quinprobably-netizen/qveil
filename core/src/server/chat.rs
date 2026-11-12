@@ -236,9 +236,11 @@ while IFS= read -r l; do printf '%s\n' "$l" >> "$part"; sleep {pause}; done < "$
             open.line(),
             json!({"author":"@TipJarTester","text":"keep it up :hand-pink-waving:","owner":false,"amount":"$5.00"})
         );
-        // Each came as it was written, not all of them at the end.
+        // Each came as it was written, not all of them at the end: 0.8 s
+        // after the first was written, less up to a poll (0.25 s) that the
+        // first may have waited for, less some slack for a busy machine.
         let took = began.elapsed();
-        assert!(took >= Duration::from_millis(600), "{took:?}");
+        assert!(took >= Duration::from_millis(400), "{took:?}");
         // The stream ended (yt-dlp is done, the file has its final name): so
         // does the chat.
         assert_eq!(open.next(), None);

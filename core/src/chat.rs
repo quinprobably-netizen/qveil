@@ -11,8 +11,9 @@ use crate::ytdlp::ChatReader;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,10 @@ const POLL: Duration = Duration::from_millis(250);
 /// The longest line that is read. yt-dlp's are a few kilobytes each (one
 /// action); one that is longer than this is skipped, not held in memory.
 const LINE_MAX: usize = 1 << 20;
+/// How much of the chat file that has been read is let go at a time. The
+/// file is in RAM (`$XDG_RUNTIME_DIR`), and a busy chat writes hundreds of
+/// megabytes an hour, so what has been read is freed as it is read.
+const FREE_EVERY: u64 = 1 << 20;
 
 /// One chat message, as the window shows it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -106,9 +111,16 @@ fn run_text(run: &Value) -> Option<&str> {
         .or_else(|| emoji["emojiId"].as_str())
 }
 
-/// `s` without its control characters, cut at `max` characters.
+/// `s` without its control characters and bidi overrides and isolates
+/// (which would turn the rest of the line around: an author named with
+/// U+202E reads backwards), cut at `max` characters.
 fn clean(s: &str, max: usize) -> String {
-    s.chars().filter(|c| !c.is_control()).take(max).collect()
+    s.chars()
+        .filter(|&c| {
+            !c.is_control() && !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(max)
+        .collect()
 }
 
 /// Reads a file that another process is writing a line at a time, as it
@@ -116,6 +128,10 @@ fn clean(s: &str, max: usize) -> String {
 /// asked. The file is the first of `files` there is, looked for until one
 /// is (yt-dlp writes the chat as `.part` and renames it once the stream
 /// ends: a file that is open is read on after a rename).
+///
+/// What has been read is let go of on disk as it is read (see `free`), so
+/// the file takes no more room than what is yet to be read, however long
+/// the chat goes on.
 pub struct Tail {
     files: [PathBuf; 2],
     file: Option<File>,
@@ -123,6 +139,11 @@ pub struct Tail {
     pending: Vec<u8>,
     /// Whether the line being read is too long (`LINE_MAX`) and skipped.
     skipping: bool,
+    /// How far the file has been read, and how much of that is freed.
+    read: u64,
+    freed: u64,
+    /// Freeing works here (it doesn't on every file system).
+    frees: bool,
 }
 
 impl Tail {
@@ -132,6 +153,40 @@ impl Tail {
             file: None,
             pending: Vec::new(),
             skipping: false,
+            read: 0,
+            freed: 0,
+            frees: true,
+        }
+    }
+
+    /// Lets go of what has been read of the file, once there is
+    /// `FREE_EVERY` of it, by punching a hole over it: the pages go, while
+    /// the file keeps its length, so the writer's place and the reader's are
+    /// where they were, and nothing written meanwhile is lost (truncating
+    /// would lose what came between reading and truncating). Whole pages
+    /// only; the bytes freed are in hand already (as lines, or `pending`).
+    fn free(&mut self, file: &File) {
+        const PAGE: u64 = 4096;
+        let upto = self.read / PAGE * PAGE;
+        if !self.frees || upto < self.freed + FREE_EVERY {
+            return;
+        }
+        let (Ok(at), Ok(len)) = (
+            libc::off_t::try_from(self.freed),
+            libc::off_t::try_from(upto - self.freed),
+        ) else {
+            return;
+        };
+        let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        // SAFETY: fallocate only reads its arguments; the descriptor is open.
+        if unsafe { libc::fallocate(file.as_raw_fd(), mode, at, len) } == 0 {
+            self.freed = upto;
+        } else {
+            note!(
+                "qveil: the chat file can't be freed as it is read: {}",
+                io::Error::last_os_error()
+            );
+            self.frees = false;
         }
     }
 
@@ -140,7 +195,17 @@ impl Tail {
         let mut lines = Vec::new();
         if self.file.is_none() {
             for path in &self.files {
-                match File::open(path) {
+                // Open to write as well, which freeing needs; nothing is
+                // written to it.
+                let opened = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .or_else(|e| match e.kind() {
+                        io::ErrorKind::PermissionDenied => File::open(path),
+                        _ => Err(e),
+                    });
+                match opened {
                     Ok(f) => {
                         self.file = Some(f);
                         break;
@@ -157,11 +222,15 @@ impl Tail {
         let read = loop {
             match file.read(&mut buf) {
                 Ok(0) => break Ok(lines),
-                Ok(n) => self.take(&buf[..n], &mut lines),
+                Ok(n) => {
+                    self.read += n as u64;
+                    self.take(&buf[..n], &mut lines);
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => break Err(e),
             }
         };
+        self.free(&file);
         self.file = Some(file);
         read
     }
@@ -365,5 +434,60 @@ mod tests {
         assert_eq!(wide[0].text, "é".repeat(500));
         // A message that is nothing but control characters is none.
         assert_eq!(said("@Z", json!([{"text": "\u{0}\u{7}"}])), []);
+    }
+
+    #[test]
+    fn bidi_overrides_and_isolates_go() {
+        let line = json!({"replayChatItemAction": {"actions": [{"addChatItemAction": {"item": {
+            "liveChatTextMessageRenderer": {
+                "authorName": {"simpleText": "@\u{202E}evil\u{202C}name"},
+                "message": {"runs": [{"text": "a\u{202A}b\u{202B}c\u{202D}d\u{2066}e\u{2067}f\u{2068}g\u{2069}h"}]}
+            }
+        }}}]}});
+        let got = parse_chat_line(&line.to_string());
+        assert_eq!(got, [message("@evilname", "abcdefgh")]);
+        // Right-to-left text itself, and the joiner emoji need, stay.
+        assert_eq!(clean("שלום 👩\u{200D}💻", 50), "שלום 👩\u{200D}💻");
+    }
+
+    #[test]
+    fn what_has_been_read_of_the_chat_file_is_freed() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::store::testing::TempDir::new();
+        let path = dir.0.join("c.live_chat.json.part");
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut tail = Tail::new([path.clone(), dir.0.join("c.live_chat.json")]);
+        // 8 MiB of chat, read as it is written, a poll every 64 lines.
+        let one = format!("{{\"n\":\"{}\"}}", "x".repeat(4000));
+        let total = 2048;
+        let mut read = Vec::new();
+        for n in 1..=total {
+            writeln!(writer, "{one}").unwrap();
+            if n % 64 == 0 {
+                read.extend(tail.lines().unwrap());
+            }
+        }
+        read.extend(tail.lines().unwrap());
+        // Every line, whole, and none twice.
+        assert_eq!(read.len(), total);
+        assert!(read.iter().all(|l| *l == one));
+        let meta = std::fs::metadata(&path).unwrap();
+        // It still is as long as was written, so the writer goes on where
+        // it was ...
+        assert_eq!(meta.len(), (total * (one.len() + 1)) as u64);
+        // ... but holds no more than about what was left to read.
+        assert!(
+            meta.blocks() * 512 < 2 * FREE_EVERY,
+            "{} bytes held",
+            meta.blocks() * 512
+        );
+        // And what is written after a hole is read as before.
+        writeln!(writer, "after").unwrap();
+        assert_eq!(tail.lines().unwrap(), ["after"]);
     }
 }
