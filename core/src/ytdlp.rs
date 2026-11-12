@@ -553,13 +553,6 @@ impl Ytdlp {
     /// stream's or a past broadcast's fragments, best video within
     /// `max_height` and best audio (see `live::choose`), or when an
     /// announced one starts.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the play path opens with it once it serves live streams"
-        )
-    )]
     pub fn open_until(
         &self,
         url: &str,
@@ -572,6 +565,32 @@ impl Ytdlp {
             Err(e) if needs_live(&e) => e,
             Err(e) => return Err(e),
         };
+        self.live_lookup(url, max_height, abort, Some(original))
+    }
+
+    /// The live lookup alone, for a stream that is known to be one: the
+    /// timeline looks a stream it plays up again this way, when its URLs
+    /// have stopped working or to see whether it has ended, without the
+    /// usual lookup's request before it.
+    pub fn live_until(
+        &self,
+        url: &str,
+        max_height: u32,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Opening> {
+        self.live_lookup(url, max_height, abort, None)
+    }
+
+    /// `open_until` from the live lookup on. `original` is what the usual
+    /// lookup said, the answer for an ordinary video that the live lookup
+    /// finds nothing for either.
+    fn live_lookup(
+        &self,
+        url: &str,
+        max_height: u32,
+        abort: &dyn Fn() -> bool,
+        original: Option<anyhow::Error>,
+    ) -> Result<Opening> {
         let v = self.json_with(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
         if live_state(&v) == Some(LiveState::Upcoming) {
             return Ok(Opening::Upcoming {
@@ -586,7 +605,7 @@ impl Ytdlp {
             Err(e) if is_stream => Err(e),
             // An ordinary video that yt-dlp found nothing for: what the
             // usual lookup said is what there is to say.
-            Err(_) => Err(original),
+            Err(e) => Err(original.unwrap_or(e)),
         }
     }
 
@@ -744,7 +763,7 @@ const RUNNING_UNSKIPPED: &str = "live stream recording is not available";
 /// premiere (yt-dlp fails on one without `--ignore-no-formats-error`), or a
 /// running stream (`RUNNING_UNSKIPPED`). Which it was, the live lookup
 /// finds out.
-fn says_live(e: &anyhow::Error) -> bool {
+pub(crate) fn says_live(e: &anyhow::Error) -> bool {
     const SAID: &[&str] = &[RUNNING_UNSKIPPED, "live event will begin", "Premieres in"];
     match e.downcast_ref::<Failed>() {
         Some(f) => SAID.iter().any(|said| f.raw.contains(said)),

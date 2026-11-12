@@ -203,13 +203,14 @@ pub fn explain(err: &str) -> Explained {
             "YouTube is limiting how fast this address may ask. Wait a while, or try another route.",
         );
     }
-    // A stream or a premiere that hasn't started: there is nothing to play yet
-    // either way, and qveil can't relay a live stream when it does start.
+    // A stream or a premiere that hasn't started: there is nothing to play
+    // yet. A play answers one with when it starts (`waiting`), so this is
+    // only what is left when that couldn't be found out.
     const NOT_YET: &[&str] = &["live event will begin", "Premieres in"];
     if NOT_YET.iter().any(|needle| err.contains(needle)) {
         return Explained::new(
             Code::Live,
-            "This is a live stream or premiere that hasn't started; qveil can't play live streams yet.",
+            "This is a live stream or premiere that hasn't started yet.",
         );
     }
     // yt-dlp needs one to solve YouTube's challenges, and it fails like

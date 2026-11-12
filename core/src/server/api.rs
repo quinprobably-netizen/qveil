@@ -12,6 +12,7 @@ use crate::privacy;
 use crate::resume;
 use crate::util::lock;
 use crate::video::Video;
+use crate::ytdlp;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -85,7 +86,7 @@ impl Server {
                     // Nobody will play it, so what is being fetched for
                     // the player is not wanted either.
                     if let Some(s) = &opened.session {
-                        s.warm.stop();
+                        s.unwanted();
                     }
                     return Err(e);
                 }
@@ -108,6 +109,12 @@ impl Server {
     /// the window hanging up (it moved on to another video) ends it too,
     /// unless a play of the same video is waiting on it (see
     /// `lookups::Running`). Nothing is added to the history: nothing was watched.
+    ///
+    /// A live or announced stream is never looked up ahead: the window says
+    /// which entries are (`live=now` or `live=upcoming`), and one it didn't
+    /// know of is found out by the usual lookup, which stops there. A running
+    /// stream plays from a timeline that only runs while it is watched, and an
+    /// announced one has nothing to play yet.
     pub(super) fn prepare_next(self: &Arc<Self>, out: &mut TcpStream, req: &Request) -> Result<()> {
         let watch = Watch::new(out);
         let rt = self.runtime();
@@ -119,7 +126,10 @@ impl Server {
             let v = ids::parse_video(target)
                 .with_context(|| format!("{target:?} isn't a YouTube video"))?;
             let format = rt.cfg.format();
-            if self.lookups.get(&v.id, &format, &rt.net).is_some() {
+            let live = req.query.get("live").map(String::as_str);
+            if matches!(live, Some("now" | "upcoming"))
+                || self.lookups.get(&v.id, &format, &rt.net).is_some()
+            {
                 return Ok(false);
             }
             let mine = Arc::new(AtomicBool::new(false));
@@ -151,8 +161,11 @@ impl Server {
             }
             running.finish(&done);
             drop(running);
-            done?;
-            Ok(true)
+            match done {
+                Ok(_) => Ok(true),
+                Err(e) if ytdlp::says_live(&e) => Ok(false),
+                Err(e) => Err(e),
+            }
         });
         match prepared {
             Ok(looked_up) => {

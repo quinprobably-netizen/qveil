@@ -144,7 +144,7 @@ mod tests {
             channel: None,
             channel_id: None,
             duration: None,
-            start: Some(90),
+            start: Some(90.0),
             resume: None,
             video: "http://127.0.0.1:4000/SECRETTOKEN/s/sid/v".into(),
             audio: Some("http://127.0.0.1:4000/SECRETTOKEN/s/sid/a".into()),
@@ -155,6 +155,8 @@ mod tests {
             chapters: vec![],
             chapters_later: false,
             details_later: false,
+            live: None,
+            waiting: None,
         }
     }
 

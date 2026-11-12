@@ -18,7 +18,7 @@
 //! - `lookups`: the lookups of the videos played lately, to play them again.
 //! - `warm`: the start of a video's streams, fetched when it is opened.
 //! - `chapters`: a video's chapters, when the page data had to be asked for.
-//! - `timeline`: a live stream's playlists: which segments the player is told exist.
+//! - `timeline`: a live stream's playlists, and the session that serves their segments.
 
 mod api;
 mod chapters;
@@ -39,17 +39,19 @@ use crate::app::{self, Runtime, Watched};
 use crate::ids::VideoRef;
 use crate::inflight::{ROUTE_CHANGED, Why};
 use crate::lens;
+use crate::live::{Fragments, LiveStreams, Opening};
 use crate::resume;
 use crate::store::{self, Paths};
 use crate::util::{lock, random_hex};
 use crate::video::Chapter;
-use crate::ytdlp::Streams;
+use crate::ytdlp::{Streams, Ytdlp};
 use anyhow::{Context, Result, bail};
 use http::{
     ACCEPT_BACKOFF, Deadline, Pending, REQUEST_LINE_TIMEOUT, REQUEST_TIMEOUT, Reject, Slot,
     Unverified, WRITE_TIMEOUT, read_request_line, read_request_rest, refuse,
 };
 use relay::{Live, Session, StreamBroke};
+use reqwest::blocking::Client;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::BufReader;
@@ -57,6 +59,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
+use timeline::LiveSession;
 
 const MAX_SESSIONS: usize = 4;
 const MAX_SEARCH: usize = 60;
@@ -66,7 +69,7 @@ pub struct Server {
     pub paths: Paths,
     token: String,
     base: OnceLock<String>,
-    sessions: Mutex<VecDeque<(String, Arc<Session>)>>,
+    sessions: Mutex<VecDeque<(String, Registered)>>,
     thumbs: thumbs::Thumbs,
     /// The comments fetched lately (see `comments`).
     comments: comments::Kept,
@@ -112,7 +115,58 @@ impl Drop for Recording<'_> {
     }
 }
 
-#[derive(Serialize)]
+/// What a session id stands for: a relayed video, or a live stream's
+/// timeline. Both share one registry, its ids and its cap.
+#[derive(Clone)]
+enum Registered {
+    Relay(Arc<Session>),
+    Live(Arc<LiveSession>),
+}
+
+impl Registered {
+    /// Ends it: nothing more is fetched for it.
+    fn cancel(&self) {
+        match self {
+            Registered::Relay(s) => s.cancel(),
+            Registered::Live(s) => s.cancel(),
+        }
+    }
+
+    /// Its answer never reached the window, so nobody will play it: what is
+    /// fetched ahead for it stops.
+    fn unwanted(&self) {
+        match self {
+            Registered::Relay(s) => s.warm.stop(),
+            Registered::Live(s) => s.cancel(),
+        }
+    }
+}
+
+impl From<Session> for Registered {
+    fn from(s: Session) -> Self {
+        Registered::Relay(Arc::new(s))
+    }
+}
+
+impl From<Arc<LiveSession>> for Registered {
+    fn from(s: Arc<LiveSession>) -> Self {
+        Registered::Live(s)
+    }
+}
+
+/// What a lookup to play a video found.
+enum Found {
+    Plain(Streams, Live),
+    /// A stream, and the client of the identity that looked it up.
+    Live(LiveStreams, Client),
+    Upcoming {
+        title: String,
+        channel: Option<String>,
+        starts: Option<i64>,
+    },
+}
+
+#[derive(Serialize, Default)]
 pub struct PlayInfo {
     pub id: String,
     pub title: String,
@@ -122,13 +176,16 @@ pub struct PlayInfo {
     pub channel_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u64>,
+    /// Where to start, in seconds: from the link, or for a running stream
+    /// three segments back from its end (negative), where mpv joins it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<u64>,
+    pub start: Option<f64>,
     /// Where this video was stopped last time, when that is remembered and
     /// the link asked for no start of its own (see `resume`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<u64>,
-    /// Absolute loopback URLs.
+    /// Absolute loopback URLs. None for a stream that hasn't started.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub video: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
@@ -153,6 +210,37 @@ pub struct PlayInfo {
     /// video that wasn't played from a card that has them (see `chapters`).
     #[serde(rename = "detailsLater", skip_serializing_if = "std::ops::Not::not")]
     pub details_later: bool,
+    /// A live stream, running or over, played through the engine's timeline:
+    /// `video` and `audio` are its two playlists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveInfo>,
+    /// An announced stream that hasn't started: there is nothing to play yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<Waiting>,
+}
+
+/// What the play answer says of a live stream.
+#[derive(Serialize)]
+pub struct LiveInfo {
+    /// `"now"` while it runs, `"ended"` once it is over.
+    pub state: &'static str,
+    /// How long a segment is, in seconds.
+    pub segment: f64,
+    /// When it started, in Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<i64>,
+    /// Whether it can be rewound further than the last few segments.
+    pub rewind: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watching: Option<u64>,
+}
+
+/// What the play answer says of an announced stream.
+#[derive(Serialize)]
+pub struct Waiting {
+    /// When it is due to start, in Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starts: Option<i64>,
 }
 
 /// A video that is resolved and registered for relaying, and what is left to
@@ -162,7 +250,7 @@ pub struct Opened {
     /// What to add to the history, if it is on. Not added yet: see `Server::remember`.
     watched: Option<Watched>,
     /// The session it was registered as.
-    session: Option<Arc<Session>>,
+    session: Option<Registered>,
 }
 
 impl Server {
@@ -281,6 +369,9 @@ impl Server {
     /// from has it, for a lookup that has none (see `open_until`).
     pub fn open_as(self: &Arc<Self>, v: &VideoRef, channel: Option<String>) -> Result<PlayInfo> {
         let opened = self.open_until(v, channel, &|| false)?;
+        if opened.info.waiting.is_some() {
+            bail!("This live stream hasn't started yet.");
+        }
         self.remember(&opened);
         Ok(opened.info)
     }
@@ -302,6 +393,10 @@ impl Server {
         abort: &dyn Fn() -> bool,
     ) -> Result<Opened> {
         let base = self.listen()?;
+        // A play means the user has left the live stream that was playing,
+        // if one was (the window stops the player before it asks): its
+        // timeline stops asking upstream for anything.
+        self.leave_live();
         let rt = self.runtime();
         let format = rt.cfg.format();
         // The video that is being looked up ahead (the next in the list) is
@@ -324,8 +419,29 @@ impl Server {
             Some((s, live)) => (s, live, None),
             None => {
                 let started = self.lookups.start();
-                let (s, live) = self.look_up(&rt, v, &format, abort)?;
-                (s, live, Some(started))
+                match self.open_up(&rt, v, &format, abort)? {
+                    Found::Plain(s, live) => (s, live, Some(started)),
+                    Found::Live(s, client) => {
+                        return self.open_live(&rt, &base, v, channel, s, client);
+                    }
+                    Found::Upcoming {
+                        title,
+                        channel: named,
+                        starts,
+                    } => {
+                        return Ok(Opened {
+                            info: PlayInfo {
+                                id: v.id.clone(),
+                                title,
+                                channel: named.or(channel),
+                                waiting: Some(Waiting { starts }),
+                                ..PlayInfo::default()
+                            },
+                            watched: None,
+                            session: None,
+                        });
+                    }
+                }
             }
         };
         let has_audio = s.audio.is_some();
@@ -361,7 +477,7 @@ impl Server {
                 channel,
                 channel_id: s.channel_id,
                 duration: s.duration,
-                start: v.start,
+                start: v.start.map(|t| t as f64),
                 resume: self.kept_position(&rt, v),
                 video: format!("{base}/s/{sid}/v"),
                 audio: has_audio.then(|| format!("{base}/s/{sid}/a")),
@@ -372,10 +488,102 @@ impl Server {
                 chapters: s.chapters,
                 chapters_later: s.chapters_later,
                 details_later,
+                ..PlayInfo::default()
             },
             watched,
-            session,
+            session: session.map(Registered::Relay),
         })
+    }
+
+    /// Opens a live stream (running, or over and only offered as fragments)
+    /// on its timeline: learns where it is, registers it, and answers with
+    /// its two playlists. A running one is joined three segments back from
+    /// its end, where the player doesn't wait for the next segment to start.
+    fn open_live(
+        self: &Arc<Self>,
+        rt: &Runtime,
+        base: &str,
+        v: &VideoRef,
+        channel: Option<String>,
+        s: LiveStreams,
+        client: Client,
+    ) -> Result<Opened> {
+        let session = Arc::new(LiveSession::new(
+            v.clone(),
+            rt.cfg.max_height,
+            rt.net.clone(),
+            &s,
+            client,
+        ));
+        let rewind = session.begin(self).inspect_err(|_| session.cancel())?;
+        let sid = self
+            .register(rt, Arc::clone(&session))
+            .inspect_err(|_| session.cancel())?;
+        session.start(self);
+        let channel = s
+            .channel
+            .clone()
+            .or(channel)
+            .or_else(|| self.subscribed_name(s.channel_id.as_deref()));
+        let watched = rt.cfg.history.then(|| Watched {
+            id: v.id.clone(),
+            title: s.title.clone(),
+            channel: channel.clone(),
+            at: app::now(),
+        });
+        let running = !s.ended;
+        let duration = match &s.fragments {
+            Fragments::Listed(list) => {
+                Some(list.iter().map(|(_, d)| d).sum::<f64>().round() as u64)
+            }
+            Fragments::Numbered => None,
+        };
+        Ok(Opened {
+            info: PlayInfo {
+                id: v.id.clone(),
+                title: s.title,
+                channel,
+                channel_id: s.channel_id,
+                duration,
+                // A running stream isn't resumed: it has moved on. One that is
+                // over is a video like any other.
+                start: if running {
+                    Some(-3.0 * s.target)
+                } else {
+                    v.start.map(|t| t as f64)
+                },
+                resume: if running {
+                    None
+                } else {
+                    self.kept_position(rt, v)
+                },
+                video: format!("{base}/live/{sid}/video.m3u8"),
+                audio: Some(format!("{base}/live/{sid}/audio.m3u8")),
+                published: if running { None } else { s.started },
+                live: Some(LiveInfo {
+                    state: if running { "now" } else { "ended" },
+                    segment: s.target,
+                    started: s.started,
+                    rewind,
+                    watching: s.watching,
+                }),
+                ..PlayInfo::default()
+            },
+            watched,
+            session: Some(Registered::Live(session)),
+        })
+    }
+
+    /// Ends the live sessions there are, and forgets them.
+    fn leave_live(&self) {
+        let mut sessions = lock(&self.sessions);
+        sessions.retain(|(_, s)| match s {
+            Registered::Live(live) => {
+                live.cancel();
+                false
+            }
+            Registered::Relay(_) => true,
+        });
     }
 
     /// The name of the subscription to channel `id`, if there is one.
@@ -449,13 +657,13 @@ impl Server {
     /// after the user switched to Tor. The check happens under the sessions
     /// lock, which `update_config` also holds while it swaps the runtime and
     /// clears the sessions, so no session can slip in after that clear.
-    fn register(&self, rt: &Runtime, session: Session) -> Result<String> {
+    fn register(&self, rt: &Runtime, session: impl Into<Registered>) -> Result<String> {
         let mut sessions = lock(&self.sessions);
         if !self.runtime().net.same_route(&rt.net) {
             bail!("The route changed while opening the video; try again");
         }
         let sid = random_hex();
-        sessions.push_back((sid.clone(), Arc::new(session)));
+        sessions.push_back((sid.clone(), session.into()));
         // A session that falls out of the queue is ended, not just forgotten:
         // a player that still holds one of its streams would otherwise carry
         // on pulling the video, with nothing left to stop it.
@@ -478,17 +686,38 @@ impl Server {
     ) -> Result<(Streams, Live)> {
         let yt = rt.pinned_ytdlp();
         let s = yt.resolve_until(&v.watch_url(), format, abort)?;
-        let live = Live {
-            generation: 0,
-            dial: 0,
-            video: s.video.clone(),
-            audio: s.audio.clone(),
-            headers: s.headers.clone(),
-            client: yt.net.relay_client()?,
-            served: Arc::default(),
-            pool: Arc::default(),
-        };
+        let live = upstream_of(&s, &yt)?;
         Ok((s, live))
+    }
+
+    /// `look_up`, for a play: a stream is looked up as live (see
+    /// `Ytdlp::open_until`).
+    fn open_up(
+        &self,
+        rt: &Runtime,
+        v: &VideoRef,
+        format: &str,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Found> {
+        let yt = rt.pinned_ytdlp();
+        Ok(
+            match yt.open_until(&v.watch_url(), format, rt.cfg.max_height, abort)? {
+                Opening::Plain(s) => {
+                    let live = upstream_of(&s, &yt)?;
+                    Found::Plain(s, live)
+                }
+                Opening::Live(s) => Found::Live(s, yt.net.relay_client()?),
+                Opening::Upcoming {
+                    title,
+                    channel,
+                    starts,
+                } => Found::Upcoming {
+                    title,
+                    channel,
+                    starts,
+                },
+            },
+        )
     }
 
     /// Keeps a lookup made on `rt`'s route for playing the video again,
@@ -511,10 +740,17 @@ impl Server {
     }
 
     fn session(&self, sid: &str) -> Option<Arc<Session>> {
-        lock(&self.sessions)
-            .iter()
-            .find(|(id, _)| id == sid)
-            .map(|(_, s)| Arc::clone(s))
+        lock(&self.sessions).iter().find_map(|(id, s)| match s {
+            Registered::Relay(s) if id == sid => Some(Arc::clone(s)),
+            _ => None,
+        })
+    }
+
+    fn live_session(&self, sid: &str) -> Option<Arc<LiveSession>> {
+        lock(&self.sessions).iter().find_map(|(id, s)| match s {
+            Registered::Live(s) if id == sid => Some(Arc::clone(s)),
+            _ => None,
+        })
     }
 
     /// Serves one connection on its own thread. Until it has shown the token
@@ -587,6 +823,12 @@ impl Server {
             ("GET" | "HEAD", ["s", sid, kind @ ("v" | "a")]) => {
                 self.relay(&mut stream, &req, sid, kind)
             }
+            ("GET", ["live", sid, file @ ("video.m3u8" | "audio.m3u8")]) => {
+                self.live_playlist(&mut stream, sid, file)
+            }
+            ("GET", ["live", sid, track @ ("v" | "a"), name]) => {
+                self.live_segment(&mut stream, sid, track, name)
+            }
             ("GET", ["thumb", id]) => self.thumb(&mut stream, &req, id),
             // A query with rules in it is searched by topic and filtered
             // here; any other goes to YouTube as it was typed.
@@ -609,6 +851,21 @@ impl Server {
             _ => self.json_api(&mut stream, &req, &segs),
         }
     }
+}
+
+/// The upstream half of a relayed video that `yt` looked up, with the
+/// client of `yt`'s identity.
+fn upstream_of(s: &Streams, yt: &Ytdlp) -> Result<Live> {
+    Ok(Live {
+        generation: 0,
+        dial: 0,
+        video: s.video.clone(),
+        audio: s.audio.clone(),
+        headers: s.headers.clone(),
+        client: yt.net.relay_client()?,
+        served: Arc::default(),
+        pool: Arc::default(),
+    })
 }
 
 #[cfg(test)]

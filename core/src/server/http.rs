@@ -521,6 +521,7 @@ pub(super) fn respond(out: &mut TcpStream, status: u16, ctype: &str, body: &[u8]
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        410 => "Gone",
         408 => "Request Timeout",
         413 => "Content Too Large",
         414 => "URI Too Long",

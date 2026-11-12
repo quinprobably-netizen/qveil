@@ -56,16 +56,16 @@ pub(super) const SPARE_WITHIN: Duration = Duration::from_secs(3);
 /// twice: two minutes of a black window before the player is told.
 /// Over Tor an answer takes under a second (300 ms, measured), and a
 /// new connection's under two.
-const FIRST_WITHIN: Duration = Duration::from_secs(15);
+pub(super) const FIRST_WITHIN: Duration = Duration::from_secs(15);
 /// How often a relay waiting on the other side of `Ahead` looks at the cancel flag.
 const AHEAD_POLL: Duration = Duration::from_millis(250);
 /// How long a resolve again that failed is the answer for the requests on
 /// the same resolve, instead of trying again (see `Server::resolve_again`).
-const FAILED_FOR: Duration = Duration::from_secs(10);
+pub(super) const FAILED_FOR: Duration = Duration::from_secs(10);
 /// How often a session may put a new client, or a new lookup, in place of
 /// one that stalled (see `Server::recover`). A route that keeps stalling
 /// ends its streams instead of costing an identity every time.
-const RECOVER_EVERY: Duration = Duration::from_secs(10);
+pub(super) const RECOVER_EVERY: Duration = Duration::from_secs(10);
 
 /// One relayed stream. What mpv fetches goes through `live`, which is
 /// replaced when the upstream URLs go stale (see `Server::refresh`).
@@ -900,7 +900,7 @@ fn send_upstream(
 /// hasn't by then. (A request's own timeout would cover its whole body
 /// too.) The request carries on until the client's idle timeout, on a
 /// thread of its own, and its answer is dropped if it comes later.
-fn answer_within(
+pub(super) fn answer_within(
     rb: reqwest::blocking::RequestBuilder,
     within: Duration,
 ) -> Option<reqwest::Result<reqwest::blocking::Response>> {
