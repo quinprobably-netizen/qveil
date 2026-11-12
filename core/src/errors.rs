@@ -19,12 +19,16 @@ pub enum Code {
     RateLimited,
     YtdlpOutdated,
     DenoMissing,
+    MembersOnly,
+    Region,
+    NoRecording,
+    GaveUp,
     Other,
 }
 
 impl Code {
     #[cfg(test)]
-    pub const ALL: [Code; 11] = [
+    pub const ALL: [Code; 15] = [
         Code::BotCheck,
         Code::AgeRestricted,
         Code::TorDown,
@@ -35,6 +39,10 @@ impl Code {
         Code::RateLimited,
         Code::YtdlpOutdated,
         Code::DenoMissing,
+        Code::MembersOnly,
+        Code::Region,
+        Code::NoRecording,
+        Code::GaveUp,
         Code::Other,
     ];
 
@@ -50,6 +58,10 @@ impl Code {
             Code::RateLimited => "rate_limited",
             Code::YtdlpOutdated => "ytdlp_outdated",
             Code::DenoMissing => "deno_missing",
+            Code::MembersOnly => "members_only",
+            Code::Region => "region",
+            Code::NoRecording => "no_recording",
+            Code::GaveUp => "gave_up",
             Code::Other => "other",
         }
     }
@@ -70,6 +82,15 @@ impl Explained {
         }
     }
 }
+
+/// The engine's own words for an announced stream that never started: the
+/// waiting room stops looking 6 hours after the time it was announced for.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the waiting room gives up with it")
+)]
+pub const GAVE_UP: &str =
+    "The stream hasn't started, and qveil stopped waiting for it after 6 hours.";
 
 /// The body of an error reply: `{"error": <text>, "code": <code>}`.
 pub fn body(err: &str) -> Value {
@@ -135,6 +156,36 @@ pub fn explain(err: &str) -> Explained {
         return Explained::new(
             Code::Private,
             "This video is private; only the people it was shared with can watch it.",
+        );
+    }
+    // A channel's members-only video or stream. yt-dlp says "Join this
+    // channel to get access to members-only content", or names the level of
+    // membership it is for. qveil never has an account.
+    const MEMBERS: &[&str] = &["members-only content", "channel's members on level"];
+    if MEMBERS.iter().any(|needle| err.contains(needle)) {
+        return Explained::new(
+            Code::MembersOnly,
+            "This video is for the channel's members only; qveil never signs in, so it can't be played.",
+        );
+    }
+    // "The uploader has not made this video available in your country": the
+    // country is the route's, so another route may have it.
+    if err.contains("available in your country") {
+        return Explained::new(
+            Code::Region,
+            "YouTube doesn't offer this video in this route's region. Try another route.",
+        );
+    }
+    // A stream that has ended, and that YouTube kept nothing of (or keeps
+    // only as a manifestless post-live stream, which yt-dlp can't fetch).
+    const NO_RECORDING: &[&str] = &[
+        "This live stream recording is not available",
+        "Post-Live Manifestless",
+    ];
+    if NO_RECORDING.iter().any(|needle| err.contains(needle)) {
+        return Explained::new(
+            Code::NoRecording,
+            "The stream has ended, and YouTube kept no recording of it.",
         );
     }
     // HTTP 429, as yt-dlp (`HTTP Error 429: Too Many Requests`) and reqwest
@@ -209,7 +260,12 @@ fn already_explained(err: &str) -> Code {
         ("This video is age-restricted", Code::AgeRestricted),
         ("This video is private", Code::Private),
         ("YouTube is limiting how fast", Code::RateLimited),
-        ("Live streams aren't supported yet", Code::Live),
+        ("for the channel's members only", Code::MembersOnly),
+        ("in this route's region", Code::Region),
+        ("YouTube kept no recording", Code::NoRecording),
+        ("qveil stopped waiting for it", Code::GaveUp),
+        (crate::live::NO_FRAGMENTS, Code::Live),
+        (crate::ytdlp::NOT_PLAIN, Code::Live),
         ("a live stream or premiere that hasn't started", Code::Live),
         ("yt-dlp needs a JavaScript runtime", Code::DenoMissing),
         ("yt-dlp couldn't read YouTube's reply", Code::YtdlpOutdated),
@@ -357,6 +413,10 @@ mod tests {
                 "rate_limited",
                 "ytdlp_outdated",
                 "deno_missing",
+                "members_only",
+                "region",
+                "no_recording",
+                "gave_up",
                 "other"
             ]
         );
@@ -418,17 +478,36 @@ mod tests {
                 "The route changed while opening the video; try again",
                 Code::RouteChanged,
             ),
+            (crate::live::NO_FRAGMENTS, Code::Live),
+            (crate::ytdlp::NOT_PLAIN, Code::Live),
             (
-                "Live streams aren't supported yet: they can't be relayed through your route.",
-                Code::Live,
+                "ERROR: [youtube] abc: Join this channel to get access to members-only content like this video.",
+                Code::MembersOnly,
             ),
+            (
+                "ERROR: [youtube] abc: This video is available to this channel's members on level: Fan",
+                Code::MembersOnly,
+            ),
+            (
+                "ERROR: [youtube] abc: The uploader has not made this video available in your country",
+                Code::Region,
+            ),
+            (
+                "ERROR: [youtube] abc: This live stream recording is not available.",
+                Code::NoRecording,
+            ),
+            (GAVE_UP, Code::GaveUp),
             ("HTTP Error 404", Code::Other),
             ("something nobody foresaw", Code::Other),
         ] {
             let said = explain(raw);
             assert_eq!(said.code, code, "{raw} -> {said:?}");
             // The reader never sees yt-dlp's own words for a failure that has a code.
-            if code != Code::Other && code != Code::RouteChanged && code != Code::Live {
+            // (Those are the engine's own words.)
+            if !matches!(
+                code,
+                Code::Other | Code::RouteChanged | Code::Live | Code::GaveUp
+            ) {
                 assert_ne!(said.text, raw);
             }
             // Mapping what was mapped changes neither the words nor the code.
@@ -440,6 +519,49 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn no_recording_is_explained() {
+        for raw in [
+            "ERROR: [youtube] abc: This live stream recording is not available.",
+            "ERROR: [youtube] abc: Post-Live Manifestless mode is not supported",
+        ] {
+            let said = explain(raw);
+            assert_eq!(said.code, Code::NoRecording, "{raw}");
+            assert!(said.text.contains("no recording"), "{}", said.text);
+            assert_eq!(explain(&said.text), said);
+        }
+    }
+
+    #[test]
+    fn members_only_is_explained() {
+        let raw = "ERROR: [youtube] abc: Join this channel to get access to members-only content like this video, and other exclusive perks.";
+        let said = explain(raw);
+        assert_eq!(said.code, Code::MembersOnly);
+        assert!(said.text.contains("members"), "{}", said.text);
+        assert!(!said.text.contains("Join"), "{}", said.text);
+        assert_eq!(explain(&said.text), said);
+    }
+
+    #[test]
+    fn region_is_explained() {
+        let raw =
+            "ERROR: [youtube] abc: The uploader has not made this video available in your country";
+        let said = explain(raw);
+        assert_eq!(said.code, Code::Region);
+        assert!(
+            said.text.contains("region") && said.text.contains("another route"),
+            "{}",
+            said.text
+        );
+        assert_eq!(explain(&said.text), said);
+    }
+
+    #[test]
+    fn giving_up_on_a_stream_that_never_started_has_its_code() {
+        assert_eq!(explain(GAVE_UP).code, Code::GaveUp);
+        assert!(GAVE_UP.contains("6 hours"), "{GAVE_UP}");
     }
 
     #[test]

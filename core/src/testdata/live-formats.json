@@ -1,0 +1,19 @@
+{"title":"A live cam","channel":"Cam","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa","live_status":"is_live","is_live":true,
+ "release_timestamp":1771008448,"concurrent_view_count":567,"formats":[
+  {"format_id":"139","ext":"m4a","protocol":"http_dash_segments_generator","height":null,"vcodec":"none","acodec":"mp4a.40.5","target_duration":5,"url":"https://gv.test/live/139","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"140","ext":"m4a","protocol":"http_dash_segments_generator","height":null,"vcodec":"none","acodec":"mp4a.40.2","target_duration":5,"url":"https://gv.test/live/140","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"160","ext":"mp4","protocol":"http_dash_segments_generator","height":144,"vcodec":"avc1.42C00B","acodec":"none","target_duration":5,"url":"https://gv.test/live/160","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"278","ext":"webm","protocol":"http_dash_segments_generator","height":144,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/278","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"133","ext":"mp4","protocol":"http_dash_segments_generator","height":240,"vcodec":"avc1.4D4015","acodec":"none","target_duration":5,"url":"https://gv.test/live/133","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"242","ext":"webm","protocol":"http_dash_segments_generator","height":240,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/242","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"134","ext":"mp4","protocol":"http_dash_segments_generator","height":360,"vcodec":"avc1.4D401E","acodec":"none","target_duration":5,"url":"https://gv.test/live/134","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"243","ext":"webm","protocol":"http_dash_segments_generator","height":360,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/243","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"135","ext":"mp4","protocol":"http_dash_segments_generator","height":480,"vcodec":"avc1.4D401F","acodec":"none","target_duration":5,"url":"https://gv.test/live/135","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"244","ext":"webm","protocol":"http_dash_segments_generator","height":480,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/244","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"136","ext":"mp4","protocol":"http_dash_segments_generator","height":720,"vcodec":"avc1.4D401F","acodec":"none","target_duration":5,"url":"https://gv.test/live/136","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"247","ext":"webm","protocol":"http_dash_segments_generator","height":720,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/247","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"137","ext":"mp4","protocol":"http_dash_segments_generator","height":1080,"vcodec":"avc1.640028","acodec":"none","target_duration":5,"url":"https://gv.test/live/137","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"248","ext":"webm","protocol":"http_dash_segments_generator","height":1080,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/248","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"271","ext":"webm","protocol":"http_dash_segments_generator","height":1440,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/271","http_headers":{"User-Agent":"UA","Cookie":"a=b"}},
+  {"format_id":"313","ext":"webm","protocol":"http_dash_segments_generator","height":2160,"vcodec":"vp9","acodec":"none","target_duration":5,"url":"https://gv.test/live/313","http_headers":{"User-Agent":"UA","Cookie":"a=b"}}
+]}

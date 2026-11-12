@@ -11,6 +11,7 @@ use crate::comments::{self, Comments, Sort};
 use crate::errors::friendly;
 use crate::ids;
 use crate::inflight::{Inflight, Run, StartError};
+use crate::live::{self, Opening};
 use crate::net::{Net, USER_AGENT};
 use crate::private::PrivateDir;
 use crate::spare;
@@ -41,10 +42,11 @@ const ABORT_EVERY: Duration = Duration::from_millis(100);
 /// call, and this keeps a single dead connection from using up all of it.
 const SOCKET_TIMEOUT: &str = "20";
 
-/// Why a live stream is refused: the relay can only carry a plain download.
-const LIVE_UNSUPPORTED: &str =
-    "Live streams aren't supported yet: they can't be relayed through your route.";
-const MANIFEST_ONLY: &str = "This video is only offered as an HLS/DASH stream, which can't be relayed through your route yet.";
+/// What the usual lookup ends with when its answer is a stream (running or
+/// announced) or a video only offered as a manifest: there is no plain
+/// download in it, and `Ytdlp::open_until` looks it up as live instead.
+pub(crate) const NOT_PLAIN: &str =
+    "This is a live stream, or a video only offered in fragments, and not a plain download.";
 
 /// What an answer without a format to play ends with.
 const NOTHING_PLAYABLE: &str = "no playable format";
@@ -56,8 +58,8 @@ pub const CANCELLED: &str = "The request was cancelled";
 
 /// The format selector only takes plain downloads, so the HLS manifest that
 /// yt-dlp fetches for every video (a quarter of a second of a 1.3 s resolve,
-/// measured) is never used. Skipped when resolving; `explain_no_format` still
-/// fetches it, to tell a live stream from a video that has no plain download.
+/// measured) is never used. Skipped when resolving; the live lookup (see
+/// `LIVE_LOOKUP`) can't do without them.
 const SKIP_MANIFESTS: &str = "youtube:skip=hls,dash";
 
 /// How a search is asked for. `approximate_date` turns YouTube's "3 days
@@ -97,6 +99,18 @@ const LOOKUP: &str =
 /// neither the page nor the player's JavaScript, and nothing is downloaded.
 const CHAPTERS_LOOKUP: &str =
     "youtube:skip=hls,dash;player_skip=webpage,configs,js;player_client=default,-web";
+/// How a stream is looked up (see `Ytdlp::open_until`): with the manifests,
+/// which is where its fragments are, from the start (`--live-from-start`
+/// is what makes yt-dlp offer the DASH fragments of a running stream, and
+/// not only its HLS), and with yt-dlp's own format choice, since each
+/// track is chosen here (`live::choose`). An announced stream has no
+/// formats yet, and still answers, with when it starts.
+const LIVE_LOOKUP: &[&str] = &[
+    "-J",
+    "--no-playlist",
+    "--live-from-start",
+    "--ignore-no-formats-error",
+];
 
 /// yt-dlp exited with an error. `raw` is its last stderr line; the message
 /// shown is the readable version of it.
@@ -515,12 +529,70 @@ impl Ytdlp {
 
     /// `resolve`, which ends (and kills yt-dlp) once `abort` says that nobody
     /// is waiting for the result any more: the window hung up on the request.
+    /// Only for a plain video: a stream ends with `NOT_PLAIN` (see
+    /// `open_until`, which opens either).
     pub fn resolve_until(
         &self,
         url: &str,
         format: &str,
         abort: &dyn Fn() -> bool,
     ) -> Result<Streams> {
+        self.lookup(url, format, abort).map_err(|e| {
+            // With the manifests skipped, a running stream says it in the
+            // words of a lost recording, which it isn't.
+            let running = e
+                .downcast_ref::<Failed>()
+                .is_some_and(|f| f.raw.contains(RUNNING_UNSKIPPED));
+            if running { anyhow!(NOT_PLAIN) } else { e }
+        })
+    }
+
+    /// What `url` opens as. The usual lookup first, which is all a plain
+    /// video needs. When it finds no format, or a stream, or only manifests,
+    /// one live lookup follows (see `LIVE_LOOKUP`): it finds a running
+    /// stream's or a past broadcast's fragments, best video within
+    /// `max_height` and best audio (see `live::choose`), or when an
+    /// announced one starts.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the play path opens with it once it serves live streams"
+        )
+    )]
+    pub fn open_until(
+        &self,
+        url: &str,
+        format: &str,
+        max_height: u32,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Opening> {
+        let original = match self.lookup(url, format, abort) {
+            Ok(s) => return Ok(Opening::Plain(s)),
+            Err(e) if needs_live(&e) => e,
+            Err(e) => return Err(e),
+        };
+        let v = self.json_with(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
+        if live_state(&v) == Some(LiveState::Upcoming) {
+            return Ok(Opening::Upcoming {
+                title: str_field(&v, &["title"]).unwrap_or_else(|| url.into()),
+                channel: str_field(&v, &["channel", "uploader"]),
+                starts: v["release_timestamp"].as_i64(),
+            });
+        }
+        let is_stream = live_state(&v).is_some() || streamed(&v);
+        match live::choose(&v, max_height) {
+            Ok(s) => Ok(Opening::Live(s)),
+            Err(e) if is_stream => Err(e),
+            // An ordinary video that yt-dlp found nothing for: what the
+            // usual lookup said is what there is to say.
+            Err(_) => Err(original),
+        }
+    }
+
+    /// The usual lookup: the quick one first if it is on (see `LOOKUP`),
+    /// then the page and all, both with the manifests skipped.
+    fn lookup(&self, url: &str, format: &str, abort: &dyn Fn() -> bool) -> Result<Streams> {
         let args = ["-J", "--no-playlist", "-f", format];
         if self.quick_lookup {
             let quick = self.json_with(&args, Some(LOOKUP), url, RESOLVE, abort);
@@ -535,13 +607,8 @@ impl Ytdlp {
                 Err(_) => {}
             }
         }
-        let found = self
-            .json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort)
-            .and_then(|v| streams_from(&v, url));
-        match found {
-            Err(e) if is_no_format(&e) => Err(self.explain_no_format(url, e, abort)),
-            found => found,
-        }
+        self.json_with(&args, Some(SKIP_MANIFESTS), url, RESOLVE, abort)
+            .and_then(|v| streams_from(&v, url))
     }
 
     /// What the page data says of a video, which a quick lookup to play it
@@ -570,24 +637,6 @@ impl Ytdlp {
             channel: str_field(&v, &["channel", "uploader"]),
             published: published(&v),
         })
-    }
-
-    /// The format selector only accepts plain downloads, so a live stream
-    /// (HLS only) makes yt-dlp fail with a bare "no format". Ask again with
-    /// its default selector, which does return something, to say why. This
-    /// costs a second request, but only on a path that was failing anyway.
-    fn explain_no_format(
-        &self,
-        url: &str,
-        original: anyhow::Error,
-        abort: &dyn Fn() -> bool,
-    ) -> anyhow::Error {
-        match self.json_with(&["-J", "--no-playlist"], None, url, RESOLVE, abort) {
-            Ok(v) if live_state(&v).is_some() => anyhow!(LIVE_UNSUPPORTED),
-            Ok(v) if !chosen_formats(&v).iter().all(|f| is_plain(f)) => anyhow!(MANIFEST_ONLY),
-            Err(e) if e.to_string() == CANCELLED => e,
-            _ => original,
-        }
     }
 }
 
@@ -682,12 +731,31 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
 }
 
 fn is_no_format(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<Failed>().is_some_and(|f| {
-        // With the manifests skipped, a live stream has no formats at all,
-        // and yt-dlp says so in these words instead.
-        f.raw.contains("Requested format is not available")
-            || f.raw.contains("live stream recording is not available")
-    })
+    e.downcast_ref::<Failed>()
+        .is_some_and(|f| f.raw.contains("Requested format is not available"))
+}
+
+/// What yt-dlp says of a running stream when the manifests are skipped: it
+/// has no format at all then, and yt-dlp words that as a lost recording.
+const RUNNING_UNSKIPPED: &str = "live stream recording is not available";
+
+/// Whether the usual lookup ended in a way that a stream ends it: an answer
+/// without a plain download in it (`NOT_PLAIN`), an announced stream or
+/// premiere (yt-dlp fails on one without `--ignore-no-formats-error`), or a
+/// running stream (`RUNNING_UNSKIPPED`). Which it was, the live lookup
+/// finds out.
+fn says_live(e: &anyhow::Error) -> bool {
+    const SAID: &[&str] = &[RUNNING_UNSKIPPED, "live event will begin", "Premieres in"];
+    match e.downcast_ref::<Failed>() {
+        Some(f) => SAID.iter().any(|said| f.raw.contains(said)),
+        None => e.to_string() == NOT_PLAIN,
+    }
+}
+
+/// Whether the usual lookup's `e` is worth a live lookup: it says a stream
+/// (`says_live`), or it found no format, which may be a stream's.
+fn needs_live(e: &anyhow::Error) -> bool {
+    says_live(e) || is_no_format(e)
 }
 
 /// Whether a quick lookup (see `LOOKUP`) that ended with `e` is worth
@@ -698,8 +766,8 @@ fn is_no_format(e: &anyhow::Error) -> bool {
 /// that the quick lookup asks can't play it). So whatever yt-dlp failed
 /// with, or a result with nothing playable in it, is asked again; but not a
 /// lookup that was given up on, or stopped, or ran out of time, or a route
-/// that is down, which the usual way would only wait for again, nor a live
-/// stream, which neither can play.
+/// that is down, which the usual way would only wait for again, nor an
+/// answer that is a stream's (`NOT_PLAIN`), which the live lookup is for.
 fn worth_the_usual_way(e: &anyhow::Error) -> bool {
     if let Some(f) = e.downcast_ref::<Failed>() {
         return !matches!(
@@ -748,14 +816,11 @@ fn is_plain(f: &Value) -> bool {
 }
 
 fn streams_from(v: &Value, url: &str) -> Result<Streams> {
-    if live_state(v).is_some() {
-        bail!(LIVE_UNSUPPORTED);
+    let formats = chosen_formats(v);
+    if live_state(v).is_some() || !formats.iter().all(|f| is_plain(f)) {
+        bail!(NOT_PLAIN);
     }
     let title = str_field(v, &["title"]).unwrap_or_else(|| url.into());
-    let formats = chosen_formats(v);
-    if !formats.iter().all(|f| is_plain(f)) {
-        bail!(MANIFEST_ONLY);
-    }
     let is_video = |f: &&Value| f["vcodec"].as_str() != Some("none");
     let video_fmt = formats
         .iter()
@@ -765,18 +830,7 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
         .context(NOTHING_PLAYABLE)?;
     let audio_fmt = formats.iter().find(|f| !is_video(f));
     let audio = audio_fmt.and_then(|f| f["url"].as_str()).map(String::from);
-    // yt-dlp attaches the cookies of its in-memory jar that match the URL.
-    // None of YouTube's is meant for a googlevideo host, but the relay
-    // promises to send no cookies, so that doesn't rest on yt-dlp's jar.
-    let headers = video_fmt["http_headers"]
-        .as_object()
-        .map(|h| {
-            h.iter()
-                .filter(|(k, _)| !k.eq_ignore_ascii_case("cookie"))
-                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let headers = relay_headers(video_fmt);
     let duration = v["duration"].as_f64().map(|d| d as u64);
     let description: Option<String> =
         str_field(v, &["description"]).map(|d| d.chars().take(DESCRIPTION_MAX).collect());
@@ -802,6 +856,22 @@ fn streams_from(v: &Value, url: &str) -> Result<Streams> {
         chapters_later: false,
         details_later: false,
     })
+}
+
+/// The headers a format's bytes are fetched with. yt-dlp attaches the
+/// cookies of its in-memory jar that match the URL. None of YouTube's is
+/// meant for a googlevideo host, but the relay promises to send no cookies,
+/// so that doesn't rest on yt-dlp's jar.
+pub(crate) fn relay_headers(f: &Value) -> Vec<(String, String)> {
+    f["http_headers"]
+        .as_object()
+        .map(|h| {
+            h.iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("cookie"))
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// When the video was uploaded (or, for a stream, started), in Unix seconds:
@@ -902,7 +972,7 @@ fn chapters(v: &Value) -> Vec<Chapter> {
         .unwrap_or_default()
 }
 
-fn str_field(v: &Value, keys: &[&str]) -> Option<String> {
+pub(crate) fn str_field(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|k| v[*k].as_str().filter(|s| !s.is_empty()).map(String::from))
 }
@@ -1038,13 +1108,15 @@ mod tests {
     }
 
     #[test]
-    fn live_streams_are_refused() {
+    fn a_live_or_announced_answer_is_not_taken_for_a_plain_video() {
         for json in [
             r#"{"is_live":true,"url":"https://gv.test/x","protocol":"https"}"#,
             r#"{"live_status":"is_live","url":"https://gv.test/x","protocol":"https"}"#,
+            r#"{"live_status":"is_upcoming","url":"https://gv.test/x","protocol":"https"}"#,
         ] {
-            let e = resolved(json).unwrap_err().to_string();
-            assert_eq!(e, LIVE_UNSUPPORTED);
+            let e = resolved(json).unwrap_err();
+            assert_eq!(e.to_string(), NOT_PLAIN);
+            assert!(needs_live(&e), "{json}");
         }
         // A finished stream (`was_live`) is an ordinary download.
         assert!(
@@ -1054,18 +1126,16 @@ mod tests {
     }
 
     #[test]
-    fn manifests_are_refused_even_when_one_half_is_plain() {
+    fn manifests_are_never_taken_for_a_plain_download_even_when_one_half_is() {
         for protocol in ["m3u8_native", "m3u8", "http_dash_segments", "mhtml", "rtmp"] {
             let json = format!(
                 r#"{{"requested_formats":[
                     {{"url":"https://gv.test/v","protocol":"https","vcodec":"avc1"}},
                     {{"url":"https://gv.test/a","protocol":"{protocol}","vcodec":"none"}}]}}"#
             );
-            assert_eq!(
-                resolved(&json).unwrap_err().to_string(),
-                MANIFEST_ONLY,
-                "{protocol}"
-            );
+            let e = resolved(&json).unwrap_err();
+            assert_eq!(e.to_string(), NOT_PLAIN, "{protocol}");
+            assert!(needs_live(&e), "{protocol}");
         }
         assert!(
             resolved(r#"{"url":"https://gv.test/x"}"#).is_err(),
@@ -1149,16 +1219,6 @@ mod tests {
         )
         .unwrap();
         assert!(entries(&v).iter().all(|v| v.starts.is_none()));
-    }
-
-    #[test]
-    fn an_announced_stream_is_refused_like_a_running_one() {
-        let e = resolved(
-            r#"{"live_status":"is_upcoming","url":"https://gv.test/x","protocol":"https"}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(e, LIVE_UNSUPPORTED);
     }
 
     use crate::net::TOR_PROXY;
@@ -1666,31 +1726,215 @@ echo '{{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"
     }
 
     #[test]
-    fn manifests_are_skipped_when_resolving_but_not_when_explaining_a_failure() {
+    fn the_plain_path_tells_a_live_stream_from_a_lost_recording_in_one_call() {
         let dir = TempDir::new();
-        // A live stream: without its HLS manifest yt-dlp finds no format at
-        // all, and with it, it reports the stream as live.
-        let yt = ytdlp(
-            script(
-                &dir.0.join("yt-dlp"),
-                r#"while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
-if grep -q "^--extractor-args 'youtube:skip=hls,dash" "$conf"; then
-  echo skipped >> "$(dirname "$0")/calls"
-  echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2; exit 1
-fi
-echo full >> "$(dirname "$0")/calls"
-echo '{"is_live":true}'"#,
-            ),
-            None,
-        );
+        // A running stream: without its manifests yt-dlp finds no format at
+        // all, and says so in the words it uses for a lost recording.
+        let yt = live_fake(&dir, NO_FORMAT_LIVE, "exit 9");
         let err = yt
             .resolve("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "b")
             .unwrap_err();
-        assert_eq!(err.to_string(), LIVE_UNSUPPORTED);
-        let calls = spied(&dir, "calls");
-        let calls: Vec<_> = calls.lines().collect();
-        // The lookup, which finds no format, and the one that says why.
-        assert_eq!(calls, ["skipped", "full"]);
+        assert_eq!(err.to_string(), NOT_PLAIN);
+        assert_eq!(
+            crate::errors::explain(NOT_PLAIN).code,
+            crate::errors::Code::Live
+        );
+        assert_eq!(runs(&dir), 1);
+        assert!(spied(&dir, "conf1").contains("--extractor-args 'youtube:skip=hls,dash'\n"));
+        // An announced one keeps its own words.
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            "echo 'ERROR: [youtube] x: This live event will begin in 2 hours.' >&2; exit 1",
+            "exit 9",
+        );
+        let err = yt.resolve(WATCH, "b").unwrap_err().to_string();
+        assert!(err.contains("hasn't started"), "{err}");
+        assert_eq!(runs(&dir), 1);
+    }
+
+    const LIVE_JSON: &str = include_str!("testdata/live-formats.json");
+    /// What the usual lookup answers for a running stream (manifests skipped).
+    const NO_FORMAT_LIVE: &str =
+        r#"echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2; exit 1"#;
+    const WATCH: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+
+    /// A yt-dlp that runs `plain` (shell) for the usual lookup and `live`
+    /// for the live lookup (`--live-from-start` in its config), counts its
+    /// runs and keeps each run's config as `conf<n>`. `live.json` beside it
+    /// is a running stream's answer.
+    fn live_fake(dir: &TempDir, plain: &str, live: &str) -> Ytdlp {
+        std::fs::write(dir.0.join("live.json"), LIVE_JSON).unwrap();
+        let body = format!(
+            r#"d=$(dirname "$0")
+while [ $# -gt 0 ]; do [ "$1" = --config-locations ] && conf="$2"; shift; done
+n=$(( $(cat "$d/runs" 2>/dev/null || echo 0) + 1 )); echo $n > "$d/runs"
+cp "$conf" "$d/conf$n"
+if grep -qx -- --live-from-start "$conf"; then
+{live}
+else
+{plain}
+fi
+"#
+        );
+        ytdlp(script(&dir.0.join("yt-dlp"), &body), None)
+    }
+
+    fn runs(dir: &TempDir) -> u32 {
+        std::fs::read_to_string(dir.0.join("runs"))
+            .map(|s| s.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    fn open(yt: &Ytdlp, max_height: u32) -> Result<Opening> {
+        yt.open_until(WATCH, "b", max_height, &|| false)
+    }
+
+    #[test]
+    fn a_running_stream_opens_as_live() {
+        let dir = TempDir::new();
+        let yt = live_fake(&dir, NO_FORMAT_LIVE, r#"cat "$d/live.json""#);
+        let Opening::Live(s) = open(&yt, 1080).unwrap() else {
+            panic!("not live")
+        };
+        assert!(!s.ended);
+        assert_eq!(
+            (s.video.format_id.as_str(), s.audio.format_id.as_str()),
+            ("248", "140")
+        );
+        assert_eq!(s.fragments, crate::live::Fragments::Numbered);
+        assert_eq!(runs(&dir), 2);
+        // A running stream the usual lookup did answer for (it has no plain
+        // download) is looked up as live too.
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            r#"echo '{"live_status":"is_live","url":"https://gv.test/m","protocol":"m3u8_native"}'"#,
+            r#"cat "$d/live.json""#,
+        );
+        assert!(matches!(open(&yt, 1440).unwrap(), Opening::Live(s) if s.video.format_id == "271"));
+        assert_eq!(runs(&dir), 2);
+    }
+
+    #[test]
+    fn an_announced_stream_opens_as_upcoming_with_its_start() {
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            r#"echo 'ERROR: [youtube] x: This live event will begin in 2 hours.' >&2; exit 1"#,
+            r#"echo '{"title":"Soon","channel":"Cam","live_status":"is_upcoming","release_timestamp":1800000000}'"#,
+        );
+        let Opening::Upcoming {
+            title,
+            channel,
+            starts,
+        } = open(&yt, 1080).unwrap()
+        else {
+            panic!("not upcoming")
+        };
+        assert_eq!(starts, Some(1800000000));
+        assert_eq!((title.as_str(), channel.as_deref()), ("Soon", Some("Cam")));
+    }
+
+    #[test]
+    fn a_plain_video_still_opens_plain_with_one_call() {
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            r#"echo '{"title":"T","url":"https://gv.test/c","protocol":"https","vcodec":"avc1"}'"#,
+            "exit 9",
+        );
+        let Opening::Plain(s) = open(&yt, 1080).unwrap() else {
+            panic!("not plain")
+        };
+        assert_eq!(s.video, "https://gv.test/c");
+        assert_eq!(runs(&dir), 1);
+    }
+
+    #[test]
+    fn the_live_lookup_never_skips_manifests_and_asks_from_the_start() {
+        let dir = TempDir::new();
+        let yt = live_fake(&dir, NO_FORMAT_LIVE, r#"cat "$d/live.json""#);
+        open(&yt, 1080).unwrap();
+        assert!(spied(&dir, "conf1").contains("skip=hls,dash"));
+        let conf = spied(&dir, "conf2");
+        for line in [
+            "-J",
+            "--no-playlist",
+            "--live-from-start",
+            "--ignore-no-formats-error",
+        ] {
+            assert!(conf.lines().any(|l| l == line), "{line} in {conf}");
+        }
+        assert!(!conf.contains("skip=hls,dash"), "{conf}");
+        // yt-dlp's own choice, which offers the fragments: no selector.
+        assert!(!conf.lines().any(|l| l.starts_with("-f")), "{conf}");
+    }
+
+    #[test]
+    fn what_the_live_lookup_finds_wrong_is_said() {
+        // A members-only stream, or one that ended without a recording.
+        for (live, code) in [
+            (
+                "echo 'ERROR: [youtube] x: Join this channel to get access to members-only content like this video.' >&2; exit 1",
+                crate::errors::Code::MembersOnly,
+            ),
+            (
+                "echo 'ERROR: [youtube] x: This live stream recording is not available.' >&2; exit 1",
+                crate::errors::Code::NoRecording,
+            ),
+            // Live, with nothing but HLS.
+            (
+                r#"echo '{"live_status":"is_live","formats":[{"protocol":"m3u8_native","vcodec":"avc1","acodec":"mp4a","url":"https://gv.test/m"}]}'"#,
+                crate::errors::Code::Live,
+            ),
+        ] {
+            let dir = TempDir::new();
+            let yt = live_fake(&dir, NO_FORMAT_LIVE, live);
+            let e = open(&yt, 1080).unwrap_err();
+            assert_eq!(
+                crate::errors::explain(&e.to_string()).code,
+                code,
+                "{live}: {e}"
+            );
+            assert_eq!(runs(&dir), 2);
+        }
+        // An ordinary video that yt-dlp found no format for keeps its own error.
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            "echo 'ERROR: [youtube] x: Requested format is not available. Use --list-formats' >&2; exit 1",
+            r#"echo '{"title":"T","formats":[{"url":"https://gv.test/c","protocol":"https","vcodec":"avc1","acodec":"mp4a"}]}'"#,
+        );
+        let e = open(&yt, 1080).unwrap_err();
+        assert_eq!(
+            crate::errors::explain(&e.to_string()).code,
+            crate::errors::Code::YtdlpOutdated,
+            "{e}"
+        );
+        // And nothing that failed for another reason is looked up again.
+        let dir = TempDir::new();
+        let yt = live_fake(
+            &dir,
+            "echo 'ERROR: [youtube] x: Private video.' >&2; exit 1",
+            "exit 9",
+        );
+        assert!(open(&yt, 1080).is_err());
+        assert_eq!(runs(&dir), 1);
+    }
+
+    #[test]
+    fn a_live_lookup_given_up_on_is_cancelled() {
+        let dir = TempDir::new();
+        let yt = live_fake(&dir, NO_FORMAT_LIVE, "sleep 30");
+        let started = Instant::now();
+        let e = yt
+            .open_until(WATCH, "b", 1080, &|| {
+                started.elapsed() > Duration::from_millis(300)
+            })
+            .unwrap_err();
+        assert_eq!(e.to_string(), CANCELLED);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

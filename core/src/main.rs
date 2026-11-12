@@ -37,6 +37,7 @@ mod h2up;
 mod ids;
 mod inflight;
 mod lens;
+mod live;
 mod net;
 mod pick;
 mod player;
