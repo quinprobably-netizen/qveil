@@ -16,12 +16,20 @@ starts with "live" is a running stream, as the engine plays one: two EVENT
 playlists that list LIVE_FIRST segments when it is opened and one more each
 LIVE_SEGMENT seconds, and `live/<sid>/state`. `POST api/_live_end` ends it:
 the playlists get `#EXT-X-ENDLIST`, and the state says "ended".
+
+A video whose ID starts with "waiting" is an announced stream: its play
+answers `waiting` and no streams, and `GET api/wait` is its waiting room (see
+`Handler.wait`). Once the room has said "now", playing it again answers the
+running stream above. `GET api/_waits` says how many rooms are open.
 """
 import http.server
 import json
 import os
+import select
+import socket
 import struct
 import sys
+import threading
 import time
 import urllib.parse
 import zlib
@@ -33,6 +41,23 @@ LIVECLIP = os.environ.get("QVEIL_STANDIN_LIVECLIP", "")
 LIVE_SEGMENT, LIVE_FIRST = 2, 8
 # When the running stream was opened (it grows from then), and whether it has ended.
 live = {"opened": 0.0, "ended": False, "sid": 0, "final": 0}
+# The waiting rooms open now, and the announced streams that have started.
+waits = {"open": 0, "started": set(), "lock": threading.Lock()}
+# When each announced stream starts, from the moment it is played, by the
+# end of its ID: an hour and three quarters ahead, a little late, very late,
+# or not known.
+WAIT_STARTS = {"late": -12 * 60, "verylate": -40 * 60, "none": None}
+GAVE_UP = "The stream hasn't started, and qveil stopped waiting for it after 6 hours."
+MEMBERS_ONLY = "This video is for the channel's members only; qveil never signs in, so it can't be played."
+
+
+def wait_starts(v):
+    """When the announced stream `v` starts, as its play answers it."""
+    kind = v[len("waiting"):]
+    for name, offset in WAIT_STARTS.items():
+        if kind.startswith(name):
+            return None if offset is None else int(time.time()) + offset
+    return int(time.time()) + HOUR + 42 * 60 + 10
 
 
 def live_segments():
@@ -399,7 +424,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query, keep_blank_values=True).items()}
         path = u.path.split("/t/", 1)[-1]
-        if path != "api/_log" and not path.startswith("thumb/"):
+        if path not in ("api/_log", "api/_waits") and not path.startswith("thumb/"):
             state["log"].append("%s %s%s" % (self.command, path, "?" + u.query if u.query else ""))
         return path, q
 
@@ -453,6 +478,63 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def hung_up(self):
+        """Whether the window has hung up: its side of the connection is closed."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
+    def wait(self, q):
+        """`GET api/wait`, as the engine answers it: "upcoming" at once and as
+        a heartbeat (every QVEIL_STANDIN_WAIT_BEAT seconds, 25 by default),
+        until the window hangs up. With QVEIL_STANDIN_WAIT_NOW_MS set, the
+        stream starts that many ms after the room opened: "now", and the job
+        ends. A "waitinggaveup…" stream is given up on, and a
+        "waitingmembers…" one turns out to be for members only."""
+        v = q.get("v", "")
+        raw = q.get("starts", "")
+        starts = int(raw) if raw.lstrip("-").isdigit() else None
+        beat = float(os.environ.get("QVEIL_STANDIN_WAIT_BEAT", "25"))
+        now_ms = os.environ.get("QVEIL_STANDIN_WAIT_NOW_MS", "")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+
+        def say(line):
+            self.wfile.write((json.dumps(line) + "\n").encode())
+            self.wfile.flush()
+
+        with waits["lock"]:
+            waits["open"] += 1
+        try:
+            say({"state": "upcoming", "starts": starts})
+            if v.startswith("waitinggaveup"):
+                time.sleep(0.3)
+                say({"state": "gave_up", "error": GAVE_UP, "code": "gave_up"})
+                return
+            if v.startswith("waitingmembers"):
+                time.sleep(0.3)
+                say({"error": MEMBERS_ONLY, "code": "members_only"})
+                return
+            opened = last = time.monotonic()
+            while not self.hung_up():
+                if now_ms and (time.monotonic() - opened) * 1000 >= float(now_ms):
+                    with waits["lock"]:
+                        waits["started"].add(v)
+                    say({"state": "now"})
+                    return
+                if time.monotonic() - last >= beat:
+                    say({"state": "upcoming", "starts": starts})
+                    last = time.monotonic()
+                time.sleep(0.05)
+        except OSError:
+            pass
+        finally:
+            with waits["lock"]:
+                waits["open"] -= 1
+
     def live(self, rest):
         """A running stream's playlists, segments and state, as the engine serves them."""
         if not rest or rest[0] != str(live["sid"]):
@@ -478,6 +560,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         base = "http://%s/t" % self.headers.get("Host", "127.0.0.1")
         if path == "api/_log":
             self.send(200, state["log"])
+        elif path == "api/_waits":
+            self.send(200, {"open": waits["open"]})
+        elif path == "api/wait":
+            self.wait(q)
         elif path == "api/config":
             self.send(200, state["config"])
         elif path == "api/feed":
@@ -666,7 +752,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     or v in os.environ.get("QVEIL_STANDIN_PLAY_FAILS", "").split(","):
                 self.send(500, {"error": "The engine's words for " + v, "code": v})
                 return
-            if v.startswith("live") and LIVECLIP:
+            # An announced stream that hasn't started yet: no streams, only when.
+            if v.startswith("waiting") and v not in waits["started"]:
+                self.send(200, {"id": v, "title": "Questions, answered live", "channel": CHANNELS[0][1],
+                                "channelId": CHANNELS[0][0], "description": "Bring your questions.",
+                                "waiting": {"starts": wait_starts(v)}})
+                return
+            if (v.startswith("live") or v in waits["started"]) and LIVECLIP:
                 live.update(opened=time.monotonic(), ended=False, sid=live["sid"] + 1)
                 at = "%s/live/%d/" % (base, live["sid"])
                 cid, name = CHANNELS[0]

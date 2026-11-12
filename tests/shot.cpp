@@ -68,6 +68,8 @@ int main(int argc, char *argv[]) {
         // fallen behind it; the controls brought up just before the still.
         {"watch-live", "play({ id: 'live0000001', title: 'Live: the long one, part 2', channel: 'Low Level Hours', live: 'now' }); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 4600; running: true; onTriggered: watch.surface.reveal() }', win)"},
+        // An announced stream's waiting room, counting down.
+        {"waiting", "play({ id: 'waiting0001', title: 'Questions, answered live', channel: 'Low Level Hours', live: 'upcoming' })"},
         {"watch-live-behind", "play({ id: 'live0000001', title: 'Live: the long one, part 2', channel: 'Low Level Hours', live: 'now' }); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 3000; running: true; onTriggered: watch.surface.seekTo(4) }', win); "
                 "Qt.createQmlObject('import QtQuick; Timer { interval: 4600; running: true; onTriggered: watch.surface.reveal() }', win)"},

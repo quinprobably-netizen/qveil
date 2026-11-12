@@ -5009,6 +5009,194 @@ private slots:
         QTRY_VERIFY(app.asked("POST api/resume") >= 1);
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
     }
+
+    // --- The waiting room of an announced stream (R1). ---
+
+    // Opens the stand-in's announced stream `id` the way a card does, and
+    // waits for its room. The room, or null.
+    static QQuickItem *openWaiting(App &app, const char *id)
+    {
+        app.play({{"id", id}, {"title", "Questions, answered live"}, {"live", "upcoming"}});
+        QQuickItem *room = nullptr;
+        if (!QTest::qWaitFor([&] { return (room = app.item("waiting-room")) && room->isVisible(); }, 10000))
+            return nullptr;
+        return room;
+    }
+    static QString textOf(QQuickItem *room, const char *name)
+    {
+        QQuickItem *text = App::under(room, name);
+        return text && text->isVisible() ? text->property("text").toString() : QString();
+    }
+    // How many waiting rooms the stand-in engine has open.
+    static int openWaits(App &app)
+    {
+        const QString base = app.backend->thumbBase().chopped(QString("/thumb/").size());
+        QNetworkReply *reply = app.web.get(QNetworkRequest(QUrl(base + "/api/_waits")));
+        QSignalSpy done(reply, &QNetworkReply::finished);
+        done.wait(5000);
+        const int open = QJsonDocument::fromJson(reply->readAll()).object().value("open").toInt(-1);
+        reply->deleteLater();
+        return open;
+    }
+
+    void anAnnouncedStreamOpensTheWaitingRoomAndLoadsNothing()
+    {
+        App app;
+        READY(app);
+        QQuickItem *room = openWaiting(app, "waiting0001");
+        QVERIFY(room);
+        QQuickItem *surface = app.item("surface");
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        // The room asks the engine when it starts, with the time the play gave.
+        QTRY_COMPARE(app.askedLike("^GET api/wait\\?v=waiting0001&starts=\\d+$"), 1);
+        QCOMPARE(app.asked("POST api/play"), 1);
+        QCOMPARE(textOf(room, "waiting-eyebrow"), QString("STARTS IN"));
+        // About an hour and three quarters, to the second.
+        QVERIFY2(QRegularExpression("^1:42:\\d\\d$").match(textOf(room, "waiting-countdown")).hasMatch(),
+                 qPrintable(textOf(room, "waiting-countdown")));
+        QCOMPARE(App::under(room, "waiting-countdown")->property("font").value<QFont>().pixelSize(), 32);
+        const QString line = textOf(room, "waiting-line");
+        QVERIFY2(QRegularExpression(QString::fromUtf8("^\\S+ \\d\\d:\\d\\d \u00b7 plays from the start when it begins$")).match(line).hasMatch(),
+                 qPrintable(line));
+        // The countdown counts.
+        const QString was = textOf(room, "waiting-countdown");
+        QTRY_VERIFY_WITH_TIMEOUT(textOf(room, "waiting-countdown") != was, 3000);
+        // Under the title: when it is scheduled for.
+        QVERIFY2(app.item("watch-stats")->property("text").toString().startsWith("Scheduled for "),
+                 qPrintable(app.item("watch-stats")->property("text").toString()));
+        // Nothing goes into the player meanwhile, and nothing more is asked.
+        QTest::qWait(1500);
+        QVERIFY(!mpv->property("loaded").toBool());
+        QCOMPARE(app.asked("POST api/play"), 1);
+        QCOMPARE(openWaits(app), 1);
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+        // No controls of a player that has nothing to play.
+        QVERIFY(!App::under(surface, "seek-time")->isVisible());
+    }
+
+    void whenItStartsItPlaysOnceFromTheStart()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}, {"QVEIL_STANDIN_WAIT_NOW_MS", "1500"}});
+        READY(app);
+        QQuickItem *room = openWaiting(app, "waiting0002");
+        QVERIFY(room);
+        QQuickItem *surface = app.item("surface");
+        QObject *mpv = surface->property("mpv").value<QObject *>();
+        QVERIFY(!mpv->property("loaded").toBool());
+        // It starts: the room goes, and the stream plays, from its beginning.
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool(), 20000);
+        QVERIFY(!room->isVisible());
+        QCOMPARE(surface->property("startedAt").toDouble(), 0.0);
+        QVERIFY(surface->property("live").toBool());
+        QVERIFY2(mpv->property("position").toDouble() < 4, qPrintable(QString::number(mpv->property("position").toDouble())));
+        QTRY_VERIFY(app.askedLike("^GET live/\\d+/v/0\\.mkv") >= 1);
+        // One play to learn it was announced, and one, once, when it began.
+        // (indexOf wants the whole line to match.)
+        const QStringList asked = app.asked();
+        const int waited = asked.indexOf(QRegularExpression("GET api/wait\\?v=waiting0002.*"));
+        QVERIFY2(waited >= 0, qPrintable(asked.join('\n')));
+        QCOMPARE(asked.mid(0, waited).filter(QRegularExpression("^POST api/play")).size(), 1);
+        QCOMPARE(asked.mid(waited).filter(QRegularExpression("^POST api/play")).size(), 1);
+        QTest::qWait(1000);
+        QCOMPARE(app.asked("POST api/play"), 2);
+        QCOMPARE(app.askedLike("^GET api/wait"), 1);
+        QCOMPARE(openWaits(app), 0);
+        QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void leavingTheWaitingRoomStopsTheWait()
+    {
+        App app;
+        READY(app);
+        QVERIFY(openWaiting(app, "waiting0003"));
+        QTRY_COMPARE(openWaits(app), 1);
+        // Left: no small window (there is nothing playing to take along), and the engine is hung up on.
+        QTest::keyClick(app.window, Qt::Key_Escape);
+        QTRY_VERIFY(!app.window->property("watching").toBool());
+        QVERIFY(!app.pip()->isVisible());
+        QTRY_COMPARE(openWaits(app), 0);
+        QVERIFY(!app.backend->busy().contains("wait"));
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/play"), 1);
+        QVERIFY(!app.pip()->isVisible());
+
+        // So does opening another video from it.
+        QVERIFY(openWaiting(app, "waiting0004"));
+        QTRY_COMPARE(openWaits(app), 1);
+        app.play(app.backend->feed()->get(0));
+        QTRY_VERIFY(!app.item("waiting-room")->isVisible() && !app.item("surface")->property("pending").toBool());
+        QTRY_COMPARE(openWaits(app), 0);
+    }
+
+    void aLateStreamSaysHowLate()
+    {
+        App app;
+        READY(app);
+        QQuickItem *room = openWaiting(app, "waitinglate");
+        QVERIFY(room);
+        // Twelve minutes past its time: asked every minute.
+        QTRY_COMPARE(textOf(room, "waiting-line"), QString::fromUtf8("Should have started 12 min ago \u00b7 checking every minute"));
+        QCOMPARE(textOf(room, "waiting-eyebrow"), QString("SCHEDULED FOR"));
+        QVERIFY2(QRegularExpression("^\\S+ \\d\\d:\\d\\d$").match(textOf(room, "waiting-countdown")).hasMatch(),
+                 qPrintable(textOf(room, "waiting-countdown")));
+        // Half an hour late and more, every five, as the engine asks.
+        room = openWaiting(app, "waitingverylate");
+        QVERIFY(room);
+        QTRY_COMPARE(textOf(room, "waiting-line"), QString::fromUtf8("Should have started 40 min ago \u00b7 checking every 5 minutes"));
+        // Not known when: the engine asks every minute until it is.
+        room = openWaiting(app, "waitingnone");
+        QVERIFY(room);
+        QTRY_COMPARE(textOf(room, "waiting-line"), QString::fromUtf8("Waiting for it to start \u00b7 checking every minute"));
+        QCOMPARE(textOf(room, "waiting-countdown"), QString());
+        QTRY_COMPARE(app.askedLike("^GET api/wait\\?v=waitingnone$"), 1);
+        QVERIFY(!app.item("surface")->property("mpv").value<QObject *>()->property("loaded").toBool());
+    }
+
+    void aRouteChangeWaitsAgainOnTheNewRoute()
+    {
+        App app;
+        READY(app);
+        QQuickItem *room = openWaiting(app, "waiting0005");
+        QVERIFY(room);
+        QTRY_COMPARE(openWaits(app), 1);
+        app.backend->setConfig({{"route", "tor"}});
+        QTRY_COMPARE(app.backend->config().value("route").toString(), QString("tor"));
+        // The wait over the old route is hung up on, and the stream is looked
+        // up again, and waited for, over the new one.
+        QTRY_COMPARE(app.asked("POST api/play"), 2);
+        QTRY_COMPARE(app.askedLike("^GET api/wait\\?v=waiting0005"), 2);
+        QTRY_VERIFY(room->isVisible());
+        QTest::qWait(500);
+        QCOMPARE(openWaits(app), 1);
+        QVERIFY(!app.item("surface")->property("mpv").value<QObject *>()->property("loaded").toBool());
+        QVERIFY(!app.item("errorBar")->isVisible());
+    }
+
+    void aStreamThatNeverStartsSaysSoInTheRoom()
+    {
+        App app;
+        READY(app);
+        QQuickItem *room = openWaiting(app, "waitinggaveup");
+        QVERIFY(room);
+        // The engine's sentence, in the room where the countdown was; not in a bar over the page too.
+        QTRY_COMPARE(textOf(room, "waiting-line"), QString("The stream hasn't started, and qveil stopped waiting for it after 6 hours."));
+        QCOMPARE(textOf(room, "waiting-countdown"), QString());
+        QVERIFY(!app.item("errorBar")->isVisible());
+        QTRY_COMPARE(openWaits(app), 0);
+        QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/play"), 1);
+        QVERIFY(room->isVisible());
+        // And one that turns out to be for members only says that.
+        room = openWaiting(app, "waitingmembers");
+        QVERIFY(room);
+        QTRY_VERIFY2(textOf(room, "waiting-line").contains("members only"), qPrintable(textOf(room, "waiting-line")));
+        QVERIFY(!app.item("errorBar")->isVisible());
+        QCOMPARE(app.asked("POST api/play"), 2);
+    }
 };
 
 QVEIL_SUITE(WindowTests)

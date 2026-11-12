@@ -82,6 +82,21 @@ function dayTime(timestamp) {
     return Qt.formatDateTime(new Date(timestamp * 1000), "ddd HH:mm")
 }
 
+// What the waiting room says under its countdown, for a stream announced
+// for `starts` (Unix seconds, 0 when that isn't known) at `now`. Once it is
+// late, how often the engine asks follows the engine's schedule: every
+// minute, and every 5 minutes once it is half an hour late.
+function waitLine(starts, now) {
+    if (!(starts > 0))
+        return qsTr("Waiting for it to start · checking every minute")
+    if (now < starts)
+        return qsTr("%1 · plays from the start when it begins").arg(dayTime(starts))
+    const late = Math.max(1, Math.floor((now - starts) / 60))
+    const ago = late < 60 ? qsTr("%1 min").arg(late) : qsTr("%1 h %2 min").arg(Math.floor(late / 60)).arg(late % 60)
+    return now - starts >= 30 * 60 ? qsTr("Should have started %1 ago · checking every 5 minutes").arg(ago)
+                                   : qsTr("Should have started %1 ago · checking every minute").arg(ago)
+}
+
 // The line under a card's title. `brief`: the count without the word, for
 // where the word won't fit.
 function meta(video, date, brief) {

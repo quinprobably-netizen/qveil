@@ -177,6 +177,14 @@ public:
     Q_INVOKABLE void checkLive(const QString &playlist);
     // Hangs up on a check still running: the stream was left.
     Q_INVOKABLE void stopLiveCheck();
+    // The waiting room of an announced stream (a play answer that says
+    // `waiting`): the engine asks YouTube on its own schedule whether it has
+    // started, and waitState() says what it found. `starts` is when the play
+    // said it is announced for (Unix seconds), 0 when it didn't say. One wait
+    // at a time: a new one, or stopWait(), hangs up on the one before.
+    Q_INVOKABLE void wait(const QString &video, qint64 starts = 0);
+    // Hangs up on the wait: the room was left.
+    Q_INVOKABLE void stopWait();
     Q_INVOKABLE void loadResume();
     // Tells the engine where `video` (id, title, channel) is. Says nothing
     // until the player knows how long the video is.
@@ -258,6 +266,15 @@ signals:
     // What the engine said of the stream `playlist` (see checkLive): "now",
     // or "ended", which is also what a session it no longer has is.
     void liveChecked(const QString &playlist, const QString &state);
+    // What the engine said of the stream being waited for: "upcoming", with
+    // when it starts (0 if that isn't known), now and then while it waits;
+    // "now" once it has started, which ends the wait.
+    void waitState(const QString &state, qint64 starts);
+    // The wait is over without the stream having started: it was given up
+    // on (`code` "gave_up"), or can't be played at all (members-only, not in
+    // this region, …), in the engine's words. Shown in the room, not as the
+    // window's error.
+    void waitFailed(const QString &message, const QString &code);
     // The latest request of `task` failed (the error itself is in `error`).
     void taskFailed(const QString &task);
     void notice(const QString &text);
@@ -286,8 +303,11 @@ private:
     // A GET whose answer is one JSON object per line, sent as they are ready
     // (see qveil-core's streamed search). `batch` gets them a few at a time.
     // `ended` runs once the request is over, whatever became of it.
+    // `failed`, if given, hears of a failure in place of the window's error
+    // (see fail()); taskFailed() is said either way.
+    using Failed = std::function<void(const QString &message, const QString &code)>;
     void stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch,
-                std::function<void()> ended = {});
+                std::function<void()> ended = {}, Failed failed = {});
     // Lines that arrive together are handed on together, so a page of
     // results is one update of the grid rather than twenty.
     static constexpr int BatchMs = 100;

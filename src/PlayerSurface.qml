@@ -59,6 +59,56 @@ FocusScope {
     // How often the engine is asked whether a running stream has ended, in ms.
     property int liveCheckInterval: 10000
 
+    // An announced stream that hasn't started (the answer said `waiting`):
+    // the waiting room shows in place of the player, which loads nothing.
+    readonly property bool waiting: active && !pending && !!info.waiting
+    // What the room shows: when it starts (Unix seconds, 0 if not known),
+    // "upcoming" while the engine waits ("gave_up" or "failed" once it has
+    // stopped, with its words in waitMessage), or "" with no wait running.
+    property real waitStarts: 0
+    property string waitState: ""
+    property string waitMessage: ""
+    // Set when the stream that was waited for has started: its play answer
+    // opens it at its start, not at its edge.
+    property bool fromStart: false
+
+    // The stream has started: it is looked up once more, and plays from its start.
+    function begin() {
+        if (!waiting || waitState !== "upcoming")
+            return
+        const i = info
+        prepare({ id: i.id, title: i.title || "", channel: i.channel || "", channelId: i.channelId || "",
+                  published: i.published || 0, batch: i.batch || 0 })
+        fromStart = true
+        backend.play(i.id, i.channel || "")
+    }
+    // Lets go of the wait, if there is one.
+    function endWait() {
+        if (waitState === "upcoming")
+            backend.stopWait()
+        waitState = ""
+        waitMessage = ""
+        waitStarts = 0
+    }
+    Connections {
+        target: backend
+        function onWaitState(state, starts) {
+            if (!surface.waiting || surface.waitState !== "upcoming")
+                return
+            if (state === "upcoming" && starts > 0)
+                surface.waitStarts = starts
+            else if (state === "now")
+                // (Not from inside the engine's answer, which this hangs up on.)
+                Qt.callLater(surface.begin)
+        }
+        function onWaitFailed(message, code) {
+            if (!surface.waiting || surface.waitState !== "upcoming")
+                return
+            surface.waitState = code === "gave_up" ? "gave_up" : "failed"
+            surface.waitMessage = message
+        }
+    }
+
     // To the live edge, where a running stream is joined.
     function goLive() {
         if (live)
@@ -92,6 +142,8 @@ FocusScope {
     // looks it up; `open` follows with the streams.
     function prepare(video) {
         report()
+        endWait()
+        fromStart = false
         if (mpv.loaded)
             mpv.stop()
         info = {
@@ -119,6 +171,11 @@ FocusScope {
     // `at`: where to start instead of where the answer says (a video picked
     // up from the other window carries on where that one was).
     function openAt(i, at) {
+        endWait()
+        // The stream that was waited for, now that it runs: from its beginning.
+        if (at === undefined && fromStart && i.id === info.id)
+            at = 0
+        fromStart = false
         pending = false
         // The card's channel and age stay where the answer has none (a lookup
         // without the watch page has neither) and it is the same video.
@@ -139,6 +196,15 @@ FocusScope {
         if (i.detailsLater && (!info.channel || !info.published))
             backend.loadChapters(i.id)
         mpv.volume = savedVolume
+        // Announced, and not started: the engine is asked to say when it
+        // does, from the time the answer gave. Nothing is loaded meanwhile.
+        if (i.waiting) {
+            waitStarts = i.waiting.starts > 0 ? i.waiting.starts : 0
+            waitState = "upcoming"
+            backend.wait(i.id, waitStarts)
+            reveal()
+            return
+        }
         // A video without a stream has nothing to load (and makes no sound).
         if (i.video)
             mpv.load(i.video, i.audio || "", startedAt, !!i.live)
@@ -176,6 +242,8 @@ FocusScope {
             report()
         if (pending)
             backend.cancelPlay()
+        endWait()
+        fromStart = false
         pending = false
         mpv.stop()
         active = false
@@ -318,9 +386,18 @@ FocusScope {
         fillMode: Image.PreserveAspectFit
         asynchronous: true
         source: surface.active ? Format.thumb(backend.thumbBase, surface.info.id, surface.info.batch) : ""
-        opacity: surface.active && !mpv.started ? 0.5 : 0
+        opacity: surface.active && !mpv.started && !surface.waiting ? 0.5 : 0
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 180 } }
+    }
+
+    WaitingRoom {
+        anchors.fill: parent
+        visible: surface.waiting
+        info: surface.info
+        starts: surface.waitStarts
+        phase: surface.waitState || "upcoming"
+        message: surface.waitMessage
     }
 
     Column {
@@ -371,7 +448,7 @@ FocusScope {
         hoverEnabled: true
         cursorShape: surface.chrome ? Qt.ArrowCursor : Qt.BlankCursor
         onPositionChanged: surface.reveal()
-        onClicked: mpv.togglePause()
+        onClicked: if (!surface.waiting) mpv.togglePause()
         onDoubleClicked: surface.fullscreenToggled()
     }
 
@@ -477,7 +554,8 @@ FocusScope {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         height: controls.height + Style.u * 12
-        opacity: surface.chrome && surface.active ? 1 : 0
+        // (Not over the waiting room: there is nothing to play yet.)
+        opacity: surface.chrome && surface.active && !surface.waiting ? 1 : 0
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 220 } }
         gradient: Gradient {

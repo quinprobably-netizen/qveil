@@ -219,7 +219,9 @@ FocusScope {
                     visible: text !== ""
                     // A running stream: how many watch and how long it has run. One
                     // that has ended (or was over when opened) is a streamed video.
-                    text: surface.live ? Format.liveMeta(page.info.live, page.now)
+                    // One that is announced: when it is scheduled for.
+                    text: surface.waiting ? (surface.waitStarts > 0 ? qsTr("Scheduled for %1").arg(Format.dayTime(surface.waitStarts)) : "")
+                        : surface.live ? Format.liveMeta(page.info.live, page.now)
                         : Format.meta(page.info.live ? Object.assign({}, page.info, { streamed: true }) : page.info,
                                       page.info.published || 0)
                     textFormat: Text.PlainText

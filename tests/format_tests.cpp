@@ -41,6 +41,7 @@ private slots:
                           "  function startsIn(a, b, c) { return Format.startsIn(a) }\n"
                           "  function dayTime(a, b, c) { return Format.dayTime(a) }\n"
                           "  function meta(a, b, c) { return Format.meta(a, b, c) }\n"
+                          "  function waitLine(a, b, c) { return Format.waitLine(a, b) }\n"
                           "}",
                           QUrl("qrc:/FormatStage.qml"));
         format.reset(component.create());
@@ -93,6 +94,19 @@ private slots:
         QCOMPARE(call("meta", QVariantMap{{"streamed", true}}, now() - 86400 - 60), QString("Streamed 1 day ago"));
         // Any other video is as it was.
         QCOMPARE(call("meta", QVariantMap{{"views", 59000}}, now() - 3 * 86400 - 60), QString("3 days ago · 59K views"));
+    }
+
+    void theWaitingRoomSaysWhenAndHowOftenItAsks()
+    {
+        const qint64 starts = 1800000000;
+        QCOMPARE(call("waitLine", starts, starts - 3600), call("dayTime", starts) + QString(" · plays from the start when it begins"));
+        QCOMPARE(call("waitLine", 0, starts), QString("Waiting for it to start · checking every minute"));
+        // Late: every minute, as the engine asks, and every 5 minutes from half an hour on.
+        QCOMPARE(call("waitLine", starts, starts + 20), QString("Should have started 1 min ago · checking every minute"));
+        QCOMPARE(call("waitLine", starts, starts + 12 * 60 + 30), QString("Should have started 12 min ago · checking every minute"));
+        QCOMPARE(call("waitLine", starts, starts + 29 * 60 + 59), QString("Should have started 29 min ago · checking every minute"));
+        QCOMPARE(call("waitLine", starts, starts + 30 * 60), QString("Should have started 30 min ago · checking every 5 minutes"));
+        QCOMPARE(call("waitLine", starts, starts + 3 * 3600 + 34 * 60), QString("Should have started 3 h 34 min ago · checking every 5 minutes"));
     }
 };
 

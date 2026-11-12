@@ -277,7 +277,7 @@ void Backend::refuse(const QString &task) {
 
 bool Backend::newestOnly(const QString &task) {
     static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "chapters", "lens", "read",
-                                     "live-state"};
+                                     "live-state", "wait"};
     return tasks.contains(task);
 }
 
@@ -365,8 +365,9 @@ void Backend::adoptConfig(const QVariantMap &next, bool routeSet) {
     if (!moved)
         return;
     // A video that was still being looked up went through the old route, so
-    // its answer must not open a player now.
+    // its answer must not open a player now. Nor is a stream waited for on it.
     supersede("play");
+    supersede("wait");
     emit routeChanged();
 }
 
@@ -392,6 +393,7 @@ void Backend::setConfig(const QVariantMap &patch) {
                   adoptConfig(next, newProxy);
               } else if (newProxy) {
                   supersede("play");
+                  supersede("wait");
                   emit routeChanged();
               }
               // Fewer days, or none, takes kept positions with it.
@@ -535,7 +537,7 @@ void Backend::search(const QString &query) {
 }
 
 void Backend::stream(const QString &path, const QUrlQuery &query, const QString &task, Batch batch,
-                     std::function<void()> ended) {
+                     std::function<void()> ended, Failed failed) {
     if (!ready()) {
         refuse(task);
         if (ended)
@@ -599,7 +601,14 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
         if (!state->lines.isEmpty() && !flush->isActive())
             flush->start();
     });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, state, flush, parse, deliver, current, task, ended] {
+    // What became of a request that failed: the window's error, or `failed`'s to say.
+    auto report = [this, failed](const QString &message, const QString &code, const QString &fallback) {
+        if (failed)
+            failed(message.isEmpty() ? fallback : message, code);
+        else
+            fail(message, code, fallback);
+    };
+    connect(reply, &QNetworkReply::finished, this, [this, reply, state, flush, parse, deliver, current, task, ended, report] {
         reply->deleteLater();
         if (m_replies.value(task) == reply)
             m_replies.remove(task);
@@ -624,7 +633,7 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
             if (!current())
                 return;
             const QJsonObject body = QJsonDocument::fromJson(reply->readAll()).object();
-            fail(body.value("error").toString(), body.value("code").toString(), failure(reply));
+            report(body.value("error").toString(), body.value("code").toString(), failure(reply));
             emit taskFailed(task);
             return;
         }
@@ -638,7 +647,7 @@ void Backend::stream(const QString &path, const QUrlQuery &query, const QString 
         // The engine's own words if it said any; else the connection's (cut
         // short, or silent for too long).
         if (!state->error.isEmpty() || reply->error() != QNetworkReply::NoError) {
-            fail(state->error, state->code, failure(reply));
+            report(state->error, state->code, failure(reply));
             emit taskFailed(task);
         }
     });
@@ -813,6 +822,36 @@ void Backend::checkLive(const QString &playlist) {
 }
 
 void Backend::stopLiveCheck() { supersede("live-state"); }
+
+void Backend::wait(const QString &video, qint64 starts) {
+    QUrlQuery q;
+    q.addQueryItem("v", video);
+    if (starts > 0)
+        q.addQueryItem("starts", QString::number(starts));
+    // The engine says it is still waiting every 25 s or so, and nothing else
+    // for minutes at a time. That is well inside the idle timeout, which is
+    // counted from the last bytes received (see stream()).
+    static_assert(IdleTimeoutMs >= 60000, "a wait is silent for up to 25 s between two lines");
+    stream(
+        "api/wait", q, "wait",
+        [this](const QVariantList &lines) {
+            for (const QVariant &line : lines) {
+                const QVariantMap o = line.toMap();
+                const QString state = o.value("state").toString();
+                if (!state.isEmpty())
+                    emit waitState(state, o.value("starts").toLongLong());
+            }
+        },
+        {},
+        [this](const QString &message, const QString &code) {
+            // The user left the route it was waited for on; the window opens
+            // it again on the new one (see routeChanged).
+            if (code != "route_changed")
+                emit waitFailed(message, code);
+        });
+}
+
+void Backend::stopWait() { supersede("wait"); }
 
 void Backend::loadResume() {
     call("GET", "api/resume", {}, {}, "resume", [this](const QJsonValue &v) {
