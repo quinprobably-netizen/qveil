@@ -930,7 +930,7 @@ ApplicationWindow {
                 // time makes it as long as that is.
                 BusyLine {
                     objectName: "progress"
-                    readonly property var tasks: backend.busy.filter(t => ["play", "prepare", "config", "config-write", "read", "resume", "resume-note", "lenses", "live-state", "wait"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0 && t !== "topics-list" && t !== "history" && t !== "history-write")
+                    readonly property var tasks: backend.busy.filter(t => ["play", "prepare", "config", "config-write", "read", "resume", "resume-note", "lenses", "live-state", "wait", "lineup"].indexOf(t) < 0 && t.indexOf("shelf-") !== 0 && t !== "topics-list" && t !== "history" && t !== "history-write")
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.top: parent.top

@@ -4,6 +4,8 @@ import Qveil
 // Beside the video: what it says about itself, what people say about it,
 // and what comes next. One of them at a time. While a stream runs, its live
 // chat stands first in place of the comments, which return once it ends.
+// An announced stream's waiting room has the same two tabs as a running
+// one (its chat opens when it starts), so nothing moves when it does.
 Rectangle {
     id: sheet
     objectName: "sheet"
@@ -14,6 +16,9 @@ Rectangle {
     // chat may be shown (the setting).
     property bool live: false
     property bool chatOn: true
+    // Whether it is an announced stream's waiting room (or that stream,
+    // started, being opened): no comments, and the chat's tab where it will be.
+    property bool waiting: false
     // How many comments the video has, when that is known.
     property var commentCount: undefined
     // Whether the video has chapters: without them there is no tab for them.
@@ -22,9 +27,11 @@ Rectangle {
     property alias next: nextSlot.data
     property alias comments: commentsSlot.data
     property alias chapters: chaptersSlot.data
-    readonly property var tabsNow: tabsOf(live, chatOn, hasChapters)
-    function tabsOf(live, chatOn, hasChapters) {
-        return (live ? (chatOn ? ["chat", "next"] : ["next"]) : ["next", "comments"]).concat(hasChapters ? ["chapters"] : [])
+    // (A stream that runs or is waited for: its chat and what comes next.)
+    readonly property bool stream: live || waiting
+    readonly property var tabsNow: tabsOf(stream, chatOn, hasChapters)
+    function tabsOf(stream, chatOn, hasChapters) {
+        return (stream ? (chatOn ? ["chat", "next"] : ["next"]) : ["next", "comments"]).concat(hasChapters ? ["chapters"] : [])
     }
     // Whether the keyboard is in the sheet.
     readonly property bool keyed: activeFocus
@@ -35,19 +42,21 @@ Rectangle {
         return slot.children.length > 0 ? slot.children[0] : null
     }
     // The tab a video opens on: a running stream's chat, else Up next.
-    function first() { return tabsOf(live, chatOn, hasChapters)[0] }
+    function first() { return tabsOf(stream, chatOn, hasChapters)[0] }
     // A tab that has gone leaves Up next showing. (Not the comments, in
     // place of the chat of a stream that ended: those are a lookup of their
     // own, made only when asked for.) A stream that starts running opens on
     // its chat. (From what the tabs are now: `tabsNow` may not have heard yet.)
     function settle() {
-        if (tabsOf(live, chatOn, hasChapters).indexOf(current) < 0)
+        if (tabsOf(stream, chatOn, hasChapters).indexOf(current) < 0)
             current = "next"
     }
     onHasChaptersChanged: settle()
     onChatOnChanged: settle()
-    onLiveChanged: {
-        if (live && chatOn)
+    // (A stream that has started goes from waited for to running with its
+    // chat showing throughout.)
+    onStreamChanged: {
+        if (stream && chatOn)
             current = "chat"
         settle()
     }
@@ -89,7 +98,7 @@ Rectangle {
             objectName: "tab-chat"
             underlined: true
             activeFocusOnTab: false
-            visible: sheet.live && sheet.chatOn
+            visible: sheet.stream && sheet.chatOn
             text: qsTr("Chat")
             current: sheet.current === "chat"
             onClicked: sheet.current = "chat"
@@ -106,7 +115,7 @@ Rectangle {
             objectName: "tab-comments"
             underlined: true
             activeFocusOnTab: false
-            visible: !sheet.live
+            visible: !sheet.stream
             text: sheet.commentCount > 0 ? qsTr("Comments %1").arg(Number(sheet.commentCount).toLocaleString(Qt.locale(), "f", 0))
                                          : qsTr("Comments")
             current: sheet.current === "comments"

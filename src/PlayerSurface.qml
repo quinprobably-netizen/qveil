@@ -117,8 +117,9 @@ FocusScope {
     // on another route, which the room offers (see routeRequested).
     property string waitNote: ""
     readonly property bool waitOffersRoute: waitState === "upcoming" ? waitNote === "bot_check" : backend.offersRouteFor(waitNote)
-    // Set when the stream that was waited for has started: its play answer
-    // opens it at its start, not at its edge.
+    // Set when the stream that was waited for has started, until its play
+    // answer has opened it, at its start, not at its edge. (What shows
+    // beside it stays the room's meanwhile: see SideSheet.waiting.)
     property bool fromStart: false
 
     // The stream has started: it is looked up once more, and plays from its start.
@@ -126,9 +127,8 @@ FocusScope {
         if (!waiting || waitState !== "upcoming")
             return
         const i = info
-        prepare({ id: i.id, title: i.title || "", channel: i.channel || "", channelId: i.channelId || "",
-                  published: i.published || 0, batch: i.batch || 0 })
-        fromStart = true
+        prepareAs({ id: i.id, title: i.title || "", channel: i.channel || "", channelId: i.channelId || "",
+                  published: i.published || 0, batch: i.batch || 0 }, true)
         backend.play(i.id, i.channel || "")
     }
     // Lets go of the wait, if there is one.
@@ -205,10 +205,12 @@ FocusScope {
 
     // Shows the player for `video` (a card's data) at once, while the engine
     // looks it up; `open` follows with the streams.
-    function prepare(video) {
+    function prepare(video) { prepareAs(video, false) }
+    // `starting`: it is the stream that was waited for, which has started (see begin).
+    function prepareAs(video, starting) {
         report()
         endWait()
-        fromStart = false
+        fromStart = !!starting
         if (mpv.loaded)
             mpv.stop()
         info = {
@@ -241,12 +243,14 @@ FocusScope {
         // The stream that was waited for, now that it runs: from its beginning.
         if (at === undefined && fromStart && i.id === info.id)
             at = 0
-        fromStart = false
         pending = false
         // The card's channel and age stay where the answer has none (a lookup
         // without the watch page has neither) and it is the same video.
         const card = info.id === i.id ? { channel: info.channel || "", published: info.published || 0 } : {}
         info = Object.assign({ batch: info.batch || 0 }, card, i)
+        // (Once it is what the answer says: a stream that has started is
+        // running by now, and never neither waited for nor running.)
+        fromStart = false
         active = true
         liveEnded = false
         forgetEdge()
@@ -714,6 +718,18 @@ FocusScope {
                         font.family: Style.font
                         font.pixelSize: Style.small
                     }
+                    // At a running stream's edge: that it is live, in the accent.
+                    Text {
+                        id: liveWord
+                        objectName: "seek-live"
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: bar.edge
+                        text: qsTr("\u25cf live")
+                        textFormat: Text.PlainText
+                        color: Style.accent
+                        font.family: Style.font
+                        font.pixelSize: Style.small
+                    }
                     // Behind a running stream's edge: the way back to it, a
                     // chip in the accent's fill (as the cards' "● LIVE" is)
                     // with its key dimmed inside it.
@@ -733,6 +749,7 @@ FocusScope {
                         // What is left beside the controls at the right; too little, and it steps aside.
                         readonly property real room: leftControls.parent.width - rightControls.width - playAct.width
                             - timeText.width - (goLiveAct.visible ? goLiveAct.width + leftControls.spacing : 0)
+                            - (liveWord.visible ? liveWord.width + leftControls.spacing : 0)
                             - 2 * leftControls.spacing - Style.u * 4
                         anchors.verticalCenter: parent.verticalCenter
                         width: Math.max(0, Math.min(implicitWidth, room))

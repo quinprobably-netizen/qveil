@@ -121,7 +121,7 @@ const SUBSCRIPTIONS_POINT: &str = "Refreshing your subscriptions asks for each c
 const COOKIES_POINT: &str = "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.";
 const COMMENTS_POINT: &str = "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.";
 const LIVE_PLAYBACK_POINT: &str = "Live streams are fetched segment by segment over your route, a few seconds ahead of what plays.";
-const WAITING_POINT: &str = "Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave.";
+const WAITING_POINT: &str = "Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave. Opening its waiting room also reads its channel's Streams tab once, to list what else the channel has running or announced.";
 const LENSES_POINT: &str = "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.";
 const LOCAL_POINT: &str = "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.";
 

@@ -137,15 +137,16 @@ function ranFor(seconds, brief) {
 }
 
 // The line under a running stream's title, from the play answer's `live`:
-// "1.2K watching · started 2 h 14 min ago" ("started 2 h ago" when `brief`,
-// for where that won't fit). `now`: the time, in Unix seconds.
+// "live now · 1.2K watching · started 2 h 14 min ago", as a card's begins.
+// Where that won't fit, `brief`: 1 says whole hours ("started 2 h ago"), 2
+// the count without its word too ("1.2K"). `now`: the time, in Unix seconds.
 function liveMeta(live, now, brief) {
-    const parts = []
+    const parts = [qsTr("live now")]
     const n = count(live && live.watching)
     if (n)
-        parts.push(qsTr("%1 watching").arg(n))
+        parts.push(brief >= 2 ? n : qsTr("%1 watching").arg(n))
     if (live && live.started > 0)
-        parts.push(qsTr("started %1 ago").arg(ranFor(now - live.started, brief)))
+        parts.push(qsTr("started %1 ago").arg(ranFor(now - live.started, brief >= 1)))
     return parts.join(" · ")
 }
 

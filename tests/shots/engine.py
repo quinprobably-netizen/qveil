@@ -191,7 +191,7 @@ COOKIES_POINT = "You are never signed in, and cookies are never stored or read f
 COMMENTS_POINT = "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched."
 LOOKUP_POINT = "Playing a video, or getting it ready, looks it up the way yt-dlp does by itself: its watch page, and then YouTube's player for its streams, with the same identity. Its chapters, its channel's name and its age come with that lookup, and cost no request of their own. yt-dlp asks the player as one of YouTube's own clients, with that client's User-Agent (with current yt-dlp, Safari's, from its visionOS client) and not qveil's Chrome one, which the video's bytes carry: a lookup and its stream show two browser identities."
 LIVE_PLAYBACK_POINT = "Live streams are fetched segment by segment over your route, a few seconds ahead of what plays."
-WAITING_POINT = "Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave."
+WAITING_POINT = "Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave. Opening its waiting room also reads its channel's Streams tab once, to list what else the channel has running or announced."
 LENSES_POINT = "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content."
 LOCAL_POINT = "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry."
 CHAT_POINT = "Live chat is read only while its tab is open: one long-running request stream over your route. No pictures (avatars, badges, emoji) are fetched."
@@ -387,14 +387,25 @@ def lens_videos(lens):
 def feed_entries():
     """The feed. With QVEIL_STANDIN_LIVE, the live check has found two
     streams running and three announced: two starting within a day (the
-    sooner one later in the feed) and one in three days."""
-    if not os.environ.get("QVEIL_STANDIN_LIVE"):
+    sooner one later in the feed) and one in three days. Set to "many", it
+    has found four running and one announced; set to "upcoming", only the
+    three announced ones."""
+    which = os.environ.get("QVEIL_STANDIN_LIVE", "")
+    if not which:
         return FEED
-    marks = {"vid00000002": {"live": "now", "watching": 1200},
-             "vid00000009": {"live": "now"},
-             "vid00000003": {"live": "upcoming", "starts": NOW + 5 * HOUR},
-             "vid00000006": {"live": "upcoming", "starts": NOW + 3 * DAY},
-             "vid00000012": {"live": "upcoming", "starts": NOW + HOUR}}
+    running = {"vid00000002": {"live": "now", "watching": 1200},
+               "vid00000009": {"live": "now"}}
+    announced = {"vid00000003": {"live": "upcoming", "starts": NOW + 5 * HOUR},
+                 "vid00000006": {"live": "upcoming", "starts": NOW + 3 * DAY},
+                 "vid00000012": {"live": "upcoming", "starts": NOW + HOUR}}
+    if which == "upcoming":
+        marks = announced
+    elif which == "many":
+        marks = dict(running, **{"vid00000011": {"live": "now", "watching": 310},
+                                 "vid00000012": {"live": "now", "watching": 45},
+                                 "vid00000003": announced["vid00000003"]})
+    else:
+        marks = dict(running, **announced)
     return [dict(v, **marks.get(v["id"], {})) for v in FEED]
 
 
@@ -405,6 +416,10 @@ def channel_streams(cid):
     def stream(n, title, **mark):
         return dict({"id": "str%08d" % n, "title": title, "channel": name, "channel_id": cid,
                      "published": NOW - n * DAY, "duration": 0, "views": 0}, **mark)
+    # (QVEIL_STANDIN_NO_LINEUP: nothing running or announced, only past broadcasts.)
+    if os.environ.get("QVEIL_STANDIN_NO_LINEUP"):
+        return [stream(3, "Live: the long one, part 1", streamed=True, duration=11564, views=40000),
+                stream(4, "Live: reading the source", streamed=True, duration=9670, views=21000)]
     return [stream(1, "Live: the long one, part 2", live="now", watching=860),
             stream(2, "Questions, answered live", live="upcoming", starts=NOW + DAY),
             stream(3, "Live: the long one, part 1", streamed=True, duration=11564, views=40000),

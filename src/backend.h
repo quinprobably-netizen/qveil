@@ -39,8 +39,8 @@ class Backend : public QObject {
     // refresh landing in the background doesn't rebuild the grid showing it.
     Q_PROPERTY(VideoModel *feed READ feed CONSTANT)
     Q_PROPERTY(QVariantMap feedInfo READ feedInfo NOTIFY feedChanged)
-    // What of the feed is live now, then what is announced to start within a
-    // day, soonest first: the feed's entries as they are, made again with it.
+    // What of the feed is live now, in its order (not what is only
+    // announced): the feed's entries as they are, made again with it.
     Q_PROPERTY(QVariantList liveNow READ liveNow NOTIFY feedChanged)
     // How far the running refresh is: channels done of channels to do. Both
     // are 0 while no refresh runs, or one that hasn't said how many there are.
@@ -64,6 +64,10 @@ class Backend : public QObject {
     // play (see `chaptersLater` and `detailsLater` in the play's answer):
     // {video, items (its chapters), channel, published}, or empty.
     Q_PROPERTY(QVariantMap chapters READ chapters NOTIFY chaptersChanged)
+    // An announced stream's channel's lineup, for its waiting room: what
+    // else of the channel runs now or is announced, from its Streams tab.
+    // {video (the room's), channel (its ID), loaded, items}, or empty.
+    Q_PROPERTY(QVariantMap lineup READ lineup NOTIFY lineupChanged)
     // The lenses, as the engine lists them: {id, text, tags, searches, count, fetchedAt}.
     Q_PROPERTY(QVariantList lenses READ lenses NOTIFY lensesChanged)
     // What each lens last found, by its id, for the shelves of the home
@@ -133,6 +137,7 @@ public:
     QVariantList resume() const { return m_resume; }
     QVariantMap comments() const { return m_comments; }
     QVariantMap chapters() const { return m_chapters; }
+    QVariantMap lineup() const { return m_lineup; }
     QVariantList lenses() const { return m_lenses; }
     QVariantMap shelves() const { return m_shelves; }
     QVariantMap topics() const { return m_topics; }
@@ -211,6 +216,11 @@ public:
     Q_INVOKABLE void loadChapters(const QString &video);
     // Hangs up on a lookup still running: the video was left.
     Q_INVOKABLE void closeChapters();
+    // Asks the channel `channel`'s Streams tab, once, for the waiting room
+    // of `video`: what of it runs now or is announced, `video` left out.
+    Q_INVOKABLE void loadLineup(const QString &channel, const QString &video);
+    // Hangs up on it and forgets it: the room was left.
+    Q_INVOKABLE void closeLineup();
     Q_INVOKABLE void loadLenses();
     // Reads what the lens `id` last found from what the engine keeps. It
     // never searches: a lens that was never fetched has an empty shelf.
@@ -261,6 +271,7 @@ signals:
     void resumeChanged();
     void commentsChanged();
     void chaptersChanged();
+    void lineupChanged();
     void lensesChanged();
     void shelvesChanged();
     void topicsChanged();
@@ -429,6 +440,7 @@ private:
     QVariantList m_resume;
     QVariantMap m_comments;
     QVariantMap m_chapters;
+    QVariantMap m_lineup;
     QVariantList m_lenses;
     QVariantMap m_shelves;
     QVariantMap m_topics;

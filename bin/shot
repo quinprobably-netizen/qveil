@@ -10,7 +10,7 @@
 # channels, channel-streams (a channel's Streams tab), history, history-on,
 # settings, settings-about, settings-home, search, sort, help, route, watch,
 # watch-comments, watch-ended, theatre, watch-live, watch-live-behind,
-# watch-chat, waiting (an announced stream's room), pip (the small window
+# watch-chat, waiting (an announced stream's room), waiting-next (its Up next), pip (the small window
 # itself, with the video in it).
 #
 # A window is 1280x720 unless it is given a size (941 508, 1920 1080, ...):

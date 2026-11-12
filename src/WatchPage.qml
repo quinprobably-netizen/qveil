@@ -231,22 +231,34 @@ FocusScope {
                     readonly property real room: parent.width - channelRow.width - Style.u * 3
                     width: Math.max(0, Math.min(implicitWidth, room))
                     elide: Text.ElideRight
-                    visible: text !== ""
-                    // A running stream: how many watch and how long it has run
-                    // (in whole hours where the minutes don't fit). One that has
-                    // ended (or was over when opened) is a streamed video. One
-                    // that is announced: when it is scheduled for.
-                    readonly property string liveText: Format.liveMeta(page.info.live, page.now)
-                    TextMetrics {
-                        id: liveWidth
-                        font: stats.font
-                        text: stats.liveText
+                    visible: said !== ""
+                    // A running stream: that it is live now, how many watch and
+                    // how long it has run (in whole hours where the minutes don't
+                    // fit). One that has ended (or was over when opened) is a
+                    // streamed video. One that is announced: when it is scheduled for.
+                    readonly property string liveText: {
+                        for (let brief = 0; brief < 2; brief++) {
+                            const said = Format.liveMeta(page.info.live, page.now, brief)
+                            if (statsMetrics.advanceWidth(said) <= room)
+                                return said
+                        }
+                        return Format.liveMeta(page.info.live, page.now, 2)
                     }
-                    text: surface.waiting ? (surface.waitStarts > 0 ? qsTr("Scheduled for %1").arg(Format.dayTime(surface.waitStarts)) : "")
-                        : surface.live ? (liveWidth.advanceWidth <= room ? liveText : Format.liveMeta(page.info.live, page.now, true))
+                    FontMetrics {
+                        id: statsMetrics
+                        font: stats.font
+                    }
+                    readonly property string said: surface.waiting ? (surface.waitStarts > 0 ? qsTr("Scheduled for %1").arg(Format.dayTime(surface.waitStarts)) : "")
+                        : surface.live ? liveText
                         : Format.meta(page.info.live ? Object.assign({}, page.info, { streamed: true }) : page.info,
                                       page.info.published || 0)
-                    textFormat: Text.PlainText
+                    // "live now" is said in the accent, as on the cards.
+                    readonly property string word: qsTr("live now")
+                    readonly property bool marked: surface.live && said.indexOf(word) === 0
+                    text: marked ? "<font color=\"" + Style.accent + "\">" + Linkify.escape(word) + "</font>"
+                                   + Linkify.escape(said.slice(word.length))
+                                 : said
+                    textFormat: marked ? Text.StyledText : Text.PlainText
                     color: Style.dim
                     font.family: Style.font
                     font.pixelSize: Style.small
@@ -300,7 +312,17 @@ FocusScope {
         commentCount: comments.count
         hasChapters: surface.chapters.length > 0 || !!page.info.chaptersLater
         live: surface.live
+        // The room, and the stream that was waited for while it is opened.
+        waiting: surface.waiting || surface.fromStart
         chatOn: backend.config.liveChat !== false
+        // The room's Up next is the channel's lineup, read once when the room opens.
+        readonly property string room: waiting ? (page.info.id || "") : ""
+        onRoomChanged: {
+            if (room !== "" && page.info.channelId)
+                backend.loadLineup(page.info.channelId, room)
+            else if (room === "")
+                backend.closeLineup()
+        }
 
         chapters: ChaptersTab {
             anchors.fill: parent
@@ -317,6 +339,7 @@ FocusScope {
             video: page.info.id || ""
             // Only while it shows, of a stream that runs, in this window.
             active: sheet.visible && sheet.current === "chat" && sheet.live && sheet.chatOn && page.active
+            waiting: sheet.waiting && !sheet.live
         }
         comments: CommentsTab {
             id: comments
@@ -333,7 +356,11 @@ FocusScope {
             list: page.list
             index: page.index
             from: page.from
-            onPicked: (video, row) => page.videoRequested(video, page.list, row)
+            // (Without a channel to ask, there is nothing else to show.)
+            lineup: sheet.room === "" ? null
+                : backend.lineup.video === sheet.room ? backend.lineup : ({ loaded: !page.info.channelId, items: [] })
+            channel: page.info.channel || ""
+            onPicked: (video, row) => lineup ? page.videoRequested(video, null, -1) : page.videoRequested(video, page.list, row)
         }
     }
 

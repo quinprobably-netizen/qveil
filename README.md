@@ -78,7 +78,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.
 - Playing a video, or getting it ready, looks it up the way yt-dlp does by itself: its watch page, and then YouTube's player for its streams, with the same identity. Its chapters, its channel's name and its age come with that lookup, and cost no request of their own. yt-dlp asks the player as one of YouTube's own clients, with that client's User-Agent (with current yt-dlp, Safari's, from its visionOS client) and not qveil's Chrome one, which the video's bytes carry: a lookup and its stream show two browser identities.
 - Live streams are fetched segment by segment over your route, a few seconds ahead of what plays.
-- Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave.
+- Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave. Opening its waiting room also reads its channel's Streams tab once, to list what else the channel has running or announced.
 - A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.
 - Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.
 
@@ -167,13 +167,15 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
   the route. You can rewind to the start of a running stream (up to 5 days
   back) with the ordinary seek bar; behind the edge, **Go live** (`End`) takes
   you back. A stream that is announced but not yet running waits in a room of
-  its own with a countdown, and starts once, from the beginning, when it does.
+  its own with a countdown, and starts once, from the beginning, when it does;
+  beside it, the channel's other running and announced streams.
   Each channel has a **Streams** tab (running, announced, then past
   broadcasts), loaded only when you open it. The **chat** of a running stream
   is the first tab of the side sheet: read only and text only (no avatars,
   badges or emoji pictures are fetched), and open only while the tab is (it
-  can be turned off in Settings). Home names what is live, and what starts
-  within a day, in one line under the lead, once something has turned up: the
+  can be turned off in Settings). Home names what is live in one line under
+  the lead, once something has turned up (announced streams are on their
+  cards): the
   opt-in **Check followed channels for live streams** in Settings (off by
   default) looks at each channel's Streams tab at every feed refresh, which is
   one more request per channel.

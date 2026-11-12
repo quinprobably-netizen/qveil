@@ -15,6 +15,9 @@ Item {
     property bool active: false
     // Whether the keyboard is in the sheet.
     property bool keyed: false
+    // Whether the stream is announced and hasn't started: its chat isn't
+    // read (nor asked for) until it has, and the tab says so.
+    property bool waiting: false
     // How many messages are kept: the oldest go first.
     readonly property int keep: 300
     readonly property alias count: messages.count
@@ -78,6 +81,20 @@ Item {
             if (tab.phase === "open")
                 tab.phase = "failed"
         }
+    }
+
+    Text {
+        objectName: "chat-later"
+        anchors.centerIn: parent
+        width: parent.width - Style.u * 8
+        visible: tab.waiting && tab.phase === ""
+        text: qsTr("Chat opens when it starts")
+        textFormat: Text.PlainText
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.Wrap
+        color: Style.faint
+        font.family: Style.font
+        font.pixelSize: Style.small
     }
 
     BusyLine {

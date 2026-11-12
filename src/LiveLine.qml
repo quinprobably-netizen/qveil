@@ -1,18 +1,18 @@
 import QtQuick
 import QtQuick.Controls
 import Qveil
-import "Format.js" as Format
 
 // One line under home's lead that names what is live: "● LIVE NOW", then
-// each running stream by its channel and title, then what is announced to
-// start within a day by its day and time. As many as fit are named, the
-// last of them cut short if it must be; what doesn't fit on the line is
-// under a "+N" at its end, which opens the rest as a list. No pictures.
+// each running stream by its channel and title. (What is only announced is
+// not on it: the cards and a channel's Streams tab say that.) As many as fit
+// are named, the last of them cut short if it must be; what doesn't fit on
+// the line is under a "+N" at its end, which opens the rest as a list. No
+// pictures.
 Rectangle {
     id: line
     objectName: "live-line"
 
-    // Feed entries: the running ones, then the upcoming ones (see Backend.liveNow).
+    // Feed entries that are running (see Backend.liveNow).
     property var entries: []
     // Which stop the keyboard is on: an entry, or the "+N" after the ones
     // that are shown; −1 when it is not on the line.
@@ -28,17 +28,15 @@ Rectangle {
     readonly property int stops: shown + (shown < entries.length ? 1 : 0)
     readonly property bool opened: rest.opened
 
-    // What an entry says: "Channel · title" while it runs, "Fri 18:00 ·
-    // Channel" when it is to start.
+    // What an entry says: "Channel · title".
     function labelOf(video) {
         if (!video)
             return ""
-        const parts = video.live === "now" ? [video.channel, video.title] : [Format.dayTime(video.starts), video.channel]
-        return parts.filter(s => !!s).join(" · ")
+        return [video.channel, video.title].filter(s => !!s).join(" · ")
     }
     // The first part of it, which stands out, and the rest.
     function headOf(video) {
-        return video.live === "now" ? (video.channel || video.title || "") : Format.dayTime(video.starts)
+        return video.channel || video.title || ""
     }
     // What Enter does on a stop.
     function activate(at) {
@@ -132,7 +130,6 @@ Rectangle {
                 required property int index
                 objectName: "live-item"
                 readonly property string label: line.labelOf(modelData)
-                readonly property bool running: modelData.live === "now"
                 readonly property bool marked: line.current === index
                 visible: index < line.shown
                 height: row.height
@@ -163,7 +160,7 @@ Rectangle {
                         text: line.headOf(entry.modelData)
                         textFormat: Text.PlainText
                         elide: Text.ElideRight
-                        color: entry.running || area.containsMouse ? Style.fg : Style.dim
+                        color: Style.fg
                         font.family: Style.font
                         font.pixelSize: Style.small
                     }
@@ -212,7 +209,7 @@ Rectangle {
             text: "+" + (line.entries.length - line.shown)
             quiet: !rest.opened
             marked: line.current === line.shown && visible
-            tip: rest.opened ? "" : qsTr("What else is live or starting today")
+            tip: rest.opened ? "" : qsTr("What else is live")
             onClicked: rest.opened ? rest.close() : rest.open()
         }
     }
@@ -307,7 +304,7 @@ Rectangle {
                         text: option.label
                         textFormat: Text.PlainText
                         elide: Text.ElideRight
-                        color: option.modelData.live === "now" || optionArea.containsMouse ? Style.fg : Style.dim
+                        color: Style.fg
                         font.family: Style.font
                         font.pixelSize: Style.small
                     }

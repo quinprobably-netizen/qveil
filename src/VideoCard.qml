@@ -121,13 +121,14 @@ Item {
                 color: Style.accent
             }
         }
-        // The keyboard's cursor: a frame on the picture.
+        // The keyboard's cursor: a ring around the picture, a little apart from it.
         Rectangle {
             objectName: "cursor"
             anchors.fill: frame
+            anchors.margins: -(Style.ringGap + Style.ring)
             visible: card.selected
             color: "transparent"
-            border.width: 2
+            border.width: Style.ring
             border.color: Style.accent
         }
 

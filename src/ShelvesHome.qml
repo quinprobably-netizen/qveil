@@ -39,7 +39,7 @@ FocusScope {
     property int leadAction: 0
     property bool moved: false
     readonly property bool leadSelected: navigating && activeFocus && onLead && first !== null
-    // What is live now and about to start, on one line under the lead (see
+    // What is live now, on one line under the lead (see
     // LiveLine). The keyboard reaches it between the lead and the first
     // shelf; `liveAt` is which of its stops it is on there.
     readonly property var liveEntries: backend.liveNow

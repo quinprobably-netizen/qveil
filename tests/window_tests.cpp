@@ -3009,7 +3009,11 @@ private slots:
                 cursor = App::under(card, "cursor");
         QVERIFY(cursor && cursor->isVisible());
         QCOMPARE(cursor->property("border").value<QObject *>()->property("width").toInt(), 2);
-        QCOMPARE(cursor->size(), App::under(cursor->parentItem(), "frost")->size());
+        // A ring around the picture, 3 px out from it, so it never touches it or the chip in its corner.
+        QQuickItem *picture = App::under(cursor->parentItem(), "frost");
+        const QRectF ring = cursor->mapRectToScene(QRectF(0, 0, cursor->width(), cursor->height())),
+                     shown = picture->mapRectToScene(QRectF(0, 0, picture->width(), picture->height()));
+        QCOMPARE(ring, shown.adjusted(-5, -5, 5, 5));
         // Under the pointer the cursor steps aside; a key brings it back where it was.
         app.hover(app.items("card").at(1));
         app.hover(app.items("card").at(2));
@@ -3946,7 +3950,7 @@ private slots:
         return said;
     }
 
-    void theLiveLineNamesWhatIsLiveAndNext()
+    void theLiveLineNamesWhatIsLiveAndOnlyThat()
     {
         // (A window this wide is drawn larger: its page is 1600 wide.)
         App app(false, QSize(2400, 1400), {{"QVEIL_STANDIN_LIVE", "1"}});
@@ -3960,21 +3964,24 @@ private slots:
         QVERIFY(top >= lead->mapToScene(QPointF(0, lead->height())).y());
         QVERIFY(top + line->height() <= app.item("shelf-latest")->mapToScene(QPointF(0, 0)).y());
 
-        // "● LIVE NOW", in the accent; then what runs, by its channel and title;
-        // then what starts within a day, soonest first, by its day and time.
+        // "● LIVE NOW", in the accent; then what runs, by its channel and
+        // title. What is only announced is not on it (the cards say that).
         QStringList said;
         App::texts(line, said);
         QVERIFY2(said.contains("\u25cf LIVE NOW"), qPrintable(said.join(" | ")));
         QCOMPARE(App::under(line, "live-mark")->property("color").value<QColor>(), QColor(app.theme->property("accent").toString()));
-        QTRY_COMPARE(liveItems(app).size(), 4);
-        const QStringList items = liveItems(app);
-        QCOMPARE(items.at(0), QString("Northlight Woodworks \u00b7 A dovetail box with four hand tools"));
-        QCOMPARE(items.at(1), QString("Kiln Notes \u00b7 Raku firing in the rain"));
-        const QRegularExpression dayTime("^\\S+ \\d\\d:\\d\\d \u00b7 ");
-        QVERIFY2(dayTime.match(items.at(2)).hasMatch() && items.at(2).endsWith(" \u00b7 The Long Ride"), qPrintable(items.at(2)));
-        QVERIFY2(dayTime.match(items.at(3)).hasMatch() && items.at(3).endsWith(" \u00b7 Signal & Noise"), qPrintable(items.at(3)));
-        // (In three days is not next.)
-        QVERIFY(!said.join("|").contains("Low Level Hours"));
+        QTRY_COMPARE(liveItems(app), (QStringList{QString("Northlight Woodworks \u00b7 A dovetail box with four hand tools"),
+                                                  QString("Kiln Notes \u00b7 Raku firing in the rain")}));
+        QCOMPARE(app.backend->property("liveNow").toList().size(), 2);
+        QVERIFY2(!said.join("|").contains("The Long Ride") && !said.join("|").contains("Signal & Noise"), qPrintable(said.join(" | ")));
+        // (The announced ones are still on their cards.)
+        const auto announced = [&] {
+            for (QQuickItem *card : app.items("card"))
+                if (card->property("upcoming").toBool())
+                    return true;
+            return false;
+        };
+        QTRY_VERIFY(announced());
         // Everything fits: nothing is under a "+N".
         QVERIFY(!app.item("live-more") || !app.item("live-more")->isVisible());
         // A click opens what it names.
@@ -3984,13 +3991,14 @@ private slots:
 
     void whatDoesNotFitOnTheLiveLineIsUnderPlusN()
     {
-        App app(false, QSize(941, 900), {{"QVEIL_STANDIN_LIVE", "1"}});
+        App app(false, QSize(941, 900), {{"QVEIL_STANDIN_LIVE", "many"}});
         READY(app);
         QQuickItem *line = nullptr, *more = nullptr;
         QTRY_VERIFY((line = app.item("live-line")) && line->isVisible());
         QTRY_VERIFY((more = app.item("live-more")) && more->isVisible());
         const QStringList shown = liveItems(app);
         QVERIFY(!shown.isEmpty() && shown.size() < 4);
+        QTRY_COMPARE(app.backend->property("liveNow").toList().size(), 4);
         QCOMPARE(more->property("text").toString(), QString("+%1").arg(4 - shown.size()));
         // The line stays inside the window.
         QVERIFY(more->mapToScene(QPointF(more->width(), 0)).x() <= 941);
@@ -4026,9 +4034,9 @@ private slots:
         app.click(more);
         QList<QQuickItem *> rest;
         QTRY_COMPARE((rest = app.items("live-rest")).size(), 4 - shown.size());
-        QCOMPARE(rest.last()->property("label").toString().endsWith(" \u00b7 Signal & Noise"), true);
+        QCOMPARE(rest.last()->property("label").toString(), QString("The Long Ride \u00b7 A packing list for six months"));
         app.click(rest.last());
-        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000003"));
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("vid00000012"));
     }
 
     void theLiveLineIsAbsentWithNothingLive()
@@ -4055,9 +4063,30 @@ private slots:
         QTRY_VERIFY(home->property("leadSelected").toBool());
     }
 
+    void theLiveLineIsHiddenWhenWhatIsFoundIsOnlyAnnounced()
+    {
+        App app(false, QSize(2400, 1400), {{"QVEIL_STANDIN_LIVE", "upcoming"}});
+        READY(app);
+        QQuickItem *home = app.item("shelves-home");
+        QTRY_VERIFY(app.item("shelf-latest") && App::count(app.item("shelf-latest"), "card") >= 4);
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        // The announced streams are on their cards, and nothing is live: no line.
+        bool announced = false;
+        for (QQuickItem *card : app.items("card"))
+            announced = announced || card->property("upcoming").toBool();
+        QVERIFY(announced);
+        QVERIFY(app.backend->property("liveNow").toList().isEmpty());
+        QVERIFY(!app.item("live-line") || !app.item("live-line")->isVisible());
+        // The keyboard goes from the lead straight to the first shelf.
+        QTRY_VERIFY(home->property("leadSelected").toBool());
+        QTest::keyClick(app.window, Qt::Key_J);
+        QTRY_VERIFY(App::under(app.item("shelf-latest"), "card")->property("selected").toBool());
+        QVERIFY(!home->property("onLive").toBool());
+    }
+
     void theLiveLineIsReachableWithJAndOpensWithEnter()
     {
-        App app(false, QSize(2400, 1400), {{"QVEIL_STANDIN_LIVE", "1"}});
+        App app(false, QSize(2400, 1400), {{"QVEIL_STANDIN_LIVE", "many"}});
         READY(app);
         QQuickItem *home = app.item("shelves-home"), *line = nullptr;
         QTRY_VERIFY((line = app.item("live-line")) && line->isVisible());
@@ -4121,6 +4150,45 @@ private slots:
         QTRY_VERIFY(videos->property("current").toBool());
         QTRY_VERIFY(cardOf(app.item("channel-page"), "vid00000001"));
         QCOMPARE(app.page(), QString("channel"));
+    }
+
+    void theKeyboardsRingStandsApartFromThePictureAndItsChip()
+    {
+        const auto box = [](QQuickItem *item) { return item->mapRectToScene(QRectF(0, 0, item->width(), item->height())); };
+        App app(false, QSize(941, 508));
+        READY(app);
+        // A channel's streams: the first card, running, marked by the keyboard.
+        QMetaObject::invokeMethod(app.window, "openChannel", Q_ARG(QVariant, QString("UCaaaaaaaaaaaaaaaaaaaaaa")));
+        QTRY_COMPARE(app.page(), QString("channel"));
+        QTest::keyClick(app.window, Qt::Key_BracketRight);
+        QTRY_VERIFY(cardOf(app.item("channel-page"), "str00000001"));
+        QQuickItem *card = cardOf(app.item("channel-page"), "str00000001");
+        QTest::keyClick(app.window, Qt::Key_L);
+        QTest::keyClick(app.window, Qt::Key_H);
+        QTRY_VERIFY(card->property("selected").toBool());
+        QQuickItem *ring = App::under(card, "cursor"), *picture = App::under(card, "frost"), *chip = App::under(card, "card-tag");
+        QTRY_VERIFY(ring->isVisible());
+        // 3 px out from the picture all round, its 2 px line outside that: it
+        // touches neither the picture nor the "● LIVE" in its corner, which stays where it was.
+        QCOMPARE(box(ring), box(picture).adjusted(-5, -5, 5, 5));
+        QCOMPARE(box(chip).bottomRight(), box(picture).bottomRight());
+        // (And none of it is cut off by the grid.)
+        QQuickItem *grid = card->parentItem();
+        while (grid && !grid->clip())
+            grid = grid->parentItem();
+        QVERIFY(grid && box(grid).contains(box(ring)));
+
+        // The same on what comes next, beside a video played from the feed.
+        QTRY_COMPARE(app.backend->feed()->count(), 12);
+        QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, app.backend->feed()->get(0)),
+                                  Q_ARG(QVariant, QVariant::fromValue(app.backend->feed())), Q_ARG(QVariant, 0));
+        QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+        QMetaObject::invokeMethod(app.item("watch"), "enterSheet", Q_ARG(QVariant, QString("next")));
+        QQuickItem *entry = nullptr;
+        QTRY_VERIFY(!app.items("next-entry").isEmpty() && (entry = app.items("next-entry").first())->property("marked").toBool());
+        QQuickItem *nextRing = App::under(entry, "cursor"), *nextPicture = App::under(entry, "frost");
+        QVERIFY(nextRing->isVisible());
+        QCOMPARE(box(nextRing), box(nextPicture).adjusted(-5, -5, 5, 5));
     }
 
     void aChannelsTabKeyIsNamedAndItsSubscribeEndsAtTheMargin()
@@ -4912,7 +4980,13 @@ private slots:
             return nullptr;
         return mpv;
     }
-    static QString timeOf(App &app) { return App::under(app.item("surface"), "seek-time")->property("text").toString(); }
+    // The clock under a video, as it reads: with "● live" after it (in the accent) at a running stream's edge.
+    static QString timeOf(App &app)
+    {
+        QQuickItem *live = App::under(app.item("surface"), "seek-live");
+        return App::under(app.item("surface"), "seek-time")->property("text").toString()
+               + (live && live->isVisible() ? " " + live->property("text").toString() : QString());
+    }
     // Where the stand-in engine says the running stream's live edge is, on
     // the player's timeline (its oldest segment is 0, as the timeline's
     // start is): the end of its newest segment, in seconds. -1 if it didn't say.
@@ -4952,14 +5026,20 @@ private slots:
         // At the edge the clock says how long the stream has run (since it
         // started, 2:14:05 ago: not the player's timeline, which is only what
         // can be rewound), and that it is live; the bar is full.
-        QTRY_VERIFY2(QRegularExpression(QString::fromUtf8("^2:1[45]:\\d\\d \u00b7 live$")).match(timeOf(app)).hasMatch(), qPrintable(timeOf(app)));
+        QTRY_VERIFY2(QRegularExpression(QString::fromUtf8("^2:1[45]:\\d\\d \u25cf live$")).match(timeOf(app)).hasMatch(), qPrintable(timeOf(app)));
         QCOMPARE(App::under(surface, "seek")->property("fraction").toReal(), 1.0);
         QQuickItem *goLive = App::under(surface, "go-live");
         QVERIFY(goLive && !goLive->isVisible());
         // Under the title: how many are watching, and how long ago it started.
-        QVERIFY2(QRegularExpression(QString::fromUtf8("^1.2K watching \u00b7 started 2 h 1[45] min ago$"))
-                     .match(app.item("watch-stats")->property("text").toString()).hasMatch(),
-                 qPrintable(app.item("watch-stats")->property("text").toString()));
+        // ("live now" in the accent, as on the cards.)
+        QQuickItem *stats = app.item("watch-stats");
+        QVERIFY2(QRegularExpression(QString::fromUtf8("^live now \u00b7 1.2K watching \u00b7 started 2 h 1[45] min ago$"))
+                     .match(stats->property("said").toString()).hasMatch(),
+                 qPrintable(stats->property("said").toString()));
+        QVERIFY(stats->property("marked").toBool());
+        QVERIFY(stats->property("text").toString().startsWith(QString("<font color=\"%1\">live now</font>")
+                                                                  .arg(QColor(app.theme->property("accent").toString()).name())));
+        QCOMPARE(App::under(surface, "seek-live")->property("color").value<QColor>(), QColor(app.theme->property("accent").toString()));
         // The seek bar grows with the stream.
         QTRY_VERIFY_WITH_TIMEOUT(surface->property("length").toDouble() >= length + 2, 10000);
         QVERIFY(surface->property("atEdge").toBool());
@@ -5000,7 +5080,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(surface->property("atEdge").toBool(), 10000);
         QTRY_VERIFY(!goLive->isVisible());
         QTRY_VERIFY2(!hintsOf(app).contains("End go live"), qPrintable(hintsOf(app).join(", ")));
-        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u00b7 live")));
+        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u25cf live")));
         // (Said at once; the player gets there a moment later.)
         QTRY_VERIFY2(mpv->property("position").toDouble() >= surface->property("length").toDouble() - 8,
                      qPrintable(QString::number(mpv->property("position").toDouble())));
@@ -5035,7 +5115,7 @@ private slots:
         // Under the title, how long it has run stays clear of the channel's
         // button: in whole hours, where the minutes don't fit beside it.
         QQuickItem *stats = app.item("watch-stats"), *channel = app.item("watch-channel");
-        QTRY_VERIFY(stats->property("text").toString().contains("started"));
+        QTRY_VERIFY(stats->property("said").toString().startsWith(QString::fromUtf8("live now \u00b7 ")));
         qreal rowEnd = channel->mapToScene(QPointF(channel->width(), 0)).x();
         for (QQuickItem *sibling : channel->parentItem()->childItems())
             if (sibling->isVisible())
@@ -5106,7 +5186,7 @@ private slots:
         // And it gets there, once, and says it is live.
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() >= target - 1 && !mpv->property("buffering").toBool(), 15000);
         QTRY_VERIFY(surface->property("atEdge").toBool());
-        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" · live")));
+        QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u25cf live")));
         QVERIFY(!goLive->isVisible());
 
         // Eight segments behind the edge is not at it, and the clock says
@@ -5270,6 +5350,10 @@ private slots:
         QCOMPARE(surface->property("info").toMap().value("live").toMap().value("state").toString(), QString("ended"));
         QVERIFY2(!app.item("watch-stats")->property("text").toString().contains("watching"),
                  qPrintable(app.item("watch-stats")->property("text").toString()));
+        // Nothing says it is live any more: not the line under the title, nor the clock.
+        QVERIFY(!app.item("watch-stats")->property("marked").toBool());
+        QVERIFY(!app.item("watch-stats")->property("said").toString().contains("live now"));
+        QVERIFY(!App::under(surface, "seek-live")->isVisible());
         // Its state is not asked for any more.
         const int checks = app.askedLike("^GET live/\\d+/state");
         QTest::qWait(1000);
@@ -5363,8 +5447,26 @@ private slots:
         QQuickItem *surface = app.item("surface");
         QObject *mpv = surface->property("mpv").value<QObject *>();
         QVERIFY(!mpv->property("loaded").toBool());
+        // Beside it, the sheet a running stream has, on its chat; nothing of
+        // it moves when the stream starts.
+        QQuickItem *sheet = app.item("sheet");
+        QCOMPARE(sheet->property("tabsNow").toStringList(), QStringList({"chat", "next"}));
+        QCOMPARE(sheet->property("current").toString(), QString("chat"));
+        // (Where it stands in the page: the page itself may still be settling into place.)
+        const QRectF before(sheet->position(), sheet->size());
+        QSignalSpy turned(sheet, SIGNAL(currentChanged()));
+        QSignalSpy tabs(sheet, SIGNAL(tabsNowChanged()));
+        QSignalSpy comments(app.item("tab-comments"), SIGNAL(visibleChanged()));
         // It starts: the room goes, and the stream plays, from its beginning.
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("started").toBool(), 20000);
+        QCOMPARE(turned.count(), 0);
+        QCOMPARE(comments.count(), 0);
+        QVERIFY2(tabs.isEmpty() || sheet->property("tabsNow").toStringList().mid(0, 2) == QStringList({"chat", "next"}),
+                 qPrintable(sheet->property("tabsNow").toStringList().join(",")));
+        QCOMPARE(QRectF(sheet->position(), sheet->size()), before);
+        // Its chat is read now, and only now.
+        QTRY_VERIFY(app.asked("GET api/chat?v=waiting0002") >= 1);
+        QVERIFY(!app.item("chat-later")->isVisible());
         QVERIFY(!room->isVisible());
         QCOMPARE(surface->property("startedAt").toDouble(), 0.0);
         QVERIFY(surface->property("live").toBool());
@@ -5382,6 +5484,63 @@ private slots:
         QCOMPARE(app.askedLike("^GET api/wait"), 1);
         QCOMPARE(openWaits(app), 0);
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void theWaitingRoomsSheetIsItsChatToComeAndTheChannelsLineup()
+    {
+        App app;
+        READY(app);
+        QVERIFY(openWaiting(app, "waiting0001"));
+        QQuickItem *sheet = app.item("sheet");
+        // Chat and Up next, as a running stream has; no comments of something not yet aired.
+        QCOMPARE(sheet->property("tabsNow").toStringList(), QStringList({"chat", "next"}));
+        QCOMPARE(sheet->property("current").toString(), QString("chat"));
+        QVERIFY(app.item("tab-chat")->isVisible());
+        QVERIFY(!app.item("tab-comments")->isVisible());
+        // The chat isn't read until it starts: the tab says when it opens.
+        QQuickItem *later = app.item("chat-later");
+        QVERIFY(later && later->isVisible());
+        QCOMPARE(later->property("text").toString(), QString("Chat opens when it starts"));
+        // Up next is the channel's lineup: its Streams tab, asked once as the room opens.
+        const QString lineup = "GET api/channel?id=UCaaaaaaaaaaaaaaaaaaaaaa&tab=streams";
+        QTRY_COMPARE(app.asked(lineup), 1);
+        sheet->setProperty("current", "next");
+        QTRY_COMPARE(app.items("next-entry").size(), 2);
+        // What runs and what is announced (not the past broadcasts), with the cards' chips.
+        const QList<QQuickItem *> entries = app.items("next-entry");
+        QCOMPARE(entries.at(0)->property("title").toString(), QString("Live: the long one, part 2"));
+        QCOMPARE(entries.at(1)->property("title").toString(), QString("Questions, answered live"));
+        QQuickItem *liveTag = App::under(entries.at(0), "next-tag"), *soonTag = App::under(entries.at(1), "next-tag");
+        QCOMPARE(liveTag->property("color").value<QColor>(), QColor(app.theme->property("accent").toString()));
+        QStringList said;
+        App::texts(liveTag, said);
+        QCOMPARE(said, QStringList{"● LIVE"});
+        QCOMPARE(soonTag->property("border").value<QObject *>()->property("width").toInt(), 1);
+        QTRY_COMPARE(app.item("next-from-text")->property("text").toString(), QString("From Low Level Hours · Streams"));
+        QVERIFY(!app.item("next-from-count") || !app.item("next-from-count")->isVisible());
+        QVERIFY(!app.item("next-empty") || !app.item("next-empty")->isVisible());
+        QTest::qWait(500);
+        QCOMPARE(app.asked(lineup), 1);
+        QCOMPARE(app.asked("GET api/chat?v=waiting0001"), 0);
+        QCOMPARE(app.asked("GET api/comments?v=waiting0001"), 0);
+        // One of them opens from there.
+        app.click(entries.at(1));
+        QTRY_COMPARE(app.item("surface")->property("info").toMap().value("id").toString(), QString("str00000002"));
+    }
+
+    void aWaitingRoomWithNothingElseAnnouncedSaysSo()
+    {
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_NO_LINEUP", "1"}});
+        READY(app);
+        QVERIFY(openWaiting(app, "waiting0001"));
+        QQuickItem *sheet = app.item("sheet");
+        QTRY_COMPARE(app.asked("GET api/channel?id=UCaaaaaaaaaaaaaaaaaaaaaa&tab=streams"), 1);
+        sheet->setProperty("current", "next");
+        QQuickItem *empty = nullptr;
+        QTRY_VERIFY((empty = app.item("next-empty")) && empty->isVisible());
+        QCOMPARE(empty->property("text").toString(), QString("Nothing else announced"));
+        QVERIFY(app.items("next-entry").isEmpty());
+        QVERIFY(!app.item("next-from-text") || !app.item("next-from-text")->isVisible());
     }
 
     void leavingTheWaitingRoomStopsTheWait()

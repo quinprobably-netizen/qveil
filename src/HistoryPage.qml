@@ -201,15 +201,16 @@ FocusScope {
                     height: 3
                     color: Style.accent
                 }
-                // The keyboard's cursor: a frame on the picture, as on a card.
-                Rectangle {
-                    objectName: "cursor"
-                    anchors.fill: parent
-                    visible: keptRow.current
-                    color: "transparent"
-                    border.width: 2
-                    border.color: Style.accent
-                }
+            }
+            // The keyboard's cursor: a ring around the picture, as on a card.
+            Rectangle {
+                objectName: "cursor"
+                anchors.fill: keptPicture
+                anchors.margins: -(Style.ringGap + Style.ring)
+                visible: keptRow.current
+                color: "transparent"
+                border.width: Style.ring
+                border.color: Style.accent
             }
             Column {
                 anchors.left: keptPicture.right

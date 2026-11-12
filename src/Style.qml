@@ -53,6 +53,10 @@ QtObject {
     readonly property int bar: 56
     readonly property int gutter: 24
     readonly property int control: 28
+    // The keyboard's ring on a card's picture: this far outside it, with the
+    // gap showing, so it never touches the picture or the chip in its corner.
+    readonly property int ringGap: 3
+    readonly property int ring: 2
     // How wide the column down the side of a page is (the channels, the
     // settings' categories), in a page `width` wide.
     function rail(width) { return width < 700 ? 200 : 260 }

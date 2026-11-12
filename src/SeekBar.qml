@@ -40,7 +40,9 @@ Column {
         triggeredOnStart: true
         onTriggered: seek.now = Date.now() / 1000
     }
-    readonly property string time: edge ? qsTr("%1 · live").arg(Format.clock(started > 0 ? now - started : length))
+    // (At the edge, the word that it is live is said beside it, in the
+    // accent: see PlayerSurface.)
+    readonly property string time: edge ? Format.clock(started > 0 ? now - started : length)
                                         : Format.clock(position) + " / " + Format.clock(length)
     // "3/7 Reborrowing"
     readonly property string chapterText: chapter >= 0 ? (chapter + 1) + "/" + chapters.length + " " + chapters[chapter].title : ""

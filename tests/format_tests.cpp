@@ -114,16 +114,18 @@ private slots:
     {
         const qint64 started = 1800000000;
         const auto live = [&](int watching) { return QVariantMap{{"started", started}, {"watching", watching}}; };
-        // As the cards say a time: minutes, then hours and minutes; never seconds.
-        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60 + 12), QString("1.2K watching · started 2 h 14 min ago"));
-        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60 + 59), QString("1.2K watching · started 2 h 14 min ago"));
-        QCOMPARE(call("liveMeta", QVariantMap{{"started", started}}, started + 3 * 3600 + 20), QString("started 3 h ago"));
-        QCOMPARE(call("liveMeta", live(5), started + 14 * 60 + 5), QString("5 watching · started 14 min ago"));
-        QCOMPARE(call("liveMeta", live(5), started + 12), QString("5 watching · started 1 min ago"));
-        QCOMPARE(call("liveMeta", QVariantMap{{"watching", 860}}, started), QString("860 watching"));
+        // It begins as a running stream's card does; and says a time as the cards do: minutes, then hours and minutes; never seconds.
+        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60 + 12), QString("live now · 1.2K watching · started 2 h 14 min ago"));
+        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60 + 59), QString("live now · 1.2K watching · started 2 h 14 min ago"));
+        QCOMPARE(call("liveMeta", QVariantMap{{"started", started}}, started + 3 * 3600 + 20), QString("live now · started 3 h ago"));
+        QCOMPARE(call("liveMeta", live(5), started + 14 * 60 + 5), QString("live now · 5 watching · started 14 min ago"));
+        QCOMPARE(call("liveMeta", live(5), started + 12), QString("live now · 5 watching · started 1 min ago"));
+        QCOMPARE(call("liveMeta", QVariantMap{{"watching", 860}}, started), QString("live now · 860 watching"));
         // Where that won't fit, whole hours.
-        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60, true), QString("1.2K watching · started 2 h ago"));
-        QCOMPARE(call("liveMeta", live(5), started + 14 * 60, true), QString("5 watching · started 14 min ago"));
+        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60, true), QString("live now · 1.2K watching · started 2 h ago"));
+        QCOMPARE(call("liveMeta", live(5), started + 14 * 60, true), QString("live now · 5 watching · started 14 min ago"));
+        // And narrower still, the count without its word.
+        QCOMPARE(call("liveMeta", live(1234), started + 2 * 3600 + 14 * 60, 2), QString("live now · 1.2K · started 2 h ago"));
     }
 };
 

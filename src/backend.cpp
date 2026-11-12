@@ -277,7 +277,7 @@ void Backend::refuse(const QString &task) {
 
 bool Backend::newestOnly(const QString &task) {
     static const QSet<QString> tasks{"search", "channel", "play", "prepare", "feed", "feed-cache", "comments", "chapters", "lens", "read",
-                                     "live-state", "wait", "chat"};
+                                     "live-state", "wait", "chat", "lineup"};
     return tasks.contains(task);
 }
 
@@ -327,6 +327,15 @@ void Backend::request(const QByteArray &verb, const QString &path, const QUrlQue
             // playing it looks it up as usual, and says so if that fails too.
             if (task == "prepare")
                 return;
+            // So is a waiting room's lineup: the room says it couldn't be read, no more.
+            if (task == "lineup") {
+                if (m_latest.value(task) == id && !m_lineup.isEmpty()) {
+                    m_lineup.insert("loaded", true);
+                    m_lineup.insert("failed", true);
+                    emit lineupChanged();
+                }
+                return;
+            }
             // Whether a stream has ended is asked again at the next check, and
             // a session the engine no longer has (404) is one that is over.
             if (task == "live-state") {
@@ -461,33 +470,20 @@ void Backend::loadFeed(bool network, bool shorts, const QString &channel) {
 
 namespace {
 
-// What of `entries` is live now (in the feed's order), then what is
-// announced to start within a day of `now`, soonest first. (What is past its
-// start and not yet running is still announced: it is about to start.)
-QVariantList liveOf(const QVariantList &entries, qint64 now) {
-    QVariantList running, upcoming;
+// What of `entries` is live now, in the feed's order. (What is announced is
+// not: the cards and a channel's Streams tab say that.)
+QVariantList liveOf(const QVariantList &entries) {
+    QVariantList running;
     QSet<QString> seen;
     for (const QVariant &entry : entries) {
         const QVariantMap video = entry.toMap();
         const QString id = video.value("id").toString();
-        const QString live = video.value("live").toString();
-        if (id.isEmpty() || seen.contains(id))
+        if (id.isEmpty() || seen.contains(id) || video.value("live").toString() != "now")
             continue;
-        if (live == "now") {
-            seen.insert(id);
-            running << video;
-        } else if (live == "upcoming") {
-            const qint64 starts = video.value("starts").toLongLong();
-            if (starts > 0 && starts - now < 86400) {
-                seen.insert(id);
-                upcoming << video;
-            }
-        }
+        seen.insert(id);
+        running << video;
     }
-    std::stable_sort(upcoming.begin(), upcoming.end(), [](const QVariant &a, const QVariant &b) {
-        return a.toMap().value("starts").toLongLong() < b.toMap().value("starts").toLongLong();
-    });
-    return running + upcoming;
+    return running;
 }
 
 } // namespace
@@ -504,7 +500,7 @@ void Backend::applyFeed(const QVariantMap &answer, bool network, bool shorts) {
     newPage(m_feed);
     const QVariantList entries = answer.value("entries").toList();
     m_feed->assign(entries);
-    m_liveNow = liveOf(entries, QDateTime::currentSecsSinceEpoch());
+    m_liveNow = liveOf(entries);
     m_feedInfo = answer;
     m_feedInfo.remove("entries");
     if (network)
@@ -1012,6 +1008,38 @@ void Backend::loadChapters(const QString &video) {
 void Backend::closeChapters() {
     // The engine sees the hang-up and stops looking.
     supersede("chapters");
+}
+
+void Backend::loadLineup(const QString &channel, const QString &video) {
+    if (channel.isEmpty())
+        return;
+    m_lineup = {{"video", video}, {"channel", channel}, {"loaded", false}, {"items", QVariantList()}};
+    emit lineupChanged();
+    QUrlQuery q;
+    q.addQueryItem("id", channel);
+    q.addQueryItem("tab", "streams");
+    call("GET", "api/channel", q, {}, "lineup", [this, channel, video](const QJsonValue &v) {
+        if (m_lineup.value("video").toString() != video || m_lineup.value("channel").toString() != channel)
+            return;
+        QVariantList items;
+        for (const QJsonValue &entry : v.toObject().value("videos").toArray()) {
+            const QVariantMap stream = entry.toObject().toVariantMap();
+            const QString live = stream.value("live").toString();
+            if ((live == "now" || live == "upcoming") && stream.value("id").toString() != video)
+                items << stream;
+        }
+        m_lineup.insert("items", items);
+        m_lineup.insert("loaded", true);
+        emit lineupChanged();
+    });
+}
+
+void Backend::closeLineup() {
+    supersede("lineup");
+    if (m_lineup.isEmpty())
+        return;
+    m_lineup.clear();
+    emit lineupChanged();
 }
 
 void Backend::loadLenses() {
