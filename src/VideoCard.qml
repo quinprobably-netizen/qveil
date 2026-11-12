@@ -1,6 +1,7 @@
 import QtQuick
 import Qveil
 import "Format.js" as Format
+import "Linkify.js" as Linkify
 
 // One video, in a grid or on a shelf: its thumbnail (frosted until it is
 // pointed at or selected, when thumbnails are set to be), its title, channel
@@ -33,6 +34,11 @@ Item {
     // The video's id and length, for whoever asks the card (its `video` may be a row of a list).
     readonly property string videoId: video.id || ""
     readonly property int seconds: video.duration || 0
+    // A stream that is on now, or one that is yet to begin.
+    readonly property bool liveNow: video.live === "now"
+    readonly property bool upcoming: video.live === "upcoming"
+    // The line under the channel's name, as words.
+    readonly property string metaText: Format.meta(video, stamp)
 
     width: view.cellWidth
     height: view.cellHeight
@@ -79,20 +85,28 @@ Item {
                 scale: hover.hovered ? 1.045 : 1
                 Behavior on scale { NumberAnimation { duration: Style.move * 1.5; easing.type: Easing.OutCubic } }
             }
+            // The corner tag: its length, or what kind of video it is. A
+            // stream that is on now is in the accent's fill (there is no red
+            // in qveil), and one yet to begin has its day and time, outlined.
             Rectangle {
+                objectName: "card-tag"
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
                 visible: tag.text !== ""
                 width: tag.implicitWidth + Style.u * 3
                 height: tag.implicitHeight + Style.u
-                color: card.video.short ? Style.accent : Style.scrim
+                color: card.liveNow || (card.video.short && !card.upcoming) ? Style.accent : Style.scrim
+                border.width: card.upcoming ? 1 : 0
+                border.color: Style.dim
                 Text {
                     id: tag
                     anchors.centerIn: parent
-                    text: card.video.short ? qsTr("Short")
+                    text: card.liveNow ? qsTr("\u25cf LIVE")
+                        : card.upcoming ? (Format.dayTime(card.video.starts) || qsTr("Upcoming"))
+                        : card.video.short ? qsTr("Short")
                         : card.video.duration ? Format.clock(card.video.duration) : ""
                     textFormat: Text.PlainText
-                    color: card.video.short ? Style.accentText : Style.fg
+                    color: card.liveNow || (card.video.short && !card.upcoming) ? Style.accentText : Style.fg
                     font.family: Style.font
                     font.pixelSize: Style.caption
                 }
@@ -156,13 +170,19 @@ Item {
         }
         Text {
             id: meta
+            objectName: "card-meta"
             anchors.top: channel.bottom
             anchors.topMargin: 2
             width: Math.min(implicitWidth, parent.width)
-            text: Format.meta(card.video, card.stamp)
+            // "live now" is said in the accent, as the corner tag is.
+            readonly property string word: qsTr("live now")
+            readonly property bool marked: card.liveNow && card.metaText.indexOf(word) === 0
+            text: marked ? "<font color=\"" + Style.accent + "\">" + Linkify.escape(word) + "</font>"
+                           + Linkify.escape(card.metaText.slice(word.length))
+                         : card.metaText
             // A video with neither date nor views has no such line.
             height: text === "" ? 0 : implicitHeight
-            textFormat: Text.PlainText
+            textFormat: marked ? Text.StyledText : Text.PlainText
             elide: Text.ElideRight
             color: Style.faint
             font.family: Style.font
@@ -171,7 +191,8 @@ Item {
             HoverHandler { id: dateHover }
             Tip {
                 text: card.view.estimateNote
-                shown: dateHover.hovered && card.stamp > 0 && card.approximate
+                // (A stream that is on now or yet to begin has no date in its line.)
+                shown: dateHover.hovered && card.stamp > 0 && card.approximate && !card.video.live
             }
         }
         Text {

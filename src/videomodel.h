@@ -15,8 +15,8 @@
 // The roles are named like the engine's JSON keys, so a delegate reads
 // `model.title` or `model.channel_id`; `get(row)` returns the whole entry.
 //
-// Live streams are not shown (the engine marks them `"live": true`), because
-// qveil can't play them: no grid has a card for one.
+// Live and upcoming streams are rows like any other: the engine marks them
+// `"live": "now"` or `"upcoming"`, and a card shows the mark.
 class VideoModel : public QAbstractListModel {
     Q_OBJECT
     Q_PROPERTY(int count READ count NOTIFY countChanged)

@@ -3,22 +3,24 @@
 // Sorting and filtering a list of videos that is already here. Nothing in
 // this asks anybody for anything: it only reorders and leaves out.
 //
-// A setting is { sort, length, watched }:
+// A setting is { sort, length, watched, live }:
 //   sort     "" (the order the list came in), "newest", "views", "longest", "shortest"
 //   length   "any", "short" (under 10 minutes), "medium" (10 to 30), "long" (over 30)
 //   watched  "show" or "hide"
+//   live     "show" or "hide": streams that are on now or yet to begin
+//            (one that is over is a video like any other)
 
-function fresh() { return { sort: "", length: "any", watched: "show" } }
+function fresh() { return { sort: "", length: "any", watched: "show", live: "show" } }
 
 function of(setting) {
     const s = setting || {}
-    return { sort: s.sort || "", length: s.length || "any", watched: s.watched || "show" }
+    return { sort: s.sort || "", length: s.length || "any", watched: s.watched || "show", live: s.live || "show" }
 }
 
 // Whether it leaves the list as it came.
 function plain(setting) {
     const s = of(setting)
-    return s.sort === "" && s.length === "any" && s.watched === "show"
+    return s.sort === "" && s.length === "any" && s.watched === "show" && s.live === "show"
 }
 
 function stamp(v) { return v.date || v.published || 0 }
@@ -38,6 +40,8 @@ function apply(videos, setting, watched) {
         })
     if (s.watched === "hide")
         out = out.filter(v => !(watched && watched[v.id]))
+    if (s.live === "hide")
+        out = out.filter(v => !v.live)
     if (s.sort !== "") {
         const key = s.sort === "newest" ? (v => -stamp(v))
                   : s.sort === "views" ? (v => -(v.views || 0))

@@ -200,8 +200,11 @@ def topic_groups():
     for i in range(2, int(os.environ.get("QVEIL_STANDIN_TOPIC_GROUPS", "2"))):
         groups.append({"id": "%012x" % (i + 1), "label": "topic %d" % (i + 1), "channels": ["Channel %d" % i],
                        "searches": ["topic %d" % (i + 1)], "videos": found("tp%d" % i, "topic %d" % (i + 1), ["Someone"])})
+    # With QVEIL_STANDIN_LIVE, the first group has a stream announced for in
+    # two hours and one that was streamed three days ago.
     if os.environ.get("QVEIL_STANDIN_LIVE"):
-        groups[0]["videos"][0]["live"] = True
+        groups[0]["videos"][0].update({"live": "upcoming", "starts": NOW + 2 * HOUR + 600})
+        groups[0]["videos"][2]["streamed"] = True
     out = []
     for g in groups:
         if g["id"] in state["topics"]["hidden"]:
@@ -275,8 +278,9 @@ def lens_videos(lens):
     out = []
     for i, v in enumerate(FEED[:6]):
         v = dict(v)
+        # With QVEIL_STANDIN_LIVE, each lens's first video is live now.
         if i == 0 and os.environ.get("QVEIL_STANDIN_LIVE"):
-            v["live"] = True
+            v.update({"live": "now", "watching": 863})
         v["id"] = "len%s%02d" % (lens["id"][-6:], i)
         v["why"] = [topics[i % len(topics)]] + ["over " + x for x in rule]
         out.append(v)

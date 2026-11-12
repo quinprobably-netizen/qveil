@@ -5,11 +5,11 @@ import "Arrange.js" as Arrange
 
 // One control for how a list is sorted and filtered. It says what it is set
 // to, and opens a small menu of the choices: the order, the length, and
-// whether what was watched is shown.
+// whether what was watched, and streams that are live or yet to begin, are shown.
 Act {
     id: control
 
-    // { sort, length, watched }: see Arrange.js.
+    // { sort, length, watched, live }: see Arrange.js.
     property var setting: ({})
     readonly property var now: Arrange.of(setting)
     // What the order the list came in is called: "Newest" for a feed, "Best
@@ -35,7 +35,8 @@ Act {
     }
 
     text: [sortName(now.sort), now.length !== "any" ? lengthName(now.length) : "",
-           now.watched === "hide" ? qsTr("unwatched") : ""].filter(s => s !== "").join(" · ")
+           now.watched === "hide" ? qsTr("unwatched") : "", now.live === "hide" ? qsTr("no live") : ""]
+          .filter(s => s !== "").join(" · ")
     // A quiet word, with the mark of something that opens.
     quiet: !menu.opened
     trailing: "\u25be"
@@ -142,7 +143,7 @@ Act {
                 return null
             }
             function step(by) {
-                for (let to = at + by; to >= 0 && to <= 10; to += by) {
+                for (let to = at + by; to >= 0 && to <= 11; to += by) {
                     const there = option(to)
                     if (there && there.visible) {
                         at = to
@@ -184,6 +185,15 @@ Act {
             Head { text: qsTr("Watched") }
             Option { objectName: "watched-show"; order: 9; text: qsTr("Show"); current: control.now.watched === "show"; onPicked: control.set("watched", "show") }
             Option { objectName: "watched-hide"; order: 10; text: qsTr("Hide"); current: control.now.watched === "hide"; onPicked: control.set("watched", "hide") }
+            Head { text: qsTr("Live") }
+            // One choice that is on or off: picked again, it shows them again.
+            Option {
+                objectName: "live-hide"
+                order: 11
+                text: qsTr("Hide live and upcoming")
+                current: control.now.live === "hide"
+                onPicked: control.set("live", current ? "show" : "hide")
+            }
         }
     }
 }

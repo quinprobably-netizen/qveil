@@ -11,6 +11,10 @@
     "one": "%n day ago",
     "other": "%n days ago"
   },
+  "in %n days": {
+    "one": "in %n day",
+    "other": "in %n days"
+  },
   "%n months ago": {
     "one": "%n month ago",
     "other": "%n months ago"

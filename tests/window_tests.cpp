@@ -3785,7 +3785,18 @@ private slots:
         QCOMPARE(lead->mapToScene(QPointF(0, 0)).y(), top);
     }
 
-    void liveStreamsAreNotOnShelves()
+    // The card of `id` on `shelf`, if it shows one.
+    static QQuickItem *cardOf(QQuickItem *shelf, const QString &id)
+    {
+        QList<QQuickItem *> cards;
+        App::collect(shelf, "card", cards);
+        for (QQuickItem *card : cards)
+            if (card->property("videoId").toString() == id)
+                return card;
+        return nullptr;
+    }
+
+    void liveAndUpcomingStreamsAreOnShelvesWithTheirMarks()
     {
         App app(false, QSize(1280, 2400), {{"QVEIL_STANDIN_LIVE", "1"}, {"QVEIL_STANDIN_TOPICS", "fetched"}});
         READY(app);
@@ -3796,15 +3807,74 @@ private slots:
         QTRY_VERIFY(App::count(topic, "card") >= 4);
         QTRY_VERIFY((lens = app.item("shelf-aaaa0002")));
         QTRY_VERIFY(App::count(lens, "card") >= 4);
-        // One of each shelf's videos is a live stream, which qveil can't play: it isn't offered.
-        for (QQuickItem *shelf : {lens, topic}) {
-            QList<QQuickItem *> cards;
-            App::collect(shelf, "card", cards);
-            for (QQuickItem *card : cards) {
-                QVERIFY2(card->property("videoId").toString() != "len0000200" && card->property("videoId").toString() != "tpw0000000",
-                         qPrintable(card->property("videoId").toString()));
-            }
-        }
+
+        // Running: "● LIVE" where the length goes, and how many watch.
+        QQuickItem *live = nullptr;
+        QTRY_VERIFY((live = cardOf(lens, "lenaa000200")));
+        QStringList said;
+        App::texts(live, said);
+        QVERIFY2(said.contains("\u25cf LIVE"), qPrintable(said.join(" | ")));
+        QCOMPARE(live->property("metaText").toString(), QString("live now \u00b7 863 watching"));
+
+        // Upcoming: its day and time in the corner, and when that is.
+        QQuickItem *upcoming = nullptr;
+        QTRY_VERIFY((upcoming = cardOf(topic, "tpw0000000")));
+        said.clear();
+        App::texts(upcoming, said);
+        const QRegularExpression dayTime("^\\S+ \\d\\d:\\d\\d$");
+        QString corner;
+        for (const QString &text : std::as_const(said))
+            if (dayTime.match(text).hasMatch())
+                corner = text;
+        QVERIFY2(!corner.isEmpty(), qPrintable(said.join(" | ")));
+        QCOMPARE(upcoming->property("metaText").toString(), QString("Starts in 2 h \u00b7 ") + corner);
+        QVERIFY(!said.contains("15:00"));
+
+        // Over: when it was streamed, and its length as any video's.
+        QQuickItem *streamed = nullptr;
+        QTRY_VERIFY((streamed = cardOf(topic, "tpw0000002")));
+        QVERIFY2(streamed->property("metaText").toString().startsWith("Streamed 3 days ago"),
+                 qPrintable(streamed->property("metaText").toString()));
+        said.clear();
+        App::texts(streamed, said);
+        QVERIFY2(said.contains("25:00"), qPrintable(said.join(" | ")));
+    }
+
+    void hidingLiveAndUpcomingLeavesOnlyVideos()
+    {
+        App app(false, QSize(1280, 2400), {{"QVEIL_STANDIN_LIVE", "1"}, {"QVEIL_STANDIN_TOPICS", "fetched"}});
+        READY(app);
+        app.backend->setConfig({{"topicFeeds", true}});
+        QQuickItem *lens = nullptr, *topic = nullptr;
+        QTRY_VERIFY((topic = app.item("shelf-topic-aa11bb22cc33")));
+        QTRY_VERIFY(cardOf(topic, "tpw0000000"));
+        QTRY_VERIFY((lens = app.item("shelf-aaaa0002")));
+        QTRY_VERIFY(cardOf(lens, "lenaa000200"));
+
+        // From the shelf's menu.
+        QQuickItem *sort = App::under(topic, "shelf-sort");
+        QVERIFY(sort);
+        app.click(sort);
+        QQuickItem *hide = nullptr;
+        QTRY_VERIFY((hide = app.item("live-hide")) && hide->isVisible());
+        QVERIFY(!hide->property("current").toBool());
+        app.click(hide);
+        QTRY_VERIFY(!cardOf(topic, "tpw0000000"));
+        QVERIFY(hide->property("current").toBool());
+        // A stream that is over is a video like any other.
+        QVERIFY(cardOf(topic, "tpw0000002"));
+        QVERIFY2(sort->property("text").toString().contains("no live"), qPrintable(sort->property("text").toString()));
+        QTest::keyClick(app.window, Qt::Key_Escape);
+
+        // And as the setting is kept.
+        QMetaObject::invokeMethod(app.window, "arrange", Q_ARG(QVariant, QString("aaaa0002")),
+                                  Q_ARG(QVariant, QVariantMap({{"live", "hide"}})));
+        QTRY_VERIFY(!cardOf(lens, "lenaa000200"));
+        QList<QQuickItem *> cards;
+        App::collect(lens, "card", cards);
+        QVERIFY(!cards.isEmpty());
+        for (QQuickItem *card : cards)
+            QVERIFY(!card->property("metaText").toString().startsWith("live now"));
     }
 
     void aSortedGridKeepsItsPlaceWhenItsListChanges()
@@ -3975,6 +4045,18 @@ private slots:
         QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("duration").toDouble() > 0, 15000);
         QTest::qWait(500);
+        QCOMPARE(app.asked("POST api/prepare"), 1);
+        // A stream, live or yet to begin, has nothing to get ready.
+        VideoModel streams;
+        streams.assign({app.backend->feed()->get(0), QVariantMap{{"id", "liveliveli1"}, {"title", "Live"}, {"live", "now"}},
+                        QVariantMap{{"id", "upcomingup1"}, {"title", "Soon"}, {"live", "upcoming"}}});
+        for (int at : {0, 1}) {
+            QMetaObject::invokeMethod(app.window, "play", Q_ARG(QVariant, streams.get(at)),
+                                      Q_ARG(QVariant, QVariant::fromValue(&streams)), Q_ARG(QVariant, at));
+            QTRY_VERIFY(!app.item("surface")->property("pending").toBool());
+            QTRY_VERIFY_WITH_TIMEOUT(mpv->property("duration").toDouble() > 0, 15000);
+            QTest::qWait(500);
+        }
         QCOMPARE(app.asked("POST api/prepare"), 1);
     }
 

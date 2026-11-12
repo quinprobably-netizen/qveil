@@ -10,9 +10,12 @@ namespace {
 // The keys of an engine entry that a delegate can read as roles. Others stay
 // in the entry for get(), and a change in one of them tells no view anything.
 const QList<QByteArray> &roleKeys() {
+    // A stream says "live" ("now" or "upcoming"), when it "starts" (unix
+    // seconds) and how many are "watching"; one that is over is "streamed".
     static const QList<QByteArray> keys{"id",       "title",    "channel",  "channel_id", "published",
                                         "date",     "estimated", "duration", "views",      "short",
-                                        "batch",    "why"};
+                                        "batch",    "why",      "live",     "starts",     "watching",
+                                        "streamed"};
     return keys;
 }
 
@@ -77,7 +80,7 @@ QVector<QVariantMap> VideoModel::distinct(const QVariantList &entries) {
     for (const QVariant &entry : entries) {
         const QVariantMap map = entry.toMap();
         const QString id = idOf(map);
-        if (id.isEmpty() || seen.contains(id) || map.value(QStringLiteral("live")).toBool())
+        if (id.isEmpty() || seen.contains(id))
             continue;
         seen.insert(id);
         found.append(map);

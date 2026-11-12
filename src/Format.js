@@ -60,12 +60,50 @@ function views(n) {
     return qsTr("%1 views").arg(n)
 }
 
-// `brief`: the count of views without the word, for where the word won't fit.
+// How long until a stream's start (unix seconds): "in 5 min", "in 2 h",
+// "in 3 days". Empty once that time has come.
+function startsIn(timestamp) {
+    const d = (timestamp || 0) - Date.now() / 1000
+    if (!timestamp || d <= 0)
+        return ""
+    const minutes = Math.max(1, Math.round(d / 60))
+    if (minutes < 60)
+        return qsTr("in %1 min").arg(minutes)
+    const hours = Math.max(1, Math.round(d / 3600))
+    if (d < 48 * 3600 && hours < 48)
+        return qsTr("in %1 h").arg(hours)
+    return qsTr("in %n days", "", Math.round(d / 86400))
+}
+
+// A stream's start as its day and time, in local time: "Fri 18:00".
+function dayTime(timestamp) {
+    if (!timestamp)
+        return ""
+    return Qt.formatDateTime(new Date(timestamp * 1000), "ddd HH:mm")
+}
+
+// The line under a card's title. `brief`: the count without the word, for
+// where the word won't fit.
 function meta(video, date, brief) {
     const parts = []
+    if (video.live === "now") {
+        parts.push(qsTr("live now"))
+        const n = count(video.watching)
+        if (n)
+            parts.push(brief ? n : qsTr("%1 watching").arg(n))
+        return parts.join(" · ")
+    }
+    if (video.live === "upcoming") {
+        const rel = startsIn(video.starts)
+        parts.push(rel ? qsTr("Starts %1").arg(rel) : video.starts ? qsTr("Starting soon") : qsTr("Upcoming"))
+        const at = dayTime(video.starts)
+        if (at)
+            parts.push(at)
+        return parts.join(" · ")
+    }
     const when = age(date)
     if (when)
-        parts.push(when)
+        parts.push(video.streamed ? qsTr("Streamed %1").arg(when) : when)
     const v = brief ? views(video.views).replace(/\s*\S+$/, "") : views(video.views)
     if (v)
         parts.push(v)

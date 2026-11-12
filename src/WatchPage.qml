@@ -339,7 +339,8 @@ FocusScope {
         readonly property var next: page.list && page.index >= 0 && page.index + 1 < page.list.count
             ? page.list.get(page.index + 1) : null
         readonly property var clock: page.playing || surface
-        readonly property bool due: !!backend.config.prepareNext && !!next && !!next.id
+        // (A stream, on now or yet to begin, has nothing to get ready.)
+        readonly property bool due: !!backend.config.prepareNext && !!next && !!next.id && !next.live
             && clock.length > 0 && clock.length - clock.mpv.position <= 30
         // The video that was asked for, so it is asked for once.
         property string asked: ""

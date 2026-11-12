@@ -207,7 +207,8 @@ private slots:
     void rolesAreNamedLikeTheEnginesKeys() {
         VideoModel model;
         const QList<QByteArray> names = model.roleNames().values();
-        for (const char *key : {"id", "title", "channel", "channel_id", "published", "date", "estimated", "duration", "views", "short"})
+        for (const char *key : {"id", "title", "channel", "channel_id", "published", "date", "estimated", "duration", "views", "short",
+                                "live", "starts", "watching", "streamed"})
             QVERIFY2(names.contains(key), key);
         QVariantMap entry = video("a", "Title");
         entry.insert("channel_id", "UC1");
@@ -216,6 +217,23 @@ private slots:
         for (auto it = roles.begin(); it != roles.end(); ++it)
             if (it.value() == "channel_id")
                 QCOMPARE(model.data(model.index(0), it.key()).toString(), QString("UC1"));
+    }
+
+    void liveAndUpcomingStreamsAreKept() {
+        // The engine marks them, and a card shows the marks.
+        VideoModel model;
+        QVariantMap live = video("live", "Live"), soon = video("soon", "Soon");
+        live.insert("live", "now");
+        live.insert("watching", 863);
+        soon.insert("live", "upcoming");
+        soon.insert("starts", 1800000000);
+        model.assign({video("a", "A"), live});
+        model.append({soon});
+        QCOMPARE(model.ids(), QStringList({"a", "live", "soon"}));
+        const QHash<int, QByteArray> roles = model.roleNames();
+        QCOMPARE(model.data(model.index(1), roles.key("live")).toString(), QString("now"));
+        QCOMPARE(model.data(model.index(1), roles.key("watching")).toInt(), 863);
+        QCOMPARE(model.data(model.index(2), roles.key("starts")).toLongLong(), 1800000000LL);
     }
 
     void anyUpdateIsAppliedExactlyAndInTheFewestMoves() {

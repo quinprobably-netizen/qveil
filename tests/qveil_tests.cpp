@@ -632,7 +632,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(backend.refreshTotal() == 4, 5000);
         QVERIFY(backend.busy().contains("feed"));
         // The feed lands with the last line, and the progress is over with the stream.
-        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 3, 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
         QCOMPARE(backend.refreshTotal(), 0);
         QCOMPARE(backend.refreshDone(), 0);
@@ -663,7 +663,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(backend.ready(), 5000);
 
         backend.refreshFeed(true, false);
-        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 2, 8000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 3, 8000);
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
         QVERIFY2(backend.error().isEmpty(), qPrintable(backend.error()));
 
@@ -762,7 +762,7 @@ private slots:
         // The engine puts the thumbnails of one batch on one Tor circuit, as
         // a page load would, so a new page needs a new number, and cards of a
         // page that is updated in place keep theirs (their pictures aren't
-        // fetched again). No two grids share a number. Live streams get no card.
+        // fetched again). No two grids share a number.
         QTemporaryDir dir;
         Backend backend(QProcessEnvironment::systemEnvironment(), contractEngine(dir));
         backend.start();
@@ -771,33 +771,36 @@ private slots:
 
         // The cache's answer, then a refresh that has one more video.
         backend.refreshFeed(false, false);
-        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.feed()->count(), 3, 5000);
         const int cached = batchOf(backend.feed(), 0);
         QVERIFY(cached > 0);
         QCOMPARE(batchOf(backend.feed(), 1), cached);
         backend.refreshFeed(true, false);
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("feed"), 5000);
-        QCOMPARE(backend.feed()->count(), 2);
+        QCOMPARE(backend.feed()->count(), 3);
         QCOMPARE(batchOf(backend.feed(), 0), cached);
 
         backend.search("rust");
-        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 3, 5000);
         const int first = batchOf(backend.results(), 0);
         QVERIFY(first > cached);
         QCOMPARE(batchOf(backend.results(), 1), first);
         QTRY_VERIFY_WITH_TIMEOUT(!backend.busy().contains("search"), 5000);
 
         backend.search("again");
-        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.results()->count(), 3, 5000);
         QVERIFY(batchOf(backend.results(), 0) > first);
 
         backend.openChannel("UC0123456789abcdefghij");
-        QTRY_COMPARE_WITH_TIMEOUT(backend.channelVideos()->count(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(backend.channelVideos()->count(), 2, 5000);
         QVERIFY(batchOf(backend.channelVideos(), 0) > batchOf(backend.results(), 0));
 
-        // The live stream in each answer is not shown.
-        for (VideoModel *model : {backend.feed(), backend.results(), backend.channelVideos()})
-            QVERIFY(!model->ids().contains("liveliveli1"));
+        // The live stream in each answer has a card too, with its marks.
+        for (VideoModel *model : {backend.feed(), backend.results(), backend.channelVideos()}) {
+            const int row = model->ids().indexOf("liveliveli1");
+            QVERIFY(row >= 0);
+            QCOMPARE(model->get(row).value("live").toString(), QString("now"));
+        }
     }
 
     void theTokenNeverReachesTheWindowOrItsLogs()
@@ -1438,7 +1441,7 @@ private:
     static QString contractEngine(const QTemporaryDir &dir)
     {
         return engine(dir, R"PY(import http.server,json,time,urllib.parse
-def entries(n): return [{'id':'feed%07d'%i,'title':'Video %d'%i} for i in range(n)] + [{'id':'liveliveli1','title':'Live','live':True}]
+def entries(n): return [{'id':'feed%07d'%i,'title':'Video %d'%i} for i in range(n)] + [{'id':'liveliveli1','title':'Live','live':'now','watching':12}]
 class H(http.server.BaseHTTPRequestHandler):
   protocol_version='HTTP/1.0'
   def send(s,code,body):
@@ -1464,7 +1467,7 @@ class H(http.server.BaseHTTPRequestHandler):
       if term.startswith('code:'): s.line({'error':"The engine's words for "+term[5:],'code':term[5:]});return
       s.line({'id':'res0000001','title':term})
       if term=='quiet': time.sleep(3);return
-      s.line({'id':'res0000002','title':term});s.line({'id':'liveliveli1','title':'Live','live':True})
+      s.line({'id':'res0000002','title':term});s.line({'id':'liveliveli1','title':'Live','live':'now','watching':12})
     else: s.send(200,{})
   def do_POST(s):
     u=urllib.parse.urlparse(s.path);q=urllib.parse.parse_qs(u.query)

@@ -156,8 +156,6 @@ FocusScope {
         } else {
             all = backend.shelves[key] || []
         }
-        // A live stream can't be played here, so it isn't offered.
-        all = all.filter(v => !v.live)
         // (What is left unfinished is not "watched" on its own shelf.)
         return Arrange.apply(all, arrangements[key], key === "resume" ? ({}) : watched)
     }
