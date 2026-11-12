@@ -253,9 +253,11 @@ impl Server {
                 continue;
             }
             asked = Some(now);
-            let found = rt
-                .pinned_ytdlp()
-                .live_until(&v.watch_url(), rt.cfg.max_height, &abort);
+            // A bot check is asked again at once, on a fresh identity (see
+            // `fresh_on_bot_check`); only the last is said.
+            let found = self.fresh_on_bot_check(&rt, &abort, |yt| {
+                yt.live_until(&v.watch_url(), rt.cfg.max_height, &abort)
+            });
             if watch.gone() || deaf.get() {
                 return Ok(());
             }
@@ -540,6 +542,33 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_check_on_tor_is_asked_again_at_once_on_a_fresh_circuit() {
+        let up = LiveUpstream::start(60_000, 0, 20);
+        let bin = TempDir::new();
+        let fake = fake_live_ytdlp_upcoming(&bin.0, &up, 1, app::now() - 720);
+        let ytdlp = bot_checked_ytdlp(&bin.0, &fake.display().to_string(), 2);
+        let (_s, base, _d) = server_tuned(
+            Config {
+                ytdlp,
+                proxy: Some("socks5h://127.0.0.1:9".into()),
+                isolate_circuits: true,
+                ..Config::default()
+            },
+            |rt| rt.wait_speed = SPEED,
+        );
+        let lines = waited(&base, &format!("v={ID}"));
+        // The two bot checks were met again within the first ask, on fresh
+        // identities, so the window never heard of them.
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["state"], "upcoming");
+        assert!(lines[0].get("note").is_none(), "{lines:?}");
+        assert_eq!(lines[1], json!({"state":"now"}));
+        let ran = identities_of(&bin.0);
+        assert_eq!(ran.len(), 4, "{ran:?}");
+        assert!(ran[0] != ran[1] && ran[1] != ran[2], "{ran:?}");
+    }
+
+    #[test]
     fn a_failed_ask_is_tried_again_at_the_next_one() {
         let up = LiveUpstream::start(60_000, 0, 20);
         let bin = TempDir::new();
@@ -634,12 +663,14 @@ exec '{}' "$@"
         // (and never an error line: the job goes on to the start).
         assert_eq!(lines.first(), Some(&plain), "{lines:?}");
         assert_eq!(lines.last(), Some(&json!({"state":"now"})), "{lines:?}");
+        // (A heartbeat may come before the first ask is answered, on a busy
+        // machine: it says what was known then, the plain line.)
         let middle = &lines[1..lines.len() - 1];
         let a = middle.iter().position(|l| *l == checked);
-        let b = middle.iter().position(|l| *l == plain);
+        let b = a.and_then(|a| middle[a..].iter().position(|l| *l == plain).map(|b| a + b));
         assert!(matches!((a, b), (Some(a), Some(b)) if a < b), "{lines:?}");
         let (a, b) = (a.unwrap(), b.unwrap());
-        assert_eq!(a, 0, "{lines:?}");
+        assert!(middle[..a].iter().all(|l| *l == plain), "{lines:?}");
         assert!(middle[a..b].iter().all(|l| *l == checked), "{lines:?}");
         assert!(middle[b..].iter().all(|l| *l == plain), "{lines:?}");
         assert_eq!(

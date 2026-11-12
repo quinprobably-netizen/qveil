@@ -27,6 +27,7 @@ use crate::ids;
 use crate::inflight::ROUTE_CHANGED;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::cell::Cell;
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -50,18 +51,28 @@ impl Server {
         let read = req.param("v").and_then(|target| {
             let v = ids::parse_video(target)
                 .with_context(|| format!("{target:?} isn't a YouTube video"))?;
-            let yt = rt.pinned_ytdlp();
-            let reader = yt.chat(&v.watch_url())?;
             let wanted = || !watch.gone() && self.still_on(&rt) && self.runtime().cfg.live_chat;
-            if chat::follow(&reader, rt.chat_heartbeat, &wanted, &mut |l| lines.say(l))? {
-                return yt.chat_ended(reader);
-            }
-            // Nobody wants it: yt-dlp is stopped, and its files go.
-            drop(reader);
-            if !watch.gone() && !self.still_on(&rt) {
-                bail!(ROUTE_CHANGED);
-            }
-            Ok(())
+            // A reader that meets the bot check ends before it has said a
+            // word, and is started again on a fresh identity (see
+            // `fresh_on_bot_check`). One that has said something is not:
+            // starting again would say it all again.
+            let said = Cell::new(false);
+            self.fresh_on_bot_check(&rt, &|| !wanted() || said.get(), |yt| {
+                let reader = yt.chat(&v.watch_url())?;
+                let say = &mut |l: &Value| {
+                    said.set(true);
+                    lines.say(l)
+                };
+                if chat::follow(&reader, rt.chat_heartbeat, &wanted, say)? {
+                    return yt.chat_ended(reader);
+                }
+                // Nobody wants it: yt-dlp is stopped, and its files go.
+                drop(reader);
+                if !watch.gone() && !self.still_on(&rt) {
+                    bail!(ROUTE_CHANGED);
+                }
+                Ok(())
+            })
         });
         match read {
             Ok(()) => lines.head(),
@@ -287,6 +298,21 @@ while IFS= read -r l; do printf '%s\n' "$l" >> "$part"; sleep {pause}; done < "$
         }
         // Each chat is a circuit of its own.
         assert_ne!(proxies[0], proxies[1]);
+    }
+
+    #[test]
+    fn a_chat_that_meets_the_bot_check_on_tor_starts_again_on_a_fresh_circuit() {
+        let bin = TempDir::new();
+        let inner = chat_ytdlp(&bin.0, &[fixture(1)], "0", ENDED);
+        let ytdlp = bot_checked_ytdlp(&bin.0, &inner, 1);
+        let (_s, base, _d) = serve(ytdlp, |_| {});
+        switch_to_tor(&base);
+        let mut open = Open::new(&base, &format!("v={ID}"));
+        assert_eq!(open.line()["author"], "@Invented.Viewer");
+        assert_eq!(open.next(), None);
+        let ran = identities_of(&bin.0);
+        assert_eq!(ran.len(), 2, "{ran:?}");
+        assert_ne!(ran[0], ran[1]);
     }
 
     #[test]

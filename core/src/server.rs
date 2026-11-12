@@ -16,6 +16,7 @@
 //! - `thumbs`: thumbnails, fetched a page at a time.
 //! - `relay`: the video relay, chunked and Range-forwarding.
 //! - `lookups`: the lookups of the videos played lately, to play them again.
+//! - `marks`: which videos the lists served lately said were live, to look them up as such.
 //! - `warm`: the start of a video's streams, fetched when it is opened.
 //! - `chapters`: a video's chapters, when the page data had to be asked for.
 //! - `timeline`: a live stream's playlists, and the session that serves their segments.
@@ -31,6 +32,7 @@ mod http;
 mod jobs;
 mod lenses;
 mod lookups;
+mod marks;
 mod relay;
 #[cfg(test)]
 mod testkit;
@@ -40,14 +42,16 @@ mod wait;
 mod warm;
 
 use crate::app::{self, Runtime, Watched};
+use crate::errors;
 use crate::ids::VideoRef;
 use crate::inflight::{ROUTE_CHANGED, Why};
 use crate::lens;
 use crate::live::{Fragments, LiveStreams, Opening};
+use crate::net::Net;
 use crate::resume;
 use crate::store::{self, Paths};
 use crate::util::{lock, random_hex};
-use crate::video::Chapter;
+use crate::video::{Chapter, LiveState};
 use crate::ytdlp::{Streams, Ytdlp};
 use anyhow::{Context, Result, bail};
 use http::{
@@ -55,7 +59,6 @@ use http::{
     Unverified, WRITE_TIMEOUT, read_request_line, read_request_rest, refuse,
 };
 use relay::{Live, Session, StreamBroke};
-use reqwest::blocking::Client;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::BufReader;
@@ -66,6 +69,9 @@ use std::time::Instant;
 use timeline::LiveSession;
 
 const MAX_SESSIONS: usize = 4;
+/// How many times a lookup that met the bot check is made again, each on a
+/// fresh identity (see `Server::fresh_on_bot_check`).
+const BOT_RETRIES: u32 = 2;
 const MAX_SEARCH: usize = 60;
 
 pub struct Server {
@@ -97,6 +103,8 @@ pub struct Server {
     sparing: AtomicBool,
     /// The lookups of the videos played lately (see `lookups`).
     lookups: lookups::Lookups,
+    /// Which videos the lists served lately said were live (see `marks`).
+    marks: marks::Marks,
     /// What tells the lookup of the next video that is running, if one is,
     /// to stop (see `prepare_next`).
     preparing: Mutex<Option<Arc<AtomicBool>>>,
@@ -161,8 +169,8 @@ impl From<Arc<LiveSession>> for Registered {
 /// What a lookup to play a video found.
 enum Found {
     Plain(Streams, Live),
-    /// A stream, and the client of the identity that looked it up.
-    Live(LiveStreams, Client),
+    /// A stream, and the identity that looked it up.
+    Live(LiveStreams, Net),
     Upcoming {
         title: String,
         channel: Option<String>,
@@ -235,6 +243,10 @@ pub struct LiveInfo {
     pub started: Option<i64>,
     /// Whether it can be rewound further than the last few segments.
     pub rewind: bool,
+    /// Where a running stream is joined: seconds back from the end of its
+    /// playlist, as the player's clock has them (the same as `start`, and
+    /// as the playlist's `#EXT-X-START` says). 0 for one that is over.
+    pub join: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watching: Option<u64>,
 }
@@ -297,6 +309,7 @@ impl Server {
             warming: AtomicBool::new(true),
             sparing: AtomicBool::new(true),
             lookups: lookups::Lookups::default(),
+            marks: marks::Marks::default(),
             preparing: Mutex::new(None),
             recording: Default::default(),
         })
@@ -324,6 +337,50 @@ impl Server {
             work
         } else {
             bail!(ROUTE_CHANGED)
+        }
+    }
+
+    /// `work`, on a pinned identity of `rt`'s route, made again on a fresh
+    /// identity each time it meets YouTube's bot check, up to `BOT_RETRIES`
+    /// times. Only on a route that isolates, where a fresh identity is a
+    /// fresh Tor circuit, with another exit; on any other the address is the
+    /// same, and asking again only asks to be refused again. Never on
+    /// another route: the last bot check is the answer, and the window
+    /// offers that switch. Not once `abort` says nobody waits for it, or
+    /// the route has changed.
+    ///
+    /// A running stream that one identity was offered no fragments of (only
+    /// HLS, measured over Tor) is asked again too, once: another circuit is
+    /// as likely to get them as one past a bot check is.
+    fn fresh_on_bot_check<T>(
+        &self,
+        rt: &Runtime,
+        abort: &dyn Fn() -> bool,
+        mut work: impl FnMut(Ytdlp) -> Result<T>,
+    ) -> Result<T> {
+        let isolates = rt.net.isolates();
+        let (mut bots, mut bare) = if isolates { (BOT_RETRIES, 1) } else { (0, 0) };
+        loop {
+            let done = work(rt.pinned_ytdlp());
+            let Err(e) = &done else { return done };
+            if abort() || !self.still_on(rt) {
+                return done;
+            }
+            let said = format!("{e:#}");
+            if bots > 0 && errors::explain(&said).code == errors::Code::BotCheck {
+                bots -= 1;
+                note!("qveil: YouTube asked for a bot check; asking again on a fresh circuit");
+            } else if bare > 0
+                && said.contains(crate::live::NO_FRAGMENTS)
+                && !said.contains(crate::live::ENDED)
+            {
+                bare -= 1;
+                note!(
+                    "qveil: a live stream came without fragments; asking again on a fresh circuit"
+                );
+            } else {
+                return done;
+            }
         }
     }
 
@@ -372,7 +429,7 @@ impl Server {
     /// `open`, with the name of the channel as the list the video was picked
     /// from has it, for a lookup that has none (see `open_until`).
     pub fn open_as(self: &Arc<Self>, v: &VideoRef, channel: Option<String>) -> Result<PlayInfo> {
-        let opened = self.open_until(v, channel, &|| false)?;
+        let opened = self.open_until(v, channel, None, &|| false)?;
         if opened.info.waiting.is_some() {
             bail!("This live stream hasn't started yet.");
         }
@@ -390,10 +447,18 @@ impl Server {
     /// name for it (see `ytdlp::LOOKUP`): it is then `channel`, the name on
     /// the card the video was picked from, or else the name of the
     /// subscription to it, if there is one.
+    ///
+    /// `live` is what the card said the video is, live or announced, if it
+    /// said: the window knows from the list. Failing that, what the lists
+    /// the engine served lately said of it (see `marks`). A video said to
+    /// be either is looked up as a stream straight away, without the usual
+    /// lookup that is bound to fail for one; one that turns out not to be
+    /// is then looked up the usual way (see `Ytdlp::open_live_first`).
     fn open_until(
         self: &Arc<Self>,
         v: &VideoRef,
         channel: Option<String>,
+        live: Option<LiveState>,
         abort: &dyn Fn() -> bool,
     ) -> Result<Opened> {
         let base = self.listen()?;
@@ -423,10 +488,21 @@ impl Server {
             Some((s, live)) => (s, live, None),
             None => {
                 let started = self.lookups.start();
-                match self.open_up(&rt, v, &format, abort)? {
+                let live_first = live.or_else(|| self.marks.get(&v.id)).is_some();
+                let found = self.open_up(&rt, v, &format, live_first, abort)?;
+                self.marks.found(
+                    &v.id,
+                    match &found {
+                        Found::Plain(..) => None,
+                        Found::Live(s, _) if s.ended => None,
+                        Found::Live(..) => Some(LiveState::Now),
+                        Found::Upcoming { .. } => Some(LiveState::Upcoming),
+                    },
+                );
+                match found {
                     Found::Plain(s, live) => (s, live, Some(started)),
-                    Found::Live(s, client) => {
-                        return self.open_live(&rt, &base, v, channel, s, client);
+                    Found::Live(s, ident) => {
+                        return self.open_live(&rt, &base, v, channel, s, ident);
                     }
                     Found::Upcoming {
                         title,
@@ -510,15 +586,15 @@ impl Server {
         v: &VideoRef,
         channel: Option<String>,
         s: LiveStreams,
-        client: Client,
+        ident: Net,
     ) -> Result<Opened> {
         let session = Arc::new(LiveSession::new(
             v.clone(),
             rt.cfg.max_height,
             rt.net.clone(),
             &s,
-            client,
-        ));
+            ident,
+        )?);
         let rewind = session.begin(self).inspect_err(|_| session.cancel())?;
         let sid = self
             .register(rt, Arc::clone(&session))
@@ -536,6 +612,11 @@ impl Server {
             at: app::now(),
         });
         let running = !s.ended;
+        let join = if running {
+            (session.join_back() * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        };
         let duration = match &s.fragments {
             Fragments::Listed(list) => {
                 Some(list.iter().map(|(_, d)| d).sum::<f64>().round() as u64)
@@ -552,7 +633,7 @@ impl Server {
                 // A running stream isn't resumed: it has moved on. One that is
                 // over is a video like any other.
                 start: if running {
-                    Some(-3.0 * s.target)
+                    Some(-join)
                 } else {
                     v.start.map(|t| t as f64)
                 },
@@ -569,6 +650,7 @@ impl Server {
                     segment: s.target,
                     started: s.started,
                     rewind,
+                    join,
                     watching: s.watching,
                 }),
                 ..PlayInfo::default()
@@ -695,22 +777,30 @@ impl Server {
     }
 
     /// `look_up`, for a play: a stream is looked up as live (see
-    /// `Ytdlp::open_until`).
+    /// `Ytdlp::open_until`), and one said to be live (`live_first`) as
+    /// live first (see `Ytdlp::open_live_first`). A bot check is met on a
+    /// fresh identity again (see `fresh_on_bot_check`).
     fn open_up(
         &self,
         rt: &Runtime,
         v: &VideoRef,
         format: &str,
+        live_first: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<Found> {
-        let yt = rt.pinned_ytdlp();
-        Ok(
-            match yt.open_until(&v.watch_url(), format, rt.cfg.max_height, abort)? {
+        let (url, height) = (v.watch_url(), rt.cfg.max_height);
+        self.fresh_on_bot_check(rt, abort, |yt| {
+            let opening = if live_first {
+                yt.open_live_first(&url, format, height, abort)?
+            } else {
+                yt.open_until(&url, format, height, abort)?
+            };
+            Ok(match opening {
                 Opening::Plain(s) => {
                     let live = upstream_of(&s, &yt)?;
                     Found::Plain(s, live)
                 }
-                Opening::Live(s) => Found::Live(s, yt.net.relay_client()?),
+                Opening::Live(s) => Found::Live(s, yt.net),
                 Opening::Upcoming {
                     title,
                     channel,
@@ -720,8 +810,8 @@ impl Server {
                     channel,
                     starts,
                 },
-            },
-        )
+            })
+        })
     }
 
     /// Keeps a lookup made on `rt`'s route for playing the video again,

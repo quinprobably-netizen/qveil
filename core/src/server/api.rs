@@ -11,7 +11,7 @@ use crate::net::{self, TOR_PROXY};
 use crate::privacy;
 use crate::resume;
 use crate::util::lock;
-use crate::video::Video;
+use crate::video::{LiveState, Video};
 use crate::ytdlp;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -75,10 +75,17 @@ impl Server {
             })
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty());
+        // What the card says the video is: live (`live=now`) or announced
+        // (`live=upcoming`), from the list it was in.
+        let live = match req.query.get("live").map(String::as_str) {
+            Some("now") => Some(LiveState::Now),
+            Some("upcoming") => Some(LiveState::Upcoming),
+            _ => None,
+        };
         let opened = req.param("v").and_then(|target| {
             let v = ids::parse_video(target)
                 .with_context(|| format!("{target:?} isn't a YouTube video"))?;
-            self.open_until(&v, hint, &|| watch.gone())
+            self.open_until(&v, hint, live, &|| watch.gone())
         });
         match opened {
             Ok(opened) => {
@@ -217,14 +224,16 @@ impl Server {
                 // Each result is a line of yt-dlp's output and a card in the
                 // window, and `n` comes from the caller.
                 let n = req.num("n", 40).clamp(1, MAX_SEARCH);
-                let found = app::search(&rt, req.param("q")?, n);
-                json!(self.guarded(&rt, found)?)
+                let found = self.guarded(&rt, app::search(&rt, req.param("q")?, n))?;
+                self.marks.note(&found);
+                json!(found)
             }
             ("GET", ["api", "channel"]) => {
                 // The Streams tab is read only when it is asked for.
                 let tab = app::ChannelTab::named(req.query.get("tab").map(String::as_str))?;
-                let page = app::channel(&rt, paths, req.param("id")?, tab);
-                json!(self.guarded(&rt, page)?)
+                let page = self.guarded(&rt, app::channel(&rt, paths, req.param("id")?, tab))?;
+                self.marks.note(page.videos.iter().map(|e| &e.video));
+                json!(page)
             }
             ("GET", ["api", "subs"]) => json!(app::load_subs(paths)?.channels),
             ("POST", ["api", "subs", "add"]) => {
@@ -256,6 +265,7 @@ impl Server {
                 // cleared whatever becomes of those: that is said in the log,
                 // and not by an error for what is done.
                 self.lookups.clear();
+                self.marks.clear();
                 if let Err(e) = self.thumbs.disk.forget(&paths.thumbs()) {
                     note!(
                         "qveil: the history was cleared, but not the thumbnails kept on disk: {e:#}"
@@ -509,6 +519,7 @@ impl Server {
         let mut started = false;
         let mut gone = false;
         let mut each = |v: Video| {
+            self.marks.note([&v]);
             let mut line = json!(v).to_string();
             line.push('\n');
             if !started {

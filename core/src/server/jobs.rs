@@ -367,7 +367,7 @@ impl Server {
                 shape.limit,
                 &|| true,
             );
-            return reply(out, stream, false, feed.map(|f| json!(f)));
+            return reply(out, stream, false, feed.map(|f| self.feed_json(&f)));
         }
         let watch = Watch::new(out);
         // Whether the stream's head is out: a request that waits sends it
@@ -411,7 +411,7 @@ impl Server {
                             };
                             let feed =
                                 app::feed_result(&self.paths, shape.no_shorts, shape.limit, &left);
-                            return reply(out, stream, head, feed.map(|f| json!(f)));
+                            return reply(out, stream, head, feed.map(|f| self.feed_json(&f)));
                         }
                     }
                 }
@@ -448,12 +448,15 @@ impl Server {
     /// The feed as the request wants it, from what the job left in the cache.
     fn job_result(&self, finished: Result<Arc<Refreshed>, String>, shape: Shape) -> Result<Value> {
         let done = finished.map_err(anyhow::Error::msg)?;
-        Ok(json!(app::feed_result(
-            &self.paths,
-            shape.no_shorts,
-            shape.limit,
-            &done
-        )?))
+        let feed = app::feed_result(&self.paths, shape.no_shorts, shape.limit, &done)?;
+        Ok(self.feed_json(&feed))
+    }
+
+    /// The feed's answer, with what it says is live or announced noted
+    /// (see `marks`).
+    fn feed_json(&self, feed: &app::FeedResult) -> Value {
+        self.marks.note(feed.entries.iter().map(|e| &e.video));
+        json!(feed)
     }
 
     /// Answers with the feed once the job is over. Without `stream` there is

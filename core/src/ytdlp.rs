@@ -309,6 +309,20 @@ impl Ytdlp {
         limit: Duration,
         abort: &dyn Fn() -> bool,
     ) -> Result<Value> {
+        Ok(self
+            .json_and_warnings(args, extractor_args, target, limit, abort)?
+            .0)
+    }
+
+    /// `json_with`, and what yt-dlp said on stderr while it went well.
+    fn json_and_warnings(
+        &self,
+        args: &[&str],
+        extractor_args: Option<&str>,
+        target: &str,
+        limit: Duration,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<(Value, Vec<u8>)> {
         // yt-dlp would create it with the default mode, and every directory
         // above it that doesn't exist yet along with it.
         crate::store::ensure_dir(&self.cache_dir)?;
@@ -325,7 +339,27 @@ impl Ytdlp {
         if !out.status.success() {
             return Err(self.failure(&out.stderr));
         }
-        serde_json::from_slice(&out.stdout).context("yt-dlp returned invalid JSON")
+        let v = serde_json::from_slice(&out.stdout).context("yt-dlp returned invalid JSON")?;
+        Ok((v, out.stderr))
+    }
+
+    /// The live lookup's answer (see `LIVE_LOOKUP`). With
+    /// `--ignore-no-formats-error`, yt-dlp answers even when YouTube asked
+    /// this address for a bot check instead of saying anything of the
+    /// video: it only warns, and the answer has no live status and nothing
+    /// to play (at most the storyboards). That is the bot check's error, as
+    /// if it had failed, so that it is asked again on a fresh identity, not
+    /// taken for an ordinary video and looked up again the usual way (which
+    /// the same identity is refused, measured).
+    fn live_json(&self, url: &str, abort: &dyn Fn() -> bool) -> Result<Value> {
+        let (v, said) = self.json_and_warnings(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
+        let said = String::from_utf8_lossy(&said);
+        if live_state(&v).is_none()
+            && let Some(line) = said.lines().rev().find(|l| l.contains("not a bot"))
+        {
+            return Err(self.failure(line.as_bytes()));
+        }
+        Ok(v)
     }
 
     /// What a failed run says: its last line on stderr.
@@ -590,6 +624,32 @@ impl Ytdlp {
         self.live_lookup(url, max_height, abort, Some(original))
     }
 
+    /// What `url` opens as, for a video said to be live or announced (the
+    /// card it was picked from said so): the live lookup first, without
+    /// the usual lookup that can't find a running stream's formats. If the
+    /// answer is no running or announced stream (the card was wrong, or
+    /// the stream is over), the usual lookup follows, as for any video,
+    /// and the live answer already in hand stands in for the live lookup
+    /// that would come after it: a past broadcast only offered in
+    /// fragments still plays on the timeline.
+    pub fn open_live_first(
+        &self,
+        url: &str,
+        format: &str,
+        max_height: u32,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Opening> {
+        let v = self.live_json(url, abort)?;
+        if live_state(&v).is_some() {
+            return live_answer(&v, url, max_height, None);
+        }
+        match self.lookup(url, format, abort) {
+            Ok(s) => Ok(Opening::Plain(s)),
+            Err(e) if needs_live(&e) => live_answer(&v, url, max_height, Some(e)),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The live lookup alone, for a stream that is known to be one: the
     /// timeline looks a stream it plays up again this way, when its URLs
     /// have stopped working or to see whether it has ended, without the
@@ -613,25 +673,8 @@ impl Ytdlp {
         abort: &dyn Fn() -> bool,
         original: Option<anyhow::Error>,
     ) -> Result<Opening> {
-        let v = self.json_with(LIVE_LOOKUP, None, url, RESOLVE, abort)?;
-        if live_state(&v) == Some(LiveState::Upcoming) {
-            return Ok(Opening::Upcoming {
-                title: str_field(&v, &["title"]).unwrap_or_else(|| url.into()),
-                channel: str_field(&v, &["channel", "uploader"]),
-                starts: v["release_timestamp"].as_i64(),
-            });
-        }
-        let is_stream = live_state(&v).is_some() || streamed(&v);
-        match live::choose(&v, max_height) {
-            Ok(s) => Ok(Opening::Live(s)),
-            // Over, and nothing of it can be fetched: said as such, so that
-            // a session playing it knows it has ended (see `live::ENDED`).
-            Err(e) if streamed(&v) => Err(e.context(live::ENDED)),
-            Err(e) if is_stream => Err(e),
-            // An ordinary video that yt-dlp found nothing for: what the
-            // usual lookup said is what there is to say.
-            Err(e) => Err(original.unwrap_or(e)),
-        }
+        let v = self.live_json(url, abort)?;
+        live_answer(&v, url, max_height, original)
     }
 
     /// The usual lookup: the quick one first if it is on (see `LOOKUP`),
@@ -891,6 +934,33 @@ fn drain_tail(pipe: Option<impl Read + Send + 'static>, keep: usize) -> JoinHand
         }
         kept
     })
+}
+
+/// What the live lookup's answer `v` opens as (see `Ytdlp::live_lookup`).
+fn live_answer(
+    v: &Value,
+    url: &str,
+    max_height: u32,
+    original: Option<anyhow::Error>,
+) -> Result<Opening> {
+    if live_state(v) == Some(LiveState::Upcoming) {
+        return Ok(Opening::Upcoming {
+            title: str_field(v, &["title"]).unwrap_or_else(|| url.into()),
+            channel: str_field(v, &["channel", "uploader"]),
+            starts: v["release_timestamp"].as_i64(),
+        });
+    }
+    let is_stream = live_state(v).is_some() || streamed(v);
+    match live::choose(v, max_height) {
+        Ok(s) => Ok(Opening::Live(s)),
+        // Over, and nothing of it can be fetched: said as such, so that
+        // a session playing it knows it has ended (see `live::ENDED`).
+        Err(e) if streamed(v) => Err(e.context(live::ENDED)),
+        Err(e) if is_stream => Err(e),
+        // An ordinary video that yt-dlp found nothing for: what the
+        // usual lookup said is what there is to say.
+        Err(e) => Err(original.unwrap_or(e)),
+    }
 }
 
 /// The ways that yt-dlp says it found no format: older versions word it as

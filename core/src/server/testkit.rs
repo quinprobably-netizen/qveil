@@ -1172,8 +1172,22 @@ struct LiveShared {
     ended: Mutex<Option<u64>>,
     /// Segments below this are gone.
     dropped: AtomicU64,
-    /// The segment whose next request hangs.
-    frozen: Mutex<Option<u64>>,
+    /// The segment whose next requests hang, and how many of them.
+    frozen: Mutex<Option<(u64, usize)>>,
+    /// The track (`v` or `a`) whose base requests hang, while set.
+    held_base: Mutex<Option<String>>,
+    /// Every request of a generation up to this one hangs, as all those of
+    /// a circuit that died do (-1: none).
+    dead: AtomicI64,
+    /// A segment whose answers start only this many ms after it is asked.
+    slow_head: Mutex<Option<(u64, u64)>>,
+    /// Whole answers (not ranges) say no length, and end when the
+    /// connection does, as googlevideo's mostly do.
+    no_length: AtomicBool,
+    /// Segments carry a media clock: segment `n` starts at `n` segment
+    /// lengths, less `.1` s from segment `.0` on (a break in the stream).
+    /// See `clock`.
+    clock: Mutex<Option<(u64, f64)>>,
     /// The segment whose next request stops after this many bytes of its
     /// body, and hangs.
     cut: Mutex<Option<(u64, usize)>>,
@@ -1207,6 +1221,17 @@ struct LiveShared {
 }
 
 impl LiveShared {
+    fn segment(&self, track: &str, n: u64) -> Vec<u8> {
+        match *self.clock.lock().unwrap() {
+            Some((from, lost)) => {
+                let length = self.target_ms as f64 / 1000.0;
+                let at = length * n as f64 - if n >= from { lost } else { 0.0 };
+                clocked_segment(track, n, at)
+            }
+            None => live_segment(track, n),
+        }
+    }
+
     /// The newest segment that exists.
     fn head(&self) -> u64 {
         match *self.ended.lock().unwrap() {
@@ -1272,6 +1297,52 @@ pub fn live_segment(track: &str, n: u64) -> Vec<u8> {
         .collect()
 }
 
+/// A segment of a stand-in with a media clock (see `LiveUpstream::clock`):
+/// the start of a real one's container, saying it begins at `at` seconds
+/// (WebM for `v`, fragmented MP4 for `a`), then `live_segment`'s bytes, cut
+/// to 64 KiB in all.
+pub fn clocked_segment(track: &str, n: u64, at: f64) -> Vec<u8> {
+    let ms = (at * 1000.0).round() as u64;
+    let mut b = if track == "v" {
+        let mut b = vec![0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01];
+        b.extend_from_slice(&[
+            0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        b.extend_from_slice(&[0x15, 0x49, 0xA9, 0x66, 0x88, 0x2A, 0xD7, 0xB1, 0x84]);
+        b.extend_from_slice(&1_000_000u32.to_be_bytes());
+        b.extend_from_slice(&[
+            0x1F, 0x43, 0xB6, 0x75, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]);
+        b.extend_from_slice(&[0xE7, 0x88]);
+        b.extend_from_slice(&ms.to_be_bytes());
+        b
+    } else {
+        let boxed = |kind: &[u8; 4], body: &[u8]| {
+            let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(kind);
+            b.extend_from_slice(body);
+            b
+        };
+        let mut mdhd = vec![0u8; 12];
+        mdhd.extend_from_slice(&1000u32.to_be_bytes());
+        mdhd.extend_from_slice(&[0; 8]);
+        let moov = boxed(
+            b"moov",
+            &boxed(b"trak", &boxed(b"mdia", &boxed(b"mdhd", &mdhd))),
+        );
+        let mut tfdt = vec![1, 0, 0, 0];
+        tfdt.extend_from_slice(&ms.to_be_bytes());
+        let moof = boxed(b"moof", &boxed(b"traf", &boxed(b"tfdt", &tfdt)));
+        let mut b = [boxed(b"ftyp", &[0; 8]), moov, moof].concat();
+        b.extend_from_slice(&(64u32 << 10).to_be_bytes());
+        b.extend_from_slice(b"mdat");
+        b
+    };
+    let rest = live_segment(track, n);
+    let k = b.len();
+    b.extend_from_slice(&rest[k..]);
+    b
+}
 impl LiveUpstream {
     /// A stream whose segments `first..=head` exist, and whose head grows by
     /// one every `target_ms` from now on.
@@ -1288,6 +1359,11 @@ impl LiveUpstream {
             ended: Mutex::new(None),
             dropped: AtomicU64::new(0),
             frozen: Mutex::new(None),
+            held_base: Mutex::new(None),
+            dead: AtomicI64::new(-1),
+            slow_head: Mutex::new(None),
+            no_length: AtomicBool::new(false),
+            clock: Mutex::new(None),
             cut: Mutex::new(None),
             trickle_ms: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
@@ -1417,7 +1493,41 @@ impl LiveUpstream {
     /// until the client hangs up or the `LiveUpstream` is dropped. The ones
     /// after it are answered.
     pub fn freeze(&self, n: u64) {
-        *self.live.frozen.lock().unwrap() = Some(n);
+        self.freeze_times(n, 1);
+    }
+
+    /// `freeze`, for the first `k` requests for segment `n`.
+    pub fn freeze_times(&self, n: u64, k: usize) {
+        *self.live.frozen.lock().unwrap() = Some((n, k));
+    }
+
+    /// Every request for a URL of generation `g` or older hangs from now on,
+    /// with nothing sent: the circuit those URLs work on has died.
+    pub fn kill_generation(&self, g: i64) {
+        self.live.dead.fetch_max(g, Ordering::SeqCst);
+    }
+
+    /// Answers for segment `n` start `ms` after they are asked for.
+    pub fn slow_head(&self, n: u64, ms: u64) {
+        *self.live.slow_head.lock().unwrap() = Some((n, ms));
+    }
+
+    /// Segments carry a media clock from now on (see `clocked_segment`):
+    /// segment `n` starts at `n` segment lengths, and `lost` s less from
+    /// segment `from` on, as a stream that broke off for that long does.
+    pub fn clock(&self, from: u64, lost: f64) {
+        *self.live.clock.lock().unwrap() = Some((from, lost));
+    }
+
+    /// Whole answers say no length from now on (ranges still do).
+    pub fn no_length(&self) {
+        self.live.no_length.store(true, Ordering::SeqCst);
+    }
+
+    /// Requests for the base of `track` (`v` or `a`), which say where the
+    /// head is, hang from now on (see `freeze`).
+    pub fn hold_base(&self, track: &str) {
+        *self.live.held_base.lock().unwrap() = Some(track.to_string());
     }
 
     /// How many requests are hanging (see `freeze`).
@@ -1540,11 +1650,23 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
         _ => return reply(&mut conn, "404 Not Found", "", b""),
     };
     live.newest.fetch_max(generation as i64, Ordering::SeqCst);
+    if generation as i64 <= live.dead.load(Ordering::SeqCst) {
+        live.hanging.fetch_add(1, Ordering::SeqCst);
+        hang(&mut conn, live);
+        live.hanging.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
     if generation as i64 <= live.forbidden.load(Ordering::SeqCst) {
         return reply(&mut conn, "403 Forbidden", "", b"denied");
     }
     let head = || format!("X-Head-Seqnum: {}\r\n", live.head());
     let Some(n) = sq else {
+        if live.held_base.lock().unwrap().as_deref() == Some(track) {
+            live.hanging.fetch_add(1, Ordering::SeqCst);
+            hang(&mut conn, live);
+            live.hanging.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
         return match kind {
             "live" => reply(
                 &mut conn,
@@ -1565,11 +1687,13 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
         .push((target.clone(), range.clone()));
     let hold = {
         let mut frozen = live.frozen.lock().unwrap();
-        let hold = *frozen == Some(n);
-        if hold {
-            *frozen = None;
+        match *frozen {
+            Some((m, k)) if m == n => {
+                *frozen = (k > 1).then_some((m, k - 1));
+                true
+            }
+            _ => false,
         }
-        hold
     };
     if hold {
         live.hanging.fetch_add(1, Ordering::SeqCst);
@@ -1592,31 +1716,44 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
     } else {
         "audio/mp4"
     };
-    let whole = live_segment(track, n);
-    let from = range
+    let whole = live.segment(track, n);
+    // `bytes=a-` or `bytes=a-b`.
+    let wanted = range
         .as_deref()
         .and_then(|r| r.strip_prefix("bytes="))
-        .and_then(|r| r.strip_suffix('-'))
-        .and_then(|a| a.parse::<usize>().ok())
-        .filter(|a| *a < whole.len());
-    let (status, extra, body) = match from {
-        Some(a) => (
+        .and_then(|r| r.split_once('-'))
+        .and_then(|(a, b)| {
+            let a = a.parse::<usize>().ok()?;
+            let b = match b {
+                "" => whole.len() - 1,
+                b => b.parse::<usize>().ok()?.min(whole.len() - 1),
+            };
+            (a < whole.len() && a <= b).then_some((a, b))
+        });
+    let (status, extra, body) = match wanted {
+        Some((a, b)) => (
             "206 Partial Content",
-            format!(
-                "Content-Range: bytes {a}-{}/{}\r\n",
-                whole.len() - 1,
-                whole.len()
-            ),
-            &whole[a..],
+            format!("Content-Range: bytes {a}-{b}/{}\r\n", whole.len()),
+            &whole[a..=b],
         ),
         None => ("200 OK", String::new(), &whole[..]),
+    };
+    let slow = *live.slow_head.lock().unwrap();
+    if let Some((m, ms)) = slow
+        && m == n
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+    let length = if wanted.is_none() && live.no_length.load(Ordering::SeqCst) {
+        String::new()
+    } else {
+        format!("Content-Length: {}\r\n", body.len())
     };
     let _ = write!(
         conn,
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n{}X-Sequence-Num: {n}\r\n{extra}\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
+         {length}Connection: close\r\n\r\n",
         head(),
-        body.len()
     );
     if head_only {
         return;
@@ -1754,6 +1891,133 @@ EOF
     .replace("@TARGET@", &(up.live.target_ms as f64 / 1000.0).to_string())
     .replace("@BASE@", &up.base);
     crate::store::testing::script(&dir.join("yt-dlp"), &script).into()
+}
+
+/// A SOCKS5 proxy on a local port that passes each connection on to where
+/// it asks to go (on this machine), as Tor would to an exit, and keeps the
+/// identity (the user name) each came over, with where it went. Tor makes a
+/// circuit for each identity; this is how a test sees which identities the
+/// requests used.
+pub struct Hop {
+    pub port: u16,
+    /// For each connection: the identity, and the port it went to.
+    seen: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl Hop {
+    pub fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<(String, u16)>>> = Arc::default();
+        let kept = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for mut client in listener.incoming().flatten() {
+                let kept = Arc::clone(&kept);
+                std::thread::spawn(move || {
+                    let Some((user, to)) = socks_connect(&mut client) else {
+                        return;
+                    };
+                    let Ok(server) = TcpStream::connect(("127.0.0.1", to)) else {
+                        return;
+                    };
+                    kept.lock().unwrap().push((user, to));
+                    let flag = Arc::new(AtomicBool::new(false));
+                    let (up, down) = (server.try_clone().unwrap(), client.try_clone().unwrap());
+                    let f = Arc::clone(&flag);
+                    std::thread::spawn(move || pass_on(up, down, &f));
+                    pass_on(client, server, &flag);
+                });
+            }
+        });
+        Hop { port, seen }
+    }
+
+    pub fn proxy(&self) -> String {
+        format!("socks5h://127.0.0.1:{}", self.port)
+    }
+
+    /// The identities that connections to `port` came over, each once, in order.
+    pub fn identities_to(&self, port: u16) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for (who, to) in self.seen.lock().unwrap().iter() {
+            if *to == port && !found.contains(who) {
+                found.push(who.clone());
+            }
+        }
+        found
+    }
+}
+
+/// `socks_handshake`, which also says the port the client asks to reach.
+fn socks_connect(c: &mut TcpStream) -> Option<(String, u16)> {
+    let mut head = [0u8; 2];
+    c.read_exact(&mut head).ok()?;
+    let mut methods = vec![0u8; head[1] as usize];
+    c.read_exact(&mut methods).ok()?;
+    c.write_all(&[5, 2]).ok()?;
+    let mut len = [0u8; 2];
+    c.read_exact(&mut len).ok()?;
+    let mut user = vec![0u8; len[1] as usize];
+    c.read_exact(&mut user).ok()?;
+    let mut plen = [0u8; 1];
+    c.read_exact(&mut plen).ok()?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    c.read_exact(&mut pass).ok()?;
+    c.write_all(&[1, 0]).ok()?;
+    let mut req = [0u8; 4];
+    c.read_exact(&mut req).ok()?;
+    let skip = match req[3] {
+        1 => 4,
+        4 => 16,
+        _ => {
+            let mut n = [0u8; 1];
+            c.read_exact(&mut n).ok()?;
+            n[0] as usize
+        }
+    };
+    let mut rest = vec![0u8; skip + 2];
+    c.read_exact(&mut rest).ok()?;
+    let port = u16::from_be_bytes([rest[skip], rest[skip + 1]]);
+    c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
+    Some((String::from_utf8_lossy(&user).into_owned(), port))
+}
+
+/// What yt-dlp says when YouTube asks the address to sign in.
+pub const BOT_CHECK: &str = "ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you\u{2019}re not a bot. \
+    Use --cookies-from-browser or --cookies for the authentication.";
+
+/// A yt-dlp in `dir` that meets the bot check on its first `n` runs and
+/// then runs `inner` as it was asked. Every run's identity (its proxy's
+/// user name, empty without one) is kept, in order (see `identities_of`).
+pub fn bot_checked_ytdlp(dir: &std::path::Path, inner: &str, n: u32) -> String {
+    let script = r#"d='@DIR@'
+conf=""
+prev=""
+for a in "$@"; do [ "$prev" = --config-locations ] && conf="$a"; prev="$a"; done
+who=$(sed -n "s|.*--proxy 'socks5h://\([^:]*\):.*|\1|p" "$conf")
+echo "$who" >> "$d/identities"
+k=$(cat "$d/bot-runs" 2>/dev/null || echo 0)
+echo $((k + 1)) > "$d/bot-runs.new" && mv "$d/bot-runs.new" "$d/bot-runs"
+if [ "$k" -lt @N@ ]; then
+  cat "$d/bot-check" >&2
+  exit 1
+fi
+exec '@INNER@' "$@"
+"#
+    .replace("@DIR@", &dir.display().to_string())
+    .replace("@N@", &n.to_string())
+    .replace("@INNER@", inner);
+    std::fs::write(dir.join("bot-check"), format!("{BOT_CHECK}\n")).unwrap();
+    crate::store::testing::script(&dir.join("yt-dlp-bot"), &script)
+}
+
+/// The identities a `bot_checked_ytdlp` in `dir` ran on, in order.
+pub fn identities_of(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("identities"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
