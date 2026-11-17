@@ -1216,12 +1216,23 @@ struct LiveShared {
     /// The folders of the fake yt-dlps made for it (see `fake_live_ytdlp`),
     /// which learn of the end, and say how many generations they have given.
     homes: Mutex<Vec<std::path::PathBuf>>,
+    /// How long a segment is, in bytes (0: 64 KiB, as `live_segment`).
+    size: AtomicUsize,
+    /// Answers for a track's base start only this many ms after they are
+    /// asked for (see `slow_bases`).
+    slow_bases_ms: AtomicU64,
+    /// Looks at the start of a segment below this one hang (see `hang_peeks_below`).
+    peeks_hang_below: AtomicU64,
     /// Set when the `LiveUpstream` is dropped.
     released: AtomicBool,
 }
 
 impl LiveShared {
     fn segment(&self, track: &str, n: u64) -> Vec<u8> {
+        let size = self.size.load(Ordering::SeqCst);
+        if size > 0 {
+            return live_segment_sized(track, n, size);
+        }
         match *self.clock.lock().unwrap() {
             Some((from, lost)) => {
                 let length = self.target_ms as f64 / 1000.0;
@@ -1290,11 +1301,12 @@ const LIVE_SAYS: &str = "live-says";
 /// What a segment of the stand-in is: its track's name and number
 /// (`v-5`) repeated to 64 KiB.
 pub fn live_segment(track: &str, n: u64) -> Vec<u8> {
-    format!("{track}-{n}")
-        .bytes()
-        .cycle()
-        .take(64 << 10)
-        .collect()
+    live_segment_sized(track, n, 64 << 10)
+}
+
+/// `live_segment`, `size` bytes long (see `LiveUpstream::segment_size`).
+pub fn live_segment_sized(track: &str, n: u64, size: usize) -> Vec<u8> {
+    format!("{track}-{n}").bytes().cycle().take(size).collect()
 }
 
 /// A segment of a stand-in with a media clock (see `LiveUpstream::clock`):
@@ -1378,6 +1390,9 @@ impl LiveUpstream {
             hanging: AtomicUsize::new(0),
             seen: Mutex::default(),
             homes: Mutex::default(),
+            size: AtomicUsize::new(0),
+            slow_bases_ms: AtomicU64::new(0),
+            peeks_hang_below: AtomicU64::new(0),
             released: AtomicBool::new(false),
         });
         let shared = Arc::clone(&live);
@@ -1530,6 +1545,25 @@ impl LiveUpstream {
         *self.live.held_base.lock().unwrap() = Some(track.to_string());
     }
 
+    /// Segments are `size` bytes long from now on (see `live_segment_sized`).
+    pub fn segment_size(&self, size: usize) {
+        self.live.size.store(size, Ordering::SeqCst);
+    }
+
+    /// Answers for a track's base, which say where the head is, start only
+    /// `ms` after they are asked for, from now on.
+    pub fn slow_bases(&self, ms: u64) {
+        self.live.slow_bases_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// A look at the start of a segment below `n` (a request for its first
+    /// `media_time::PEEK` bytes) hangs from now on, gone or not, as one
+    /// stuck on a slow circuit does (see `freeze`). Other requests for it
+    /// are answered.
+    pub fn hang_peeks_below(&self, n: u64) {
+        self.live.peeks_hang_below.store(n, Ordering::SeqCst);
+    }
+
     /// How many requests are hanging (see `freeze`).
     pub fn hanging(&self) -> usize {
         self.live.hanging.load(Ordering::SeqCst)
@@ -1667,6 +1701,10 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
             live.hanging.fetch_sub(1, Ordering::SeqCst);
             return;
         }
+        let slow = live.slow_bases_ms.load(Ordering::SeqCst);
+        if slow > 0 {
+            std::thread::sleep(Duration::from_millis(slow));
+        }
         return match kind {
             "live" => reply(
                 &mut conn,
@@ -1677,6 +1715,13 @@ fn live_serve(mut conn: TcpStream, live: &LiveShared, base: &str) {
             _ => reply(&mut conn, "200 OK", &head(), b""),
         };
     };
+    let peek = format!("bytes=0-{}", crate::media_time::PEEK - 1);
+    if n < live.peeks_hang_below.load(Ordering::SeqCst) && range.as_deref() == Some(peek.as_str()) {
+        live.hanging.fetch_add(1, Ordering::SeqCst);
+        hang(&mut conn, live);
+        live.hanging.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
     let first = live.first.max(live.dropped.load(Ordering::SeqCst));
     if n < first || n > live.head() {
         return reply(&mut conn, "404 Not Found", "", b"");

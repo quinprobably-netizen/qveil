@@ -14,9 +14,10 @@
 
 use super::Server;
 use super::http::respond;
-use super::relay::{FAILED_FOR, RECOVER_EVERY, content_range, stalled_read};
+use super::relay::{FAILED_FOR, RECOVER_EVERY, RELAY_WRITE_TIMEOUT, content_range, stalled_read};
 use crate::errors::{self, friendly};
 use crate::ids::VideoRef;
+use crate::inflight::ROUTE_CHANGED;
 use crate::live::{self, Fragments, LiveStreams, Opening, Track};
 use crate::net::Net;
 use crate::util::lock;
@@ -522,6 +523,10 @@ impl Broken {
     }
 }
 
+/// What a look at the start of a segment got (see `LiveSession::peek`): the
+/// answer's status and its first bytes, or nothing in time.
+type Peeked = Option<(u16, Vec<u8>)>;
+
 /// What a request was answered with: its status and the head it said. The
 /// body of a segment's is in its fetch.
 struct Answer {
@@ -586,6 +591,8 @@ pub(super) struct LiveSession {
     /// Each track's playlist lengths, once the media's clock has been read
     /// (see `begin`).
     lengths: Mutex<[Option<Lengths>; 2]>,
+    /// Why the session failed for good, if it did (see `fail`).
+    broken: Mutex<Option<String>>,
 }
 
 impl LiveSession {
@@ -640,6 +647,7 @@ impl LiveSession {
             stall_ms: AtomicU64::new(STALL.as_millis() as u64),
             heard: Mutex::new(now),
             lengths: Mutex::new([None, None]),
+            broken: Mutex::new(None),
         })
     }
 
@@ -667,6 +675,39 @@ impl LiveSession {
         self.changed.notify_all();
     }
 
+    /// Ends the session for good, saying `why` to the window, which asks
+    /// how the stream is (see `serve_state`): it can't go on.
+    fn fail(&self, why: &str) {
+        note!("qveil: a live stream can't go on: {why}");
+        lock(&self.broken).get_or_insert_with(|| why.to_string());
+        self.cancel();
+    }
+
+    /// Fails the session if `e`, a lookup again's error, says the stream is
+    /// no longer offered in the tracks the player opened (see `relook`).
+    fn fail_if_changed(&self, e: &anyhow::Error) {
+        if format!("{e:#}").contains(live::TRACKS_CHANGED) {
+            self.fail(live::TRACKS_CHANGED);
+        }
+    }
+
+    /// Whether the route in use is still the one the session was opened
+    /// on. Nothing of it goes out on another.
+    fn on_route(&self, server: &Server) -> bool {
+        server.runtime().net.same_route(&self.route)
+    }
+
+    /// Ends a session that `begin` stops opening: the route changed, or
+    /// nobody waits for the answer any more. What it says why.
+    fn left(&self, server: &Server) -> anyhow::Error {
+        self.cancel();
+        anyhow::anyhow!(if self.on_route(server) {
+            crate::ytdlp::CANCELLED
+        } else {
+            ROUTE_CHANGED
+        })
+    }
+
     /// Learns where the stream is before the player is told of it: the head,
     /// from the final answer to a HEAD of a track's base (googlevideo may
     /// redirect it, and the host it ends on is the one that knows), and
@@ -681,35 +722,49 @@ impl LiveSession {
     /// segments the player joins at (the last `HELD` of each track) start
     /// coming in, while the answer and the player's start take their time:
     /// its first requests find them on their way (see `take_warm`).
-    pub(super) fn begin(self: &Arc<Self>, server: &Arc<Server>) -> Result<bool> {
+    ///
+    /// Nothing is asked once the route has changed or `abort` says nobody
+    /// waits for the answer: the session isn't registered yet, so nothing
+    /// else would stop it, and it ends with an error.
+    pub(super) fn begin(
+        self: &Arc<Self>,
+        server: &Arc<Server>,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool> {
         if !matches!(self.fragments, Fragments::Numbered) {
             return Ok(true);
         }
+        let gone = || abort() || !self.on_route(server);
+        if gone() {
+            return Err(self.left(server));
+        }
         let began = Instant::now();
-        let head = self.first_head(server)?;
+        let head = self.first_head(server, &gone)?;
         trace!("begin head={head} after_ms={}", ms(began));
         lock(&self.span).head = head;
         let mut oldest = oldest_for(head, self.target);
         if oldest + 3 < head {
+            if gone() {
+                return Err(self.left(server));
+            }
             // The start of the oldest segment and of the join, of each
             // track, at once: whether the oldest is still there, and where
             // both are on the media's clock (see `Lengths`).
             let join = head + 1 - JOIN;
-            let [a0, v0, a1, v1] = self.peek_all([
-                (Kind::Audio, oldest),
-                (Kind::Video, oldest),
-                (Kind::Audio, join),
-                (Kind::Video, join),
-            ]);
-            if a0
-                .as_ref()
-                .is_some_and(|(status, _)| matches!(status, 404 | 410))
-            {
+            let [a0, v0, a1, v1] = self.peek_all(
+                server,
+                &gone,
+                [
+                    (Kind::Audio, oldest),
+                    (Kind::Video, oldest),
+                    (Kind::Audio, join),
+                    (Kind::Video, join),
+                ],
+            )?;
+            if !self.oldest_is_there(server, oldest, &a0, &v0) {
                 oldest = head - 3;
             } else {
-                let at = |p: &Option<(u16, Vec<u8>)>| {
-                    p.as_ref().and_then(|(_, b)| crate::media_time::start_of(b))
-                };
+                let at = |p: &Peeked| p.as_ref().and_then(|(_, b)| crate::media_time::start_of(b));
                 let measure = |p0, p1| match (at(p0), at(p1)) {
                     (Some(t0), Some(t1)) => Lengths::measured(oldest, join, t0, t1, self.target),
                     _ => None,
@@ -725,6 +780,9 @@ impl LiveSession {
             }
         }
         trace!("begin oldest={oldest} total_ms={}", ms(began));
+        if gone() {
+            return Err(self.left(server));
+        }
         // After the look at the oldest segment, not beside it: on a slow
         // circuit, eight segments coming in held its answer up for longer
         // than a stall (measured), and the player only asks for the join
@@ -740,10 +798,47 @@ impl LiveSession {
         Ok(oldest + 3 < span.head)
     }
 
+    /// Whether segment `oldest`, the oldest the window allows, is still
+    /// there, from what the looks at its start (`audio`, `video`; see
+    /// `peek_all`) said: not if either was told it is gone (the streamer
+    /// turned rewinding off). If neither got an answer within a stall (a
+    /// slow circuit, measured at 5-12 s a look), it is asked once more, the
+    /// way that recovers (a HEAD, made again on a fresh client or identity
+    /// as any request is), and one that can't be had counts as gone: a
+    /// playlist that starts near the head plays, one that lists segments
+    /// that don't exist never would.
+    fn oldest_is_there(
+        &self,
+        server: &Server,
+        oldest: u64,
+        audio: &Peeked,
+        video: &Peeked,
+    ) -> bool {
+        let gone = |p: &Peeked| {
+            p.as_ref()
+                .is_some_and(|(status, _)| matches!(status, 404 | 410))
+        };
+        if gone(audio) || gone(video) {
+            return false;
+        }
+        if audio.is_some() || video.is_some() {
+            return true;
+        }
+        let t = Instant::now();
+        let asked = self.request(server, Method::HEAD, Kind::Audio, Some(oldest), None);
+        trace!(
+            "begin oldest HEAD -> {:?} ms={}",
+            asked.as_ref().map(|a| a.status.as_u16()).ok(),
+            ms(t)
+        );
+        asked.is_ok_and(|a| a.status.is_success())
+    }
+
     /// The head, from whichever track's base answers with it first (see
     /// `begin`). The other's request goes on by itself, and what it says
-    /// of the head is taken too. An error only if neither can say.
-    fn first_head(self: &Arc<Self>, server: &Arc<Server>) -> Result<u64> {
+    /// of the head is taken too. An error only if neither can say, or once
+    /// `gone` says the session has nobody to open for (it is then ended).
+    fn first_head(self: &Arc<Self>, server: &Arc<Server>, gone: &dyn Fn() -> bool) -> Result<u64> {
         let (tx, rx) = std::sync::mpsc::channel();
         for kind in [Kind::Video, Kind::Audio] {
             let (s, server, sender) = (Arc::clone(self), Arc::clone(server), tx.clone());
@@ -764,7 +859,13 @@ impl LiveSession {
         }
         drop(tx);
         let mut failed = None;
-        for (kind, said) in rx {
+        loop {
+            let (kind, said) = match rx.recv_timeout(WAIT_POLL) {
+                Ok(answer) => answer,
+                Err(RecvTimeoutError::Timeout) if gone() => return Err(self.left(server)),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             match said {
                 Ok(head) => return Ok(head),
                 // The video's reason is the one given, if both fail.
@@ -778,22 +879,40 @@ impl LiveSession {
     /// The first `PEEK` bytes of each `(kind, n)`, all at once: the answer's
     /// status and those bytes (none unless it was a success), or nothing if
     /// it couldn't be had within a stall. Made once each, on the client
-    /// there is: what it says is a help, not a must (see `begin`).
+    /// there is: what it says is a help, not a must (see `begin`). An error
+    /// once `gone` says the session has nobody to open for (it is then
+    /// ended, which stops the looks still on their way).
     fn peek_all<const N: usize>(
         self: &Arc<Self>,
+        server: &Arc<Server>,
+        gone: &dyn Fn() -> bool,
         asked: [(Kind, u64); N],
-    ) -> [Option<(u16, Vec<u8>)>; N] {
-        let threads = asked.map(|(kind, n)| {
-            let s = Arc::clone(self);
-            std::thread::Builder::new()
-                .spawn(move || s.peek(kind, n))
-                .ok()
-        });
-        threads.map(|t| t.and_then(|t| t.join().ok().flatten()))
+    ) -> Result<[Peeked; N]> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, (kind, n)) in asked.into_iter().enumerate() {
+            let (s, server, tx) = (Arc::clone(self), Arc::clone(server), tx.clone());
+            // One that can't be started has no answer.
+            let _ = std::thread::Builder::new().spawn(move || {
+                let _ = tx.send((i, s.peek(&server, kind, n)));
+            });
+        }
+        drop(tx);
+        let mut said = [(); N].map(|()| None);
+        loop {
+            match rx.recv_timeout(WAIT_POLL) {
+                Ok((i, peeked)) => said[i] = peeked,
+                Err(RecvTimeoutError::Timeout) if gone() => return Err(self.left(server)),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ok(said),
+            }
+        }
     }
 
-    fn peek(&self, kind: Kind, n: u64) -> Option<(u16, Vec<u8>)> {
+    fn peek(&self, server: &Server, kind: Kind, n: u64) -> Peeked {
         use crate::media_time::PEEK;
+        if self.is_cancelled() || !self.on_route(server) {
+            return None;
+        }
         let up = lock(&self.upstream).clone();
         let url = self.url(&up, kind, Some(n))?;
         let t = Instant::now();
@@ -1034,6 +1153,11 @@ impl LiveSession {
     /// oldest segments listed. Asking it doesn't count as playing: it keeps
     /// no head polls going (the player's own reloads do that).
     pub(super) fn serve_state(&self, out: &mut TcpStream) -> Result<()> {
+        // A session that failed says why, which the window shows.
+        if let Some(why) = lock(&self.broken).clone() {
+            let body = errors::body(&why).to_string();
+            return respond(out, 502, "application/json", body.as_bytes());
+        }
         if self.is_cancelled() {
             return respond(out, 404, "text/plain", b"stream expired");
         }
@@ -1115,6 +1239,16 @@ impl LiveSession {
                 return respond(out, 502, "text/plain", f.to_string().as_bytes());
             }
         };
+        // A player that is paused, or rewound with its cache full, stops
+        // reading part way through a segment, for as long as it likes: the
+        // relay's long write timeout, not the 10 s of an ordinary answer,
+        // which would cut the segment short (a gap once it plays on). It
+        // costs a thread and the loopback connection, never a request: the
+        // fetch upstream goes on, or stops, on its own.
+        if let Err(e) = out.set_write_timeout(Some(RELAY_WRITE_TIMEOUT)) {
+            self.hung_up(kind, fetch);
+            return Err(e.into());
+        }
         let head = write!(
             out,
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {length}\r\n\
@@ -1463,7 +1597,10 @@ impl LiveSession {
         let mut relooked = false;
         let (mut strikes, mut tries, mut stalls) = (0, 0, 0);
         loop {
-            if self.is_cancelled() || into.is_some_and(Fetch::unwanted) {
+            // Never on a route the user left: a session that `begin` is
+            // still opening isn't registered, so a route change doesn't
+            // cancel it.
+            if self.is_cancelled() || into.is_some_and(Fetch::unwanted) || !self.on_route(server) {
                 return Err(Failure::Cancelled);
             }
             let url = self.url(&up, kind, n).ok_or(Failure::Gone)?;
@@ -1791,6 +1928,7 @@ impl LiveSession {
                 Ok((fresh, _)) => Some(fresh),
                 Err(e) => {
                     note!("qveil: couldn't look up a stalled live stream again: {e:#}");
+                    self.fail_if_changed(&e);
                     None
                 }
             };
@@ -1820,13 +1958,24 @@ impl LiveSession {
                 return Ok(up.clone());
             }
         }
-        Ok(self.relook(server, seen)?.0)
+        let relooked = self.relook(server, seen);
+        if let Err(e) = &relooked {
+            self.fail_if_changed(e);
+        }
+        Ok(relooked?.0)
     }
 
     /// The live lookup again, under `refreshing`, and its URLs and identity
     /// swapped in. Returns them, and whether the stream has ended. Never on
     /// a route the user left; one that failed is the answer for `seen`
     /// within `FAILED_FOR`; and it is stopped once the session ends.
+    ///
+    /// It answers with the tracks the player opened, the same formats cut
+    /// the same way, or not at all: segments of another format, or a list
+    /// of fragments where the session numbers them, can't go on where the
+    /// player is (`live::TRACKS_CHANGED`). The URLs the session has stay;
+    /// a 403 or a stall that needed this fails the session (see `fail`),
+    /// and an end check goes on with them.
     fn relook(&self, server: &Server, seen: u32) -> Result<(Upstream, bool)> {
         let rt = server.runtime();
         if !rt.net.same_route(&self.route) {
@@ -1841,10 +1990,23 @@ impl LiveSession {
         }
         let abort = || self.is_cancelled();
         let t = Instant::now();
+        let (video, audio) = {
+            let up = lock(&self.upstream);
+            (up.video.format_id.clone(), up.audio.format_id.clone())
+        };
+        let keep = Some((video.as_str(), audio.as_str()));
+        let cut = std::mem::discriminant(&self.fragments);
         // A bot check is met on a fresh identity again (see
         // `Server::fresh_on_bot_check`); the URLs are of the one that got through.
         let found = server.fresh_on_bot_check(&rt, &abort, |yt| {
-            match yt.live_until(&self.source.watch_url(), self.max_height, &abort)? {
+            match yt.live_until(&self.source.watch_url(), self.max_height, keep, &abort)? {
+                // (Over, as one that is processed is: an end check ends it.)
+                Opening::Live(s) if std::mem::discriminant(&s.fragments) != cut && s.ended => {
+                    bail!("{}: {}", live::ENDED, live::TRACKS_CHANGED)
+                }
+                Opening::Live(s) if std::mem::discriminant(&s.fragments) != cut => {
+                    bail!(live::TRACKS_CHANGED)
+                }
                 Opening::Live(s) => Ok((s, yt.net)),
                 _ => bail!(NOT_LIVE),
             }
@@ -2837,7 +2999,7 @@ mod serving {
         let (s, base, _d) = server();
         // Nothing listens on port 1, so connecting fails.
         let session = session_at(&s, "http://127.0.0.1:1/videoplayback?sig=SECRETSIG");
-        let err = session.begin(&s).unwrap_err();
+        let err = session.begin(&s, &|| false).unwrap_err();
         assert!(!format!("{err:#}").contains("SECRETSIG"), "{err:#}");
         // And a segment's failure, as the player is told it.
         let sid = s.register(&s.runtime(), Arc::clone(&session)).unwrap();
@@ -3500,5 +3662,188 @@ exec '{inner}' "$@"
         assert_eq!(status, 500, "{body}");
         assert!(body.contains("no fragments"), "{body}");
         assert_eq!(hls_runs(&st.bin.0), 1);
+    }
+
+    /// Makes `c` take in little at a time, so that a player that stops
+    /// reading holds up the engine's writes to it soon.
+    fn small_receive_buffer(c: &TcpStream) {
+        use std::os::fd::AsRawFd;
+        let size: libc::c_int = 64 << 10;
+        // SAFETY: the option is an int, passed by a pointer to one, on an
+        // open socket.
+        let set = unsafe {
+            libc::setsockopt(
+                c.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[test]
+    fn a_player_paused_part_way_through_a_segment_still_gets_all_of_it() {
+        // Larger than the sockets between can hold, as a 4K segment is.
+        const SIZE: usize = 8 << 20;
+        let st = stream(60_000, 0, 20);
+        st.up.segment_size(SIZE);
+        let sid = st.open();
+        let mut c = TcpStream::connect(addr(&st.base)).unwrap();
+        small_receive_buffer(&c);
+        c.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        write!(
+            c,
+            "GET {} HTTP/1.1\r\nHost: x\r\n\r\n",
+            path(&st.base, &format!("live/{sid}/v/5.mkv"))
+        )
+        .unwrap();
+        let mut got = vec![0u8; 1 << 20];
+        c.read_exact(&mut got).unwrap();
+        // Paused, its cache full, for longer than an ordinary answer may
+        // wait to be written. (Twice that, and then some: for a while after
+        // a reader stops, the kernel still finds room for a little more now
+        // and then, and each bit that goes starts the timeout again.)
+        std::thread::sleep(crate::server::http::WRITE_TIMEOUT * 2 + Duration::from_secs(5));
+        c.read_to_end(&mut got).unwrap();
+        assert!(got.starts_with(b"HTTP/1.1 200"));
+        let body = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(got.len() - body, SIZE, "the segment was cut short");
+        assert!(got[body..] == live_segment_sized("v", 5, SIZE)[..]);
+    }
+
+    /// What the fake yt-dlp's live lookup says of the stream, with its URLs
+    /// of generation 7, but offering `formats` (JSON) in place of its own.
+    fn answer_offering(state: &str, formats: &str) -> String {
+        format!(
+            r#"{{"title":"A live cam","channel":"Cam","channel_id":"UCaaaaaaaaaaaaaaaaaaaaaa",{state},
+ "release_timestamp":1771008448,"concurrent_view_count":567,"formats":[{formats}]}}"#
+        )
+    }
+
+    /// The session plays in 271 and 140, numbered. A 403 looks it up again,
+    /// and the answer is `answer`, which doesn't offer those as they were:
+    /// the session fails, says why, and fetches nothing of what it offers.
+    fn other_tracks_fail_the_session(answer: impl Fn(&str) -> String) {
+        let st = stream(60_000, 0, 20);
+        let sid = st.open();
+        assert_eq!(st.segment(&sid, "v", 5).0, 200);
+        st.up.lookups_answer(Some(&answer(&st.up.base)));
+        st.up.forbid_until_relooked();
+        assert_ne!(st.segment(&sid, "v", 12).0, 200);
+        assert_eq!(st.live_lookups(), 2);
+        // The window asks how the stream is, and is told.
+        let (status, _, body) = st.get(&format!("live/{sid}/state"));
+        assert_eq!(status, 502, "{}", String::from_utf8_lossy(&body));
+        let said: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(said["error"], live::TRACKS_CHANGED, "{said}");
+        assert!(st.session(&sid).cancelled.load(Ordering::Acquire));
+        assert_ne!(st.segment(&sid, "a", 12).0, 200);
+        let other: Vec<_> = st
+            .up
+            .requests()
+            .into_iter()
+            .filter(|r| r.contains("/7/"))
+            .collect();
+        assert!(other.is_empty(), "{other:?}");
+        assert_eq!(st.live_lookups(), 2);
+    }
+
+    #[test]
+    fn a_lookup_again_that_offers_another_format_fails_the_session() {
+        // Another identity's best video is another format.
+        other_tracks_fail_the_session(|base| {
+            answer_offering(
+                r#""live_status":"is_live","is_live":true"#,
+                &format!(
+                    r#"{{"format_id":"140","ext":"m4a","protocol":"http_dash_segments_generator","vcodec":"none","acodec":"mp4a.40.2","target_duration":60,"url":"{base}/live/7/a","http_headers":{{"User-Agent":"UA"}}}},
+ {{"format_id":"248","ext":"webm","protocol":"http_dash_segments_generator","height":720,"vcodec":"vp9","acodec":"none","target_duration":60,"url":"{base}/live/7/v","http_headers":{{"User-Agent":"UA"}}}}"#
+                ),
+            )
+        });
+    }
+
+    #[test]
+    fn a_lookup_again_that_lists_the_fragments_instead_fails_the_session() {
+        // Hours on, the stream has been processed: the same formats, as a
+        // list of fragments.
+        other_tracks_fail_the_session(|base| {
+            let list = r#"[{"path":"sq/0","duration":60.0},{"path":"sq/1","duration":60.0}]"#;
+            answer_offering(
+                r#""live_status":"was_live""#,
+                &format!(
+                    r#"{{"format_id":"140","ext":"m4a","protocol":"http_dash_segments","vcodec":"none","acodec":"mp4a.40.2","url":"{base}/m","fragment_base_url":"{base}/live/7/a/","fragments":{list},"http_headers":{{"User-Agent":"UA"}}}},
+ {{"format_id":"271","ext":"webm","protocol":"http_dash_segments","height":720,"vcodec":"vp9","acodec":"none","url":"{base}/m","fragment_base_url":"{base}/live/7/v/","fragments":{list},"http_headers":{{"User-Agent":"UA"}}}}"#
+                ),
+            )
+        });
+    }
+
+    #[test]
+    fn a_lookup_again_keeps_the_tracks_the_player_opened() {
+        // The answer's best video is 248 now, but it still offers 271.
+        let st = stream(60_000, 0, 20);
+        let sid = st.open();
+        let base = st.up.base.clone();
+        st.up.lookups_answer(Some(&answer_offering(
+            r#""live_status":"is_live","is_live":true"#,
+            &format!(
+                r#"{{"format_id":"140","ext":"m4a","protocol":"http_dash_segments_generator","vcodec":"none","acodec":"mp4a.40.2","target_duration":60,"url":"{base}/live/7/a","http_headers":{{"User-Agent":"UA"}}}},
+ {{"format_id":"271","ext":"webm","protocol":"http_dash_segments_generator","height":720,"vcodec":"vp9","acodec":"none","target_duration":60,"url":"{base}/live/7/v","http_headers":{{"User-Agent":"UA"}}}},
+ {{"format_id":"248","ext":"webm","protocol":"http_dash_segments_generator","height":720,"vcodec":"vp9","acodec":"none","target_duration":60,"url":"{base}/live/8/v","http_headers":{{"User-Agent":"UA"}}}}"#
+            ),
+        )));
+        st.up.forbid_until_relooked();
+        let (status, _, body) = st.segment(&sid, "v", 12);
+        assert_eq!(status, 200);
+        assert_eq!(body, live_segment("v", 12));
+        assert!(st.up.requests().contains(&"/live/7/v&sq=12".to_string()));
+        assert!(!st.up.requests().iter().any(|r| r.contains("/8/")));
+        assert_eq!(state(&st, &sid)["state"], "now");
+    }
+
+    #[test]
+    fn nothing_goes_out_on_a_route_the_user_left_while_the_stream_opened() {
+        let st = stream(200, 0, 10);
+        st.s.warming.store(true, Ordering::Relaxed);
+        // The head takes its time to answer, and the user switches meanwhile.
+        st.up.slow_bases(1_500);
+        let (base, target) = (st.base.clone(), path(&st.base, PLAY));
+        let play = std::thread::spawn(move || http(&base, "POST", &target, ""));
+        wait_for("the head to be asked", Duration::from_secs(10), || {
+            st.up.requests().iter().any(|r| r.starts_with("/live/0/"))
+        });
+        switch_to_tor(&st.base);
+        let (status, body) = play.join().unwrap();
+        assert_ne!(status, 200, "{body}");
+        let said: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(said["code"], "route_changed", "{said}");
+        // No look at a segment, no join fetched early: nothing of it at all.
+        std::thread::sleep(Duration::from_secs(4));
+        let segments: Vec<_> = st
+            .up
+            .requests()
+            .into_iter()
+            .filter(|r| r.contains("sq="))
+            .collect();
+        assert!(segments.is_empty(), "{segments:?}");
+        assert!(lock(&st.s.sessions).is_empty());
+        assert_eq!(runs(&st.bin.0), 2);
+    }
+
+    #[test]
+    fn a_stream_without_its_old_segments_starts_near_the_head_on_a_slow_circuit_too() {
+        // Rewinding turned off, and the looks at the start of the oldest
+        // segment get no answer in time.
+        let up = LiveUpstream::start(60_000, 17, 20);
+        up.hang_peeks_below(17);
+        let bin = TempDir::new();
+        let ytdlp = fake_live_ytdlp(&bin.0, &up).display().to_string();
+        let st = stream_with(up, bin, ytdlp, Config::default());
+        let v = st.play();
+        assert_eq!(v["live"]["rewind"], false);
+        assert_eq!(st.listed(&sid_of(&v)).0, vec![17, 18, 19, 20]);
+        assert_eq!(st.segment(&sid_of(&v), "v", 17).2, live_segment("v", 17));
     }
 }

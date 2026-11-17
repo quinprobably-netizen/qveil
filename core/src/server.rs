@@ -502,7 +502,7 @@ impl Server {
                 match found {
                     Found::Plain(s, live) => (s, live, Some(started)),
                     Found::Live(s, ident) => {
-                        return self.open_live(&rt, &base, v, channel, s, ident);
+                        return self.open_live(&rt, &base, v, channel, s, ident, abort);
                     }
                     Found::Upcoming {
                         title,
@@ -579,6 +579,7 @@ impl Server {
     /// on its timeline: learns where it is, registers it, and answers with
     /// its two playlists. A running one is joined three segments back from
     /// its end, where the player doesn't wait for the next segment to start.
+    #[allow(clippy::too_many_arguments)]
     fn open_live(
         self: &Arc<Self>,
         rt: &Runtime,
@@ -587,7 +588,16 @@ impl Server {
         channel: Option<String>,
         s: LiveStreams,
         ident: Net,
+        abort: &dyn Fn() -> bool,
     ) -> Result<Opened> {
+        // Nothing goes out for it once the route has changed, or nobody
+        // waits for it: `begin` asks upstream, before it is registered.
+        if !self.still_on(rt) {
+            bail!(ROUTE_CHANGED);
+        }
+        if abort() {
+            bail!(crate::ytdlp::CANCELLED);
+        }
         let session = Arc::new(LiveSession::new(
             v.clone(),
             rt.cfg.max_height,
@@ -595,7 +605,9 @@ impl Server {
             &s,
             ident,
         )?);
-        let rewind = session.begin(self).inspect_err(|_| session.cancel())?;
+        let rewind = session
+            .begin(self, abort)
+            .inspect_err(|_| session.cancel())?;
         let sid = self
             .register(rt, Arc::clone(&session))
             .inspect_err(|_| session.cancel())?;

@@ -75,6 +75,42 @@ pub enum Opening {
 /// lookup's answer. yt-dlp orders `formats` worst to best, so each is the
 /// last of its kind that can be fetched in fragments.
 pub fn choose(v: &Value, max_height: u32) -> Result<LiveStreams> {
+    choose_keeping(v, max_height, None)
+}
+
+/// `choose`, or with `keep` (a video and an audio `format_id`) those two
+/// formats and no others: a stream looked up again while it plays has to
+/// go on in the tracks the player opened, whatever another identity's best
+/// is. An answer that offers fragments, but not of those two, is
+/// `TRACKS_CHANGED`; one that offers none at all is what `choose` says of it.
+pub fn choose_keeping(
+    v: &Value,
+    max_height: u32,
+    keep: Option<(&str, &str)>,
+) -> Result<LiveStreams> {
+    let Some((video_id, audio_id)) = keep else {
+        let within = |f: &Value| {
+            f["height"]
+                .as_u64()
+                .is_some_and(|h| h <= u64::from(max_height))
+        };
+        return choose_by(v, within, |_| true);
+    };
+    let video = |f: &Value| f["format_id"].as_str() == Some(video_id);
+    let audio = |f: &Value| f["format_id"].as_str() == Some(audio_id);
+    choose_by(v, video, audio).or_else(|_| {
+        choose(v, max_height)?;
+        Err(anyhow::anyhow!(TRACKS_CHANGED))
+    })
+}
+
+/// The last video that `video` takes and the last audio that `audio` takes,
+/// of those that can be fetched in fragments (see `choose`).
+fn choose_by(
+    v: &Value,
+    video: impl Fn(&Value) -> bool,
+    audio: impl Fn(&Value) -> bool,
+) -> Result<LiveStreams> {
     let formats = v["formats"]
         .as_array()
         .map(Vec::as_slice)
@@ -84,11 +120,7 @@ pub fn choose(v: &Value, max_height: u32) -> Result<LiveStreams> {
         .iter()
         .rev()
         .filter(|f| only(f, "vcodec") && !only(f, "acodec"))
-        .filter(|f| {
-            f["height"]
-                .as_u64()
-                .is_some_and(|h| h <= u64::from(max_height))
-        })
+        .filter(|f| video(f))
         .find_map(|f| {
             let ext = match f["ext"].as_str()? {
                 "webm" => "mkv",
@@ -104,6 +136,7 @@ pub fn choose(v: &Value, max_height: u32) -> Result<LiveStreams> {
         .iter()
         .rev()
         .filter(|f| only(f, "acodec") && !only(f, "vcodec"))
+        .filter(|f| audio(f))
         .find_map(|f| {
             let (base, theirs) = fragments_of(f)?;
             same_cut(&fragments, &theirs).then(|| track(f, base, "m4a"))?
@@ -138,6 +171,11 @@ pub fn choose(v: &Value, max_height: u32) -> Result<LiveStreams> {
 /// a lookup's positive word that the stream is over, which a session that
 /// plays it ends on; a running stream's `NO_FRAGMENTS` alone is not.
 pub const ENDED: &str = "The stream has ended";
+
+/// What a lookup again of a stream that plays says when it no longer offers
+/// the tracks the player opened (see `choose_keeping`), or offers them cut
+/// another way: the session can't go on in them, and fails.
+pub const TRACKS_CHANGED: &str = "The stream changed format while it played; open it again.";
 
 /// What a live stream without a track that can be fetched in fragments ends
 /// with: an HLS-only stream, or one without formats at all.
@@ -228,6 +266,25 @@ mod tests {
         let s = choose(&live(), 1080).unwrap();
         assert_eq!((s.video.format_id.as_str(), s.video.ext), ("248", "mkv"));
         assert_eq!(s.audio.format_id, "140");
+    }
+
+    #[test]
+    fn a_stream_looked_up_again_keeps_the_tracks_it_plays_in() {
+        // Not the best within the cap (271): the one it was opened with.
+        let s = choose_keeping(&live(), 1440, Some(("248", "140"))).unwrap();
+        assert_eq!(
+            (s.video.format_id.as_str(), s.audio.format_id.as_str()),
+            ("248", "140")
+        );
+        // An answer without them says so, and offers nothing else.
+        let e = choose_keeping(&live(), 1440, Some(("999", "140"))).unwrap_err();
+        assert_eq!(e.to_string(), TRACKS_CHANGED);
+        let e = choose_keeping(&live(), 1440, Some(("271", "999"))).unwrap_err();
+        assert_eq!(e.to_string(), TRACKS_CHANGED);
+        // One without fragments at all is what it always was.
+        let hls = serde_json::from_str(r#"{"live_status":"is_live","formats":[]}"#).unwrap();
+        let e = choose_keeping(&hls, 1440, Some(("271", "140"))).unwrap_err();
+        assert!(e.to_string().contains(NO_FRAGMENTS), "{e}");
     }
 
     #[test]

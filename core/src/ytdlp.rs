@@ -621,7 +621,7 @@ impl Ytdlp {
             Err(e) if needs_live(&e) => e,
             Err(e) => return Err(e),
         };
-        self.live_lookup(url, max_height, abort, Some(original))
+        self.live_lookup(url, max_height, None, abort, Some(original))
     }
 
     /// What `url` opens as, for a video said to be live or announced (the
@@ -641,11 +641,11 @@ impl Ytdlp {
     ) -> Result<Opening> {
         let v = self.live_json(url, abort)?;
         if live_state(&v).is_some() {
-            return live_answer(&v, url, max_height, None);
+            return live_answer(&v, url, max_height, None, None);
         }
         match self.lookup(url, format, abort) {
             Ok(s) => Ok(Opening::Plain(s)),
-            Err(e) if needs_live(&e) => live_answer(&v, url, max_height, Some(e)),
+            Err(e) if needs_live(&e) => live_answer(&v, url, max_height, None, Some(e)),
             Err(e) => Err(e),
         }
     }
@@ -653,14 +653,17 @@ impl Ytdlp {
     /// The live lookup alone, for a stream that is known to be one: the
     /// timeline looks a stream it plays up again this way, when its URLs
     /// have stopped working or to see whether it has ended, without the
-    /// usual lookup's request before it.
+    /// usual lookup's request before it. With `keep`, a video and an audio
+    /// `format_id`, those are the tracks it answers with (see
+    /// `live::choose_keeping`).
     pub fn live_until(
         &self,
         url: &str,
         max_height: u32,
+        keep: Option<(&str, &str)>,
         abort: &dyn Fn() -> bool,
     ) -> Result<Opening> {
-        self.live_lookup(url, max_height, abort, None)
+        self.live_lookup(url, max_height, keep, abort, None)
     }
 
     /// `open_until` from the live lookup on. `original` is what the usual
@@ -670,11 +673,12 @@ impl Ytdlp {
         &self,
         url: &str,
         max_height: u32,
+        keep: Option<(&str, &str)>,
         abort: &dyn Fn() -> bool,
         original: Option<anyhow::Error>,
     ) -> Result<Opening> {
         let v = self.live_json(url, abort)?;
-        live_answer(&v, url, max_height, original)
+        live_answer(&v, url, max_height, keep, original)
     }
 
     /// The usual lookup: the quick one first if it is on (see `LOOKUP`),
@@ -941,6 +945,7 @@ fn live_answer(
     v: &Value,
     url: &str,
     max_height: u32,
+    keep: Option<(&str, &str)>,
     original: Option<anyhow::Error>,
 ) -> Result<Opening> {
     if live_state(v) == Some(LiveState::Upcoming) {
@@ -951,7 +956,7 @@ fn live_answer(
         });
     }
     let is_stream = live_state(v).is_some() || streamed(v);
-    match live::choose(v, max_height) {
+    match live::choose_keeping(v, max_height, keep) {
         Ok(s) => Ok(Opening::Live(s)),
         // Over, and nothing of it can be fetched: said as such, so that
         // a session playing it knows it has ended (see `live::ENDED`).

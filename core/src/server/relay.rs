@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 /// A relayed body is different: mpv stops reading while a paused video's
 /// cache is full, so a short write timeout would kill a paused video.
-const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub(super) const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// googlevideo paces one long Range request to about twice the video's
 /// bitrate, from the first byte (0.4 MB/s for a 1080p video, measured), while a
 /// bounded range of this size comes at line speed. So a player's open-ended

@@ -256,7 +256,7 @@ impl Server {
             // A bot check is asked again at once, on a fresh identity (see
             // `fresh_on_bot_check`); only the last is said.
             let found = self.fresh_on_bot_check(&rt, &abort, |yt| {
-                yt.live_until(&v.watch_url(), rt.cfg.max_height, &abort)
+                yt.live_until(&v.watch_url(), rt.cfg.max_height, None, &abort)
             });
             if watch.gone() || deaf.get() {
                 return Ok(());
