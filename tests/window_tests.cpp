@@ -5004,6 +5004,15 @@ private slots:
         reply->deleteLater();
         return o.contains("edge") ? o.value("edge").toDouble() : -1;
     }
+    // Whether the player plays on from `from`: it has got a second past it,
+    // and not by reaching its end (which, on a running stream, it never
+    // should: a reader that gave up shows only as an end).
+    static bool playsOnFrom(QObject *mpv, double from)
+    {
+        return QTest::qWaitFor([&] { return !mpv->property("ended").toBool() && !mpv->property("buffering").toBool()
+                                            && mpv->property("position").toDouble() >= from + 1; }, 15000)
+               && !mpv->property("ended").toBool();
+    }
 
     void aLiveStreamOpensNearTheEdgeAndSaysLive()
     {
@@ -5074,6 +5083,11 @@ private slots:
         QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 0));
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 4 && !mpv->property("buffering").toBool(), 10000);
         QTRY_VERIFY(app.askedLike("^GET live/\\d+/v/0\\.mkv") >= 1 && app.askedLike("^GET live/\\d+/a/0\\.m4a") >= 1);
+        // And plays on from there. (A seek made while FFmpeg's reader waits
+        // at the playlist's end for it to grow leaves that reader broken:
+        // the player is opened again once, where it went.)
+        QVERIFY2(playsOnFrom(mpv, 0), qPrintable(QString::number(mpv->property("position").toDouble())));
+        QVERIFY(mpv->property("reopened").toInt() <= 1);
         // Behind: the clock is where it is of how long, and Go live is offered, with its key.
         QVERIFY(!surface->property("atEdge").toBool());
         QTRY_VERIFY2(QRegularExpression("^0:0\\d / 0:\\d\\d$").match(timeOf(app)).hasMatch(), qPrintable(timeOf(app)));
@@ -5092,6 +5106,7 @@ private slots:
         // (Said at once; the player gets there a moment later.)
         QTRY_VERIFY2(mpv->property("position").toDouble() >= surface->property("length").toDouble() - 8,
                      qPrintable(QString::number(mpv->property("position").toDouble())));
+        QVERIFY(playsOnFrom(mpv, surface->property("lastSeek").toDouble()));
 
         // L is still ten seconds on, and J ten back: behind again, and the button goes live too.
         QTest::keyClick(app.window, Qt::Key_J);
@@ -5103,6 +5118,35 @@ private slots:
         QTRY_VERIFY(!goLive->isVisible());
         QCOMPARE(app.asked("POST api/play"), 1);
         QVERIFY(app.item("errorBar") && !app.item("errorBar")->isVisible());
+    }
+
+    void aSeekWhilePausedAtTheEdgeStaysPausedWhereItWent()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QObject *mpv = playLive(app);
+        QVERIFY(mpv);
+        QQuickItem *surface = app.item("surface");
+        QTRY_VERIFY(surface->property("atEdge").toBool());
+        QMetaObject::invokeMethod(mpv, "togglePause");
+        QTRY_VERIFY(mpv->property("paused").toBool());
+        // Back to the start: there, still paused (also if the player had to
+        // be opened again for it), and not at an end.
+        QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 0));
+        QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 4 && !mpv->property("buffering").toBool(), 10000);
+        QTest::qWait(1000);
+        QVERIFY(mpv->property("paused").toBool());
+        QVERIFY(!mpv->property("ended").toBool());
+        QVERIFY(mpv->property("position").toDouble() < 1);
+        QVERIFY(mpv->property("reopened").toInt() <= 1);
+        // And it plays on from there once it is played.
+        QMetaObject::invokeMethod(mpv, "togglePause");
+        QVERIFY2(playsOnFrom(mpv, 0), qPrintable(QString::number(mpv->property("position").toDouble())));
+        QCOMPARE(app.asked("POST api/play"), 1);
     }
 
     void inTheNarrowTileTheLiveKeysStayAndGoLiveIsAChip()
@@ -5181,6 +5225,11 @@ private slots:
         QTRY_VERIFY(surface->property("atEdge").toBool());
         QMetaObject::invokeMethod(surface, "seekTo", Q_ARG(QVariant, 0));
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() < 4 && !mpv->property("buffering").toBool(), 10000);
+        // It plays from there (see fallingBehindShowsGoLiveAndEndReturns),
+        // and far enough behind its cache fills and its reader rests.
+        QVERIFY2(playsOnFrom(mpv, 0), qPrintable(QString::number(mpv->property("position").toDouble())));
+        const int reopened = mpv->property("reopened").toInt();
+        QVERIFY(reopened <= 1);
         // The player's length falls behind the stream's end by eight segments and more.
         QTRY_VERIFY_WITH_TIMEOUT(edgeOf(app) + 7 - mpv->property("duration").toDouble() >= 16, 40000);
         const double stale = mpv->property("duration").toDouble();
@@ -5196,8 +5245,10 @@ private slots:
         QVERIFY2(target >= edge - join - 2 && target <= edge - join,
                  qPrintable(QString("went to %1, the edge is at %2, the player's length %3").arg(target).arg(edge).arg(stale)));
         QVERIFY(target > stale);
-        // And it gets there, once, and says it is live.
+        // And it gets there, once, plays on from there, and says it is live.
         QTRY_VERIFY_WITH_TIMEOUT(mpv->property("position").toDouble() >= target - 1 && !mpv->property("buffering").toBool(), 15000);
+        QVERIFY2(playsOnFrom(mpv, target), qPrintable(QString("at %1 of %2").arg(mpv->property("position").toDouble()).arg(target)));
+        QVERIFY(mpv->property("reopened").toInt() <= reopened + 1);
         QTRY_VERIFY(surface->property("atEdge").toBool());
         QTRY_VERIFY(timeOf(app).endsWith(QString::fromUtf8(" \u25cf live")));
         QVERIFY(!goLive->isVisible());
@@ -5213,6 +5264,7 @@ private slots:
         }
         QTest::keyClick(app.window, Qt::Key_End);
         QTRY_VERIFY_WITH_TIMEOUT(surface->property("atEdge").toBool() && !mpv->property("buffering").toBool(), 10000);
+        QVERIFY(playsOnFrom(mpv, surface->property("lastSeek").toDouble()));
         QCOMPARE(app.asked("POST api/play"), 1);
     }
 

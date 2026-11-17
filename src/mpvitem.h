@@ -91,6 +91,10 @@ class MpvItem : public QQuickFramebufferObject {
     Q_PROPERTY(bool ended READ ended NOTIFY endedChanged)
     // Whether the current file has started playing: its first frame is up.
     Q_PROPERTY(bool started READ started NOTIFY startedChanged)
+    // How many times the live stream loaded last was opened again where a
+    // seek went, because the seek left the player's reader broken (see
+    // reopen): for the tests.
+    Q_PROPERTY(int reopened READ reopened NOTIFY reopenedChanged)
     Q_PROPERTY(double volume READ volume WRITE setVolume NOTIFY volumeChanged)
     Q_PROPERTY(bool muted READ muted WRITE setMuted NOTIFY mutedChanged)
     // How fast it plays: 1 is as recorded.
@@ -137,6 +141,7 @@ public:
     bool loaded() const { return m_loaded; }
     bool ended() const { return m_ended; }
     bool started() const { return m_started; }
+    int reopened() const { return m_reopened; }
     double volume() const { return m_volume; }
     bool muted() const { return m_muted; }
     void setVolume(double volume);
@@ -163,6 +168,7 @@ signals:
     void loadedChanged();
     void endedChanged();
     void startedChanged();
+    void reopenedChanged();
     void volumeChanged();
     void mutedChanged();
     void speedChanged();
@@ -211,7 +217,11 @@ private:
     QTimer m_handoverTimeout, m_handingOverTimeout;
     // A video that was asked for before there was anything to draw it with
     // (see load()).
-    void startLoad();
+    void startLoad(bool paused = false);
+    // Opens the live stream again where the seek under way went, once.
+    void reopen();
+    // Whether mpv has sound it plays (or would, unpaused).
+    bool hasAudio() const;
     bool m_waiting = false;
     quint64 m_asked = 0;
     QString m_video, m_audio;
@@ -221,6 +231,13 @@ private:
     bool m_paused = false, m_cachePaused = false, m_seeking = false, m_loading = false;
     bool m_loaded = false, m_ended = false, m_muted = false, m_started = false, m_handingOver = false;
     bool m_releaseWhenHidden = false;
+    // A live stream's seek, from when it is asked for until it plays on from
+    // where it went (-1 when there is none), whether it was paused then, and
+    // whether it was opened again for it already (see reopen). m_reopening
+    // while that new opening hasn't started.
+    double m_seekTarget = -1;
+    bool m_seekPaused = false, m_seekReopened = false, m_reopening = false;
+    int m_reopened = 0;
     QMetaObject::Connection m_hidden;
     QColor m_background = Qt::black;
 };

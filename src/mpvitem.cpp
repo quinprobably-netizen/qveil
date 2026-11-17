@@ -626,6 +626,12 @@ void MpvItem::load(const QString &video, const QString &audio, double start, boo
     m_loading = true;
     m_loaded = false;
     m_ended = false;
+    m_seekTarget = -1;
+    m_reopening = false;
+    if (m_reopened != 0) {
+        m_reopened = 0;
+        emit reopenedChanged();
+    }
     setStarted(false);
     m_position = m_duration = m_cached = 0;
     emit bufferingChanged();
@@ -671,7 +677,7 @@ void MpvItem::renderFreed() {
     update();
 }
 
-void MpvItem::startLoad() {
+void MpvItem::startLoad(bool paused) {
     ensureCore();
     m_waiting = false;
     // Set as a node list: an audio URL contains ':', which the plain string
@@ -687,7 +693,7 @@ void MpvItem::startLoad() {
     mpv_set_property(m_core->handle, "audio-files", MPV_FORMAT_NODE, &files);
     // A negative start counts from the end: mpv reads "-15" as 15 s before it.
     mpv_set_property_string(m_core->handle, "start", m_start != 0 ? QByteArray::number(m_start).constData() : "none");
-    mpv_set_property_string(m_core->handle, "pause", "no");
+    mpv_set_property_string(m_core->handle, "pause", paused ? "yes" : "no");
     if (!m_live) {
         command({"loadfile", m_video.toUtf8(), "replace"});
         return;
@@ -733,6 +739,8 @@ void MpvItem::stop() {
     // What was waiting to be loaded is no longer wanted.
     m_waiting = false;
     m_loading = false;
+    m_seekTarget = -1;
+    m_reopening = false;
     setStarted(false);
     emit bufferingChanged();
     command({"stop"});
@@ -832,6 +840,11 @@ void MpvItem::takeState(MpvItem *from) {
     m_audio = from->m_audio;
     m_start = from->m_start;
     m_live = from->m_live;
+    m_seekTarget = from->m_seekTarget;
+    m_seekPaused = from->m_seekPaused;
+    m_seekReopened = from->m_seekReopened;
+    m_reopening = from->m_reopening;
+    take(m_reopened, from->m_reopened, &MpvItem::reopenedChanged);
     m_cachePaused = from->m_cachePaused;
     m_seeking = from->m_seeking;
     m_loading = from->m_loading;
@@ -855,6 +868,8 @@ void MpvItem::clearState() {
     const bool wasBuffering = buffering();
     m_waiting = false;
     m_cachePaused = m_seeking = m_loading = false;
+    m_seekTarget = -1;
+    m_reopening = false;
     setStarted(false);
     auto clear = [this](auto &field, auto value, void (MpvItem::*signal)()) {
         if (field != value) {
@@ -901,7 +916,56 @@ void MpvItem::togglePause() {
 }
 
 void MpvItem::seek(double seconds, bool relative) {
+    // A live stream's seek is watched until it plays on from where it went
+    // (see reopen).
+    if (m_live) {
+        m_seekTarget = qMax(0.0, relative ? m_position + seconds : seconds);
+        m_seekPaused = m_paused;
+        m_seekReopened = false;
+    }
     command({"seek", QByteArray::number(seconds), relative ? "relative" : "absolute"});
+}
+
+// A live stream's seek can leave the player unable to read it any more, and
+// then the stream is opened again, once, where the seek went: what would
+// have played from there plays from there, and nothing plays twice.
+//
+// mpv (from 0.42) makes a read it is blocked in give up when a seek is
+// asked for. On a running stream FFmpeg's HLS reader is blocked there
+// whenever it has read all the playlist has, waiting for it to grow: always,
+// at the live edge. It gives up with AVERROR_EXIT, which its playlist's
+// AVIOContext keeps as its error, and its seek (hls_read_seek) clears the
+// end of that context but not the error. So every read after the seek fails
+// with "Immediate exit requested", mpv gives up after ten, and the player is
+// at its end for good (with keep-open, paused there): it reads nothing and
+// reloads no playlist, and every seek after fails. mpv can't open a file's
+// reader again in place, so it is a new loadfile, with the same playlists
+// of the same session, at the seek's second: the seek, made a little
+// later. It is told by the seek's coming back with no sound to play (mpv
+// says "audio-pts" is unavailable: nothing was read), or by the end it
+// reaches: a running stream never ends (its reader waits for it to grow),
+// and one that has ended ends where it does, not before it has played on
+// from a seek.
+void MpvItem::reopen() {
+    m_seekReopened = true;
+    m_reopening = true;
+    ++m_reopened;
+    emit reopenedChanged();
+    m_start = m_seekTarget;
+    const bool wasBuffering = buffering();
+    m_loading = true;
+    if (buffering() != wasBuffering)
+        emit bufferingChanged();
+    if (m_paused != m_seekPaused) {
+        m_paused = m_seekPaused;
+        emit pausedChanged();
+    }
+    startLoad(m_seekPaused);
+}
+
+bool MpvItem::hasAudio() const {
+    double pts;
+    return m_core && mpv_get_property(m_core->handle, "audio-pts", MPV_FORMAT_DOUBLE, &pts) >= 0;
 }
 
 void MpvItem::setVolume(double volume) {
@@ -952,9 +1016,17 @@ void MpvItem::onProperty(const mpv_event_property *p) {
             emit(self->*signal)();
         }
     };
-    if (name == "time-pos")
+    // While a live stream is opened again where a seek went, it stays where
+    // it was until the new opening says where it is (see reopen).
+    if (!has && m_reopening && (name == "time-pos" || name == "duration"))
+        return;
+    if (name == "time-pos") {
         update(m_position, number, &MpvItem::positionChanged, this);
-    else if (name == "duration")
+        // A live seek that has got where it went, and plays on from there.
+        // (Not what it said before the seek: that is anywhere but just past it.)
+        if (m_seekTarget >= 0 && has && number >= m_seekTarget + 0.5 && number <= m_seekTarget + 3)
+            m_seekTarget = -1;
+    } else if (name == "duration")
         update(m_duration, number, &MpvItem::durationChanged, this);
     else if (name == "demuxer-cache-time")
         update(m_cached, number, &MpvItem::cachedChanged, this);
@@ -964,8 +1036,17 @@ void MpvItem::onProperty(const mpv_event_property *p) {
         update(m_cachePaused, flag, &MpvItem::bufferingChanged, this);
     else if (name == "seeking")
         update(m_seeking, flag, &MpvItem::bufferingChanged, this);
-    else if (name == "eof-reached")
+    else if (name == "eof-reached") {
+        // The end of a live stream reached from a seek, before it played on
+        // from there: the seek broke its reader (see reopen). (And what the
+        // file being replaced says meanwhile is of no more use.)
+        if (flag && m_live && m_seekTarget >= 0 && (m_reopening || !m_seekReopened)) {
+            if (!m_reopening)
+                reopen();
+            return;
+        }
         update(m_ended, flag, &MpvItem::endedChanged, this);
+    }
     else if (name == "volume" && has)
         update(m_volume, number, &MpvItem::volumeChanged, this);
     else if (name == "mute")
@@ -992,8 +1073,21 @@ void MpvItem::handleEvents() {
             // The first one after loading means the first frame is up; the
             // ones after seeks change nothing.
             setStarted(true);
+            // (Once the new opening is loaded: not the old file's last.)
+            if (m_reopening && !m_loading)
+                m_reopening = false;
+            else if (!m_reopening && m_live && m_seekTarget >= 0 && !m_seekReopened && !m_audio.isEmpty() && !hasAudio())
+                // Back from a live seek with no sound to play: the seek broke
+                // the sound's reader (see reopen). Told here, as it is told
+                // while paused too, where no end is reached until it plays.
+                reopen();
             break;
         case MPV_EVENT_FILE_LOADED:
+            // Opened again where a live seek went: played or paused as it was
+            // then. (The old file's end, which it may have reached meanwhile,
+            // paused the player: keep-open.)
+            if (m_reopening)
+                mpv_set_property_string(m_core->handle, "pause", m_seekPaused ? "yes" : "no");
             m_loading = false;
             m_loaded = true;
             emit bufferingChanged();
@@ -1003,6 +1097,7 @@ void MpvItem::handleEvents() {
             const auto *end = static_cast<mpv_event_end_file *>(event->data);
             if (end->reason == MPV_END_FILE_REASON_ERROR) {
                 m_loading = false;
+                m_reopening = false;
                 emit bufferingChanged();
                 emit failed(tr("Playback failed: %1").arg(QString::fromUtf8(mpv_error_string(end->error))));
             }
