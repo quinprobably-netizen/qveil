@@ -180,8 +180,9 @@ public:
     Q_INVOKABLE void cancelPrepare();
     // Asks the engine whether the running stream whose video playlist is
     // `playlist` (the play answer's `video`, `<base>/live/<session>/video.m3u8`)
-    // has ended: liveChecked() says. Quiet: nothing shows while it runs, and a
-    // failure is asked again at the next check.
+    // has ended: liveChecked() says ("now", "ended", or "failed" for one the
+    // engine can't go on with, whose reason is the error). Quiet: nothing
+    // shows while it runs, and any other failure is asked again at the next check.
     Q_INVOKABLE void checkLive(const QString &playlist);
     // Hangs up on a check still running: the stream was left.
     Q_INVOKABLE void stopLiveCheck();

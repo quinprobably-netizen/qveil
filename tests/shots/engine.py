@@ -17,6 +17,9 @@ playlists that list LIVE_FIRST segments when it is opened and one more each
 LIVE_SEGMENT seconds, and `live/<sid>/state`. `POST api/_live_end` ends it:
 the playlists get `#EXT-X-ENDLIST`, and the state says "ended". `POST
 api/_live_drop` forgets its session, as an engine that no longer has it.
+`POST api/_live_fail` fails it, as an engine that can't go on with it: the
+state is a 502 that says why. `POST api/_live_state_hold` holds every answer
+to the state until `POST api/_live_state_release`, as a slow engine would.
 
 A video whose ID starts with "waiting" is an announced stream: its play
 answers `waiting` and no streams, and `GET api/wait` is its waiting room (see
@@ -53,7 +56,9 @@ LIVE_EDGE_SKEW = float(os.environ.get("QVEIL_STANDIN_LIVE_EDGE_SKEW", "0"))
 # How many segments back from the newest a player joins a running stream.
 LIVE_JOIN = 3
 # When the running stream was opened (it grows from then), and whether it has ended.
-live = {"opened": 0.0, "ended": False, "sid": 0, "final": 0}
+live = {"opened": 0.0, "ended": False, "sid": 0, "final": 0, "failed": None, "hold": False}
+# What the engine says when it can't go on with a running stream (see api/_live_fail).
+LIVE_FAILED = "The stream changed format while it played; open it again."
 # The waiting rooms open now, and the announced streams that have started.
 waits = {"open": 0, "started": set(), "lock": threading.Lock()}
 # When each announced stream starts, from the moment it is played, by the
@@ -668,6 +673,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not rest or rest[0] != str(live["sid"]):
             self.send(404, {"error": "no such session", "code": "other"})
         elif rest[1:] == ["state"]:
+            held = time.monotonic()
+            while live["hold"] and not self.hung_up() and time.monotonic() - held < 10:
+                time.sleep(0.02)
+            if live["failed"]:
+                self.send(502, {"error": live["failed"], "code": "other"})
+                return
             self.send(200, {"state": "ended" if live["ended"] else "now", "head": live_head(), "oldest": 0,
                             "edge": live_edge()})
         elif rest[1:] in (["video.m3u8"], ["audio.m3u8"]):
@@ -846,6 +857,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             live.update(final=live_head(), ended=True)
             self.send(200, {})
             return
+        if path == "api/_live_fail":
+            # The engine can't go on with the running stream, and says why.
+            live.update(failed=LIVE_FAILED)
+            self.send(200, {})
+            return
+        if path in ("api/_live_state_hold", "api/_live_state_release"):
+            live.update(hold=path == "api/_live_state_hold")
+            self.send(200, {})
+            return
         if path == "api/_live_drop":
             # The engine no longer has the running stream's session: all of it is 404.
             live.update(sid=live["sid"] + 1000)
@@ -897,7 +917,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 "waiting": {"starts": wait_starts(v)}})
                 return
             if (v.startswith("live") or v in waits["started"]) and LIVECLIP:
-                live.update(opened=time.monotonic(), ended=False, sid=live["sid"] + 1)
+                live.update(opened=time.monotonic(), ended=False, failed=None, sid=live["sid"] + 1)
                 at = "%s/live/%d/" % (base, live["sid"])
                 cid, name = CHANNELS[0]
                 self.send(200, {"id": v, "title": "Live: the long one, part 2", "channel": name, "channelId": cid,

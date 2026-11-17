@@ -337,10 +337,18 @@ void Backend::request(const QByteArray &verb, const QString &path, const QUrlQue
                 return;
             }
             // Whether a stream has ended is asked again at the next check, and
-            // a session the engine no longer has (404) is one that is over.
+            // a session the engine no longer has (404) is one that is over. One
+            // it can't go on with says why: the window shows it, and stops asking.
             if (task == "live-state") {
-                if (status == 404 && m_latest.value(task) == id)
+                if (m_latest.value(task) != id)
+                    return;
+                const QJsonObject body = doc.object();
+                if (status == 404) {
                     done(QJsonObject{{"state", "ended"}});
+                } else if (body.contains("error")) {
+                    fail(body.value("error").toString(), body.value("code").toString(), failure(reply));
+                    done(QJsonObject{{"state", "failed"}});
+                }
                 return;
             }
             const QJsonObject body = doc.object();
@@ -379,10 +387,12 @@ void Backend::adoptConfig(const QVariantMap &next, bool routeSet) {
 void Backend::leaveRoute() {
     // A video that was still being looked up went through the old route, so
     // its answer must not open a player now. Nor is a stream waited for, or
-    // its chat read, on it.
+    // its chat read, on it, nor its state asked: the engine has let its
+    // session go, and a 404 for it would say the stream ended.
     supersede("play");
     supersede("wait");
     supersede("chat");
+    supersede("live-state");
     emit routeChanged();
 }
 

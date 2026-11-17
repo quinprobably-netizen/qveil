@@ -96,6 +96,9 @@ FocusScope {
     // Set once a stream that was running when it was opened has ended: it
     // is a video like any other from then on (and the Comments tab returns).
     property bool liveEnded: false
+    // Set once the engine has said it can't go on with a running stream (the
+    // window shows why): it plays what it has, and isn't asked about again.
+    property bool liveFailed: false
     // How often the engine is asked where a running stream's edge is, and
     // whether it has ended, in ms: 0 for once a segment, which keeps the
     // edge as new as the stream.
@@ -229,6 +232,7 @@ FocusScope {
         startedAt = 0
         lastSeek = -1
         liveEnded = false
+        liveFailed = false
         forgetEdge()
         pending = true
         active = true
@@ -254,6 +258,7 @@ FocusScope {
         fromStart = false
         active = true
         liveEnded = false
+        liveFailed = false
         forgetEdge()
         // (A running stream's start is negative: that many seconds before its end.)
         const resumed = at === undefined && !i.start && i.resume > 0
@@ -296,6 +301,7 @@ FocusScope {
         lastPosition = from.lastPosition
         forgetWhenStarted = from.forgetWhenStarted
         liveEnded = from.liveEnded
+        liveFailed = from.liveFailed
         liveEdge = from.liveEdge
         atEdge = from.atEdge
         note.shown = false
@@ -449,7 +455,7 @@ FocusScope {
         interval: surface.liveCheckInterval > 0 ? surface.liveCheckInterval : Math.max(1000, surface.segment * 1000)
         repeat: true
         triggeredOnStart: true
-        running: surface.active && !surface.pending && surface.live
+        running: surface.active && !surface.pending && surface.live && !surface.liveFailed
         onTriggered: backend.checkLive(surface.info.video)
     }
     Connections {
@@ -457,6 +463,10 @@ FocusScope {
         function onLiveChecked(playlist, state, edge) {
             if (!surface.active || !surface.live || playlist !== surface.info.video)
                 return
+            if (state === "failed") {
+                surface.liveFailed = true
+                return
+            }
             if (state !== "ended") {
                 if (edge > 0)
                     surface.liveEdge = edge

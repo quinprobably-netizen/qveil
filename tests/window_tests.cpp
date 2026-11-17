@@ -265,10 +265,12 @@ struct App {
     int askedLike(const char *pattern) { return asked().filter(QRegularExpression(pattern)).size(); }
 
     // Ends the running stream the stand-in engine serves (QVEIL_STANDIN_LIVECLIP).
-    void endTheStream()
+    void endTheStream() { tellTheStandIn("api/_live_end"); }
+    // Tells the stand-in engine `path` (one of its api/_ knobs).
+    void tellTheStandIn(const QString &path)
     {
         const QString base = backend->thumbBase().chopped(QString("/thumb/").size());
-        QNetworkReply *reply = web.post(QNetworkRequest(QUrl(base + "/api/_live_end")), QByteArray());
+        QNetworkReply *reply = web.post(QNetworkRequest(QUrl(base + "/" + path)), QByteArray());
         QSignalSpy done(reply, &QNetworkReply::finished);
         done.wait(5000);
         reply->deleteLater();
@@ -5347,6 +5349,53 @@ private slots:
         QCOMPARE(app.askedLike("^GET live/\\d+/state"), checks);
         QCOMPARE(app.asked("POST api/play"), 1);
         app.backend->clearError();
+    }
+
+    void aStreamTheEngineCannotGoOnWithSaysWhy()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QVERIFY(playLive(app, 300));
+        QQuickItem *surface = app.item("surface");
+        // (Looked up again, it came in another format, which can't go on where the player is.)
+        app.tellTheStandIn("api/_live_fail");
+        QTRY_COMPARE_WITH_TIMEOUT(app.backend->error(), QString("The stream changed format while it played; open it again."), 5000);
+        QTRY_VERIFY(surface->property("liveFailed").toBool());
+        // It hasn't ended, and its state is not asked for any more.
+        QVERIFY(!surface->property("liveEnded").toBool());
+        const int checks = app.askedLike("^GET live/\\d+/state");
+        QTest::qWait(1000);
+        QCOMPARE(app.askedLike("^GET live/\\d+/state"), checks);
+        QCOMPARE(app.asked("POST api/play"), 1);
+        app.backend->clearError();
+    }
+
+    void aRouteChangeHangsUpOnTheLiveCheck()
+    {
+        QTemporaryDir dir;
+        const QString clip = makeLiveClip(dir);
+        if (clip.isEmpty())
+            QSKIP("ffmpeg couldn't make a stream to play");
+        App app(false, QSize(1280, 720), {{"QVEIL_STANDIN_LIVECLIP", clip}});
+        READY(app);
+        QVERIFY(playLive(app, 300));
+        // A check of the old route's session is on its way when the route
+        // changes: its answer (a 404, from an engine that has let the
+        // session go) must not say the stream has ended.
+        app.tellTheStandIn("api/_live_state_hold");
+        QTRY_VERIFY(app.backend->busy().contains("live-state"));
+        bool checking = true;
+        QSignalSpy moved(app.backend.get(), &Backend::routeChanged);
+        connect(app.backend.get(), &Backend::routeChanged, app.window, [&] { checking = app.backend->busy().contains("live-state"); });
+        app.backend->setConfig({{"route", "tor"}});
+        QTRY_COMPARE(moved.count(), 1);
+        QVERIFY(!checking);
+        app.tellTheStandIn("api/_live_state_release");
+        QTRY_COMPARE(app.asked("POST api/play"), 2);
     }
 
     void aLiveStreamSavesNoResumePosition()
