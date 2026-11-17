@@ -77,7 +77,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.
 - Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.
 - Playing a video, or getting it ready, looks it up the way yt-dlp does by itself: its watch page, and then YouTube's player for its streams, with the same identity. Its chapters, its channel's name and its age come with that lookup, and cost no request of their own. yt-dlp asks the player as one of YouTube's own clients, with that client's User-Agent (with current yt-dlp, Safari's, from its visionOS client) and not qveil's Chrome one, which the video's bytes carry: a lookup and its stream show two browser identities.
-- Live streams are fetched segment by segment over your route, a few seconds ahead of what plays.
+- Live streams are fetched segment by segment over your route, up to about 90 seconds ahead of what plays. Opening one also makes a few small reads of its oldest segments, to find where the stream starts.
 - Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave. Opening its waiting room also reads its channel's Streams tab once, to list what else the channel has running or announced.
 - A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.
 - Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.
@@ -114,7 +114,7 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
 - **Topic feeds, off.** Off: qveil doesn't work out what the channels you follow are about, and searches for nothing by itself.
 - **Topic feeds, on.** On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups, in a new random order each time and 2 to 8 seconds apart: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.
 - **Live check, on.** With the live check on, each feed refresh also reads the Streams tab of each followed channel due for a refresh: one more request per channel, in random order with 2–8 s pauses.
-- **Live chat, on.** Live chat is read only while its tab is open: one long-running request stream over your route. No pictures (avatars, badges, emoji) are fetched.
+- **Live chat, on.** Live chat is read only while its tab is open, by yt-dlp's chat reader, which asks YouTube for new messages every few seconds over your route. No pictures (avatars, badges, emoji) are fetched.
 - **Getting the next video ready, off.** Off: a video is looked up when you play it, and not before.
 - **Getting the next video ready, on.** On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it.
 - **Keeping thumbnails on disk, off.** Off: thumbnails are kept in memory while qveil runs, and not on disk.
@@ -163,12 +163,12 @@ qveil can't make you invisible to YouTube: it still has to ask YouTube for video
   you want to look at, the settings can frost them (blurred and muted until
   you point at one), or not load thumbnails at all.
 - **Live streams** play through your route like any video: qveil fetches the
-  segments itself, a few seconds ahead of what plays, so nothing goes around
-  the route. You can rewind to the start of a running stream (up to 5 days
-  back) with the ordinary seek bar; behind the edge, **Go live** (`End`) takes
-  you back. A stream that is announced but not yet running waits in a room of
-  its own with a countdown, and starts once, from the beginning, when it does;
-  beside it, the channel's other running and announced streams.
+  segments itself, up to about 90 seconds ahead of what plays, so nothing goes
+  around the route. You can rewind to the start of a running stream (up to 5
+  days back) with the ordinary seek bar; behind the edge, **Go live** (`End`)
+  takes you back. A stream that is announced but not yet running waits in a
+  room of its own with a countdown, and starts once, from the beginning, when
+  it does; beside it, the channel's other running and announced streams.
   Each channel has a **Streams** tab (running, announced, then past
   broadcasts), loaded only when you open it. The **chat** of a running stream
   is the first tab of the side sheet: read only and text only (no avatars,

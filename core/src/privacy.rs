@@ -120,7 +120,7 @@ const FINGERPRINT_POINT: &str = "qveil's requests carry a browser User-Agent on 
 const SUBSCRIPTIONS_POINT: &str = "Refreshing your subscriptions asks for each channel on its own, in random order, skipping channels fetched in the last 15 minutes: that is still a burst of requests for exactly your channels, so timing and the set of IDs can link them.";
 const COOKIES_POINT: &str = "You are never signed in, and cookies are never stored or read from a browser: yt-dlp sends the one consent cookie it sets for itself, and sends back what YouTube sets during a single call, kept in memory until that call ends.";
 const COMMENTS_POINT: &str = "Comments are fetched only when you open them, as one more lookup of that video, on a circuit of its own over Tor, which YouTube can still tie to the video by its ID and timing; commenters' pictures are never fetched.";
-const LIVE_PLAYBACK_POINT: &str = "Live streams are fetched segment by segment over your route, a few seconds ahead of what plays.";
+const LIVE_PLAYBACK_POINT: &str = "Live streams are fetched segment by segment over your route, up to about 90 seconds ahead of what plays. Opening one also makes a few small reads of its oldest segments, to find where the stream starts.";
 const WAITING_POINT: &str = "Waiting for an announced stream asks YouTube once at its start time, then every minute (every 5 minutes after half an hour late), and stops after 6 hours or when you leave. Opening its waiting room also reads its channel's Streams tab once, to list what else the channel has running or announced.";
 const LENSES_POINT: &str = "A lens is refreshed as one search per topic (a second one for a topic whose filtered search found nothing), in a new random order each time and 2 to 8 seconds apart: on one address their timing still links them, and even over Tor a set of related searches can be linked by content.";
 const LOCAL_POINT: &str = "Subscriptions, lenses, history, resume positions and the caches stay on this computer, in files only you can read, and qveil has no telemetry.";
@@ -257,7 +257,7 @@ const TOPICS_OFF: &str = "Off: qveil doesn't work out what the channels you foll
 const TOPICS_ON: &str = "On: qveil groups the channels you follow by the words that keep coming back in their titles, on this computer, and searches YouTube by itself for up to three of those phrases for each of up to four groups, in a new random order each time and 2 to 8 seconds apart: at most twelve searches in a day, each counted before it is sent, and none for a group whose results are less than a day old, both by this computer's clock (changing the clock, or deleting qveil's data, can start the day over). YouTube sees those searches. They say what the channels you follow are about, and can point to a channel itself when what comes back in its titles is a series or a name. Videos from channels you follow are left out of what is shown. Turned off, what was found is deleted, but when the day's searches were made is kept until each is a day old, so that turning it off and on again doesn't start the count over; each is deleted by the next time qveil starts after that.";
 const TOPICS_POINT: &str = "Topic feeds are on: without being asked each time, qveil searches YouTube for phrases taken from the titles of the channels you follow, which tells YouTube what those channels are about.";
 const LIVE_CHECK_POINT: &str = "With the live check on, each feed refresh also reads the Streams tab of each followed channel due for a refresh: one more request per channel, in random order with 2\u{2013}8 s pauses.";
-const CHAT_POINT: &str = "Live chat is read only while its tab is open: one long-running request stream over your route. No pictures (avatars, badges, emoji) are fetched.";
+const CHAT_POINT: &str = "Live chat is read only while its tab is open, by yt-dlp's chat reader, which asks YouTube for new messages every few seconds over your route. No pictures (avatars, badges, emoji) are fetched.";
 const PREPARE_OFF: &str = "Off: a video is looked up when you play it, and not before.";
 const PREPARE_ON: &str = "On: in the last 30 seconds of a video you play from a list, qveil looks up the next one in Up next, so that it starts at once when you go on to it. YouTube (over Tor, the exit node too) sees that lookup even if you never watch the video. Over Tor it goes on a circuit of its own, which the video then plays on if you start it within nine minutes. Nothing is looked up because you pointed at it.";
 const PREPARE_POINT: &str = "Getting the next video ready is on: near the end of a video, the next one in its list is looked up before you play it, so YouTube sees a lookup of a video you may not watch.";
@@ -822,9 +822,16 @@ mod tests {
                 assert!(points.iter().any(|p| p == point), "{point}");
             }
         }
-        // A stream is played from its segments, over the route, a little ahead.
+        // A stream is played from its segments, over the route, as far
+        // ahead as the player reads (`demuxer-readahead-secs`), and opening
+        // it looks at its oldest segments.
         assert!(LIVE_PLAYBACK_POINT.contains("segment by segment over your route"));
-        assert!(LIVE_PLAYBACK_POINT.contains("a few seconds ahead of what plays"));
+        assert!(LIVE_PLAYBACK_POINT.contains("up to about 90 seconds ahead of what plays"));
+        assert!(LIVE_PLAYBACK_POINT.contains("a few small reads of its oldest segments"));
+        let player =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/mpvitem.cpp"))
+                .expect("the window's player is in src/");
+        assert!(player.contains(r#"{"demuxer-readahead-secs", "90"}"#));
         // The waiting room's schedule, and when it stops.
         for right in [
             "once at its start time",
@@ -910,7 +917,8 @@ mod tests {
         assert_eq!(on.points.len(), off.points.len() + 1);
         for right in [
             "Live chat is read only while its tab is open",
-            "one long-running request stream over your route",
+            "by yt-dlp's chat reader",
+            "every few seconds over your route",
             "No pictures (avatars, badges, emoji) are fetched",
         ] {
             assert!(CHAT_POINT.contains(right), "{right:?} in: {CHAT_POINT}");
