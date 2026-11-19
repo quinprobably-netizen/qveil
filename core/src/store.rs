@@ -428,8 +428,44 @@ pub mod testing {
     /// A scratch directory that is removed when dropped.
     pub struct TempDir(pub PathBuf);
 
+    /// Lets the test process open more files than the usual soft limit.
+    ///
+    /// The soft limit is often 1024: systemd's default for a session, so
+    /// what makepkg's check() runs under on an Arch desktop, and what CI's
+    /// Arch container gave it. A full run goes past it. Every server a test starts, with its listener, its
+    /// clients' pools and its connections, lives until the process ends, so
+    /// a serial run climbs to some 750 descriptors, and four test threads at
+    /// once (two of them opening a few hundred sockets on purpose, to fill
+    /// the server's pools) reach well over a thousand. The tests then fail
+    /// with "Too many open files", which says nothing about qveil. So the
+    /// soft limit is raised to 65536, or the hard limit if that is lower
+    /// (a hard limit of "unlimited" can't be the soft one: Linux refuses
+    /// more than fs.nr_open). The engine never needs this outside its
+    /// tests, so only they raise it.
+    fn more_open_files() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit and setrlimit only read and write `lim`.
+            unsafe {
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+                    return;
+                }
+                let want = lim.rlim_max.min(65536);
+                if lim.rlim_cur < want {
+                    lim.rlim_cur = want;
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                }
+            }
+        });
+    }
+
     impl TempDir {
         pub fn new() -> Self {
+            more_open_files();
             let p = std::env::temp_dir().join(format!("qveil-test-{:016x}", rand::random::<u64>()));
             std::fs::create_dir_all(&p).unwrap();
             TempDir(p)
