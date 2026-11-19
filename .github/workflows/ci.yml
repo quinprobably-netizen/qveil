@@ -33,7 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel git qt6-base qt6-declarative qt6-svg qt6-wayland mpv rust python desktop-file-utils
+      # The window lays itself out in JetBrains Mono, which the package
+      # depends on. The build below skips run-time dependencies, so the font
+      # is installed here: without it the container has no font at all, and
+      # the window tests measure text in whatever Qt falls back to.
+      - run: pacman -Syu --noconfirm --needed base-devel git qt6-base qt6-declarative qt6-svg qt6-wayland mpv rust python desktop-file-utils ttf-jetbrains-mono-nerd
       - uses: actions/checkout@v4
       - run: desktop-file-validate pkgbuild/qveil.desktop
       # makepkg refuses to run as root, and root would hide mistakes a real
