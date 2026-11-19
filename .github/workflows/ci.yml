@@ -81,6 +81,13 @@ jobs:
       # video from the relay URL it is given, which proves the stream resolved
       # and that the engine's relay can read it. The video is the first one
       # ever uploaded to YouTube, which has no reason to go away.
+      #
+      # GitHub's runners share addresses that YouTube often bot-checks
+      # ("confirm you're not a bot"): the engine then says "(bot check)" and
+      # nothing was learned about yt-dlp or qveil. That ends the step with a
+      # warning on the run instead of a failure, so the weekly run doesn't
+      # mark main's newest commit red for YouTube's reasons; any other
+      # failure still fails.
       - name: Resolve and relay a video through the built engine
         run: |
           export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_DATA_HOME="$RUNNER_TEMP/data" XDG_CACHE_HOME="$RUNNER_TEMP/cache"
@@ -97,4 +104,13 @@ jobs:
           chmod +x "$RUNNER_TEMP/fake-mpv"
           mkdir -p "$XDG_CONFIG_HOME/qveil"
           printf 'mpv = "%s"\n' "$RUNNER_TEMP/fake-mpv" > "$XDG_CONFIG_HOME/qveil/config.toml"
-          core/target/release/qveil-core play jNQXAC9IVRw
+          status=0
+          core/target/release/qveil-core play jNQXAC9IVRw 2> "$RUNNER_TEMP/play.err" || status=$?
+          cat "$RUNNER_TEMP/play.err" >&2
+          if [ "$status" -ne 0 ]; then
+            if grep -q '(bot check)' "$RUNNER_TEMP/play.err"; then
+              echo "::warning title=canary::YouTube bot-checked this runner's address, so whether a video still resolves is unknown. Run the canary again, or play a video locally."
+            else
+              exit "$status"
+            fi
+          fi
