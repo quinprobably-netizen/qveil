@@ -4,8 +4,9 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
 # The package depends on the JetBrains Mono Nerd Font, so a machine without it
-# fails the test of the typeface instead of skipping it. CI (which has no such
-# font) skips, and QVEIL_TEST_REQUIRE_FONT=0 asks for that anywhere else.
+# fails the test of the typeface instead of skipping it. CI installs the font
+# but doesn't ask for it, and QVEIL_TEST_REQUIRE_FONT=0 asks for a skip
+# anywhere else.
 if [ -z "${CI:-}" ]; then
     export QVEIL_TEST_REQUIRE_FONT="${QVEIL_TEST_REQUIRE_FONT:-1}"
 fi
